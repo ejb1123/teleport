@@ -1,0 +1,304 @@
+#![cfg(target_os = "linux")]
+
+use std::{
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
+};
+
+struct Process(Child);
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Strip development-shell discovery paths when exercising a packaged binary.
+fn teleport() -> Command {
+    if let Some(binary) = std::env::var_os("TELEPORT_TEST_BINARY") {
+        let mut command = Command::new(binary);
+        for key in [
+            "GST_PLUGIN_PATH",
+            "GST_PLUGIN_PATH_1_0",
+            "GST_PLUGIN_SYSTEM_PATH",
+            "GST_PLUGIN_SYSTEM_PATH_1_0",
+            "GST_PLUGIN_SCANNER",
+            "GST_PLUGIN_SCANNER_1_0",
+        ] {
+            command.env_remove(key);
+        }
+        command
+    } else {
+        Command::new(env!("CARGO_BIN_EXE_teleport"))
+    }
+}
+
+/// Real TLS/QUIC/MoQ, H.264 encode/decode, and control heartbeat, with no display.
+/// Run outside the Nix build sandbox: cargo test --test smoke -- --ignored --nocapture
+#[test]
+#[ignore = "requires local UDP sockets and GStreamer runtime plugins"]
+fn native_moq_video() {
+    let temp = tempfile::tempdir().unwrap();
+    let pairing = temp.path().join("pairing.json");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let mut host = Process(
+        teleport()
+            .args([
+                "host",
+                "--source",
+                "test",
+                "--listen",
+                &address,
+                "--width",
+                "640",
+                "--fps",
+                "30",
+                "--pairing-file",
+            ])
+            .arg(&pairing)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !pairing.exists() {
+        assert!(
+            host.0.try_wait().unwrap().is_none(),
+            "host exited before pairing"
+        );
+        assert!(Instant::now() < deadline, "host startup timed out");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // A complete JSON file indicates the host finished publishing credentials.
+    loop {
+        if serde_json::from_slice::<serde_json::Value>(&std::fs::read(&pairing).unwrap()).is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = teleport()
+        .args([
+            "client",
+            &address,
+            "--headless-frames",
+            "45",
+            "--pairing-file",
+        ])
+        .arg(&pairing)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "client failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("SMOKE PASS"));
+    // Reconnect to the same host: it must tear down the old pipeline and controls.
+    let output = teleport()
+        .args([
+            "client",
+            &address,
+            "--headless-frames",
+            "15",
+            "--pairing-file",
+        ])
+        .arg(&pairing)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "reconnect failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&pairing).unwrap()).unwrap();
+    for field in ["token", "fingerprint"] {
+        let mut bad = original.clone();
+        bad[field] = "0".repeat(64).into();
+        let path = temp.path().join(format!("bad-{field}.json"));
+        std::fs::write(&path, serde_json::to_vec(&bad).unwrap()).unwrap();
+        let output = teleport()
+            .args([
+                "client",
+                &address,
+                "--headless-frames",
+                "1",
+                "--pairing-file",
+            ])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "invalid {field} was accepted");
+    }
+}
+
+#[test]
+#[ignore = "requires Xvfb, local UDP sockets and GStreamer runtime plugins"]
+fn x11_capture_input_and_native_window() {
+    use std::io::BufRead;
+    use x11rb::{connection::Connection, protocol::xproto::ConnectionExt};
+    let mut display = Process(
+        Command::new("Xvfb")
+            .args([
+                "-displayfd",
+                "1",
+                "-screen",
+                "0",
+                "800x600x24",
+                "-nolisten",
+                "tcp",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("Xvfb must be installed"),
+    );
+    let mut number = String::new();
+    std::io::BufReader::new(display.0.stdout.take().unwrap())
+        .read_line(&mut number)
+        .unwrap();
+    let display_name = format!(":{}", number.trim());
+    let (connection, screen) = x11rb::connect(Some(&display_name)).unwrap();
+    let root = connection.setup().roots[screen].root;
+    // Focus an isolated test window so we can observe XTest key transitions.
+    let window = connection.generate_id().unwrap();
+    use x11rb::protocol::xproto::{CreateWindowAux, EventMask, InputFocus, WindowClass};
+    connection
+        .create_window(
+            0,
+            window,
+            root,
+            0,
+            0,
+            800,
+            600,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &CreateWindowAux::new().event_mask(EventMask::KEY_PRESS | EventMask::KEY_RELEASE),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    connection.map_window(window).unwrap().check().unwrap();
+    connection
+        .set_input_focus(InputFocus::PARENT, window, 0u32)
+        .unwrap()
+        .check()
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let pairing = temp.path().join("pairing.json");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let mut host = Process(
+        teleport()
+            .env_remove("WAYLAND_DISPLAY")
+            .env("XDG_SESSION_TYPE", "x11")
+            .env("DISPLAY", &display_name)
+            .args([
+                "host",
+                "--source",
+                "x11",
+                "--listen",
+                &address,
+                "--width",
+                "640",
+                "--fps",
+                "30",
+                "--pairing-file",
+            ])
+            .arg(&pairing)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::read(&pairing)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_none()
+    {
+        assert!(host.0.try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = teleport()
+        .args([
+            "client",
+            &address,
+            "--headless-frames",
+            "30",
+            "--smoke-input",
+            "--pairing-file",
+        ])
+        .arg(&pairing)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "input client failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut transitions = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        while let Some(event) = connection.poll_for_event().unwrap() {
+            match event {
+                x11rb::protocol::Event::KeyPress(e) => transitions.push((e.detail, true)),
+                x11rb::protocol::Event::KeyRelease(e) => transitions.push((e.detail, false)),
+                _ => (),
+            }
+        }
+        if transitions.contains(&(37, false)) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "disconnect did not release Ctrl; events: {transitions:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        transitions.contains(&(38, true)) && transitions.contains(&(38, false)),
+        "A press/release missing: {transitions:?}"
+    );
+    assert!(
+        connection
+            .query_keymap()
+            .unwrap()
+            .reply()
+            .unwrap()
+            .keys
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+    let pointer = connection.query_pointer(root).unwrap().reply().unwrap();
+    assert!((pointer.root_x - 399).abs() <= 1 && (pointer.root_y - 299).abs() <= 1);
+    let output = teleport()
+        .env_remove("WAYLAND_DISPLAY")
+        .env("SDL_VIDEODRIVER", "x11")
+        .env("DISPLAY", &display_name)
+        .args([
+            "client",
+            &address,
+            "--software-renderer",
+            "--exit-after-frames",
+            "30",
+            "--pairing-file",
+        ])
+        .arg(&pairing)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "native window failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
