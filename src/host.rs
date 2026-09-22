@@ -11,7 +11,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub struct Options {
     /// Bind address (UDP). Use 0.0.0.0:4443 for LAN access.
     #[arg(long, default_value = "127.0.0.1:4443")]
@@ -21,11 +21,12 @@ pub struct Options {
     /// New private pairing file; never overwritten. Copy securely to the client.
     #[arg(long, default_value = "pairing.json")]
     pub pairing_file: PathBuf,
-    #[arg(long, default_value_t = 1280, value_parser = clap::value_parser!(u32).range(320..=3840))]
+    /// Stream width; 0 uses the selected monitor's reported native size.
+    #[arg(long, default_value_t = 1280, value_parser = parse_width)]
     pub width: u32,
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=120))]
     pub fps: u32,
-    /// H.264 bitrate in kilobits per second.
+    /// Video bitrate in kilobits per second.
     #[arg(long, default_value_t = 8000, value_parser = clap::value_parser!(u32).range(500..=100000))]
     pub bitrate: u32,
     /// Persistent private identity directory; keeps paired clients valid across restarts.
@@ -50,6 +51,11 @@ pub struct Options {
     /// Open one-time code enrollment on TCP at the same port for five minutes.
     #[arg(long)]
     pub pair: bool,
+    /// Default codec for clients without an explicit selection. Prefer H.264 for compatibility.
+    #[arg(long, value_enum, default_value_t = protocol::VideoCodec::H264)]
+    pub codec: protocol::VideoCodec,
+    #[arg(skip)]
+    pub dynamic_range: protocol::DynamicRange,
 }
 
 pub async fn run(options: Options) -> Result<()> {
@@ -166,6 +172,12 @@ async fn connection(
     options: &Options,
     capture: &mut Capture,
 ) -> Result<()> {
+    // Stream preferences belong to this connection, not the next paired client.
+    let mut negotiated = options.clone();
+    let requested = requested_format(request.query(), options.codec)?;
+    negotiated.codec = requested.codec;
+    negotiated.dynamic_range = requested.dynamic_range;
+    let options = &mut negotiated;
     capture.select_monitor(capture.active_monitor).await?;
     let outgoing = moq_net::Origin::random().produce();
     let incoming = moq_net::Origin::random().produce();
@@ -174,7 +186,7 @@ async fn connection(
         moq_net::broadcast::Route::new().with_announce(true),
     )?;
     let video = broadcast.create_track(
-        protocol::VIDEO,
+        options.codec.track(),
         moq_net::track::Info::default().with_latency_max(Duration::from_millis(500)),
     )?;
     let mut metadata = broadcast.create_track("desktop", None)?;
@@ -213,15 +225,19 @@ async fn connection(
     })
     .await
     .context("client did not open input track")??;
-    let info = desktop(options, capture)?;
+    let mut video_start_group = 0;
+    let info = desktop(options, capture, video_start_group)?;
     let mut pipeline = media::encoder(
-        &capture.pipeline_source(),
-        info.width,
-        info.height,
+        &capture.pipeline_source_for_range(options.dynamic_range)?,
+        (info.width, info.height),
         options.fps,
         options.bitrate,
         video.clone(),
         options.encoder,
+        media::VideoFormat {
+            codec: options.codec,
+            dynamic_range: options.dynamic_range,
+        },
     )?;
     let audio = match (options.audio_source.as_deref(), audio_track) {
         (Some(source), Some(track)) => Some(crate::audio::capture(source, track)?),
@@ -244,26 +260,76 @@ async fn connection(
     let mut adaptive = !options.fixed_bitrate;
     let mut last_feedback = Instant::now();
     let mut last_switch = Instant::now() - Duration::from_secs(1);
+    let mut last_configure = Instant::now() - Duration::from_secs(1);
+    let mut encoder_metrics = pipeline.encoder_metrics()?;
+    let mut telemetry_enabled = false;
+    let mut last_telemetry = Instant::now();
+    let mut actual_bitrate = options.bitrate;
     loop {
         tokio::select! {
             result = &mut incoming => return result,
             error = session.closed() => anyhow::bail!("{error}"),
-            _ = check.tick() => { pipeline.error()?; if let Some(audio) = &audio { audio.error()?; } },
+            _ = check.tick() => {
+                pipeline.error()?;
+                if let Some(audio) = &audio { audio.error()?; }
+                if telemetry_enabled && last_telemetry.elapsed() >= Duration::from_secs(1) {
+                    last_telemetry = Instant::now();
+                    publish_update(&mut updates, Update::Telemetry {
+                        encode_us: encoder_metrics.encode_us.load(std::sync::atomic::Ordering::Relaxed),
+                        bitrate: actual_bitrate,
+                        encoder: encoder_metrics.encoder.clone(),
+                    })?;
+                }
+            },
             event = receiver.recv() => {
                 match event.context("input stream closed")? {
+                    Event::ConfigureVideo { width, fps, bitrate } => {
+                        if last_configure.elapsed() < Duration::from_millis(500) {
+                            publish_update(&mut updates, Update::Notice { text: "Video settings changed too quickly; try again".into() })?;
+                            continue;
+                        }
+                        let mut requested = options.clone();
+                        requested.width = width;
+                        requested.fps = fps;
+                        requested.bitrate = bitrate;
+                        let mut info = match desktop(&requested, capture, video_start_group) {
+                            Ok(info) => info,
+                            Err(error) => {
+                                publish_update(&mut updates, Update::Notice { text: format!("Unsupported video settings: {error}") })?;
+                                continue;
+                            }
+                        };
+                        last_configure = Instant::now();
+                        capture.release_all().await;
+                        drop(pipeline);
+                        video_start_group = video_barrier(&video)?;
+                        info.video_start_group = video_start_group;
+                        capture.select_monitor(capture.active_monitor).await?;
+                        pipeline = media::encoder(&capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), fps, bitrate, video.clone(), options.encoder, media::VideoFormat { codec: options.codec, dynamic_range: options.dynamic_range })?;
+                        *options = requested;
+                        encoder_metrics = pipeline.encoder_metrics()?;
+                        actual_bitrate = bitrate;
+                        adaptation = media::BitrateController::new(bitrate);
+                        adaptive = !options.fixed_bitrate;
+                        last_feedback = Instant::now();
+                        publish_update(&mut updates, Update::Desktop { desktop: info })?;
+                    }
                     Event::SelectMonitor { index } => {
                         if index >= capture.monitors.len() || last_switch.elapsed() < Duration::from_millis(500) {
-                            publish_update(&mut updates, Update::Desktop { desktop: desktop(options, capture)? })?;
+                            publish_update(&mut updates, Update::Desktop { desktop: desktop(options, capture, video_start_group)? })?;
                             continue;
                         }
                         last_switch = Instant::now();
                         capture.release_all().await;
                         // Stop the old source before opening another PipeWire node.
                         drop(pipeline);
+                        video_start_group = video_barrier(&video)?;
                         capture.select_monitor(index).await?;
-                        let info = desktop(options, capture)?;
-                        pipeline = media::encoder(&capture.pipeline_source(), info.width, info.height, options.fps, options.bitrate, video.clone(), options.encoder)?;
+                        let info = desktop(options, capture, video_start_group)?;
+                        pipeline = media::encoder(&capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, options.bitrate, video.clone(), options.encoder, media::VideoFormat { codec: options.codec, dynamic_range: options.dynamic_range })?;
                         adaptation = media::BitrateController::new(options.bitrate);
+                        encoder_metrics = pipeline.encoder_metrics()?;
+                        actual_bitrate = options.bitrate;
                         adaptive = !options.fixed_bitrate;
                         last_feedback = Instant::now();
                         publish_update(&mut updates, Update::Desktop { desktop: info })?;
@@ -273,7 +339,7 @@ async fn connection(
                             last_feedback = Instant::now();
                             if let Some(bitrate) = adaptation.observe(queue_ms, dropped_groups) {
                                 match pipeline.set_video_bitrate(bitrate) {
-                                    Ok(()) => tracing::info!(bitrate, queue_ms, dropped_groups, "adapted video bitrate"),
+                                    Ok(()) => { actual_bitrate = bitrate; tracing::info!(bitrate, queue_ms, dropped_groups, "adapted video bitrate"); },
                                     Err(error) => { adaptive = false; tracing::warn!(%error, "encoder does not support live bitrate changes; retaining fixed bitrate"); }
                                 }
                             }
@@ -288,6 +354,10 @@ async fn connection(
                         publish_update(&mut updates, update)?;
                     }
                     Event::Clipboard { .. } | Event::ClipboardRequest => publish_update(&mut updates, Update::Notice { text: "Host clipboard is disabled; start host with --clipboard to opt in".into() })?,
+                    Event::Probe { id } => {
+                        telemetry_enabled = true;
+                        publish_update(&mut updates, Update::Pong { id })?;
+                    },
                     event => capture.input(event).await?,
                 }
             },
@@ -295,12 +365,20 @@ async fn connection(
     }
 }
 
-fn desktop(options: &Options, capture: &Capture) -> Result<Desktop> {
-    let width = options.width / 2 * 2;
+fn desktop(options: &Options, capture: &Capture, video_start_group: u64) -> Result<Desktop> {
+    let width = if options.width == 0 {
+        capture.width
+    } else {
+        options.width
+    } / 2
+        * 2;
     let height =
         ((width as u64 * capture.height as u64 / capture.width as u64) as u32 / 2 * 2).max(2);
-    ensure!(height <= 4320, "scaled desktop exceeds maximum height");
+    protocol::validate_video_size(width, height)?;
     Ok(Desktop {
+        dynamic_range: options.dynamic_range,
+        codec: options.codec,
+        codecs: vec![protocol::VideoCodec::H264, protocol::VideoCodec::H265],
         version: protocol::VERSION,
         width,
         height,
@@ -310,7 +388,76 @@ fn desktop(options: &Options, capture: &Capture) -> Result<Desktop> {
         active_monitor: capture.active_monitor,
         audio: options.audio_source.is_some(),
         clipboard: options.clipboard,
+        telemetry: true,
+        configurable_video: true,
+        native_width: capture.width,
+        native_height: capture.height,
+        bitrate: options.bitrate,
+        video_start_group,
     })
+}
+
+fn requested_format(
+    query: Option<&str>,
+    default: protocol::VideoCodec,
+) -> Result<media::VideoFormat> {
+    let query = query.unwrap_or_default();
+    ensure!(query.len() <= 128, "video request too large");
+    let mut codec = None;
+    let mut range = None;
+    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "codec" if codec.is_none() => {
+                codec = Some(match value.as_ref() {
+                    "h264" => protocol::VideoCodec::H264,
+                    "h265" => protocol::VideoCodec::H265,
+                    _ => anyhow::bail!("unsupported codec"),
+                })
+            }
+            "range" if range.is_none() => {
+                range = Some(match value.as_ref() {
+                    "sdr" => protocol::DynamicRange::Sdr,
+                    "hdr10" => protocol::DynamicRange::Hdr10,
+                    _ => anyhow::bail!("unsupported dynamic range"),
+                })
+            }
+            _ => anyhow::bail!("unknown or duplicate video request field"),
+        }
+    }
+    let format = media::VideoFormat {
+        codec: codec.unwrap_or(default),
+        dynamic_range: range.unwrap_or_default(),
+    };
+    ensure!(
+        format.dynamic_range != protocol::DynamicRange::Hdr10
+            || format.codec == protocol::VideoCodec::H265,
+        "HDR10 requires H.265"
+    );
+    Ok(format)
+}
+
+/// Reserve a completed, empty group after the old pipeline has stopped. All
+/// frames from the next encoder have a strictly greater group sequence, even
+/// when the dimensions are unchanged or video/control delivery reorders.
+fn video_barrier(video: &moq_net::track::Producer) -> Result<u64> {
+    let mut barrier = video.clone().append_group()?;
+    let first = barrier
+        .sequence
+        .checked_add(1)
+        .context("video sequence exhausted")?;
+    barrier.finish()?;
+    Ok(first)
+}
+
+fn parse_width(value: &str) -> std::result::Result<u32, String> {
+    let width: u32 = value
+        .parse()
+        .map_err(|_| "width must be a number".to_owned())?;
+    if width == 0 || (320..=7680).contains(&width) {
+        Ok(width)
+    } else {
+        Err("width must be 0 (native), or 320–7680".into())
+    }
 }
 
 fn publish_update(track: &mut moq_net::track::Producer, update: Update) -> Result<()> {
@@ -371,6 +518,68 @@ async fn ordered_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn codec_request_is_explicit_and_bounded() {
+        use protocol::VideoCodec::*;
+        assert_eq!(requested_format(None, H264).unwrap().codec, H264);
+        assert_eq!(
+            requested_format(Some("codec=h265"), H264).unwrap().codec,
+            H265
+        );
+        assert!(requested_format(Some("codec=h265&codec=h264"), H264).is_err());
+        assert!(requested_format(Some("codec=unknown"), H264).is_err());
+        assert!(requested_format(Some("codec=h264&range=hdr10"), H264).is_err());
+        assert!(requested_format(Some("codec=h265&range=hdr10&range=sdr"), H264).is_err());
+        assert!(requested_format(Some("codec=h265&range=hlg"), H264).is_err());
+        assert!(requested_format(Some("unexpected=1"), H264).is_err());
+        assert!(requested_format(Some(&"x".repeat(129)), H264).is_err());
+        assert_eq!(
+            requested_format(None, H265).unwrap().dynamic_range,
+            protocol::DynamicRange::Sdr
+        );
+        assert_eq!(
+            requested_format(Some("codec=h265&range=hdr10"), H264)
+                .unwrap()
+                .dynamic_range,
+            protocol::DynamicRange::Hdr10
+        );
+    }
+
+    #[tokio::test]
+    async fn video_restart_barrier_separates_equal_size_generations() -> Result<()> {
+        let mut broadcast = moq_net::broadcast::Info::new().produce();
+        let mut video = broadcast.create_track("video", None)?;
+        let mut consumer = video
+            .consume()
+            .subscribe(moq_net::track::Subscription::default().with_group_start(0))
+            .await?;
+        consumer.start_at(0);
+        let mut old = video.append_group()?;
+        old.write_frame(moq_net::Timestamp::now(), b"old".as_slice())?;
+        old.finish()?;
+        let floor = video_barrier(&video)?;
+        let mut fresh = video.append_group()?;
+        fresh.write_frame(moq_net::Timestamp::now(), b"fresh".as_slice())?;
+        fresh.finish()?;
+        assert!(old.sequence < floor);
+        assert_eq!(fresh.sequence, floor);
+        let mut groups = std::collections::BTreeMap::new();
+        for _ in 0..3 {
+            let group = consumer
+                .recv_group()
+                .await?
+                .context("missing video group")?;
+            groups.insert(group.sequence, group);
+        }
+        let barrier = groups.get_mut(&(floor - 1)).context("missing barrier")?;
+        assert!(protocol::read_frame(barrier, 100).await?.is_none());
+        let next = groups.get_mut(&floor).context("missing fresh group")?;
+        assert_eq!(
+            protocol::read_frame(next, 100).await?.unwrap(),
+            &b"fresh"[..]
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn control_groups_are_reordered_without_dropping_events() -> Result<()> {

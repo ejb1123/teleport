@@ -9,6 +9,16 @@ It shares an existing graphical session, one client at a time. Start on a LAN
 or a VPN with direct UDP connectivity.
 See [implementation status](docs/status.md) for verified features and unfinished work.
 
+Version 0.3 adds a redesigned native launcher, selectable stream resolution/FPS/
+bitrate, and a **Stats for nerds** overlay (toolbar or **F8**). Launcher connections
+default to native monitor resolution, 60 FPS and 20 Mbps; preferences apply on
+connection. Both endpoints need the new build for quality negotiation and host
+telemetry. The title reports actual streamed pixels, not the client window size.
+**SDR H.264 and H.265/HEVC are the tested baseline.** An experimental patched-KWin
+HDR path and Mac Metal/EDR renderer are available; see [HDR status](docs/hdr.md).
+`nix run . -- doctor --hdr` tests synthetic codecs. A passing codec probe is not HDR
+desktop support.
+
 ## Quick start: Linux → Mac
 
 Clone this repository on both machines and install Nix with flakes enabled.
@@ -46,7 +56,7 @@ nix run .
 ```
 
 Enter `LINUX_IP:4443` and the six-digit code shown in the Linux host terminal.
-Click **Pair & save host**, then **Connect / reconnect**. Next time just select
+Click **Pair & save**, then **Connect to desktop**. Next time just select
 the saved host and connect—no code or trust prompt. Keep the host's identity
 directory unchanged so saved trust survives restarts. An identity mismatch is
 never accepted automatically; explicitly pair again only after checking the host.
@@ -66,7 +76,7 @@ it in process arguments:
 nix run . -- pair LINUX_IP:4443
 ```
 
-Manual file import remains available through **Use file** or drag-and-drop.
+Manual file import remains available through **Import pairing file** or drag-and-drop.
 To use that alternative, copy the file over an existing trusted SSH connection:
 
 ```sh
@@ -85,8 +95,8 @@ Mac Command maps to Linux Super, Option maps to Alt. Some OS shortcuts remain
 local. **Ctrl+Alt+Q** quits the client locally. Losing window focus releases all
 remote keys/buttons; disconnects and expired heartbeats do the same on the host.
 
-The session toolbar provides **Monitor >**, **Audio**, **Send text**, **Get text**,
-**Fullscreen**, **Reconnect**, and **Disconnect**. The title shows monitor, size,
+The session toolbar provides **Display**, **Audio**, **Send text**, **Get text**,
+**Stats**, **Full screen**, **Reconnect**, and **Disconnect**. The title shows display, size,
 displayed FPS, and action status. Toolbar clicks are local and never forwarded
 to the remote desktop. A connection window shows failures and has Retry/Cancel.
 
@@ -107,6 +117,30 @@ to an existing logged-in graphical session, not login-screen/reboot access.
 
 ## Audio, clipboard and quality
 
+Choose native, 1080p-width, 1440p-width, 720p-width or 4K-width in the launcher,
+along with 30/60/120 FPS, 8/20/40 Mbps and H.264/H.265. Scaling preserves the selected monitor's aspect
+ratio; it does not change the Linux monitor's mode. Native uses the size reported
+by capture, which may be logical pixels on scaled Wayland desktops. Settings are
+session-local and switching displays retains the selected quality policy.
+For explicit CLI settings:
+
+```sh
+nix run . -- client LINUX_IP:4443 --pairing-file pairing.json \
+  --width 0 --fps 60 --bitrate 20000 --codec h265 --stats
+```
+
+`--width 0` means native; a positive width requests scaling, with a supported
+ceiling of 7680 pixels wide, 8192 high and 33,554,432 total pixels. Actual encoder
+hardware may have lower limits. Host CLI defaults remain 1280 wide for older
+clients; a new client's quality request overrides this for its own session.
+
+Stats distinguish control round-trip time, encoded-video payload bitrate,
+received/decoded/displayed FPS, skipped groups, superseded decoded frames,
+decoder input queue, receive-to-decoded time, decoded-frame wait, and host encoder
+time where timestamps survive. RTT includes scheduling; it is **not** one-way
+network latency or input-to-photon latency. Capture and display scanout timing
+are not measured. See [performance diagnostics](docs/performance.md).
+
 Clipboard transfers are explicit text-only actions, limited to 64 KiB. Enable
 `--clipboard` on the host and the client (or the launcher's clipboard toggle).
 **Send text** copies the local clipboard to Linux; **Get text** copies Linux's
@@ -121,10 +155,19 @@ This is output audio only, with no microphone forwarding and no tight A/V sync
 guarantee. `--audio-source test` generates a diagnostic tone.
 
 The host defaults to `--encoder auto`: it probes VA-API and NVIDIA encoding,
-then falls back to CPU x264 if neither can encode. Force `--encoder software`,
+then falls back to CPU x264 (H.264) or x265 (H.265) if neither can encode. Force `--encoder software`,
 `--encoder nvidia`, or `--encoder vaapi` for diagnosis. This is hardware
 **encoding**, not a zero-copy pipeline; capture/conversion still use CPU memory.
 The installed plugins and system GPU drivers must support the selected backend.
+
+Clients probe actual hardware decoding before connecting: NVIDIA then VA on Linux,
+and VideoToolbox on macOS. Failed probes fall back to the codec's software decoder.
+The stats overlay shows the selected decoder by name. `--software-decoder` forces
+CPU decoding. The probe checks a small synthetic stream; a device can still fail
+at larger resolutions or after a driver/device change. If that happens, reconnect
+with software decoding. Hardware decode currently downloads RGB for SDL upload;
+this is accelerated decoding, not a zero-copy render path. Physical Mac HEVC
+acceptance remains required.
 
 `--bitrate 8000` is the starting bitrate and adaptive ceiling, in kbit/s.
 Receiver queue pressure and skipped video groups reduce the bitrate, with slow
@@ -162,20 +205,22 @@ to separate networking/decoding problems from portal/capture problems.
 
 - Native SDL window, resizable with letterboxing and correctly mapped pointer
   coordinates; video, keyboard, three mouse buttons, and scrolling.
-- Default 1280-pixel stream width, 60 fps cap, 8 Mbps H.264. Tune with `--width`,
+- Host CLI defaults to 1280-pixel stream width, 60 fps cap, 8 Mbps H.264;
+  the launcher requests native/60fps/20Mbps. Tune with `--width`,
   `--fps`, and `--bitrate` (kilobits/second). Aspect ratio is retained.
-- Auto hardware encoding with CPU x264 fallback, low-delay settings and short
+- Auto hardware encoding with CPU x264/x265 fallback, low-delay settings and short
   keyframe groups. Frames still copy through CPU memory; zero-copy rendering
   is not implemented. FPS in the title is decoded/displayed frame
   rate, **not** end-to-end latency.
-- macOS selects GStreamer's VideoToolbox hardware decoder when available;
-  otherwise software H.264 decoding. Linux currently uses software decoding.
+- macOS probes VideoToolbox; Linux probes NVIDIA/VA decoding, with software
+  fallback for H.264 and H.265. Actual NVIDIA output has been tested locally.
 - KDE/GNOME require working RemoteDesktop and ScreenCast portal backends.
   Other Wayland compositors may lack remote input support. This prototype uses
   portal input notification methods, not libei yet.
 - Initial local approval is required for Wayland. Saved permission is opt-in
   and compositor-dependent. No login-screen access or unattended-access guarantee.
-- No file transfer, gamepad, virtual display, HDR, IME, monitor hotplug,
+- HDR requires the experimental patched-KWin/Mac path; see [its limitations](docs/hdr.md).
+- No file transfer, gamepad, virtual display, IME, monitor hotplug,
   keychain-backed credentials or automatic NAT traversal yet.
 - Direct LAN/VPN connections only. A bitrate above available bandwidth
   causes skipped video groups. Severe control loss/reordering disconnects the
@@ -191,8 +236,10 @@ Pinned `moq-net 0.2.20` and `moq-native 0.19.17`, Quinn backend, raw QUIC with
 **moq-lite-05** negotiated explicitly. This is the MoQ project's simplified
 wire protocol, not a claim of compliance with the latest IETF draft.
 
-The host publishes a `desktop` broadcast with metadata and an `h264` track.
-Each video group starts with an H.264 keyframe and inline SPS/PPS. The receiver
+The host publishes a `desktop` broadcast with metadata and a selected `h264` or
+`h265` track. Codec selection is an authenticated connection parameter, and the
+client requires matching metadata before subscribing. Each video group starts
+with a keyframe and inline parameter sets (including VPS for HEVC). The receiver
 cancels an older group when a newer group arrives. Frames are Annex B access
 units; this application's media framing is not Hang/CMAF interoperable.
 Application protocol version 2 adds monitors, audio, feedback and explicit
@@ -237,5 +284,5 @@ file. If video fails, run `teleport doctor` and try `--source test`. For capture
 errors, run the host in the graphical user's session, not via sudo. Portal
 cancellation and unavailable permissions are errors, not automatic fallbacks
 to privileged capture. Use `RUST_LOG=teleport=debug` for application diagnostics.
-On the client, `--software-decoder` bypasses VideoToolbox and
+On the client, `--software-decoder` bypasses hardware decoding and
 `--software-renderer` bypasses the GPU renderer for troubleshooting.

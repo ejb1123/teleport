@@ -1,0 +1,53 @@
+diff --git a/src/gst/gstpipewireformat.c b/src/gst/gstpipewireformat.c
+index fa97d3e..e6f47a8 100644
+--- a/src/gst/gstpipewireformat.c
++++ b/src/gst/gstpipewireformat.c
+@@ -130,6 +130,8 @@ static const uint32_t video_format_map[] = {
+   SPA_VIDEO_FORMAT_I422_12LE,
+   SPA_VIDEO_FORMAT_Y444_12BE,
+   SPA_VIDEO_FORMAT_Y444_12LE,
++  /* Little-endian packed word: A[31:30], B[29:20], G[19:10], R[9:0]. */
++  [GST_VIDEO_FORMAT_RGB10A2_LE] = SPA_VIDEO_FORMAT_ABGR_210LE,
+ };
+ 
+ static const uint32_t color_range_map[] = {
+@@ -429,6 +431,19 @@ add_limits (struct spa_pod_dynamic_builder *b, ConvertData *d)
+   struct spa_pod_frame f;
+   const GValue *value, *value2;
+   int i;
++  const char *color = gst_structure_get_string (d->cs, "colorimetry");
++  GstVideoColorimetry colorimetry;
++  if (color && gst_video_colorimetry_from_string (&colorimetry, color) &&
++      colorimetry.range < SPA_N_ELEMENTS (color_range_map) &&
++      colorimetry.matrix < SPA_N_ELEMENTS (color_matrix_map) &&
++      colorimetry.transfer < SPA_N_ELEMENTS (transfer_function_map) &&
++      colorimetry.primaries < SPA_N_ELEMENTS (color_primaries_map)) {
++    spa_pod_builder_add (&b->b,
++        SPA_FORMAT_VIDEO_colorRange, SPA_POD_Id (color_range_map[colorimetry.range]),
++        SPA_FORMAT_VIDEO_colorMatrix, SPA_POD_Id (color_matrix_map[colorimetry.matrix]),
++        SPA_FORMAT_VIDEO_transferFunction, SPA_POD_Id (transfer_function_map[colorimetry.transfer]),
++        SPA_FORMAT_VIDEO_colorPrimaries, SPA_POD_Id (color_primaries_map[colorimetry.primaries]), 0);
++  }
+ 
+   value = gst_structure_get_value (d->cs, "width");
+   value2 = gst_structure_get_value (d->cs, "height");
+@@ -587,7 +602,8 @@ handle_video_fields (ConvertData *d)
+             idx2 = gst_video_dma_drm_fourcc_to_format (fourcc);
+ 
+             if (idx2 != GST_VIDEO_FORMAT_UNKNOWN &&
+-                idx2 < (int)SPA_N_ELEMENTS (video_format_map)) {
++                idx2 < (int)SPA_N_ELEMENTS (video_format_map) &&
++                video_format_map[idx2] != SPA_VIDEO_FORMAT_UNKNOWN) {
+               GHashTable *modifiers =
+                   g_hash_table_lookup (formats,
+                                        GINT_TO_POINTER (video_format_map[idx2]));
+@@ -605,7 +621,8 @@ handle_video_fields (ConvertData *d)
+       } else
+ #endif
+       if (idx != GST_VIDEO_FORMAT_UNKNOWN &&
+-          idx < (int)SPA_N_ELEMENTS (video_format_map)) {
++          idx < (int)SPA_N_ELEMENTS (video_format_map) &&
++          video_format_map[idx] != SPA_VIDEO_FORMAT_UNKNOWN) {
+           GHashTable *modifiers =
+               g_hash_table_lookup (formats,
+                                    GINT_TO_POINTER (video_format_map[idx]));

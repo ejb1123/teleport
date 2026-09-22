@@ -30,7 +30,7 @@ pub struct Options {
     /// Use SDL software rendering when a GPU renderer is unavailable.
     #[arg(long)]
     pub software_renderer: bool,
-    /// Force software H.264 decoding (useful when diagnosing VideoToolbox).
+    /// Force software video decoding (useful when diagnosing hardware decoders).
     #[arg(long)]
     pub software_decoder: bool,
     /// Close the native window after displaying N frames (diagnostics).
@@ -56,6 +56,24 @@ pub struct Options {
     /// Select this monitor on connection (zero-based).
     #[arg(long)]
     pub monitor: Option<usize>,
+    /// Requested stream width; 0 uses the monitor's native resolution.
+    #[arg(long)]
+    pub width: Option<u32>,
+    /// Requested stream frame rate.
+    #[arg(long)]
+    pub fps: Option<u32>,
+    /// Requested video bitrate in kbit/s.
+    #[arg(long)]
+    pub bitrate: Option<u32>,
+    /// Show the streaming performance overlay immediately (F8 toggles it).
+    #[arg(long)]
+    pub stats: bool,
+    /// Session video codec. H.265 requires support on both host and client.
+    #[arg(long, value_enum, default_value = "h264")]
+    pub codec: protocol::VideoCodec,
+    /// Explicit experimental HDR10 requires patched capture and a macOS HDR display.
+    #[arg(long, value_enum, default_value = "sdr")]
+    pub dynamic_range: protocol::DynamicRange,
 }
 
 struct Link {
@@ -75,7 +93,13 @@ async fn connect(options: &Options) -> Result<Link> {
         !options.address.contains('/') && !options.address.contains('@'),
         "use host:port, not a URL"
     );
-    let url: url::Url = format!("moqt://{}/teleport/{}", options.address, pairing.token).parse()?;
+    let mut url: url::Url =
+        format!("moqt://{}/teleport/{}", options.address, pairing.token).parse()?;
+    url.query_pairs_mut()
+        .append_pair("codec", options.codec.track());
+    if options.dynamic_range == protocol::DynamicRange::Hdr10 {
+        url.query_pairs_mut().append_pair("range", "hdr10");
+    }
     let mut config = moq_native::ClientConfig::default();
     config.version = vec![protocol::WIRE_VERSION.parse().map_err(anyhow::Error::msg)?];
     config.tls.fingerprint = vec![pairing.fingerprint];
@@ -120,12 +144,18 @@ async fn connect(options: &Options) -> Result<Link> {
         desktop.version == protocol::VERSION,
         "incompatible Teleport version"
     );
+    protocol::validate_video_size(desktop.width, desktop.height)?;
     ensure!(
-        (2..=3840).contains(&desktop.width) && (2..=4320).contains(&desktop.height),
-        "invalid desktop size"
+        desktop.dynamic_range == options.dynamic_range,
+        "host did not negotiate requested dynamic range; HDR is never inferred from an SDR stream"
+    );
+    ensure!(
+        desktop.codec == options.codec,
+        "host did not negotiate {}; update the host or select H.264",
+        options.codec.label()
     );
     let video = remote
-        .track(protocol::VIDEO)?
+        .track(desktop.codec.track())?
         .subscribe(media::video_subscription())
         .await?;
     let updates = remote
@@ -192,6 +222,26 @@ impl Drop for Network {
 }
 
 pub fn run(options: Options, runtime: &Runtime) -> Result<()> {
+    // Hardware probing can take several seconds. Do it before opening the remote
+    // session, whose safety watchdog requires an input heartbeat every 3 seconds.
+    ensure!(
+        options.dynamic_range != protocol::DynamicRange::Hdr10
+            || options.codec == protocol::VideoCodec::H265,
+        "HDR10 requires --codec h265"
+    );
+    ensure!(
+        options.dynamic_range == protocol::DynamicRange::Sdr
+            || options.headless_frames.is_some()
+            || cfg!(target_os = "macos"),
+        "HDR presentation currently requires macOS; select an SDR stream on Linux"
+    );
+    media::prepare_decoder(
+        options.software_decoder,
+        media::VideoFormat {
+            codec: options.codec,
+            dynamic_range: options.dynamic_range,
+        },
+    )?;
     let mut last_error = None;
     loop {
         let link = if options.headless_frames.is_some() {
@@ -380,7 +430,15 @@ async fn receive_updates(
 
 fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool> {
     tracing::info!(width = link.desktop.width, height = link.desktop.height, source = %link.desktop.source, "desktop connected; Ctrl+Alt+Q quits locally");
-    let (pipeline, source, image) = media::decoder(options.software_decoder)?;
+    let stream_stats = std::sync::Arc::new(crate::stats::StreamStats::default());
+    let (pipeline, source, image) = media::decoder_with_stats(
+        options.software_decoder,
+        stream_stats.clone(),
+        media::VideoFormat {
+            codec: link.desktop.codec,
+            dynamic_range: link.desktop.dynamic_range,
+        },
+    )?;
     let (events, receiver) = mpsc::channel(256);
     let feedback = events.clone();
     let mut desktop = link.desktop.clone();
@@ -406,11 +464,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     }
     let audio_source = audio.as_ref().map(|(_, source)| source.clone());
     let audio_notices = updates_sender.clone();
+    let network_stats = stream_stats.clone();
     let mut network = Network(runtime.spawn(async move {
         let _origin = link._origin;
         let _broadcast = link._broadcast;
         tokio::select! {
-            result = media::receive_video_with_feedback(link.video, source, feedback) => result,
+            result = media::receive_video_with_stats(link.video, source, feedback, network_stats) => result,
             result = send_input(link.input, receiver) => result,
             result = receive_updates(link.updates, updates_sender) => result,
             result = async {
@@ -427,12 +486,45 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     if let Some(index) = options.monitor {
         send(&events, Event::SelectMonitor { index })?;
     }
+    let configure_video =
+        options.width.is_some() || options.fps.is_some() || options.bitrate.is_some();
+    let requested_configuration = configure_video.then_some((
+        options.width.unwrap_or(desktop.width),
+        options.fps.unwrap_or(desktop.fps),
+        options.bitrate.unwrap_or(if desktop.bitrate > 0 {
+            desktop.bitrate
+        } else {
+            20_000
+        }),
+    ));
+    let expected_initial_updates =
+        usize::from(options.monitor.is_some()) + usize::from(configure_video);
+    if configure_video {
+        ensure!(
+            desktop.configurable_video,
+            "this host does not support video quality settings; update the host or omit --width/--fps/--bitrate"
+        );
+        send(
+            &events,
+            Event::ConfigureVideo {
+                width: options.width.unwrap_or(desktop.width),
+                fps: options.fps.unwrap_or(desktop.fps),
+                bitrate: options.bitrate.unwrap_or(if desktop.bitrate > 0 {
+                    desktop.bitrate
+                } else {
+                    20_000
+                }),
+            },
+        )?;
+    }
     if let Some(frames) = options.headless_frames {
         ensure!(frames > 0, "headless frame count must be positive");
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut count = 0;
         let mut switched = false;
         let mut clipboard_ok = false;
+        let mut initial_updates = expected_initial_updates;
+        let mut initial_ready = expected_initial_updates == 0;
         const CLIPBOARD_SMOKE: &str = "Teleport clipboard smoke ✓\nline 2";
         while count < frames {
             pipeline.error()?;
@@ -444,8 +536,51 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 Instant::now() < deadline,
                 "timed out decoding frames ({count}/{frames})"
             );
-            if let Some(frame) = image.lock().unwrap().take() {
-                ensure!(!frame.data.is_empty(), "empty decoded frame");
+            while let Ok(update) = updates.try_recv() {
+                match update {
+                    Update::Desktop { desktop: next } => {
+                        ensure!(
+                            next.version == protocol::VERSION && next.monitors.len() <= 64,
+                            "invalid monitor metadata"
+                        );
+                        protocol::validate_video_size(next.width, next.height)?;
+                        ensure!(
+                            next.codec == options.codec
+                                && next.dynamic_range == options.dynamic_range,
+                            "host changed codec during an active session; reconnect to change codec"
+                        );
+                        desktop = next;
+                        *image.lock().unwrap() = None;
+                        initial_updates = initial_updates.saturating_sub(1);
+                        if initial_updates == 0
+                            && configuration_matches(&desktop, requested_configuration)
+                            && options
+                                .monitor
+                                .is_none_or(|index| index == desktop.active_monitor)
+                        {
+                            initial_ready = true;
+                        }
+                    }
+                    Update::Clipboard { text } => clipboard_ok = text == CLIPBOARD_SMOKE,
+                    Update::Notice { text } => tracing::info!(%text, "host notice"),
+                    _ => (),
+                }
+            }
+            if let Some(frame) = image.lock().unwrap().take().filter(|frame| {
+                initial_ready
+                    && frame.width == desktop.width
+                    && frame.height == desktop.height
+                    && video_generation_matches(desktop.video_start_group, frame.video_group)
+            }) {
+                ensure!(
+                    !frame.data.is_empty()
+                        || frame
+                            .hdr
+                            .as_ref()
+                            .is_some_and(|hdr| !hdr.y.is_empty() && !hdr.uv.is_empty()),
+                    "empty decoded frame"
+                );
+                protocol::validate_video_size(frame.width, frame.height)?;
                 count += 1;
                 if options.smoke_clipboard && count == 5 {
                     ensure!(
@@ -489,11 +624,6 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     }
                 }
             }
-            while let Ok(update) = updates.try_recv() {
-                if let Update::Clipboard { text } = update {
-                    clipboard_ok = text == CLIPBOARD_SMOKE;
-                }
-            }
             std::thread::sleep(Duration::from_millis(2));
         }
         ensure!(
@@ -510,8 +640,21 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             !options.smoke_clipboard || clipboard_ok,
             "clipboard did not roundtrip"
         );
+        let snapshot = stream_stats.snapshot();
         tracing::info!(
             frames = count,
+            width = desktop.width,
+            height = desktop.height,
+            received_bytes = snapshot.received_bytes,
+            received_frames = snapshot.received_frames,
+            decoded_frames = snapshot.decoded_frames,
+            receive_to_decode_us = snapshot.decode_us,
+            skipped_groups = snapshot.skipped_groups,
+            overwritten_frames = snapshot.overwritten_frames,
+            unmatched_frames = snapshot.unmatched_frames,
+            codec = desktop.codec.label(),
+            dynamic_range = desktop.dynamic_range.label(),
+            decoder = %stream_stats.decoder.lock().unwrap(),
             "SMOKE PASS: authenticated MoQ video decoded"
         );
         return Ok(false);
@@ -529,7 +672,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         .map_err(anyhow::Error::msg)?;
     let ttf = sdl2::ttf::init().map_err(anyhow::Error::msg)?;
     let font = ttf
-        .load_font(crate::launcher::font_path()?, 14)
+        .load_font(crate::launcher::font_path()?, 28)
         .map_err(anyhow::Error::msg)?;
     let builder = window.into_canvas();
     let mut canvas = if options.software_renderer {
@@ -539,28 +682,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     }
     .build()?;
     let creator = canvas.texture_creator();
-    let toolbar_labels = [
-        "Monitor >",
-        "Audio",
-        "Send text",
-        "Get text",
-        "Fullscreen",
-        "Reconnect",
-        "Disconnect",
-    ];
-    let toolbar_textures = toolbar_labels
-        .iter()
-        .map(|text| {
-            let surface = font
-                .render(text)
-                .blended(sdl2::pixels::Color::RGB(230, 237, 248))?;
-            Ok::<_, anyhow::Error>((
-                creator.create_texture_from_surface(&surface)?,
-                surface.width(),
-                surface.height(),
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut hdr_presenter = if desktop.dynamic_range == protocol::DynamicRange::Hdr10 {
+        Some(crate::hdr_present::HdrPresenter::new(canvas.window())?)
+    } else {
+        None
+    };
+    let mut hdr_frame: Option<media::Image> = None;
+    let mut hdr_frame_pending = false;
+    let mut hdr_headroom: Option<f64> = None;
+    let mut text_cache = std::collections::HashMap::new();
     let mut texture = None;
     let mut size = (0, 0);
     let mut event_pump = sdl.event_pump().map_err(anyhow::Error::msg)?;
@@ -571,10 +701,30 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut muted = options.mute;
     let mut reconnect = false;
     let mut notice = String::new();
+    let mut previous_notice = String::new();
+    let mut notice_at = Instant::now();
     let mut clipboard_requested = false;
-    let mut switching = false;
+    let mut switching = expected_initial_updates > 0;
+    let mut initial_updates = expected_initial_updates;
+    let mut awaiting_initial = expected_initial_updates > 0;
+    let initial_settings_started = Instant::now();
     let mut switch_ack = false;
     let mut first_draw = true;
+    let mut show_stats = options.stats;
+    let mut fps = 0.0;
+    let mut mbps = 0.0;
+    let mut previous_bytes = 0;
+    let mut previous_received = 0_u64;
+    let mut previous_decoded = 0_u64;
+    let mut probe_id = 0_u64;
+    let mut pending_probe: Option<(u64, Instant)> = None;
+    let mut last_probe = Instant::now() - Duration::from_secs(1);
+    let mut rtt: Option<Duration> = None;
+    let mut decoded_age = Duration::ZERO;
+    let mut stats_lines = Vec::new();
+    let mut host_encode_us = 0;
+    let mut host_bitrate = desktop.bitrate;
+    let mut host_encoder = "Waiting / unavailable".to_owned();
     'running: loop {
         let mut redraw = first_draw;
         first_draw = false;
@@ -587,17 +737,63 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             audio = None;
         }
         check_network(&mut network, runtime)?;
+        ensure!(
+            !awaiting_initial || initial_settings_started.elapsed() < Duration::from_secs(15),
+            "host did not apply the requested display/video settings within 15 seconds"
+        );
+        if desktop.telemetry && last_probe.elapsed() >= Duration::from_secs(1) {
+            if pending_probe.is_some_and(|(_, sent)| sent.elapsed() >= Duration::from_secs(3)) {
+                pending_probe = None;
+                rtt = None;
+            }
+            if pending_probe.is_none() {
+                probe_id = probe_id.wrapping_add(1);
+                send(&events, Event::Probe { id: probe_id })?;
+                pending_probe = Some((probe_id, Instant::now()));
+                last_probe = Instant::now();
+            }
+        }
         while let Ok(update) = updates.try_recv() {
             redraw = true;
             match update {
+                Update::Telemetry {
+                    encode_us,
+                    bitrate,
+                    encoder,
+                } => {
+                    host_encode_us = encode_us;
+                    host_bitrate = bitrate;
+                    host_encoder = encoder.chars().take(48).collect();
+                }
+                Update::Pong { id } => {
+                    if let Some((expected, sent)) = pending_probe
+                        && id == expected
+                    {
+                        rtt = Some(sent.elapsed());
+                        pending_probe = None;
+                    }
+                }
                 Update::Desktop { desktop: next } => {
                     ensure!(
                         next.version == protocol::VERSION && next.monitors.len() <= 64,
                         "invalid monitor metadata"
                     );
+                    protocol::validate_video_size(next.width, next.height)?;
+                    ensure!(
+                        next.codec == options.codec && next.dynamic_range == options.dynamic_range,
+                        "host changed codec during an active session; reconnect to change codec"
+                    );
                     desktop = next;
                     *image.lock().unwrap() = None;
-                    switch_ack = true;
+                    hdr_frame = None;
+                    hdr_frame_pending = false;
+                    initial_updates = initial_updates.saturating_sub(1);
+                    switch_ack = !awaiting_initial
+                        || (initial_updates == 0
+                            && configuration_matches(&desktop, requested_configuration)
+                            && options
+                                .monitor
+                                .is_none_or(|index| index == desktop.active_monitor));
                     notice = format!("Monitor {}", desktop.active_monitor + 1);
                 }
                 Update::Clipboard { text } if options.clipboard && clipboard_requested => {
@@ -619,6 +815,22 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let pointer_in_toolbar = event_pump.mouse_state().y() < TOOLBAR_HEIGHT as i32;
         for event in event_pump.poll_iter() {
             redraw = true;
+            // Both edges stay local, so the remote never receives a stray F8 release.
+            if matches!(
+                event,
+                SdlEvent::KeyDown {
+                    keycode: Some(Keycode::F8),
+                    ..
+                } | SdlEvent::KeyUp {
+                    keycode: Some(Keycode::F8),
+                    ..
+                }
+            ) {
+                if matches!(event, SdlEvent::KeyDown { repeat: false, .. }) {
+                    show_stats = !show_stats;
+                }
+                continue;
+            }
             if pointer_in_toolbar && matches!(event, SdlEvent::MouseWheel { .. }) {
                 continue;
             }
@@ -700,6 +912,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         break 'running;
                     }
                     Some(6) => break 'running,
+                    Some(7) => show_stats = !show_stats,
                     _ => (),
                 }
                 continue;
@@ -794,13 +1007,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         if let Some(event) = motion {
             send(&events, event)?;
         }
-        if let Some(frame) = image.lock().unwrap().take() {
+        if let Some(frame) =
+            image.lock().unwrap().take().filter(|frame| {
+                video_generation_matches(desktop.video_start_group, frame.video_group)
+            })
+        {
             redraw = true;
-            ensure!(
-                frame.width <= 3840 && frame.height <= 4320,
-                "decoded image exceeds bounds"
-            );
-            if size != (frame.width, frame.height) {
+            decoded_age = frame.decoded_at.elapsed();
+            protocol::validate_video_size(frame.width, frame.height)?;
+            if size != (frame.width, frame.height) && frame.hdr.is_none() {
                 size = (frame.width, frame.height);
                 texture = Some(creator.create_texture_streaming(
                     PixelFormatEnum::RGB24,
@@ -808,17 +1023,32 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     size.1,
                 )?);
             }
-            texture
-                .as_mut()
-                .unwrap()
-                .update(None, &frame.data, frame.stride)?;
-            last_frame = Instant::now();
-            if switch_ack && frame.width == desktop.width && frame.height == desktop.height {
-                switching = false;
-                switch_ack = false;
+            if frame.hdr.is_none() {
+                texture.as_mut().context("missing SDR texture")?.update(
+                    None,
+                    &frame.data,
+                    frame.stride,
+                )?;
+            } else {
+                ensure!(
+                    hdr_presenter.is_some(),
+                    "received HDR without an HDR presenter"
+                );
+                size = (frame.width, frame.height);
             }
-            frames += 1;
-            total_frames += 1;
+            last_frame = Instant::now();
+            if frame.hdr.is_some() {
+                hdr_frame = Some(frame);
+                hdr_frame_pending = true;
+            } else {
+                if switch_ack && frame.width == desktop.width && frame.height == desktop.height {
+                    switching = false;
+                    awaiting_initial = false;
+                    switch_ack = false;
+                }
+                frames += 1;
+                total_frames += 1;
+            }
         }
         ensure!(
             total_frames > 0 || last_frame.elapsed() < Duration::from_secs(15),
@@ -837,53 +1067,315 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 .copy(texture, None, desktop_rect(window_size, size))
                 .map_err(anyhow::Error::msg)?;
         }
-        for (index, (texture, width, height)) in toolbar_textures.iter().enumerate() {
+        if stats.elapsed() >= Duration::from_secs(1) || stats_lines.is_empty() {
+            let snapshot = stream_stats.snapshot();
+            let elapsed = stats.elapsed().as_secs_f64().max(0.001);
+            // The first HUD paint is not a rate sample: wait for a full interval.
+            fps = if elapsed >= 1.0 {
+                frames as f64 / elapsed
+            } else {
+                0.0
+            };
+            mbps = if elapsed >= 1.0 {
+                snapshot.received_bytes.saturating_sub(previous_bytes) as f64 * 8.0
+                    / elapsed
+                    / 1_000_000.0
+            } else {
+                0.0
+            };
+            previous_bytes = snapshot.received_bytes;
+            let received_fps = if elapsed >= 1.0 {
+                snapshot.received_frames.saturating_sub(previous_received) as f64 / elapsed
+            } else {
+                0.0
+            };
+            let decoded_fps = if elapsed >= 1.0 {
+                snapshot.decoded_frames.saturating_sub(previous_decoded) as f64 / elapsed
+            } else {
+                0.0
+            };
+            previous_received = snapshot.received_frames;
+            previous_decoded = snapshot.decoded_frames;
+            let latency = rtt.map_or_else(
+                || "Waiting / unavailable".into(),
+                |rtt| format!("{:.1} ms", rtt.as_secs_f64() * 1000.0),
+            );
+            let decode = if snapshot.decode_us == 0 {
+                "Unavailable".into()
+            } else {
+                format!(
+                    "{:.2} ms (latest frame)",
+                    snapshot.decode_us as f64 / 1000.0
+                )
+            };
+            let encode = if host_encode_us == 0 {
+                "Unavailable".into()
+            } else {
+                format!("{:.2} ms (latest frame)", host_encode_us as f64 / 1000.0)
+            };
+            stats_lines = vec![
+                "STATS FOR NERDS                                     F8 to hide".into(),
+                format!(
+                    "Video                 {} x {}   |   {} / {}",
+                    size.0,
+                    size.1,
+                    desktop.dynamic_range.label(),
+                    desktop.codec.label()
+                ),
+                format!("Presented             {fps:.1} fps"),
+                format!("Video payload         {mbps:.2} Mbps (not wire bitrate)"),
+                format!("Control round trip    {latency}"),
+                format!("Host encoder          {host_encoder}"),
+                format!(
+                    "Client decoder        {}",
+                    stream_stats.decoder.lock().unwrap()
+                ),
+                format!(
+                    "Encoder target        {:.2} Mbps",
+                    host_bitrate as f64 / 1000.0
+                ),
+                format!("Host encode           {encode}"),
+                format!("Receive to decode     {decode}"),
+                format!(
+                    "Decoded frame wait    {:.2} ms (latest frame)",
+                    decoded_age.as_secs_f64() * 1000.0
+                ),
+                format!(
+                    "Decoder queue         {} bytes",
+                    snapshot.decoder_queue_bytes
+                ),
+                format!("Received / decoded    {received_fps:.1} / {decoded_fps:.1} fps"),
+                format!(
+                    "Skipped groups        {}   |   Superseded frames  {}",
+                    snapshot.skipped_groups, snapshot.overwritten_frames
+                ),
+                format!("Unmatched timestamps  {}", snapshot.unmatched_frames),
+                "RTT includes control scheduling, not just network transit.".into(),
+                "Capture, scanout and end-to-end latency: unmeasured.".into(),
+            ];
+            if let Some(headroom) = hdr_headroom {
+                stats_lines.push(format!("HDR display headroom  {headroom:.2} × SDR white"));
+            }
+            canvas.window_mut().set_title(&format!(
+                "Teleport — display {}/{} · {}×{} · {fps:.0} fps",
+                desktop.active_monitor + 1,
+                desktop.monitors.len(),
+                size.0,
+                size.1,
+            ))?;
+            stats = Instant::now();
+            frames = 0;
+        }
+        use sdl2::pixels::Color;
+        canvas.set_draw_color(Color::RGB(21, 27, 38));
+        canvas
+            .fill_rect(Rect::new(0, 0, window_size.0, TOOLBAR_HEIGHT))
+            .map_err(anyhow::Error::msg)?;
+        canvas.set_draw_color(Color::RGB(46, 57, 74));
+        canvas
+            .fill_rect(Rect::new(0, TOOLBAR_HEIGHT as i32 - 1, window_size.0, 1))
+            .map_err(anyhow::Error::msg)?;
+        let mouse = event_pump.mouse_state();
+        let hover = toolbar_hit(mouse.x(), mouse.y(), window_size.0);
+        let fullscreen = canvas.window().fullscreen_state() != sdl2::video::FullscreenType::Off;
+        let labels = [
+            format!("Display {}", desktop.active_monitor + 1),
+            if audio.is_none() {
+                "Audio"
+            } else if muted {
+                "Muted"
+            } else {
+                "Audio"
+            }
+            .into(),
+            "Send".into(),
+            "Get".into(),
+            if fullscreen { "Window" } else { "Full" }.into(),
+            "Retry".into(),
+            "Disconnect".into(),
+            "Stats".into(),
+        ];
+        for (index, label) in labels.iter().enumerate() {
             let rect = toolbar_rect(index, window_size.0);
             let enabled = match index {
-                0 => desktop.monitors.len() > 1,
-                1 => desktop.audio && !muted,
+                0 => desktop.monitors.len() > 1 && !switching,
+                1 => audio.is_some(),
                 2 | 3 => options.clipboard && desktop.clipboard,
                 _ => true,
             };
-            canvas.set_draw_color(if enabled {
-                sdl2::pixels::Color::RGB(38, 61, 87)
+            let active = (index == 1 && audio.is_some() && !muted)
+                || (index == 4 && fullscreen)
+                || (index == 7 && show_stats);
+            canvas.set_draw_color(if hover == Some(index) && enabled {
+                if index == 6 {
+                    Color::RGB(114, 47, 59)
+                } else {
+                    Color::RGB(51, 69, 91)
+                }
+            } else if active {
+                Color::RGB(27, 68, 75)
             } else {
-                sdl2::pixels::Color::RGB(35, 38, 43)
+                Color::RGB(30, 38, 51)
             });
             canvas.fill_rect(rect).map_err(anyhow::Error::msg)?;
-            let w = (*width).min(rect.width().saturating_sub(8));
-            canvas
-                .copy(
-                    texture,
-                    None,
-                    Rect::new(
-                        rect.x() + ((rect.width() - w) / 2) as i32,
-                        12,
-                        w.max(1),
-                        *height,
-                    ),
-                )
-                .map_err(anyhow::Error::msg)?;
+            canvas.set_draw_color(if active {
+                Color::RGB(71, 196, 172)
+            } else {
+                Color::RGB(48, 61, 79)
+            });
+            canvas.draw_rect(rect).map_err(anyhow::Error::msg)?;
+            session_text(
+                &mut canvas,
+                &creator,
+                &font,
+                &mut text_cache,
+                label,
+                Rect::new(rect.x() + 9, rect.y() + 9, rect.width() - 18, 20),
+                if !enabled {
+                    Color::RGB(126, 137, 153)
+                } else if index == 6 {
+                    Color::RGB(255, 161, 166)
+                } else {
+                    Color::RGB(223, 233, 243)
+                },
+            )?;
         }
-        canvas.present();
+        let hint = match hover {
+            Some(0) => "Display · switch to the next remote monitor",
+            Some(1) => "Audio · toggle playback (requires host audio)",
+            Some(2) => "Send text · copy your clipboard to the remote desktop",
+            Some(3) => "Get text · copy remote text to your clipboard",
+            Some(4) => "Full screen · toggle the native window",
+            Some(5) => "Reconnect · release held keys and start a fresh connection",
+            Some(6) => "Disconnect · end this session safely (Ctrl+Alt+Q)",
+            Some(7) => "Stats for nerds · measured streaming performance (F8)",
+            _ => "",
+        };
+        if previous_notice != notice {
+            previous_notice.clone_from(&notice);
+            notice_at = Instant::now();
+        }
+        let status = if !hint.is_empty() {
+            hint.into()
+        } else if !notice.is_empty() && notice_at.elapsed() < Duration::from_secs(5) {
+            notice.clone()
+        } else {
+            format!(
+                "CONNECTED   ·   Display {} of {}   ·   {} × {}   ·   {}   ·   {fps:.0} fps   ·   {mbps:.1} Mbps",
+                desktop.active_monitor + 1,
+                desktop.monitors.len(),
+                size.0,
+                size.1,
+                desktop.dynamic_range.label()
+            )
+        };
+        session_text(
+            &mut canvas,
+            &creator,
+            &font,
+            &mut text_cache,
+            &status,
+            Rect::new(14, 55, window_size.0.saturating_sub(28), 20),
+            Color::RGB(146, 167, 188),
+        )?;
+        let mut stats_panel = None;
+        if show_stats {
+            let panel_width = 520.min(window_size.0.saturating_sub(24));
+            let panel = Rect::new(
+                window_size.0 as i32 - panel_width as i32 - 12,
+                TOOLBAR_HEIGHT as i32 + 12,
+                panel_width,
+                stats_lines.len() as u32 * 24 + 28,
+            );
+            stats_panel = Some(panel);
+            canvas.set_draw_color(Color::RGB(16, 23, 33));
+            canvas.fill_rect(panel).map_err(anyhow::Error::msg)?;
+            canvas.set_draw_color(Color::RGB(67, 103, 114));
+            canvas.draw_rect(panel).map_err(anyhow::Error::msg)?;
+            for (index, line) in stats_lines.iter().enumerate() {
+                session_text(
+                    &mut canvas,
+                    &creator,
+                    &font,
+                    &mut text_cache,
+                    line,
+                    Rect::new(
+                        panel.x() + 14,
+                        panel.y() + 14 + index as i32 * 24,
+                        panel_width - 28,
+                        20,
+                    ),
+                    if index == 0 {
+                        Color::RGB(99, 218, 193)
+                    } else {
+                        Color::RGB(207, 220, 234)
+                    },
+                )?;
+            }
+        }
+        if let (Some(presenter), Some(frame)) = (&mut hdr_presenter, &hdr_frame) {
+            let hdr = frame
+                .hdr
+                .as_ref()
+                .context("missing high-precision planes")?;
+            let mut ui = vec![read_hdr_overlay(
+                &mut canvas,
+                Rect::new(0, 0, window_size.0, TOOLBAR_HEIGHT),
+                window_size,
+            )?];
+            if let Some(panel) = stats_panel {
+                ui.push(read_hdr_overlay(&mut canvas, panel, window_size)?);
+            }
+            let overlays: Vec<_> = ui
+                .iter()
+                .map(|ui| crate::hdr_present::Overlay {
+                    rect: ui.rect,
+                    width: ui.width,
+                    height: ui.height,
+                    stride: ui.width as usize * 4,
+                    rgba: &ui.pixels,
+                })
+                .collect();
+            canvas.present();
+            match presenter.present(
+                &crate::hdr_present::P010Frame {
+                    width: frame.width,
+                    height: frame.height,
+                    y: &hdr.y,
+                    uv: &hdr.uv,
+                    y_stride: hdr.y_stride,
+                    uv_stride: hdr.uv_stride,
+                },
+                desktop_rect(window_size, size),
+                &overlays,
+                window_size,
+            )? {
+                crate::hdr_present::PresentOutcome::Presented { headroom } => {
+                    hdr_headroom = Some(headroom);
+                    if hdr_frame_pending {
+                        frames += 1;
+                        total_frames += 1;
+                        hdr_frame_pending = false;
+                        if switch_ack
+                            && frame.width == desktop.width
+                            && frame.height == desktop.height
+                        {
+                            switching = false;
+                            awaiting_initial = false;
+                            switch_ack = false;
+                        }
+                    }
+                }
+                crate::hdr_present::PresentOutcome::DrawableUnavailable => (),
+            }
+        } else {
+            canvas.present();
+        }
         if options
             .exit_after_frames
             .is_some_and(|limit| total_frames >= limit)
         {
             break;
-        }
-        if stats.elapsed() >= Duration::from_secs(1) {
-            let fps = frames as f64 / stats.elapsed().as_secs_f64();
-            canvas.window_mut().set_title(&format!(
-                "Teleport — monitor {}/{} · {}×{} · {fps:.0} fps · {}",
-                desktop.active_monitor + 1,
-                desktop.monitors.len(),
-                size.0,
-                size.1,
-                notice
-            ))?;
-            stats = Instant::now();
-            frames = 0;
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -892,21 +1384,119 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     Ok(reconnect)
 }
 
-const TOOLBAR_HEIGHT: u32 = 44;
+const TOOLBAR_HEIGHT: u32 = 82;
+
+struct HdrOverlayPixels {
+    rect: Rect,
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+fn read_hdr_overlay(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    rect: Rect,
+    window: (u32, u32),
+) -> Result<HdrOverlayPixels> {
+    let rect = rect
+        .intersection(Rect::new(0, 0, window.0, window.1))
+        .context("HDR overlay is outside the window")?;
+    let (output_width, output_height) = canvas.output_size().map_err(anyhow::Error::msg)?;
+    let sx = f64::from(output_width) / f64::from(window.0.max(1));
+    let sy = f64::from(output_height) / f64::from(window.1.max(1));
+    let x = (f64::from(rect.x()) * sx).floor() as i32;
+    let y = (f64::from(rect.y()) * sy).floor() as i32;
+    let right = (f64::from(rect.right()) * sx)
+        .ceil()
+        .min(f64::from(output_width)) as i32;
+    let bottom = (f64::from(rect.bottom()) * sy)
+        .ceil()
+        .min(f64::from(output_height)) as i32;
+    let pixels_rect = Rect::new(x, y, (right - x).max(1) as u32, (bottom - y).max(1) as u32);
+    // ReadPixels uses physical coordinates but clips to the renderer viewport.
+    // Remove logical-size letterboxing during readback so fractional scaling
+    // cannot leave a clipped, uninitialized edge in SDL's returned buffer.
+    let logical = canvas.logical_size();
+    canvas.set_logical_size(0, 0)?;
+    let pixels = canvas.read_pixels(pixels_rect, PixelFormatEnum::RGBA32);
+    canvas.set_logical_size(logical.0, logical.1)?;
+    let pixels = pixels.map_err(anyhow::Error::msg)?;
+    Ok(HdrOverlayPixels {
+        rect,
+        width: pixels_rect.width(),
+        height: pixels_rect.height(),
+        pixels,
+    })
+}
+
+fn configuration_matches(desktop: &Desktop, requested: Option<(u32, u32, u32)>) -> bool {
+    requested.is_none_or(|(width, fps, bitrate)| {
+        let width = if width == 0 {
+            desktop.native_width
+        } else {
+            width
+        } / 2
+            * 2;
+        desktop.width == width && desktop.fps == fps && desktop.bitrate == bitrate
+    })
+}
+
+fn video_generation_matches(start_group: u64, frame_group: Option<u64>) -> bool {
+    // A legacy host has no generation barrier. New hosts require positively
+    // attributed frames; unknown PTS/group metadata must never unlock input.
+    start_group == 0 || frame_group.is_some_and(|group| group >= start_group)
+}
 
 fn toolbar_rect(index: usize, width: u32) -> Rect {
-    let left = width * index as u32 / 7;
-    let right = width * (index as u32 + 1) / 7;
-    Rect::new(
-        left as i32 + 2,
-        2,
-        right.saturating_sub(left + 4).max(1),
-        TOOLBAR_HEIGHT - 4,
-    )
+    // Fixed, legible controls with a flexible gap between session and window actions.
+    // Visual order differs from action IDs to preserve existing button semantics.
+    let widths = [88, 76, 78, 76, 88, 88, 98, 54];
+    let left = match index {
+        0..=3 => 12 + widths[..index].iter().sum::<u32>() + index as u32 * 4,
+        7 => width.saturating_sub(12 + 54 + 88 + 88 + 98 + 12),
+        4 => width.saturating_sub(12 + 88 + 88 + 98 + 8),
+        5 => width.saturating_sub(12 + 88 + 98 + 4),
+        _ => width.saturating_sub(12 + 98),
+    };
+    Rect::new(left as i32, 10, widths[index], 36)
 }
 
 fn toolbar_hit(x: i32, y: i32, width: u32) -> Option<usize> {
-    (0..7).find(|&index| toolbar_rect(index, width).contains_point((x, y)))
+    (0..8).find(|&index| toolbar_rect(index, width).contains_point((x, y)))
+}
+
+fn session_text<'a>(
+    canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+    creator: &'a sdl2::render::TextureCreator<sdl2::video::WindowContext>,
+    font: &sdl2::ttf::Font<'_, '_>,
+    cache: &mut std::collections::HashMap<String, sdl2::render::Texture<'a>>,
+    text: &str,
+    rect: Rect,
+    color: sdl2::pixels::Color,
+) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    if !cache.contains_key(text) {
+        if cache.len() >= 128 {
+            cache.clear();
+        }
+        let surface = font.render(text).blended(sdl2::pixels::Color::WHITE)?;
+        cache.insert(text.into(), creator.create_texture_from_surface(&surface)?);
+    }
+    let texture = cache.get_mut(text).unwrap();
+    texture.set_color_mod(color.r, color.g, color.b);
+    let query = texture.query();
+    let width = (query.width / 2).min(rect.width());
+    let height = query.height / 2;
+    // Render at twice logical resolution for crisp Retina/HiDPI text. Clip, never stretch.
+    canvas
+        .copy(
+            texture,
+            Rect::new(0, 0, width * 2, query.height),
+            Rect::new(rect.x(), rect.y(), width, height),
+        )
+        .map_err(anyhow::Error::msg)
 }
 
 fn desktop_rect(window: (u32, u32), image: (u32, u32)) -> Rect {
@@ -987,5 +1577,87 @@ mod tests {
         assert!(pointer(0, 0, (1000, 1000), (1920, 1080)).is_none());
         let (x, y) = pointer(500, 500, (1000, 1000), (1920, 1080)).unwrap();
         assert!((x - 0.5).abs() < 0.01 && (y - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn toolbar_controls_fit_and_hit_at_all_supported_widths() {
+        for width in [700, 1024, 1280, 2560] {
+            for index in 0..8 {
+                let rect = toolbar_rect(index, width);
+                assert!(rect.x() >= 0 && rect.right() <= width as i32);
+                assert_eq!(
+                    toolbar_hit(rect.center().x(), rect.center().y(), width),
+                    Some(index)
+                );
+                for other in (index + 1)..8 {
+                    assert!(!rect.has_intersection(toolbar_rect(other, width)));
+                }
+            }
+            assert_eq!(toolbar_hit(2, 60, width), None);
+        }
+    }
+
+    #[test]
+    fn session_chrome_never_maps_to_remote_desktop() {
+        for y in 0..TOOLBAR_HEIGHT as i32 {
+            assert!(desktop_pointer(350, y, (700, 600), (1920, 1080)).is_none());
+        }
+        let rect = desktop_rect((700, 600), (1920, 1080));
+        let (x, y) = desktop_pointer(
+            rect.center().x(),
+            rect.center().y(),
+            (700, 600),
+            (1920, 1080),
+        )
+        .unwrap();
+        assert!((x - 0.5).abs() < 0.01 && (y - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn video_configuration_ack_matches_native_even_width_and_quality() {
+        let desktop: Desktop = serde_json::from_value(serde_json::json!({
+            "version": protocol::VERSION, "width": 1920, "height": 1080,
+            "fps": 60, "source": "test", "monitors": [], "active_monitor": 0,
+            "audio": false, "clipboard": false, "native_width": 1921,
+            "native_height": 1080, "bitrate": 20000
+        }))
+        .unwrap();
+        assert_eq!(desktop.codec, protocol::VideoCodec::H264);
+        assert!(desktop.codecs.is_empty());
+        assert!(configuration_matches(&desktop, None));
+        assert!(configuration_matches(&desktop, Some((0, 60, 20000))));
+        assert!(configuration_matches(&desktop, Some((1921, 60, 20000))));
+        assert!(!configuration_matches(&desktop, Some((1280, 60, 20000))));
+        assert!(!configuration_matches(&desktop, Some((0, 120, 20000))));
+        assert!(!configuration_matches(&desktop, Some((0, 60, 8000))));
+    }
+
+    #[test]
+    fn video_generation_barrier_rejects_old_and_unattributed_frames() {
+        assert!(video_generation_matches(0, None));
+        assert!(video_generation_matches(0, Some(0)));
+        assert!(!video_generation_matches(42, None));
+        assert!(!video_generation_matches(42, Some(41)));
+        assert!(video_generation_matches(42, Some(42)));
+        assert!(video_generation_matches(42, Some(100)));
+        assert!(!video_generation_matches(u64::MAX, Some(u64::MAX - 1)));
+        assert!(video_generation_matches(u64::MAX, Some(u64::MAX)));
+    }
+
+    #[test]
+    fn codec_cli_defaults_to_h264_and_accepts_explicit_h265() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Arguments {
+            #[command(flatten)]
+            options: Options,
+        }
+        let base = ["test", "localhost:4443", "--pairing-file", "unused.json"];
+        let parsed = Arguments::try_parse_from(base).unwrap();
+        assert_eq!(parsed.options.codec, protocol::VideoCodec::H264);
+        let parsed =
+            Arguments::try_parse_from(base.into_iter().chain(["--codec", "h265"])).unwrap();
+        assert_eq!(parsed.options.codec, protocol::VideoCodec::H265);
+        assert!(Arguments::try_parse_from(base.into_iter().chain(["--codec", "av1"])).is_err());
     }
 }

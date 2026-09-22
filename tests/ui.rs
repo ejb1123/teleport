@@ -223,7 +223,7 @@ fn rendered_pixel(connection: &RustConnection, window: u32, x: i16, y: i16, rgb:
 
 fn wait_field_focus(connection: &RustConnection, window: u32, y: i16) {
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !rendered_pixel(connection, window, 25, y, 0x324b68) {
+    while !rendered_pixel(connection, window, 304, y, 0x5bdfc9) {
         assert!(
             Instant::now() < deadline,
             "launcher never rendered focused field"
@@ -316,8 +316,8 @@ fn native_launcher_pairs_with_code_and_connects_saved_host() {
     // Wait for a real UI frame; SDL may replace the early X window.
     let deadline = Instant::now() + Duration::from_secs(15);
     let window = loop {
-        let window = desktop_window(&connection, root, &mut launcher, "Connect", None);
-        if rendered_pixel(&connection, window, 10, 540, 0x161b24) {
+        let window = desktop_window(&connection, root, &mut launcher, "Teleport", None);
+        if rendered_pixel(&connection, window, 1030, 820, 0x0c121b) {
             break window;
         }
         assert!(
@@ -326,15 +326,15 @@ fn native_launcher_pairs_with_code_and_connects_saved_host() {
         );
         std::thread::sleep(Duration::from_millis(30));
     };
-    click(&connection, root, window, 100, 110);
-    wait_field_focus(&connection, window, 95);
+    click(&connection, root, window, 400, 200);
+    wait_field_focus(&connection, window, 180);
     type_ascii(&connection, root, window, &address);
     std::thread::sleep(Duration::from_millis(100));
-    click(&connection, root, window, 100, 190);
-    wait_field_focus(&connection, window, 175);
+    click(&connection, root, window, 400, 603);
+    wait_field_focus(&connection, window, 585);
     type_ascii(&connection, root, window, &code);
     std::thread::sleep(Duration::from_millis(100));
-    click(&connection, root, window, 180, 252);
+    click(&connection, root, window, 870, 603);
     let index = config.join("teleport/profiles.json");
     let deadline = Instant::now() + Duration::from_secs(15);
     let profiles: serde_json::Value = loop {
@@ -369,9 +369,9 @@ fn native_launcher_pairs_with_code_and_connects_saved_host() {
         )
         .unwrap()
     );
-    let window = desktop_window(&connection, root, &mut launcher, "Connect", None);
-    click(&connection, root, window, 180, 388);
-    let desktop = desktop_window(&connection, root, &mut launcher, "monitor 1/2", None);
+    let window = desktop_window(&connection, root, &mut launcher, "Teleport", None);
+    click(&connection, root, window, 500, 294);
+    let desktop = desktop_window(&connection, root, &mut launcher, "display 1/2", None);
     assert_ne!(desktop, window);
     // The launcher's disconnect control owns and reaps the streaming child.
     connection
@@ -382,7 +382,7 @@ fn native_launcher_pairs_with_code_and_connects_saved_host() {
         .unwrap()
         .check()
         .unwrap();
-    click(&connection, root, window, 580, 388);
+    click(&connection, root, window, 870, 294);
     let deadline = Instant::now() + Duration::from_secs(10);
     while connection
         .query_tree(root)
@@ -474,10 +474,21 @@ fn native_toolbar_monitor_reconnect_disconnect_and_launcher() {
             .spawn()
             .unwrap(),
     );
-    let first = desktop_window(&connection, root, &mut client, "monitor 1/2", None);
-    click(&connection, root, first, 91, 22);
+    let first = desktop_window(&connection, root, &mut client, "display 1/2", None);
+    // Stats is rendered locally; opening it must not disrupt the session.
+    click(&connection, root, first, 955, 28);
+    let stats_deadline = Instant::now() + Duration::from_secs(10);
+    while !rendered_pixel(&connection, first, 760, 100, 0x101721) {
+        assert!(
+            Instant::now() < stats_deadline,
+            "stats overlay did not render"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    click(&connection, root, first, 955, 28);
+    click(&connection, root, first, 56, 28);
     assert_eq!(
-        desktop_window(&connection, root, &mut client, "monitor 2/2", None),
+        desktop_window(&connection, root, &mut client, "display 2/2", None),
         first
     );
     connection
@@ -489,7 +500,7 @@ fn native_toolbar_monitor_reconnect_disconnect_and_launcher() {
         .unwrap()
         .check()
         .unwrap();
-    click(&connection, root, first, 1005, 22);
+    click(&connection, root, first, 1122, 28);
     // SDL may reuse the same X resource ID after rebuilding its video context.
     // Observe actual destruction, then wait for a newly connected desktop title.
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -506,8 +517,8 @@ fn native_toolbar_monitor_reconnect_disconnect_and_launcher() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    let second = desktop_window(&connection, root, &mut client, "monitor", None);
-    click(&connection, root, second, 1188, 22);
+    let second = desktop_window(&connection, root, &mut client, "display", None);
+    click(&connection, root, second, 1219, 28);
     wait_exit(&mut client);
 
     let mut launcher = Process(
@@ -517,7 +528,7 @@ fn native_toolbar_monitor_reconnect_disconnect_and_launcher() {
             .spawn()
             .unwrap(),
     );
-    let window = desktop_window(&connection, root, &mut launcher, "Connect", None);
+    let window = desktop_window(&connection, root, &mut launcher, "Teleport", None);
     let protocols = connection
         .intern_atom(false, b"WM_PROTOCOLS")
         .unwrap()

@@ -1,0 +1,214 @@
+diff --git a/src/core/shmgraphicsbufferallocator.cpp b/src/core/shmgraphicsbufferallocator.cpp
+index f2f30b1..fd5fec5 100644
+--- a/src/core/shmgraphicsbufferallocator.cpp
++++ b/src/core/shmgraphicsbufferallocator.cpp
+@@ -89,6 +89,7 @@ GraphicsBuffer *ShmGraphicsBufferAllocator::allocate(const GraphicsBufferOptions
+     switch (options.format) {
+     case DRM_FORMAT_ARGB8888:
+     case DRM_FORMAT_XRGB8888:
++    case DRM_FORMAT_ABGR2101010:
+         break;
+     default:
+         return nullptr;
+diff --git a/src/plugins/screencast/outputscreencastsource.cpp b/src/plugins/screencast/outputscreencastsource.cpp
+index 5a44c3f..55a303c 100644
+--- a/src/plugins/screencast/outputscreencastsource.cpp
++++ b/src/plugins/screencast/outputscreencastsource.cpp
+@@ -48,6 +48,14 @@ quint32 OutputScreenCastSource::drmFormat() const
+     return DRM_FORMAT_ARGB8888;
+ }
+ 
++bool OutputScreenCastSource::supportsHdr() const
++{
++    // GLTexture::allocate's GLES path ignores its internalFormat argument and
++    // allocates 8-bit storage. Never advertise 10-bit capture on that path.
++    const auto backend = dynamic_cast<EglBackend *>(Compositor::self()->backend());
++    return backend && !backend->openglContext()->isOpenGLES();
++}
++
+ QSize OutputScreenCastSource::textureSize() const
+ {
+     return m_output->pixelSize();
+@@ -68,7 +76,8 @@ void OutputScreenCastSource::setRenderCursor(bool enable)
+ 
+ Region OutputScreenCastSource::render(QImage *target, const Region &bufferRepair)
+ {
+-    auto texture = GLTexture::allocate(GL_RGBA8, target->size());
++    const bool tenBit = target->format() == QImage::Format_A2BGR30_Premultiplied;
++    auto texture = GLTexture::allocate(tenBit ? GL_RGB10_A2 : GL_RGBA8, target->size());
+     if (!texture) {
+         return Region{};
+     }
+@@ -80,6 +89,7 @@ Region OutputScreenCastSource::render(QImage *target, const Region &bufferRepair
+ 
+ Region OutputScreenCastSource::render(GLFramebuffer *target, const Region &bufferRepair)
+ {
++    m_layer->setColor(captureColorDescription(), RenderingIntent::RelativeColorimetric, ColorPipeline());
+     m_layer->setFramebuffer(target, bufferRepair & Rect(QPoint(), target->size()));
+     if (!m_layer->preparePresentationTest()) {
+         return Region{};
+diff --git a/src/plugins/screencast/outputscreencastsource.h b/src/plugins/screencast/outputscreencastsource.h
+index 7c3142b..3be4ae4 100644
+--- a/src/plugins/screencast/outputscreencastsource.h
++++ b/src/plugins/screencast/outputscreencastsource.h
+@@ -30,6 +30,7 @@ public:
+     QSize textureSize() const override;
+     qreal devicePixelRatio() const override;
+     quint32 drmFormat() const override;
++    bool supportsHdr() const override;
+ 
+     void setRenderCursor(bool enable) override;
+     Region render(GLFramebuffer *target, const Region &bufferRepair) override;
+diff --git a/src/plugins/screencast/screencastlayer.cpp b/src/plugins/screencast/screencastlayer.cpp
+index 2260ee6..26ff346 100644
+--- a/src/plugins/screencast/screencastlayer.cpp
++++ b/src/plugins/screencast/screencastlayer.cpp
+@@ -36,7 +36,7 @@ FormatModifierMap ScreencastLayer::supportedDrmFormats() const
+ std::optional<OutputLayerBeginFrameInfo> ScreencastLayer::doBeginFrame()
+ {
+     return OutputLayerBeginFrameInfo{
+-        .renderTarget = RenderTarget(m_buffer),
++        .renderTarget = RenderTarget(m_buffer, colorDescription()),
+         .repaint = m_bufferDamage,
+     };
+ }
+diff --git a/src/plugins/screencast/screencastsource.h b/src/plugins/screencast/screencastsource.h
+index c15f812..3ecb7a6 100644
+--- a/src/plugins/screencast/screencastsource.h
++++ b/src/plugins/screencast/screencastsource.h
+@@ -7,6 +7,8 @@
+ #pragma once
+ 
+ #include <QObject>
++#include "core/colorspace.h"
++#include <memory>
+ 
+ class QImage;
+ 
+@@ -30,6 +32,10 @@ public:
+     virtual quint32 drmFormat() const = 0;
+     virtual QSize textureSize() const = 0;
+     virtual qreal devicePixelRatio() const = 0;
++    // Experimental HDR is negotiated per stream; window/region capture stays SDR.
++    virtual bool supportsHdr() const { return false; }
++    void setCaptureColorDescription(const std::shared_ptr<ColorDescription> &color) { m_captureColor = color; }
++    const std::shared_ptr<ColorDescription> &captureColorDescription() const { return m_captureColor; }
+ 
+     virtual void setRenderCursor(bool enable) = 0;
+     virtual Region render(GLFramebuffer *target, const Region &bufferRepair) = 0;
+@@ -47,6 +53,8 @@ public:
+ Q_SIGNALS:
+     void frame();
+     void closed();
++private:
++    std::shared_ptr<ColorDescription> m_captureColor = ColorDescription::sRGB;
+ };
+ 
+ } // namespace KWin
+diff --git a/src/plugins/screencast/screencaststream.cpp b/src/plugins/screencast/screencaststream.cpp
+index 022e965..9106006 100644
+--- a/src/plugins/screencast/screencaststream.cpp
++++ b/src/plugins/screencast/screencaststream.cpp
+@@ -43,6 +43,10 @@ static const struct
+     uint32_t drmFormat;
+     spa_video_format spaFormat;
+ } supportedFormats[] = {
++    {
++        .drmFormat = DRM_FORMAT_ABGR2101010,
++        .spaFormat = SPA_VIDEO_FORMAT_ABGR_210LE,
++    },
+     {
+         .drmFormat = DRM_FORMAT_ARGB8888,
+         .spaFormat = SPA_VIDEO_FORMAT_BGRA,
+@@ -234,6 +238,21 @@ void ScreenCastStream::onStreamParamChanged(uint32_t id, const struct spa_pod *f
+     }
+ 
+     spa_format_video_raw_parse(format, &m_videoFormat);
++    const bool hdr = m_videoFormat.format == SPA_VIDEO_FORMAT_ABGR_210LE;
++    if (hdr && (!m_source->supportsHdr()
++        || m_videoFormat.transfer_function != SPA_VIDEO_TRANSFER_SMPTE2084
++        || m_videoFormat.color_primaries != SPA_VIDEO_COLOR_PRIMARIES_BT2020
++        || m_videoFormat.color_matrix != SPA_VIDEO_COLOR_MATRIX_RGB
++        || m_videoFormat.color_range != SPA_VIDEO_COLOR_RANGE_0_255
++        || spa_pod_find_prop(format, nullptr, SPA_FORMAT_VIDEO_modifier))) {
++        pw_stream_set_error(m_pwStream, -EINVAL, "HDR requires full-range BT.2020 PQ RGB memfd capture");
++        return;
++    }
++    // This describes our output container, not the mastering metadata of the
++    // content. Preserve PQ's full 10000 nit headroom and use 203 nit SDR white.
++    m_source->setCaptureColorDescription(hdr
++        ? std::make_shared<ColorDescription>(Colorimetry::BT2020, TransferFunction(TransferFunction::PerceptualQuantizer, 0, 10000), 203, 0, 10000, 10000)
++        : ColorDescription::sRGB);
+     auto modifierProperty = spa_pod_find_prop(format, nullptr, SPA_FORMAT_VIDEO_modifier);
+     if (modifierProperty) {
+         const uint32_t valueCount = SPA_POD_CHOICE_N_VALUES(&modifierProperty->value);
+@@ -768,6 +787,11 @@ QList<const spa_pod *> ScreenCastStream::buildFormats(bool fixate, char buffer[2
+         params.append(buildFormat(&podBuilder, dmabufFormat, &resolution, &defFramerate, &minFramerate, &maxFramerate, m_modifiers, SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE));
+     }
+     params.append(buildFormat(&podBuilder, shmFormat, &resolution, &defFramerate, &minFramerate, &maxFramerate, {}, 0));
++    // Keep all SDR choices first. Only an explicitly HDR-capable consumer
++    // negotiates this high-precision CPU readback path. No HDR DMA-BUF offer.
++    if (m_source->supportsHdr()) {
++        params.append(buildFormat(&podBuilder, SPA_VIDEO_FORMAT_ABGR_210LE, &resolution, &defFramerate, &minFramerate, &maxFramerate, {}, 0));
++    }
+     return params;
+ }
+ 
+@@ -798,6 +822,14 @@ spa_pod *ScreenCastStream::buildFormat(struct spa_pod_builder *b, enum spa_video
+         spa_pod_builder_add(b, SPA_FORMAT_VIDEO_format, SPA_POD_Id(format), 0);
+     }
+ 
++    if (format == SPA_VIDEO_FORMAT_ABGR_210LE) {
++        spa_pod_builder_add(b,
++            SPA_FORMAT_VIDEO_colorRange, SPA_POD_Id(SPA_VIDEO_COLOR_RANGE_0_255),
++            SPA_FORMAT_VIDEO_colorMatrix, SPA_POD_Id(SPA_VIDEO_COLOR_MATRIX_RGB),
++            SPA_FORMAT_VIDEO_transferFunction, SPA_POD_Id(SPA_VIDEO_TRANSFER_SMPTE2084),
++            SPA_FORMAT_VIDEO_colorPrimaries, SPA_POD_Id(SPA_VIDEO_COLOR_PRIMARIES_BT2020), 0);
++    }
++
+     if (!modifiers.empty()) {
+         spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier, modifiersFlags);
+         spa_pod_builder_push_choice(b, &f[1], SPA_CHOICE_Enum, 0);
+diff --git a/src/plugins/screencast/screencastutils.h b/src/plugins/screencast/screencastutils.h
+index 0d83508..6d73547 100644
+--- a/src/plugins/screencast/screencastutils.h
++++ b/src/plugins/screencast/screencastutils.h
+@@ -29,6 +29,8 @@ static void mirrorVertically(uchar *data, int height, int stride)
+ static GLenum closestGLType(QImage::Format format)
+ {
+     switch (format) {
++    case QImage::Format_A2BGR30_Premultiplied:
++        return GL_RGBA;
+     case QImage::Format_ARGB32:
+     case QImage::Format_ARGB32_Premultiplied:
+     case QImage::Format_RGB32:
+@@ -47,6 +49,7 @@ static void doGrabTexture(GLTexture *texture, QImage *target)
+ 
+     const auto context = EglContext::currentContext();
+     const QSize size = texture->size();
++    const GLenum elementType = target->format() == QImage::Format_A2BGR30_Premultiplied ? GL_UNSIGNED_INT_2_10_10_10_REV : GL_UNSIGNED_BYTE;
+     const bool invertNeeded = context->isOpenGLES() ^ (texture->contentTransform() != OutputTransform::FlipY);
+     const bool invertNeededAndSupported = invertNeeded && context->supportsPackInvert();
+     GLboolean prev;
+@@ -61,10 +64,10 @@ static void doGrabTexture(GLTexture *texture, QImage *target)
+     if (context->isOpenGLES() || context->glPlatform()->driver() == Driver_NVidia) {
+         GLFramebuffer fbo(texture);
+         GLFramebuffer::pushFramebuffer(&fbo);
+-        context->glReadnPixels(0, 0, size.width(), size.height(), closestGLType(target->format()), GL_UNSIGNED_BYTE, target->sizeInBytes(), target->bits());
++        context->glReadnPixels(0, 0, size.width(), size.height(), closestGLType(target->format()), elementType, target->sizeInBytes(), target->bits());
+         GLFramebuffer::popFramebuffer();
+     } else {
+-        context->glGetnTexImage(texture->target(), 0, closestGLType(target->format()), GL_UNSIGNED_BYTE, target->sizeInBytes(), target->bits());
++        context->glGetnTexImage(texture->target(), 0, closestGLType(target->format()), elementType, target->sizeInBytes(), target->bits());
+     }
+ 
+     if (invertNeededAndSupported) {
+@@ -83,7 +86,7 @@ static void grabTexture(GLTexture *texture, QImage *target)
+         doGrabTexture(texture, target);
+     } else {
+         const QSize size = contentTransform.map(texture->size());
+-        const auto backingTexture = GLTexture::allocate(GL_RGBA8, size);
++        const auto backingTexture = GLTexture::allocate(target->format() == QImage::Format_A2BGR30_Premultiplied ? GL_RGB10_A2 : GL_RGBA8, size);
+         if (!backingTexture) {
+             return;
+         }

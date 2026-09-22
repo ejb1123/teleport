@@ -20,7 +20,10 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Formatting
-        run: nix develop --command bash -c 'cargo fmt --check && nixfmt --check flake.nix nix/module.nix'
+        run: nix develop --command bash -c 'cargo fmt --check && nixfmt --check flake.nix nix/*.nix'
+      - name: PipeWire HDR negotiation regression
+        if: runner.os == 'Linux'
+        run: nix build .#checks.x86_64-linux.pipewire-hdr --no-link
       - name: Lints and unit tests
         run: nix develop --command bash -c 'cargo clippy --locked --all-targets -- -D warnings && cargo test --locked'
       - name: Real QUIC video, authentication, X11 input and native window tests

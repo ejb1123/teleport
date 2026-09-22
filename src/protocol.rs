@@ -4,7 +4,46 @@ use std::{path::Path, time::Duration};
 
 pub const VERSION: u32 = 2;
 pub const WIRE_VERSION: &str = "moq-lite-05";
-pub const VIDEO: &str = "h264";
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoCodec {
+    #[default]
+    H264,
+    H265,
+}
+
+/// HDR10 here specifies PQ/BT.2020 limited-range 10-bit video, not mastering metadata.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum DynamicRange {
+    #[default]
+    Sdr,
+    Hdr10,
+}
+
+impl DynamicRange {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Sdr => "SDR",
+            Self::Hdr10 => "HDR10 · PQ/BT.2020",
+        }
+    }
+}
+
+impl VideoCodec {
+    pub fn track(self) -> &'static str {
+        match self {
+            Self::H264 => "h264",
+            Self::H265 => "h265",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::H264 => "H.264",
+            Self::H265 => "H.265",
+        }
+    }
+}
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub const INPUT_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MAX_TEXT: usize = 64 * 1024;
@@ -35,6 +74,12 @@ impl Pairing {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Desktop {
+    #[serde(default)]
+    pub dynamic_range: DynamicRange,
+    #[serde(default)]
+    pub codec: VideoCodec,
+    #[serde(default)]
+    pub codecs: Vec<VideoCodec>,
     pub version: u32,
     pub width: u32,
     pub height: u32,
@@ -44,6 +89,19 @@ pub struct Desktop {
     pub active_monitor: usize,
     pub audio: bool,
     pub clipboard: bool,
+    #[serde(default)]
+    pub telemetry: bool,
+    #[serde(default)]
+    pub configurable_video: bool,
+    #[serde(default)]
+    pub native_width: u32,
+    #[serde(default)]
+    pub native_height: u32,
+    #[serde(default)]
+    pub bitrate: u32,
+    /// First video group belonging to these settings; zero for older hosts.
+    #[serde(default)]
+    pub video_start_group: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -57,9 +115,23 @@ pub struct Monitor {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Update {
-    Desktop { desktop: Desktop },
-    Clipboard { text: String },
-    Notice { text: String },
+    Telemetry {
+        encode_us: u64,
+        bitrate: u32,
+        encoder: String,
+    },
+    Pong {
+        id: u64,
+    },
+    Desktop {
+        desktop: Desktop,
+    },
+    Clipboard {
+        text: String,
+    },
+    Notice {
+        text: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -77,6 +149,8 @@ pub enum Event {
     Scroll { x: i32, y: i32 },
     ReleaseAll,
     Ping,
+    Probe { id: u64 },
+    ConfigureVideo { width: u32, fps: u32, bitrate: u32 },
     SelectMonitor { index: usize },
     Feedback { queue_ms: u32, dropped_groups: u32 },
     Clipboard { text: String },
@@ -86,6 +160,16 @@ pub enum Event {
 impl Event {
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::ConfigureVideo {
+                width,
+                fps,
+                bitrate,
+            } => ensure!(
+                (*width == 0 || (320..=7680).contains(width))
+                    && (1..=120).contains(fps)
+                    && (500..=100_000).contains(bitrate),
+                "invalid video settings"
+            ),
             Self::Motion { x, y } => ensure!(
                 x.is_finite()
                     && y.is_finite()
@@ -115,6 +199,16 @@ impl Event {
         }
         Ok(())
     }
+}
+
+pub fn validate_video_size(width: u32, height: u32) -> Result<()> {
+    ensure!(
+        (2..=7680).contains(&width)
+            && (2..=8192).contains(&height)
+            && u64::from(width) * u64::from(height) <= 33_554_432,
+        "video size exceeds supported limits"
+    );
+    Ok(())
 }
 
 /// Read untrusted MoQ frames with an application-level size limit.
@@ -222,7 +316,48 @@ pub fn evdev(scancode: sdl2::keyboard::Scancode) -> Option<u16> {
 mod tests {
     use super::*;
     #[test]
+    fn old_metadata_defaults_to_h264_without_new_capabilities() {
+        let old = serde_json::json!({ "version": 2, "width": 1280, "height": 720, "fps": 60,
+            "source": "test", "monitors": [], "active_monitor": 0, "audio": false, "clipboard": false });
+        let desktop: Desktop = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(desktop.codec, VideoCodec::H264);
+        assert!(!desktop.configurable_video && !desktop.telemetry);
+        assert_eq!(desktop.video_start_group, 0);
+        let mut invalid = old;
+        invalid["codec"] = serde_json::json!("surprise");
+        assert!(serde_json::from_value::<Desktop>(invalid).is_err());
+    }
+    #[test]
     fn input_bounds() {
+        assert!(
+            Event::ConfigureVideo {
+                width: 0,
+                fps: 120,
+                bitrate: 100_000
+            }
+            .validate()
+            .is_ok()
+        );
+        for (width, fps, bitrate) in [
+            (319, 60, 8000),
+            (7681, 60, 8000),
+            (1920, 0, 8000),
+            (1920, 121, 8000),
+            (1920, 60, 100_001),
+        ] {
+            assert!(
+                Event::ConfigureVideo {
+                    width,
+                    fps,
+                    bitrate
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(validate_video_size(5120, 1440).is_ok());
+        assert!(validate_video_size(2160, 3840).is_ok());
+        assert!(validate_video_size(7680, 8192).is_err());
         assert!(
             Event::Motion {
                 x: f64::NAN,

@@ -14,6 +14,97 @@ impl Drop for Process {
 }
 
 #[test]
+#[ignore = "requires local UDP sockets and GStreamer runtime plugins"]
+fn negotiated_resolution_and_native_portrait() {
+    let temp = tempfile::tempdir().unwrap();
+    let pairing = temp.path().join("pairing.json");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let mut host = Process(
+        teleport()
+            .args([
+                "host",
+                "--source",
+                "test",
+                "--encoder",
+                "software",
+                "--listen",
+                &address,
+                "--width",
+                "640",
+                "--pairing-file",
+            ])
+            .arg(&pairing)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::read(&pairing)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_none()
+    {
+        assert!(host.0.try_wait().unwrap().is_none(), "test host exited");
+        assert!(Instant::now() < deadline, "test host did not become ready");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    for (codec, width, monitor, expected_width, expected_height, software) in [
+        ("h264", "1920", "0", 1920, 1080, true),
+        ("h264", "0", "1", 720, 1280, true),
+        ("h265", "1920", "0", 1920, 1080, true),
+        ("h265", "0", "1", 720, 1280, true),
+        ("h265", "640", "0", 640, 360, false),
+    ] {
+        let mut command = teleport();
+        command
+            .args(["client", &address, "--pairing-file"])
+            .arg(&pairing)
+            .args([
+                "--headless-frames",
+                "15",
+                "--codec",
+                codec,
+                "--width",
+                width,
+                "--fps",
+                "30",
+                "--bitrate",
+                "4000",
+                "--monitor",
+                monitor,
+            ]);
+        if software {
+            command.arg("--software-decoder");
+        }
+        let output = command.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "negotiation failed: {stdout} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("SMOKE PASS"),
+            "video did not decode: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("width={expected_width}")),
+            "wrong negotiated width: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("height={expected_height}")),
+            "wrong negotiated height: {stdout}"
+        );
+        assert!(
+            stdout.contains("receive_to_decode_us="),
+            "pipeline diagnostics missing: {stdout}"
+        );
+    }
+}
+
+#[test]
 #[ignore = "requires local TCP/UDP sockets and GStreamer plugins"]
 fn one_time_code_saves_trust_and_connects_without_file_transfer() {
     use std::io::{BufRead, Write};
@@ -207,7 +298,58 @@ fn native_moq_video() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("SMOKE PASS"));
-    // Reconnect to the same host: it must tear down the old pipeline and controls.
+    // Same authenticated host, explicitly selected HEVC and automatic hardware
+    // decoding. Codec choice must not change or rotate trust.
+    let output = teleport()
+        .args([
+            "client",
+            &address,
+            "--codec",
+            "h265",
+            "--headless-frames",
+            "30",
+            "--pairing-file",
+        ])
+        .arg(&pairing)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "HEVC hardware-auto stream failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("SMOKE PASS"));
+    // Explicit HDR on the synthetic source: authenticated transport must retain
+    // Main 10/PQ metadata and the decoder's high-precision planes. This is not
+    // a desktop-capture or physical HDR-display acceptance test.
+    let output = teleport()
+        .args([
+            "client",
+            &address,
+            "--codec",
+            "h265",
+            "--dynamic-range",
+            "hdr10",
+            "--headless-frames",
+            "15",
+            "--pairing-file",
+        ])
+        .arg(&pairing)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "HDR transport failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let hdr_output = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        hdr_output.contains("SMOKE PASS") && hdr_output.contains("HDR10"),
+        "{hdr_output}"
+    );
+    // Reconnect to SDR on the same host: tear down the old pipeline and controls.
     let output = teleport()
         .args([
             "client",

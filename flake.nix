@@ -33,7 +33,7 @@
             SDL2_ttf
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-            pkgs.pipewire
+            (import ./nix/pipewire-hdr.nix { inherit pkgs; })
             pkgs.libei
             pkgs.wayland
             pkgs.libxkbcommon
@@ -50,6 +50,28 @@
     in
     {
       nixosModules.default = import ./nix/module.nix;
+      nixosModules.experimental-kwin-hdr = import ./nix/kwin-hdr-module.nix;
+      # Explicit opt-in: building the app never replaces the running compositor.
+      overlays.kwin-hdr = _final: prev: {
+        kdePackages = prev.kdePackages.overrideScope (
+          _kfinal: kprev: {
+            kwin = import ./nix/kwin-hdr.nix {
+              pkgs = prev // {
+                kdePackages = kprev;
+              };
+            };
+          }
+        );
+      };
+      checks = forAllSystems (
+        system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in
+        pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          pipewire-hdr = import ./nix/pipewire-hdr-check.nix { inherit pkgs; };
+        }
+      );
       packages = forAllSystems (
         system:
         let
@@ -59,7 +81,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "teleport";
-            version = "0.2.1";
+            version = "0.3.0";
             src = pkgs.lib.fileset.toSource {
               root = ./.;
               fileset = pkgs.lib.fileset.unions [

@@ -251,6 +251,25 @@ impl Capture {
         }
     }
 
+    pub fn pipeline_source_for_range(
+        &self,
+        range: crate::protocol::DynamicRange,
+    ) -> Result<String> {
+        if range == crate::protocol::DynamicRange::Sdr {
+            return Ok(self.pipeline_source());
+        }
+        ensure!(
+            !matches!(self.backend, Backend::X11 { .. }),
+            "HDR capture requires a compatible Wayland compositor; X11 capture is SDR"
+        );
+        // Require real high-precision PQ RGB, never relabel an 8-bit source.
+        // Test mode generates synthetic PQ code values, not desktop capture.
+        Ok(format!(
+            "{} ! capsfilter name=hdr_source caps=video/x-raw,format=RGB10A2_LE,colorimetry=1:1:14:7",
+            self.pipeline_source()
+        ))
+    }
+
     async fn key(&self, code: u16, down: bool) -> Result<()> {
         match &self.backend {
             Backend::Portal { proxy, session, .. } => {
@@ -433,6 +452,8 @@ impl Capture {
             Event::Ping => (),
             // Host-level controls are handled before injection.
             Event::SelectMonitor { .. }
+            | Event::Probe { .. }
+            | Event::ConfigureVideo { .. }
             | Event::Feedback { .. }
             | Event::Clipboard { .. }
             | Event::ClipboardRequest => (),
