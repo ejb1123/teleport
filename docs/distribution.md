@@ -85,6 +85,35 @@ Inspect with `systemctl --user status teleport-desktop` and
 `journalctl --user -u teleport-desktop`. Stop it with `systemctl --user stop teleport-desktop`.
 Do not enable user lingering expecting desktop capture to work before login.
 
+### Test the NixOS unit without rebooting or switching the system
+
+After adding the input and module to your system flake, build just its generated
+unit (replace `nixos` with your configuration name):
+
+```sh
+teleport_unit=$(nix build --no-link --print-out-paths \
+  '/etc/nixos#nixosConfigurations.nixos.config.systemd.user.units."teleport-desktop.service".unit')
+systemctl --user link --runtime "$teleport_unit/teleport-desktop.service"
+systemctl --user daemon-reload
+# Stop any manually launched Teleport host first, to release its port/capture.
+systemctl --user start teleport-desktop
+journalctl --user -u teleport-desktop -n 30 --no-pager
+```
+
+Approve any local portal prompt, then test `systemctl --user restart
+teleport-desktop` and reconnect from an already paired client. A running process
+alone is not proof of unattended access: check that capture actually resumes
+without local approval. Keep the same identity directory to preserve client trust.
+The service does not automatically open code enrollment on startup.
+
+This runtime link is temporary and does **not** activate the whole NixOS
+configuration or persist across reboot. A later reviewed NixOS rebuild installs
+the declarative service for future graphical logins. No reboot, logout, auto-login,
+or user lingering is needed for this current-session test. A local test input can
+use `git+file:///absolute/path/to/teleport`; its lock pins a committed revision,
+so edits are not deployed until committed and the input is updated. Such an input
+also requires that checkout when updating and is not a portable configuration.
+
 ## Release validation
 
 The manually dispatched release workflow builds Linux and macOS packages and
