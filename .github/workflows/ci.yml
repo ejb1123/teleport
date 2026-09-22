@@ -42,6 +42,9 @@ jobs:
         run: nix build --print-build-logs
       - name: Check packaged media plugins
         run: ./result/bin/teleport doctor
+      - name: Check Linux package with foreign SDL and font configuration
+        if: runner.os == 'Linux'
+        run: nix develop --command env TELEPORT_TEST_BINARY=./result/bin/teleport cargo test --locked --test package_env -- --ignored --nocapture
       - name: Check Linux desktop entry
         if: runner.os == 'Linux'
         run: test -f result/share/applications/teleport.desktop

@@ -17,7 +17,7 @@ use tokio::{
 use crate::protocol::Pairing;
 
 pub const MAGIC: [u8; 8] = *b"TPAUTH01";
-const TIMEOUT: Duration = Duration::from_secs(15);
+const TIMEOUT: Duration = Duration::from_secs(90);
 const MAX_PACKET: usize = 4096;
 
 struct Suite;
@@ -43,6 +43,54 @@ fn password_ksf() -> argon2::Argon2<'static> {
 struct Hello {
     username: String,
     device_name: String,
+    #[serde(default)]
+    u2f: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TouchChallenge {
+    credential: crate::security_key::Credential,
+    hash: [u8; 32],
+}
+
+fn touch_cipher(session: &[u8], label: &[u8]) -> Result<aead::LessSafeKey> {
+    let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &MAGIC).extract(session);
+    let mut key = [0; 32];
+    prk.expand(&[label], hkdf::HKDF_SHA256)
+        .map_err(|_| anyhow::anyhow!("key derivation failed"))?
+        .fill(&mut key)
+        .map_err(|_| anyhow::anyhow!("key derivation failed"))?;
+    Ok(aead::LessSafeKey::new(
+        aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &key)
+            .map_err(|_| anyhow::anyhow!("cipher initialization failed"))?,
+    ))
+}
+const TOUCH_REQUEST: &[u8] = b"teleport/u2f/challenge/v1";
+const TOUCH_REPLY: &[u8] = b"teleport/u2f/assertion/v1";
+fn seal_touch(session: &[u8], label: &[u8], context: &[u8], mut data: Vec<u8>) -> Result<Vec<u8>> {
+    let nonce: [u8; 12] = rand::random();
+    touch_cipher(session, label)?
+        .seal_in_place_append_tag(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(context),
+            &mut data,
+        )
+        .map_err(|_| anyhow::anyhow!("security-key message encryption failed"))?;
+    let mut packet = nonce.to_vec();
+    packet.extend(data);
+    Ok(packet)
+}
+fn open_touch(session: &[u8], label: &[u8], context: &[u8], mut data: Vec<u8>) -> Result<Vec<u8>> {
+    ensure!(data.len() >= 28, "invalid security-key message");
+    let nonce = data[..12].try_into()?;
+    Ok(touch_cipher(session, label)?
+        .open_in_place(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(context),
+            &mut data[12..],
+        )
+        .map_err(|_| anyhow::anyhow!("security-key message authentication failed"))?
+        .to_vec())
 }
 
 pub fn validate_username(username: &str) -> Result<()> {
@@ -146,10 +194,35 @@ pub async fn login(
     password: &str,
     device_name: &str,
 ) -> Result<Pairing> {
+    login_with_touch(
+        address,
+        username,
+        password,
+        device_name,
+        true,
+        |credential, hash| crate::security_key::sign_u2f(&credential, &hash, None),
+    )
+    .await
+}
+
+async fn login_with_touch<F>(
+    address: &str,
+    username: &str,
+    password: &str,
+    device_name: &str,
+    supports_u2f: bool,
+    touch: F,
+) -> Result<Pairing>
+where
+    F: FnOnce(crate::security_key::Credential, [u8; 32]) -> Result<crate::security_key::Assertion>
+        + Send
+        + 'static,
+{
     crate::pairing::validate_address(address)?;
     let hello = Hello {
         username: username.into(),
         device_name: device_name.into(),
+        u2f: supports_u2f,
     };
     validate_hello(&hello)?;
     ensure!(
@@ -188,11 +261,32 @@ pub async fn login(
                 anyhow::anyhow!("login failed; check username/password or host access settings")
             })?;
         write_packet(&mut stream, &finish.message.serialize()).await?;
-        let pairing = open_credential(
-            &finish.session_key,
-            &context,
-            read_packet(&mut stream).await?,
-        )?;
+        let mut packet = read_packet(&mut stream).await?;
+        if packet.starts_with(b"TPU2F001") {
+            let challenge: TouchChallenge = serde_json::from_slice(&open_touch(
+                &finish.session_key,
+                TOUCH_REQUEST,
+                &context,
+                packet[8..].to_vec(),
+            )?)?;
+            crate::security_key::validate_u2f_credential(&challenge.credential, &fingerprint)?;
+            eprintln!("Touch your YubiKey to authorize this new device.");
+            let assertion =
+                tokio::task::spawn_blocking(move || touch(challenge.credential, challenge.hash))
+                    .await??;
+            write_packet(
+                &mut stream,
+                &seal_touch(
+                    &finish.session_key,
+                    TOUCH_REPLY,
+                    &context,
+                    serde_json::to_vec(&assertion)?,
+                )?,
+            )
+            .await?;
+            packet = read_packet(&mut stream).await?;
+        }
+        let pairing = open_credential(&finish.session_key, &context, packet)?;
         ensure!(
             pairing.fingerprint == fingerprint,
             "authenticated host identity mismatch"
@@ -216,6 +310,7 @@ pub struct DeviceSummary {
 pub struct AccessStatus {
     pub username: Option<String>,
     pub devices: Vec<DeviceSummary>,
+    pub u2f_required: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -256,6 +351,10 @@ mod server {
         devices: Vec<Device>,
         generation: u64,
         attempts: Vec<u64>,
+        #[serde(default)]
+        u2f: Option<crate::security_key::Credential>,
+        #[serde(default)]
+        u2f_counter: u32,
     }
     pub struct ServerState {
         path: PathBuf,
@@ -311,6 +410,9 @@ mod server {
                         "invalid stored device credential"
                     );
                 }
+                if let Some(key) = &record.u2f {
+                    crate::security_key::validate_u2f_credential(key, &legacy_pairing.fingerprint)?;
+                }
                 record
             } else {
                 let record = Record {
@@ -320,6 +422,8 @@ mod server {
                     devices: Vec::new(),
                     generation: 0,
                     attempts: Vec::new(),
+                    u2f: None,
+                    u2f_counter: 0,
                 };
                 crate::identity::write_new(&path, &serde_json::to_vec(&record)?)?;
                 record
@@ -372,7 +476,56 @@ mod server {
             AccessStatus {
                 username: record.account.as_ref().map(|a| a.username.clone()),
                 devices: record.devices.iter().map(|d| d.summary.clone()).collect(),
+                u2f_required: record.u2f.is_some(),
             }
+        }
+
+        /// Same-user local administration only. Existing trusted devices remain valid.
+        pub fn require_u2f(&self, credential: crate::security_key::Credential) -> Result<()> {
+            crate::security_key::validate_u2f_credential(&credential, &self.legacy.fingerprint)?;
+            self.update(|r| {
+                ensure!(r.account.is_some(), "configure a Teleport password first");
+                r.u2f = Some(credential);
+                r.u2f_counter = 0;
+                r.generation = r
+                    .generation
+                    .checked_add(1)
+                    .context("access generation exhausted")?;
+                Ok(())
+            })
+        }
+        pub fn disable_u2f(&self) -> Result<()> {
+            self.update(|r| {
+                r.u2f = None;
+                r.u2f_counter = 0;
+                r.generation = r
+                    .generation
+                    .checked_add(1)
+                    .context("access generation exhausted")?;
+                Ok(())
+            })
+        }
+
+        fn accept_touch(
+            &self,
+            generation: u64,
+            hash: &[u8; 32],
+            assertion: &crate::security_key::Assertion,
+        ) -> Result<()> {
+            self.update(|r| {
+                ensure!(
+                    r.generation == generation,
+                    "access settings changed; log in again"
+                );
+                let credential = r.u2f.as_ref().context("security-key settings changed")?;
+                let counter = crate::security_key::verify_u2f(credential, hash, assertion)?;
+                ensure!(
+                    counter > r.u2f_counter,
+                    "security-key counter did not advance; enrollment rejected"
+                );
+                r.u2f_counter = counter;
+                Ok(())
+            })
         }
 
         pub fn set_password(&self, username: &str, password: &str) -> Result<()> {
@@ -552,57 +705,97 @@ mod server {
             .map_err(|_| anyhow::anyhow!("login temporarily unavailable"))?;
         state.admit(stream.peer_addr()?.ip())?;
         tokio::time::timeout(TIMEOUT, async {
-            let mut magic = [0; 8];
-            stream.read_exact(&mut magic).await?;
-            ensure!(magic == MAGIC, "unsupported access protocol");
-            let hello_bytes = read_packet(&mut stream).await?;
-            let hello: Hello = serde_json::from_slice(&hello_bytes)?;
-            validate_hello(&hello)?;
-            let fingerprint = &state.legacy.fingerprint;
-            write_packet(&mut stream, fingerprint.as_bytes()).await?;
-            let context = serde_json::to_vec(&(MAGIC, &hello_bytes, fingerprint))?;
-            let request =
-                CredentialRequest::<Suite>::deserialize(&read_packet(&mut stream).await?)?;
-            let (setup, password_file, generation) = {
-                let record = state
-                    .record
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("access state unavailable"))?;
-                let file = record
-                    .account
+            let (finish, context, hello, generation, u2f) =
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    let mut magic = [0; 8];
+                    stream.read_exact(&mut magic).await?;
+                    ensure!(magic == MAGIC, "unsupported access protocol");
+                    let hello_bytes = read_packet(&mut stream).await?;
+                    let hello: Hello = serde_json::from_slice(&hello_bytes)?;
+                    validate_hello(&hello)?;
+                    let fingerprint = &state.legacy.fingerprint;
+                    write_packet(&mut stream, fingerprint.as_bytes()).await?;
+                    let context = serde_json::to_vec(&(MAGIC, &hello_bytes, fingerprint))?;
+                    let request =
+                        CredentialRequest::<Suite>::deserialize(&read_packet(&mut stream).await?)?;
+                    let (setup, password_file, generation, u2f) = {
+                        let record = state
+                            .record
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("access state unavailable"))?;
+                        let file = record
+                            .account
+                            .as_ref()
+                            .filter(|a| a.username == hello.username)
+                            .map(|a| ServerRegistration::<Suite>::deserialize(&a.registration))
+                            .transpose()?;
+                        (
+                            ServerSetup::<Suite>::deserialize(&record.setup)?,
+                            file,
+                            record.generation,
+                            record.u2f.clone(),
+                        )
+                    };
+                    let parameters = ServerLoginParameters {
+                        context: Some(&context),
+                        identifiers: Identifiers {
+                            client: Some(hello.username.as_bytes()),
+                            server: Some(fingerprint.as_bytes()),
+                        },
+                    };
+                    let start = ServerLogin::<Suite>::start(
+                        &mut OsRng,
+                        &setup,
+                        password_file,
+                        request,
+                        hello.username.as_bytes(),
+                        parameters.clone(),
+                    )?;
+                    write_packet(&mut stream, &start.message.serialize()).await?;
+                    let finish = start
+                        .state
+                        .finish(
+                            CredentialFinalization::<Suite>::deserialize(
+                                &read_packet(&mut stream).await?,
+                            )?,
+                            parameters,
+                        )
+                        .map_err(|_| anyhow::anyhow!("login failed"))?;
+                    Ok::<_, anyhow::Error>((finish, context, hello, generation, u2f))
+                })
+                .await
+                .context("password proof timed out")??;
+            if let Some(credential) = u2f {
+                ensure!(
+                    hello.u2f,
+                    "host requires password plus U2F; update your client"
+                );
+                // Fresh challenge binds this OPAQUE exchange, account and pinned host.
+                let nonce: [u8; 32] = rand::random();
+                let mut binding = b"teleport/u2f/login/v1".to_vec();
+                binding.extend_from_slice(&context);
+                binding.extend_from_slice(&finish.session_key);
+                binding.extend_from_slice(&nonce);
+                let hash: [u8; 32] = digest::digest(&digest::SHA256, &binding)
                     .as_ref()
-                    .filter(|a| a.username == hello.username)
-                    .map(|a| ServerRegistration::<Suite>::deserialize(&a.registration))
-                    .transpose()?;
-                (
-                    ServerSetup::<Suite>::deserialize(&record.setup)?,
-                    file,
-                    record.generation,
-                )
-            };
-            let parameters = ServerLoginParameters {
-                context: Some(&context),
-                identifiers: Identifiers {
-                    client: Some(hello.username.as_bytes()),
-                    server: Some(fingerprint.as_bytes()),
-                },
-            };
-            let start = ServerLogin::<Suite>::start(
-                &mut OsRng,
-                &setup,
-                password_file,
-                request,
-                hello.username.as_bytes(),
-                parameters.clone(),
-            )?;
-            write_packet(&mut stream, &start.message.serialize()).await?;
-            let finish = start
-                .state
-                .finish(
-                    CredentialFinalization::<Suite>::deserialize(&read_packet(&mut stream).await?)?,
-                    parameters,
-                )
-                .map_err(|_| anyhow::anyhow!("login failed"))?;
+                    .try_into()?;
+                let challenge = TouchChallenge { credential, hash };
+                let mut packet = b"TPU2F001".to_vec();
+                packet.extend(seal_touch(
+                    &finish.session_key,
+                    TOUCH_REQUEST,
+                    &context,
+                    serde_json::to_vec(&challenge)?,
+                )?);
+                write_packet(&mut stream, &packet).await?;
+                let assertion = serde_json::from_slice(&open_touch(
+                    &finish.session_key,
+                    TOUCH_REPLY,
+                    &context,
+                    read_packet(&mut stream).await?,
+                )?)?;
+                state.accept_touch(generation, &hash, &assertion)?;
+            }
             let pairing = state.issue(generation, &hello.device_name)?;
             let mut payload = serde_json::to_vec(&pairing)?;
             let nonce: [u8; 12] = rand::random();
@@ -651,7 +844,9 @@ mod server {
                 while let Ok((stream, _)) = listener.accept().await {
                     let state = state.clone();
                     tokio::spawn(async move {
-                        let _ = handle(stream, state).await;
+                        if let Err(error) = handle(stream, state).await {
+                            eprintln!("test access rejection: {error:#}");
+                        }
                     });
                 }
             });
@@ -691,6 +886,128 @@ mod server {
             let disk = fs::read_to_string(&state.path)?;
             assert!(!disk.contains(PASSWORD));
             assert!(!disk.contains(&first.token));
+            Ok(())
+        }
+
+        #[tokio::test]
+        #[ignore = "requires local TCP sockets and libfido2; run outside the Nix build sandbox"]
+        async fn u2f_password_enrollment_fails_closed_and_preserves_saved_devices() -> Result<()> {
+            use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
+            let (_temporary, state) = state()?;
+            let rng = ring::rand::SystemRandom::new();
+            let pkcs8 =
+                EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+            let key = Arc::new(
+                EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng)
+                    .unwrap(),
+            );
+            let fp = &state.legacy.fingerprint;
+            let rp = format!("f-{}.{}.teleport.invalid", &fp[..32], &fp[32..]);
+            let credential: crate::security_key::Credential =
+                serde_json::from_value(serde_json::json!({
+                    "version": 2, "fingerprint": fp, "rp": rp, "id": [1, 2, 3],
+                    "public_key": key.public_key().as_ref()[1..], "algorithm": -7,
+                    "uv_required": false, "mode": "U2f"
+                }))?;
+            let generation = state.record.lock().unwrap().generation;
+            let saved = state.issue(generation, "existing device")?;
+            state.require_u2f(credential.clone())?;
+            assert!(state.status().u2f_required);
+            assert!(state.authorized(&saved.token));
+            assert!(state.authorized(&state.legacy.token));
+            let (address, task) = listener(state.clone()).await?;
+            assert!(
+                login_with_touch(
+                    &address,
+                    "ej",
+                    "wrong password",
+                    "work",
+                    true,
+                    |_, _| panic!("touch requested before password proof")
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                login_with_touch(&address, "ej", PASSWORD, "old", false, |_, _| panic!(
+                    "old client reached touch"
+                ))
+                .await
+                .is_err()
+            );
+            assert!(
+                login_with_touch(
+                    &address,
+                    "ej",
+                    PASSWORD,
+                    "missing",
+                    true,
+                    |_, _| anyhow::bail!("no key connected")
+                )
+                .await
+                .is_err()
+            );
+            let signed = Arc::new(Mutex::new(None));
+            let signed_copy = signed.clone();
+            let signing_key = key.clone();
+            let enrolled =
+                login_with_touch(&address, "ej", PASSWORD, "touched", true, move |_, hash| {
+                    let mut authdata = digest::digest(&digest::SHA256, rp.as_bytes())
+                        .as_ref()
+                        .to_vec();
+                    authdata.push(1);
+                    authdata.extend_from_slice(&1u32.to_be_bytes());
+                    let mut message = authdata.clone();
+                    message.extend_from_slice(&hash);
+                    let assertion = crate::security_key::Assertion {
+                        authdata,
+                        signature: signing_key
+                            .sign(&ring::rand::SystemRandom::new(), &message)
+                            .unwrap()
+                            .as_ref()
+                            .to_vec(),
+                    };
+                    *signed_copy.lock().unwrap() = Some((hash, serde_json::to_vec(&assertion)?));
+                    Ok(assertion)
+                })
+                .await?;
+            assert!(state.authorized(&enrolled.token));
+            let (previous_hash, previous) = signed.lock().unwrap().take().unwrap();
+            let generation = state.record.lock().unwrap().generation;
+            let old_assertion = serde_json::from_slice(&previous)?;
+            assert!(
+                state
+                    .accept_touch(generation, &previous_hash, &old_assertion)
+                    .is_err(),
+                "same counter must not be accepted twice"
+            );
+            assert!(
+                login_with_touch(&address, "ej", PASSWORD, "replay", true, move |_, _| Ok(
+                    serde_json::from_slice(&previous)?
+                ))
+                .await
+                .is_err()
+            );
+            assert_eq!(state.status().devices.len(), 2);
+            let reopened = ServerState::open(state.path.parent().unwrap(), state.legacy.clone())?;
+            assert!(reopened.status().u2f_required);
+            assert_eq!(reopened.record.lock().unwrap().u2f_counter, 1);
+            state.set_password("ej", "Changed password retains U2F!")?;
+            assert!(state.status().u2f_required);
+            assert!(
+                state
+                    .accept_touch(generation, &previous_hash, &old_assertion)
+                    .is_err()
+            );
+            assert!(
+                state
+                    .issue(generation, "changed policy during touch")
+                    .is_err()
+            );
+            state.disable_u2f()?;
+            assert!(!state.status().u2f_required);
+            assert!(state.authorized(&state.legacy.token));
+            task.abort();
             Ok(())
         }
 
@@ -835,6 +1152,22 @@ mod tests {
             assert!(validate_username(bad).is_err());
         }
         assert!(validate_username("EJ-work_1").is_ok());
+    }
+
+    #[test]
+    fn u2f_encrypted_messages_bind_role_session_and_context() -> Result<()> {
+        let packet = seal_touch(b"session", TOUCH_REQUEST, b"context", b"challenge".to_vec())?;
+        assert_eq!(
+            open_touch(b"session", TOUCH_REQUEST, b"context", packet.clone())?,
+            b"challenge"
+        );
+        assert!(open_touch(b"session", TOUCH_REPLY, b"context", packet.clone()).is_err());
+        assert!(open_touch(b"other session", TOUCH_REQUEST, b"context", packet.clone()).is_err());
+        assert!(open_touch(b"session", TOUCH_REQUEST, b"other context", packet.clone()).is_err());
+        let mut tampered = packet;
+        tampered[12] ^= 1;
+        assert!(open_touch(b"session", TOUCH_REQUEST, b"context", tampered).is_err());
+        Ok(())
     }
 
     #[test]

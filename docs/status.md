@@ -1,5 +1,31 @@
 # Implementation status
 
+## Version 0.4.1: Arch environment isolation and NEO enrollment
+
+The Linux package now isolates its SDL libraries and Fontconfig configuration
+from inherited system overrides. A packaged regression test deliberately supplies
+a foreign SDL library and invalid font configuration; the old package fails it.
+Security-key diagnostics no longer initialize GStreamer.
+
+Explicit U2F/CTAP1 enrollment supports password-plus-key-touch for new device
+credentials. Challenges follow OPAQUE password proof, bind the authenticated host
+and exchange, and use authenticated encryption. Verification checks presence,
+signature and a persistent increasing counter. Existing trusted-device and code
+pairing paths remain unchanged: **this is not touch-per-session or global MFA**.
+FIDO2 credentials retain their separate UV requirement without silent downgrade.
+See [NEO setup and recovery](yubikey-neo.md).
+
+Native verification and real TCP exchange tests use synthetic ES256 credentials;
+physical NEO enrollment/login and the updated package on the user's Arch machine
+remain acceptance tests. No authenticator reset or PIN change is required.
+
+Local verification (2026-09-22): 83 distinct tests pass, including normally
+ignored native crypto/media/network/UI tests and the packaged foreign-library
+regression. The latter fails against 0.4.0 and passes against 0.4.1. The Nix release
+build, strict Clippy, formatting checks and all 12 packaged integration tests pass.
+This remains software/laboratory evidence, not a physical NEO or Arch acceptance
+claim. The running production host was not restarted or reconfigured.
+
 ## Version 0.4 development checkpoint
 
 Implemented: native Linux Host Settings, private same-user administration over

@@ -30,6 +30,7 @@ Enter a new Teleport passphrase twice at the hidden prompts. Do not pass secrets
 in command arguments, chat, or environment variables. The username is case
 sensitive; a passphrase must have at least 12 characters. This is one Teleport
 account per host, not integration with Linux accounts/PAM.
+For optional YubiKey NEO password-plus-touch enrollment, see [U2F setup](yubikey-neo.md).
 For a custom identity directory, put `--identity-dir PATH` after `host-admin`
 and before its subcommand. Administration uses a private same-user Unix socket,
 not a network management endpoint. The updated host must be running.
@@ -104,6 +105,6 @@ cause denial of service. A strong unique passphrase and network restrictions
 remain necessary. Identity files are private to the host user; client credential
 files grant desktop access and must also stay private.
 
-Security-key login and peripheral forwarding are separate features. A password
+U2F enrollment and peripheral forwarding are separate features. A password
 login does not implicitly grant access to a client's SSH agent, smartcard, USB
 devices, or FIDO authenticator.

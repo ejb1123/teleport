@@ -1,4 +1,4 @@
-//! Offline native FIDO2 diagnostics, not network login or WebAuthn forwarding.
+//! Native FIDO2 diagnostics and explicitly selected U2F second-factor support.
 //! The private FFI uses the public libfido2 C ABI; no CTAP/crypto implementation.
 use anyhow::{Context, Result, bail, ensure};
 use clap::Subcommand;
@@ -29,6 +29,9 @@ pub enum Command {
     },
     /// Create an OFFLINE test credential on a key; does not enable Teleport login.
     Enroll {
+        /// Explicit legacy U2F mode: presence only, intended as a password second factor.
+        #[arg(long)]
+        u2f: bool,
         /// Trusted host SHA-256 certificate fingerprint (64 hexadecimal characters).
         #[arg(long)]
         fingerprint: String,
@@ -40,6 +43,9 @@ pub enum Command {
     },
     /// Request and verify an offline assertion; does not connect to a host.
     Verify {
+        /// Explicitly permit a U2F credential; never downgrades a FIDO2 credential.
+        #[arg(long)]
+        u2f: bool,
         #[arg(long)]
         credential: PathBuf,
         #[arg(long)]
@@ -49,9 +55,9 @@ pub enum Command {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Credential {
+pub struct Credential {
     version: u32,
     fingerprint: String,
     rp: String,
@@ -59,6 +65,22 @@ struct Credential {
     public_key: Vec<u8>,
     algorithm: i32,
     uv_required: bool,
+    #[serde(default)]
+    mode: Mode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum Mode {
+    #[default]
+    Fido2,
+    U2f,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Assertion {
+    pub authdata: Vec<u8>,
+    pub signature: Vec<u8>,
 }
 
 fn fingerprint(value: &str) -> Result<String> {
@@ -96,7 +118,11 @@ fn challenge_hash(
 fn validate_credential(value: &Credential, expected: &str) -> Result<()> {
     let expected = fingerprint(expected)?;
     ensure!(
-        value.version == 1 && value.algorithm == ES256 && value.uv_required,
+        value.algorithm == ES256
+            && match value.mode {
+                Mode::Fido2 => value.version == 1 && value.uv_required,
+                Mode::U2f => value.version == 2 && !value.uv_required,
+            },
         "unsupported credential version, algorithm or verification policy"
     );
     ensure!(
@@ -107,6 +133,9 @@ fn validate_credential(value: &Credential, expected: &str) -> Result<()> {
         !value.id.is_empty() && value.id.len() <= 4096 && value.public_key.len() == 64,
         "invalid credential ID or ES256 key length"
     );
+    if value.mode == Mode::U2f {
+        ensure!(value.id.len() <= 255, "U2F key handle exceeds CTAP1 limit");
+    }
     Ok(())
 }
 
@@ -159,6 +188,7 @@ native_api! {
     fido_dev_cancel: fn(*mut c_void) -> c_int,
     fido_dev_set_timeout: fn(*mut c_void, c_int) -> c_int,
     fido_dev_is_fido2: fn(*const c_void) -> bool,
+    fido_dev_force_u2f: fn(*mut c_void) -> (),
     fido_dev_has_pin: fn(*const c_void) -> bool,
     fido_dev_has_uv: fn(*const c_void) -> bool,
     fido_dev_supports_pin: fn(*const c_void) -> bool,
@@ -192,7 +222,6 @@ native_api! {
     fido_assert_id_ptr: fn(*const c_void, usize) -> *const u8,
     fido_assert_id_len: fn(*const c_void, usize) -> usize,
     fido_assert_verify: fn(*const c_void, usize, c_int, *const c_void) -> c_int,
-    fido_assert_sigcount: fn(*const c_void, usize) -> u32,
     fido_assert_set_count: fn(*mut c_void, usize) -> c_int,
     fido_assert_set_authdata_raw: fn(*mut c_void, usize, *const u8, usize) -> c_int,
     fido_assert_set_sig: fn(*mut c_void, usize, *const u8, usize) -> c_int,
@@ -350,7 +379,7 @@ impl Api {
         credential: &Credential,
         pin: Option<&[u8]>,
         hash: &[u8],
-    ) -> Result<u32> {
+    ) -> Result<Assertion> {
         let rp = CString::new(credential.rp.as_bytes())?;
         // SAFETY: all native objects live until their corresponding library calls
         // finish. Input pointers reference bounded Rust buffers for each call.
@@ -363,14 +392,21 @@ impl Api {
                 hash.len(),
             ))?;
             self.check((self.fido_assert_set_up)(assertion.pointer, OPT_TRUE))?;
-            self.check((self.fido_assert_set_uv)(assertion.pointer, OPT_TRUE))?;
+            self.check((self.fido_assert_set_uv)(
+                assertion.pointer,
+                if credential.uv_required {
+                    OPT_TRUE
+                } else {
+                    OPT_FALSE
+                },
+            ))?;
             self.check((self.fido_assert_allow_cred)(
                 assertion.pointer,
                 credential.id.as_ptr(),
                 credential.id.len(),
             ))?;
             self.check((self.fido_dev_set_timeout)(device.pointer, 30_000))?;
-            eprintln!("Touch/verify your security key for this offline host-bound assertion.");
+            eprintln!("Touch/verify your security key for this host-bound assertion.");
             self.check((self.fido_dev_get_assert)(
                 device.pointer,
                 assertion.pointer,
@@ -402,7 +438,10 @@ impl Api {
                 1024,
             )?;
             self.verify_assertion(credential, hash, &authdata, &signature)?;
-            Ok((self.fido_assert_sigcount)(assertion.pointer, 0))
+            Ok(Assertion {
+                authdata,
+                signature,
+            })
         }
     }
     fn verify_assertion(
@@ -432,7 +471,14 @@ impl Api {
                 hash.len(),
             ))?;
             self.check((self.fido_assert_set_up)(assertion.pointer, OPT_TRUE))?;
-            self.check((self.fido_assert_set_uv)(assertion.pointer, OPT_TRUE))?;
+            self.check((self.fido_assert_set_uv)(
+                assertion.pointer,
+                if credential.uv_required {
+                    OPT_TRUE
+                } else {
+                    OPT_FALSE
+                },
+            ))?;
             self.check((self.fido_assert_set_count)(assertion.pointer, 1))?;
             self.check((self.fido_assert_set_authdata_raw)(
                 assertion.pointer,
@@ -465,6 +511,7 @@ impl Api {
         device: &Handle<'_>,
         fingerprint: &str,
         pin: Option<&[u8]>,
+        u2f: bool,
     ) -> Result<Credential> {
         let rp_string = relying_party(fingerprint)?;
         let rp = CString::new(rp_string.as_bytes())?;
@@ -493,7 +540,10 @@ impl Api {
                 ptr::null(),
             ))?;
             self.check((self.fido_cred_set_rk)(credential.pointer, OPT_FALSE))?;
-            self.check((self.fido_cred_set_uv)(credential.pointer, OPT_TRUE))?;
+            self.check((self.fido_cred_set_uv)(
+                credential.pointer,
+                if u2f { OPT_FALSE } else { OPT_TRUE },
+            ))?;
             self.check((self.fido_dev_set_timeout)(device.pointer, 30_000))?;
             eprintln!(
                 "Creating an offline, non-discoverable credential. Touch/verify your key. This does not enable Teleport login."
@@ -504,8 +554,9 @@ impl Api {
                 pin.map_or(ptr::null(), |p| p.as_ptr().cast()),
             ))?;
             ensure!(
-                (self.fido_cred_flags)(credential.pointer) & 5 == 5,
-                "credential must attest user presence and verification"
+                (self.fido_cred_flags)(credential.pointer) & (if u2f { 1 } else { 5 })
+                    == (if u2f { 1 } else { 5 }),
+                "credential does not attest the requested presence/verification policy"
             );
             if (self.fido_cred_x5c_len)(credential.pointer) == 0 {
                 self.check((self.fido_cred_verify_self)(credential.pointer))?;
@@ -513,7 +564,7 @@ impl Api {
                 self.check((self.fido_cred_verify)(credential.pointer))?;
             }
             let value = Credential {
-                version: 1,
+                version: if u2f { 2 } else { 1 },
                 fingerprint: fingerprint.into(),
                 rp: rp_string,
                 id: blob(
@@ -527,7 +578,8 @@ impl Api {
                     64,
                 )?,
                 algorithm: ES256,
-                uv_required: true,
+                uv_required: !u2f,
+                mode: if u2f { Mode::U2f } else { Mode::Fido2 },
             };
             validate_credential(&value, fingerprint)?;
             // Prove possession before saving, independently of attestation format.
@@ -583,6 +635,58 @@ fn read_credential(path: &Path, expected: &str) -> Result<Credential> {
     Ok(credential)
 }
 
+/// Read a locally approved public U2F credential. Import is an administrator action.
+#[cfg(target_os = "linux")]
+pub fn read_u2f_credential(path: &Path, expected: &str) -> Result<Credential> {
+    let credential = read_credential(path, expected)?;
+    validate_u2f_credential(&credential, expected)?;
+    Ok(credential)
+}
+
+pub fn validate_u2f_credential(credential: &Credential, expected: &str) -> Result<()> {
+    validate_credential(credential, expected)?;
+    ensure!(
+        credential.mode == Mode::U2f,
+        "explicit U2F credential required; FIDO2 policy cannot be downgraded"
+    );
+    Ok(())
+}
+
+/// Blocking local key interaction. The caller supplies an authenticated, fresh,
+/// domain-separated challenge and must only use this as a second factor.
+pub fn sign_u2f(
+    credential: &Credential,
+    hash: &[u8; 32],
+    device: Option<&str>,
+) -> Result<Assertion> {
+    validate_u2f_credential(credential, &credential.fingerprint)?;
+    let api = Api::load()?;
+    let device = api.open(device)?;
+    // SAFETY: explicitly selected CTAP1 mode on a live device; never automatic fallback.
+    unsafe { (api.fido_dev_force_u2f)(device.pointer) };
+    api.assertion(&device, credential, None, hash)
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub fn verify_u2f(credential: &Credential, hash: &[u8; 32], assertion: &Assertion) -> Result<u32> {
+    validate_u2f_credential(credential, &credential.fingerprint)?;
+    ensure!(
+        assertion.authdata.len() == 37,
+        "U2F assertion must contain only RP hash, presence and counter"
+    );
+    let api = Api::load()?;
+    api.verify_assertion(credential, hash, &assertion.authdata, &assertion.signature)?;
+    Ok(u32::from_be_bytes(assertion.authdata[33..37].try_into()?))
+}
+
+fn selected_mode(credential: &Credential, u2f: bool) -> Result<()> {
+    ensure!(
+        (credential.mode == Mode::U2f) == u2f,
+        "credential mode mismatch: use --u2f only for explicitly enrolled U2F credentials"
+    );
+    Ok(())
+}
+
 pub fn run(command: Command) -> Result<()> {
     match command {
         Command::List => {
@@ -614,6 +718,7 @@ pub fn run(command: Command) -> Result<()> {
             }
         }
         Command::Enroll {
+            u2f,
             fingerprint: value,
             output,
             device,
@@ -634,8 +739,14 @@ pub fn run(command: Command) -> Result<()> {
             let mut file = options
                 .open(&output)
                 .context("create new credential output (will not overwrite)")?;
-            let pin = api.pin(&device)?;
-            let credential = api.enroll(&device, &value, pin.as_ref().map(|p| p.as_slice())).context("offline enrollment failed; output may be empty and the authenticator may already have created a credential")?;
+            let pin = if u2f {
+                // SAFETY: explicit user-selected mode, valid opened device.
+                unsafe { (api.fido_dev_force_u2f)(device.pointer) };
+                None
+            } else {
+                api.pin(&device)?
+            };
+            let credential = api.enroll(&device, &value, pin.as_ref().map(|p| p.as_slice()), u2f).context("offline enrollment failed; output may be empty and the authenticator may already have created a credential")?;
             file.write_all(&serde_json::to_vec_pretty(&credential)?)?;
             file.sync_all()?;
             println!(
@@ -644,24 +755,38 @@ pub fn run(command: Command) -> Result<()> {
             );
         }
         Command::Verify {
+            u2f,
             credential,
             fingerprint: value,
             device,
         } => {
             let value = fingerprint(&value)?;
             let credential = read_credential(&credential, &value)?;
+            selected_mode(&credential, u2f)?;
             let api = Api::load()?;
             let device = api.open(device.as_deref())?;
-            let pin = api.pin(&device)?;
+            let pin = if u2f {
+                // SAFETY: explicit user-selected mode, valid opened device.
+                unsafe { (api.fido_dev_force_u2f)(device.pointer) };
+                None
+            } else {
+                api.pin(&device)?
+            };
             let hash = challenge_hash(&value, &credential.rp, "get", rand::random())?;
-            let counter = api.assertion(
+            let assertion = api.assertion(
                 &device,
                 &credential,
                 pin.as_ref().map(|p| p.as_slice()),
                 &hash,
             )?;
+            let counter = u32::from_be_bytes(assertion.authdata[33..37].try_into()?);
+            let policy = if u2f {
+                "U2F presence only; use alongside a password"
+            } else {
+                "FIDO2 presence + user verification"
+            };
             println!(
-                "Offline assertion verified (presence + user verification), counter={counter}. Fresh random challenge; not a network login or persistent counter/cloning assessment."
+                "Offline assertion verified ({policy}), counter={counter}. Fresh random challenge; not a network login or persistent counter/cloning assessment."
             );
         }
     }
@@ -723,6 +848,7 @@ mod tests {
             public_key: vec![0; 64],
             algorithm: ES256,
             uv_required: true,
+            mode: Mode::Fido2,
         };
         validate_credential(&credential, &expected)?;
         assert!(validate_credential(&credential, &"b".repeat(64)).is_err());
@@ -732,8 +858,81 @@ mod tests {
         credential.algorithm = -257;
         assert!(validate_credential(&credential, &expected).is_err());
         credential.algorithm = ES256;
+        // Absence of the new mode field retains the old required-UV policy.
+        let mut legacy = serde_json::to_value(&credential)?;
+        legacy.as_object_mut().unwrap().remove("mode");
+        let legacy: Credential = serde_json::from_value(legacy)?;
+        validate_credential(&legacy, &expected)?;
+        assert!(selected_mode(&legacy, true).is_err());
+        credential.mode = Mode::U2f;
+        assert!(validate_credential(&credential, &expected).is_err());
+        credential.version = 2;
+        assert!(validate_credential(&credential, &expected).is_err());
+        credential.uv_required = false;
+        validate_u2f_credential(&credential, &expected)?;
+        assert!(selected_mode(&credential, false).is_err());
+        selected_mode(&credential, true)?;
+        credential.id = vec![255; 255];
+        validate_credential(&credential, &expected)?;
+        credential.id.push(255);
+        assert!(validate_credential(&credential, &expected).is_err());
         credential.id = vec![0; 4097];
         assert!(validate_credential(&credential, &expected).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires packaged libfido2 via TELEPORT_LIBFIDO2; no hardware needed"]
+    fn native_u2f_verifies_presence_counter_and_rejects_tampering() -> Result<()> {
+        use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
+        let rng = ring::rand::SystemRandom::new();
+        let document = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let key =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, document.as_ref(), &rng)
+                .unwrap();
+        let expected = "a".repeat(64);
+        let mut credential = Credential {
+            version: 2,
+            fingerprint: expected.clone(),
+            rp: relying_party(&expected)?,
+            id: vec![1; 64],
+            public_key: key.public_key().as_ref()[1..].to_vec(),
+            algorithm: ES256,
+            uv_required: false,
+            mode: Mode::U2f,
+        };
+        let hash = [7u8; 32];
+        let mut authdata = digest::digest(&digest::SHA256, credential.rp.as_bytes())
+            .as_ref()
+            .to_vec();
+        authdata.push(1);
+        authdata.extend_from_slice(&42u32.to_be_bytes());
+        let sign = |authdata: &[u8]| {
+            let mut message = authdata.to_vec();
+            message.extend_from_slice(&hash);
+            Assertion {
+                authdata: authdata.to_vec(),
+                signature: key.sign(&rng, &message).unwrap().as_ref().to_vec(),
+            }
+        };
+        let assertion = sign(&authdata);
+        assert_eq!(verify_u2f(&credential, &hash, &assertion)?, 42);
+        assert!(verify_u2f(&credential, &[8; 32], &assertion).is_err());
+        let mut tampered = assertion.clone();
+        tampered.signature[0] ^= 1;
+        assert!(verify_u2f(&credential, &hash, &tampered).is_err());
+        tampered = assertion.clone();
+        tampered.authdata[36] ^= 1;
+        assert!(verify_u2f(&credential, &hash, &tampered).is_err());
+        authdata[32] = 0;
+        assert!(verify_u2f(&credential, &hash, &sign(&authdata)).is_err());
+        credential.rp = relying_party(&"b".repeat(64))?;
+        assert!(verify_u2f(&credential, &hash, &assertion).is_err());
+        credential.rp = relying_party(&expected)?;
+        credential.mode = Mode::Fido2;
+        credential.version = 1;
+        credential.uv_required = true;
+        assert!(verify_u2f(&credential, &hash, &assertion).is_err());
         Ok(())
     }
     #[test]
@@ -755,6 +954,7 @@ mod tests {
             public_key: key.public_key().as_ref()[1..].to_vec(),
             algorithm: ES256,
             uv_required: true,
+            mode: Mode::Fido2,
         };
         let hash = challenge_hash(&fingerprint, &credential.rp, "get", [7; 32])?;
         let mut authdata = digest::digest(&digest::SHA256, credential.rp.as_bytes())

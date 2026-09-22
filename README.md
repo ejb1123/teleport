@@ -16,6 +16,12 @@ login accounts. Security-key login and peripheral forwarding have separate
 implementation and hardware-verification requirements; see
 [security-key design](docs/security-key-design.md).
 
+Version 0.4.1 adds an explicit **password + U2F touch** enrollment path for the
+YubiKey NEO and isolates the Linux package from conflicting system SDL/font
+configuration (including Arch). See [NEO setup and limitations](docs/yubikey-neo.md).
+Saved devices still connect using their credentials; this is not a touch-per-session
+policy, and physical NEO acceptance remains pending.
+
 Version 0.3 adds a redesigned native launcher, selectable stream resolution/FPS/
 bitrate, and a **Stats for nerds** overlay (toolbar or **F8**). Launcher connections
 default to native monitor resolution, 60 FPS and 20 Mbps; preferences apply on

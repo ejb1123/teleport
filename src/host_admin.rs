@@ -27,9 +27,18 @@ pub enum AdminCommand {
     Status,
     OpenPairing,
     ClosePairing,
-    SetPassword { username: String },
+    SetPassword {
+        username: String,
+    },
     DisablePassword,
-    RevokeDevice { id: String },
+    /// Require password plus U2F touch for new password-enrolled devices.
+    RequireU2f {
+        credential_file: PathBuf,
+    },
+    DisableU2f,
+    RevokeDevice {
+        id: String,
+    },
     RevokeAllDevices,
 }
 #[derive(Serialize, Deserialize)]
@@ -37,9 +46,18 @@ pub enum Request {
     Status,
     OpenPairing,
     ClosePairing,
-    SetPassword { username: String, password: String },
+    SetPassword {
+        username: String,
+        password: String,
+    },
     DisablePassword,
-    RevokeDevice { id: String },
+    RequireU2f {
+        credential: crate::security_key::Credential,
+    },
+    DisableU2f,
+    RevokeDevice {
+        id: String,
+    },
     RevokeAllDevices,
 }
 impl Request {
@@ -55,6 +73,8 @@ pub struct Response {
     pub listen: String,
     pub fingerprint: String,
     pub username: Option<String>,
+    #[serde(default)]
+    pub u2f_required: bool,
     pub devices: Vec<Device>,
     pub pairing_open: bool,
     pub code: Option<String>,
@@ -84,6 +104,19 @@ pub fn run(options: Options) -> Result<()> {
             Request::SetPassword { username, password }
         }
         AdminCommand::DisablePassword => Request::DisablePassword,
+        AdminCommand::RequireU2f { credential_file } => {
+            let status = call(
+                &options.identity_dir.clone().unwrap_or(default_directory()?),
+                &Request::Status,
+            )?;
+            Request::RequireU2f {
+                credential: crate::security_key::read_u2f_credential(
+                    &credential_file,
+                    &status.fingerprint,
+                )?,
+            }
+        }
+        AdminCommand::DisableU2f => Request::DisableU2f,
         AdminCommand::RevokeDevice { id } => Request::RevokeDevice { id },
         AdminCommand::RevokeAllDevices => Request::RevokeAllDevices,
     };
@@ -266,6 +299,14 @@ impl Control {
                 self.access.disable_password()?;
                 self.changed.notify_one();
             }
+            Request::RequireU2f { credential } => {
+                self.access.require_u2f(credential)?;
+                self.changed.notify_one();
+            }
+            Request::DisableU2f => {
+                self.access.disable_u2f()?;
+                self.changed.notify_one();
+            }
             Request::RevokeDevice { id } => self.access.revoke_device(&id)?,
             Request::RevokeAllDevices => self.access.revoke_all_devices()?,
         }
@@ -275,6 +316,7 @@ impl Control {
             listen: self.address.to_string(),
             fingerprint: self.pairing.fingerprint.clone(),
             username: status.username,
+            u2f_required: status.u2f_required,
             devices: status
                 .devices
                 .into_iter()
@@ -316,16 +358,21 @@ impl Control {
             let accepted = tokio::select! { biased; _ = self.changed.notified() => continue, result = listener.accept() => result?, _ = tokio::time::sleep(Duration::from_secs(1)) => continue };
             let (mut stream, _) = accepted;
             // A single bounded enrollment exchange at a time limits resource use.
-            let exchange = tokio::time::timeout(Duration::from_secs(10), async {
+            let exchange = tokio::time::timeout(Duration::from_secs(95), async {
                 let mut magic = [0; 8];
-                loop {
-                    let n = stream.peek(&mut magic).await?;
-                    ensure!(n > 0, "closed enrollment connection");
-                    if n == 8 {
-                        break;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let n = stream.peek(&mut magic).await?;
+                        ensure!(n > 0, "closed enrollment connection");
+                        if n == 8 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await
+                .context("enrollment protocol header timed out")??;
                 if &magic == b"TPAUTH01" {
                     crate::access::handle(stream, self.access.clone()).await?;
                 } else if &magic == b"TPPAIR01" {
@@ -340,19 +387,23 @@ impl Control {
                         code.clone()
                     };
                     let mut used = false;
-                    let result = crate::pairing::accept_with_access(
-                        &mut stream,
-                        &attempt.value,
-                        &self.pairing,
-                        &mut used,
-                        attempt.deadline,
-                        Some(crate::pairing::DeviceEnrollment {
-                            access: &self.access,
-                            epoch: &self.epoch,
-                            generation: attempt.generation,
-                        }),
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        crate::pairing::accept_with_access(
+                            &mut stream,
+                            &attempt.value,
+                            &self.pairing,
+                            &mut used,
+                            attempt.deadline,
+                            Some(crate::pairing::DeviceEnrollment {
+                                access: &self.access,
+                                epoch: &self.epoch,
+                                generation: attempt.generation,
+                            }),
+                        ),
                     )
-                    .await;
+                    .await
+                    .context("pairing exchange timed out")?;
                     result?;
                 }
                 Ok::<_, anyhow::Error>(())

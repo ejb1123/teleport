@@ -82,7 +82,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "teleport";
-            version = "0.4.0";
+            version = "0.4.1";
             src = pkgs.lib.fileset.toSource {
               root = ./.;
               fileset = pkgs.lib.fileset.unions [
@@ -103,6 +103,12 @@
             buildInputs = deps.media;
             postFixup = ''
               wrapProgram $out/bin/teleport \
+                ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+                  --unset LD_LIBRARY_PATH --unset LD_PRELOAD \
+                  --unset SDL_DYNAMIC_API --unset SDL3_DYNAMIC_API \
+                  --set FONTCONFIG_FILE "${pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; }}" \
+                  --set FONTCONFIG_PATH "${pkgs.fontconfig.out}/etc/fonts" \
+                ''} \
                 --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : "${pkgs.lib.makeSearchPath "lib/gstreamer-1.0" (map pkgs.lib.getLib deps.media)}" \
                 --set TELEPORT_FONT "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf" \
                 --set TELEPORT_LIBFIDO2 "${pkgs.lib.getLib pkgs.libfido2}/lib/libfido2${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}" \

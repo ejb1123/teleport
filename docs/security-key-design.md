@@ -9,6 +9,12 @@ device tokens; streaming authenticates with a saved token and pinned TLS
 certificate. Neither that code nor this proposed integration has had an
 independent security audit.
 
+Version 0.4.1 separately implements explicit **password + U2F touch for new device
+enrollment**, including NEO/CTAP1 credentials. See [NEO setup](yubikey-neo.md).
+That does not implement the per-connection FIDO2 policy designed below. The
+default FIDO2 commands retain UP+UV; `--u2f` deliberately selects a separate,
+presence-only credential mode and must not be described as equivalent verification.
+
 ## Available offline development commands
 
 Run from the packaged Nix app or `nix develop`; the environment supplies an
@@ -37,7 +43,7 @@ Opening a device is bounded to five seconds; touch/verification operations to
 The native RP encoding currently uses the two 32-hex-digit halves of the host
 fingerprint as labels under `teleport.invalid`. It is not a website origin.
 
-Only ES256 credentials and UP+UV are accepted; U2F fallback is disabled. This
+By default only ES256 credentials and UP+UV are accepted; automatic U2F fallback is disabled. This
 diagnostic does not establish manufacturer trust, durable counter monitoring,
 production host enrollment, network login or forwarding. Physical Linux/macOS
 key tests and standalone Mac dynamic-library bundling still require acceptance.

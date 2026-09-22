@@ -82,7 +82,12 @@ fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    gstreamer::init()?;
+    // Key diagnostics and enrollment do not use media or scan desktop plugins.
+    // SDL is still linked: its load-time library selection is isolated by the
+    // Linux package wrapper before this process starts.
+    if !matches!(&cli.command, Some(Command::SecurityKey { .. })) {
+        gstreamer::init()?;
+    }
     let runtime = tokio::runtime::Runtime::new()?;
     // SDL's macOS window/event loop must stay on the main OS thread.
     match cli.command {

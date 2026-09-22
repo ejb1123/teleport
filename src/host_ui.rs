@@ -303,9 +303,14 @@ pub fn run() -> Result<()> {
                 .as_ref()
                 .map(|s| {
                     format!(
-                        "Listen: {}   Login: {}",
+                        "Listen: {}   Login: {}{}",
                         s.listen,
-                        s.username.as_deref().unwrap_or("disabled")
+                        s.username.as_deref().unwrap_or("disabled"),
+                        if s.u2f_required {
+                            " + U2F touch (new devices)"
+                        } else {
+                            ""
+                        }
                     )
                 })
                 .unwrap_or_else(|| {
@@ -333,6 +338,12 @@ pub fn run() -> Result<()> {
         text("Username", 28, 248, 260)?;
         text("Password (12+ characters)", 302, 248, 278)?;
         text("Confirm password", 594, 248, 298)?;
+        text(
+            "Key setup: teleport host-admin require-u2f FILE (password enrollment only)",
+            28,
+            372,
+            864,
+        )?;
         text(
             "OPTIONAL ONE-TIME PAIRING / expires in 5 minutes",
             28,

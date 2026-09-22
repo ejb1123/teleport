@@ -130,7 +130,7 @@ pub fn run() -> Result<()> {
                         }
                         Err(_) => {
                             status = if use_password {
-                                "Login failed. Check your Teleport account, host address, and TCP access."
+                                "Login failed. Check account/network and, if required, connect and touch your enrolled U2F key."
                             } else {
                                 "Pairing failed. Check host/code, TCP port, or open a new code in Host settings."
                             }.into();
@@ -491,7 +491,7 @@ pub fn run() -> Result<()> {
                             let _ = sender.send((host, result));
                         });
                         pending_pairing = Some(receiver);
-                        status = "Authenticating account and verifying host…".into();
+                        status = "Authenticating account… If this host requires U2F, touch your enrolled key when it flashes.".into();
                     }
                 }
                 Some(0) if !use_file => {

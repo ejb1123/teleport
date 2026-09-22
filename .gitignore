@@ -3,4 +3,6 @@
 /result-*
 /.direnv/
 /pairing*.json
+/neo-public.json
+/key-test.json
 /test-artifacts/
