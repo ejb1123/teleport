@@ -45,6 +45,20 @@ Mac HEVC builds additionally patch VideoToolbox's output buffering to use SPS
 reordering requirements. The native session title is deliberately stable; use F8
 for changing diagnostics.
 
+In 0.5.3, Linux VA/QSV startup and each restart get up to 750 ms from their first
+input frame to initialize, with recovery thresholds of 60 queued frames and
+8 MiB even during that interval. Size is checked before each push, so one
+additional access unit can temporarily exceed the byte threshold. Existing stale
+output filtering still applies. If two resets fail to stabilize the decoder,
+the third recovery replaces VA/QSV with the matching software decoder in the
+same session, preserving parser, HDR caps, authentication and input connection.
+It resumes at a new keyframe, never at dependent frames from the abandoned GOP.
+The software path retains the bounded recovery policy: persistent CPU overload
+can still end the session with an error rather than accumulating unlimited delay.
+F8 and the warning log identify the replacement. For a controlled comparison,
+choose **Decoder: software** before connecting. This bypasses hardware selection;
+the default remains hardware. Mac/NVIDIA selection is unaffected.
+
 Quality changes restart the video encoder for that authenticated session and
 release held input. A MoQ video-group barrier accompanies the updated desktop
 metadata; pre-change frames cannot unlock input or satisfy the configured-frame

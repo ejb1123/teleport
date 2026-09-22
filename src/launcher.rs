@@ -99,6 +99,32 @@ enum AuthMode {
     Code,
     File,
 }
+
+#[derive(Default)]
+struct DecoderPreference {
+    software: bool,
+}
+
+impl DecoderPreference {
+    fn toggle(&mut self) {
+        self.software = !self.software;
+    }
+
+    fn label(&self) -> &'static str {
+        if self.software {
+            "Decoder: software"
+        } else {
+            "Decoder: hardware"
+        }
+    }
+
+    fn apply(&self, command: &mut Command) {
+        if self.software {
+            command.arg("--software-decoder");
+        }
+    }
+}
+
 struct Approval {
     address: String,
     fingerprint: String,
@@ -275,6 +301,7 @@ pub fn run() -> Result<()> {
     let mut quality = 1usize;
     let mut codec = 0usize;
     let mut hdr = false;
+    let mut decoder = DecoderPreference::default();
     let mut clipboard = false;
     let mut mute = false;
     let mut agent_consent = AgentConsent::default();
@@ -728,6 +755,9 @@ pub fn run() -> Result<()> {
                                 if hit(pref_rect(6), x, y) {
                                     mute = !mute;
                                 }
+                                if hit(pref_rect(8), x, y) {
+                                    decoder.toggle();
+                                }
                                 if hit(pref_rect(7), x, y) {
                                     let target = selected
                                         .as_ref()
@@ -865,6 +895,7 @@ pub fn run() -> Result<()> {
                             .arg(["h264", "h265"][codec])
                             .arg("--dynamic-range")
                             .arg(if hdr { "hdr10" } else { "sdr" });
+                        decoder.apply(&mut command);
                         if clipboard {
                             command.arg("--clipboard");
                         }
@@ -1195,6 +1226,7 @@ pub fn run() -> Result<()> {
                             } else {
                                 "SSH agent off"
                             },
+                            decoder.label(),
                         ];
                         for (index, label) in labels.into_iter().enumerate() {
                             ui.button(
@@ -1204,6 +1236,14 @@ pub fn run() -> Result<()> {
                                 false,
                             )?;
                         }
+                        ui.text(
+                            &small_font,
+                            "Software decoding uses the CPU. Try it if hardware playback stalls.",
+                            304,
+                            626,
+                            688,
+                            MUTED,
+                        )?;
                     } else {
                         ui.text(
                             &font,
@@ -1416,6 +1456,31 @@ fn append_code(code: &mut String, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn software_decoder_is_explicit_and_passed_to_client() {
+        let mut preference = super::DecoderPreference::default();
+        let mut command = std::process::Command::new("teleport");
+        command.arg("client");
+        preference.apply(&mut command);
+        assert_eq!(preference.label(), "Decoder: hardware");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["client"]);
+
+        preference.toggle();
+        let mut command = std::process::Command::new("teleport");
+        command.arg("client");
+        preference.apply(&mut command);
+        assert_eq!(preference.label(), "Decoder: software");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["client", "--software-decoder"]
+        );
+
+        preference.toggle();
+        let mut command = std::process::Command::new("teleport");
+        preference.apply(&mut command);
+        assert_eq!(command.get_args().count(), 0);
+    }
+
     #[test]
     fn host_approval_requires_presented_prompt_and_single_deliberate_click() {
         let mut approval = super::Approval {

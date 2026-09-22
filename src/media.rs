@@ -617,19 +617,7 @@ pub fn decoder_with_stats(
             }
             gst::PadProbeReturn::Ok
         });
-    let output_stats = stats.clone();
-    pipeline
-        .0
-        .by_name("video_decoder")
-        .context("missing decoder")?
-        .static_pad("src")
-        .context("missing decoder output pad")?
-        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-            if let Some(key) = info.buffer().and_then(|buffer| video_reference(buffer)) {
-                output_stats.decoder_output(key);
-            }
-            gst::PadProbeReturn::Ok
-        });
+    instrument_decoder_output(&pipeline.0, stats.clone())?;
     let image: LatestImage = Arc::new(Mutex::new(None));
     let latest = image.clone();
     let hdr_pipeline = format.hdr().then(|| pipeline.0.downgrade());
@@ -776,6 +764,80 @@ pub async fn receive_video_with_stats(
 const MAX_DECODE_BACKLOG_AGE: Duration = Duration::from_millis(150);
 const MAX_DECODE_BACKLOG_FRAMES: u64 = 12;
 const MAX_DECODE_BACKLOG_BYTES: u64 = 8 * 1024 * 1024;
+const VA_STARTUP_GRACE: Duration = Duration::from_millis(750);
+
+fn va_starting(decoder: &str, started: Instant, frames: u64, bytes: u64) -> bool {
+    linux_software_fallback(decoder).is_some()
+        && started.elapsed() < VA_STARTUP_GRACE
+        && frames < 60
+        && bytes < MAX_DECODE_BACKLOG_BYTES
+}
+
+fn instrument_decoder_output(
+    pipeline: &gst::Pipeline,
+    stats: Arc<crate::stats::StreamStats>,
+) -> Result<()> {
+    pipeline
+        .by_name("video_decoder")
+        .context("missing decoder")?
+        .static_pad("src")
+        .context("missing decoder output pad")?
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(key) = info.buffer().and_then(|buffer| video_reference(buffer)) {
+                stats.decoder_output(key);
+            }
+            gst::PadProbeReturn::Ok
+        });
+    Ok(())
+}
+
+fn linux_software_fallback(decoder: &str) -> Option<&'static str> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    match decoder {
+        "vah264dec" | "qsvh264dec" => Some("avdec_h264"),
+        "vah265dec" | "qsvh265dec" => Some("avdec_h265"),
+        _ => None,
+    }
+}
+
+/// Called with the entire pipeline stopped at Ready. Preserve source, parser,
+/// raw caps (including HDR precision), conversion and sink callbacks. Resume
+/// only with a fresh GOP; replacing a decoder mid-GOP would lose references.
+fn replace_decoder(
+    pipeline: &gst::Pipeline,
+    replacement: &str,
+    stats: Arc<crate::stats::StreamStats>,
+) -> Result<()> {
+    let old = pipeline
+        .by_name("video_decoder")
+        .context("missing decoder")?;
+    let sink = old.static_pad("sink").context("decoder sink missing")?;
+    let src = old.static_pad("src").context("decoder src missing")?;
+    let upstream = sink.peer().context("decoder input disconnected")?;
+    let downstream = src.peer().context("decoder output disconnected")?;
+    let next = gst::ElementFactory::make(replacement)
+        .name("video_decoder")
+        .property("max-threads", 2_i32)
+        .build()?;
+    old.set_state(gst::State::Null)?;
+    upstream.unlink(&sink)?;
+    src.unlink(&downstream)?;
+    pipeline.remove(&old)?;
+    pipeline.add(&next)?;
+    upstream.link(
+        &next
+            .static_pad("sink")
+            .context("replacement sink missing")?,
+    )?;
+    next.static_pad("src")
+        .context("replacement src missing")?
+        .link(&downstream)?;
+    instrument_decoder_output(pipeline, stats.clone())?;
+    *stats.decoder.lock().unwrap() = replacement.to_owned();
+    Ok(())
+}
 
 #[derive(Default)]
 struct RecoveryBudget {
@@ -831,6 +893,14 @@ fn decoder_needs_recovery(
 }
 
 async fn reset_decoder(source: &AppSrc, stats: Arc<crate::stats::StreamStats>) -> Result<()> {
+    reset_decoder_with_fallback(source, stats, None).await
+}
+
+async fn reset_decoder_with_fallback(
+    source: &AppSrc,
+    stats: Arc<crate::stats::StreamStats>,
+    replacement: Option<&'static str>,
+) -> Result<()> {
     let pipeline = source
         .parent()
         .context("decoder source has no pipeline")?
@@ -867,6 +937,9 @@ async fn reset_decoder(source: &AppSrc, stats: Arc<crate::stats::StreamStats>) -
             return Ok(());
         }
         pipeline.set_state(gst::State::Ready)?;
+        if let Some(replacement) = replacement {
+            replace_decoder(&pipeline, replacement, stats.clone())?;
+        }
         stats.reset_pending();
         pipeline.set_state(gst::State::Playing)?;
         Ok(())
@@ -886,6 +959,8 @@ async fn receive_video_inner(
     let mut sequence = None;
     let mut stale_checkpoint = stats.stale_frames.load(Ordering::Relaxed);
     let mut recoveries = RecoveryBudget::default();
+    let mut decoder_started = None;
+    let mut ready_checkpoint = stats.ready_frames.load(Ordering::Relaxed);
     let record_drop = |count: u32| {
         stats
             .skipped_groups
@@ -924,12 +999,44 @@ async fn receive_video_inner(
             }
             MediaEvent::Frame(frame) => match frame {
                 Ok(Some(bytes)) => {
-                    if decoder_needs_recovery(&source, &stats, stale_checkpoint) {
+                    let decoder_name = stats.decoder.lock().unwrap().clone();
+                    let ready = stats.ready_frames.load(Ordering::Relaxed);
+                    if linux_software_fallback(&decoder_name).is_some()
+                        && ready != ready_checkpoint
+                        && !decoder_backlogged(&source, &stats)
+                    {
+                        // Startup may discard late frames, then catch up. Do not
+                        // reset a now-healthy VA pipeline for those old samples.
+                        stale_checkpoint = stats.stale_frames.load(Ordering::Relaxed);
+                    }
+                    ready_checkpoint = ready;
+                    // VA allocation/driver startup can outlast a steady-state
+                    // frame budget. Bound that allowance by time AND occupancy;
+                    // repeated restarts must not prevent initialization forever.
+                    let starting = va_starting(
+                        &decoder_name,
+                        *decoder_started.get_or_insert_with(Instant::now),
+                        source.current_level_buffers(),
+                        source.current_level_bytes(),
+                    );
+                    if !starting && decoder_needs_recovery(&source, &stats, stale_checkpoint) {
+                        let recent = recoveries
+                            .recent
+                            .iter()
+                            .filter(|at| at.elapsed() <= Duration::from_secs(5))
+                            .count();
+                        let replacement = if recent >= 2 || recoveries.without_progress >= 2 {
+                            linux_software_fallback(&decoder_name)
+                        } else {
+                            None
+                        };
                         recoveries
                             .attempt(stats.ready_frames.load(Ordering::Relaxed), Instant::now())?;
                         tracing::warn!(
                             queued_bytes = source.current_level_bytes(),
                             queued_frames = source.current_level_buffers(),
+                            queue_age_ms = stats.oldest_queued_age().map(|age| age.as_millis() as u64),
+                            decoder = %stats.decoder.lock().unwrap(),
                             "decoder backlog exceeded latency budget; resetting at next keyframe group"
                         );
                         // Abandon the complete remainder of this GOP, including
@@ -937,8 +1044,19 @@ async fn receive_video_inner(
                         // the host starts every group with an independent keyframe.
                         current = None;
                         record_drop(1);
-                        reset_decoder(&source, stats.clone()).await?;
+                        if let Some(replacement) = replacement {
+                            tracing::warn!(
+                                replacement,
+                                "Linux hardware decode repeatedly stalled; switching this session to software at the next keyframe"
+                            );
+                            reset_decoder_with_fallback(&source, stats.clone(), Some(replacement))
+                                .await?;
+                            recoveries = RecoveryBudget::default();
+                        } else {
+                            reset_decoder(&source, stats.clone()).await?;
+                        }
                         stale_checkpoint = stats.stale_frames.load(Ordering::Relaxed);
+                        decoder_started = None;
                         continue;
                     }
                     let video_group = sequence.context("video frame arrived without a group")?;
@@ -1106,6 +1224,243 @@ pub fn doctor() -> Result<()> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn va_startup_grace_is_bounded_and_linux_only() {
+        let now = Instant::now();
+        for decoder in ["vah264dec", "vah265dec", "qsvh264dec", "qsvh265dec"] {
+            assert_eq!(
+                va_starting(decoder, now, 59, MAX_DECODE_BACKLOG_BYTES - 1),
+                cfg!(target_os = "linux")
+            );
+            assert!(!va_starting(decoder, now - VA_STARTUP_GRACE, 0, 0));
+            assert!(!va_starting(decoder, now, 60, 0));
+            assert!(!va_starting(decoder, now, 0, MAX_DECODE_BACKLOG_BYTES));
+        }
+        for decoder in [
+            "avdec_h264",
+            "avdec_h265",
+            "vtdec_hw",
+            "nvh264dec",
+            "nvh265dec",
+            "unknown",
+        ] {
+            assert!(!va_starting(decoder, now, 0, 0));
+            assert!(linux_software_fallback(decoder).is_none());
+        }
+        if cfg!(target_os = "linux") {
+            assert_eq!(linux_software_fallback("vah264dec"), Some("avdec_h264"));
+            assert_eq!(linux_software_fallback("vah265dec"), Some("avdec_h265"));
+            assert_eq!(linux_software_fallback("qsvh264dec"), Some("avdec_h264"));
+            assert_eq!(linux_software_fallback("qsvh265dec"), Some("avdec_h265"));
+        }
+    }
+
+    async fn exercise_decoder_replacement(hardware: bool, encoder_kind: EncoderKind) -> Result<()> {
+        gst::init()?;
+        for (codec, va, software) in [
+            (VideoCodec::H264, "vah264dec", "avdec_h264"),
+            (VideoCodec::H265, "vah265dec", "avdec_h265"),
+        ] {
+            if hardware && gst::ElementFactory::find(va).is_none() {
+                eprintln!("skipping unavailable {va}");
+                continue;
+            }
+            if !test_encoder_available(encoder_kind, codec) {
+                eprintln!("skipping unavailable {encoder_kind:?} {codec:?}");
+                continue;
+            }
+            let encoder = Pipeline(gst::parse::launch(&format!(
+                "videotestsrc num-buffers=90 ! video/x-raw,format={},width=1280,height=720,framerate=60/1 ! {} ! {} config-interval=-1 ! {},stream-format=byte-stream,alignment=au ! appsink name=out sync=false",
+                encoder_pixel_format(encoder_kind, codec), encoder_fragment(encoder_kind, 60, 4000, codec), parser(codec), compressed_caps(codec)
+            ))?.downcast::<gst::Pipeline>().unwrap());
+            let output = encoder
+                .0
+                .by_name("out")
+                .unwrap()
+                .downcast::<AppSink>()
+                .unwrap();
+            encoder.0.set_state(gst::State::Playing)?;
+            let mut frames = Vec::new();
+            for _ in 0..90 {
+                let sample = output
+                    .try_pull_sample(gst::ClockTime::from_seconds(3))
+                    .context("replacement fixture encoder stalled")?;
+                frames.push(bytes::Bytes::copy_from_slice(
+                    sample.buffer().unwrap().map_readable()?.as_slice(),
+                ));
+            }
+            let stats = Arc::new(crate::stats::StreamStats::default());
+            let (pipeline, input, image) = decoder_with_stats(true, stats.clone(), codec)?;
+            if hardware {
+                // Explicitly select VA even on systems whose default candidate
+                // is NVDEC. Production replacement only targets software.
+                pipeline.0.set_state(gst::State::Ready)?;
+                let old = pipeline.0.by_name("video_decoder").unwrap();
+                let sink = old.static_pad("sink").unwrap();
+                let src = old.static_pad("src").unwrap();
+                let upstream = sink.peer().unwrap();
+                let downstream = src.peer().unwrap();
+                let next = gst::ElementFactory::make(va)
+                    .name("video_decoder")
+                    .build()?;
+                old.set_state(gst::State::Null)?;
+                upstream.unlink(&sink)?;
+                src.unlink(&downstream)?;
+                pipeline.0.remove(&old)?;
+                pipeline.0.add(&next)?;
+                upstream.link(&next.static_pad("sink").unwrap())?;
+                next.static_pad("src").unwrap().link(&downstream)?;
+                instrument_decoder_output(&pipeline.0, stats.clone())?;
+                *stats.decoder.lock().unwrap() = va.to_owned();
+                pipeline.0.set_state(gst::State::Playing)?;
+            }
+            let original = pipeline.0.by_name("video_decoder").unwrap();
+            for group in [70, 71] {
+                let before = stats.ready_frames.load(Ordering::Relaxed);
+                for bytes in &frames {
+                    let key = stats.received(bytes.len(), group);
+                    let mut buffer = gst::Buffer::from_slice(bytes.clone());
+                    stamp_video_buffer(buffer.get_mut().unwrap(), key);
+                    input.push_buffer(buffer)?;
+                    tokio::time::sleep(Duration::from_micros(16_667)).await;
+                }
+                // No EOS: the replacement must publish useful live output,
+                // rather than only drain successfully when the stream ends.
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while stats.ready_frames.load(Ordering::Relaxed) < before + 85 {
+                    ensure!(
+                        Instant::now() < deadline,
+                        "{codec:?} hardware={hardware} group={group}: insufficient sustained fresh output"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let frame = image
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .context("missing live replacement image")?;
+                assert_eq!(frame.video_group, Some(group));
+                assert_eq!((frame.width, frame.height), (1280, 720));
+                assert_eq!(frame.decoder_recovery, group - 70);
+                assert_eq!(stats.unmatched_frames.load(Ordering::Relaxed), 0);
+                let snapshot = stats.snapshot();
+                assert!(snapshot.decoder_us > 0);
+                assert!(snapshot.conversion_us > 0);
+                if group == 70 {
+                    reset_decoder_with_fallback(&input, stats.clone(), Some(software)).await?;
+                    assert_ne!(pipeline.0.by_name("video_decoder").unwrap(), original);
+                    assert_eq!(original.current_state(), gst::State::Null);
+                    assert_eq!(&*stats.decoder.lock().unwrap(), software);
+                    assert_eq!(stats.decoder_recoveries.load(Ordering::Relaxed), 1);
+                    assert_eq!(
+                        pipeline.0.by_name("in").unwrap(),
+                        input.clone().upcast::<gst::Element>()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires GStreamer software codecs; checks live replacement without EOS"]
+    async fn software_decoder_replacement_preserves_live_frames() -> Result<()> {
+        exercise_decoder_replacement(false, EncoderKind::Software).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires available VA decoders; exercises sustained 720p60 fallback"]
+    async fn va_decoder_fallback_preserves_live_frames() -> Result<()> {
+        exercise_decoder_replacement(true, EncoderKind::Software).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires NVIDIA encoder and VA decoder hardware"]
+    async fn nvidia_to_va_decoder_fallback_preserves_live_frames() -> Result<()> {
+        exercise_decoder_replacement(true, EncoderKind::Nvidia).await
+    }
+
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires GStreamer software codecs; injects persistent VA-like stalls"]
+    async fn repeated_linux_decoder_stalls_automatically_fall_back() -> Result<()> {
+        gst::init()?;
+        let encoder = Pipeline(gst::parse::launch(
+            "videotestsrc num-buffers=1 ! video/x-raw,format=I420,width=320,height=180,framerate=60/1 ! x264enc tune=zerolatency speed-preset=ultrafast bframes=0 threads=2 ! h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au ! appsink name=out sync=false"
+        )?.downcast::<gst::Pipeline>().unwrap());
+        let output = encoder
+            .0
+            .by_name("out")
+            .unwrap()
+            .downcast::<AppSink>()
+            .unwrap();
+        encoder.0.set_state(gst::State::Playing)?;
+        let sample = output
+            .try_pull_sample(gst::ClockTime::from_seconds(3))
+            .context("missing fixture keyframe")?;
+        let keyframe =
+            bytes::Bytes::copy_from_slice(sample.buffer().unwrap().map_readable()?.as_slice());
+        let stats = Arc::new(crate::stats::StreamStats::default());
+        let (pipeline, input, image) = decoder_with_stats(true, stats.clone(), VideoCodec::H264)?;
+        // Emulate an overloaded VA driver without requiring GPU hardware. The
+        // old element's blocking probe disappears when replacement succeeds.
+        *stats.decoder.lock().unwrap() = "vah264dec".to_owned();
+        pipeline
+            .0
+            .by_name("video_decoder")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, |_, _| {
+                std::thread::sleep(Duration::from_millis(250));
+                gst::PadProbeReturn::Ok
+            });
+        let origin = moq_net::Origin::random().produce();
+        let mut broadcast =
+            origin.create_broadcast("fallback", moq_net::broadcast::Route::new())?;
+        let mut track = broadcast.create_track("video", moq_net::track::Info::default())?;
+        let subscriber = track.subscribe(None);
+        let reader_stats = stats.clone();
+        let task = tokio::spawn(async move {
+            receive_video_inner(subscriber, input, Arc::new(AtomicU32::new(0)), reader_stats).await
+        });
+        let result = async {
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let mut sequence = 0;
+            let mut switched_at = None;
+            loop {
+                ensure!(
+                    !task.is_finished(),
+                    "receive loop disconnected instead of falling back"
+                );
+                ensure!(
+                    Instant::now() < deadline,
+                    "automatic fallback did not publish a fresh frame"
+                );
+                sequence += 1;
+                let mut group = track.create_group(moq_net::group::Info { sequence })?;
+                group.write_frame(moq_net::Timestamp::now(), keyframe.clone())?;
+                group.finish()?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if *stats.decoder.lock().unwrap() == "avdec_h264" {
+                    let switched = *switched_at.get_or_insert(sequence);
+                    if let Some(frame) = image.lock().unwrap().take()
+                        && frame.video_group.is_some_and(|group| group > switched)
+                    {
+                        assert!(frame.decoder_recovery >= 3);
+                        assert!(stats.ready_frames.load(Ordering::Relaxed) > 0);
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        }
+        .await;
+        task.abort();
+        let _ = task.await;
+        result
+    }
 
     #[test]
     fn recovery_requires_fresh_progress_even_when_failures_are_slow() {

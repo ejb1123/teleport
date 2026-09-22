@@ -212,7 +212,17 @@ acceptance remains required. Intel VA-API has been hardware-tested for H.264,
 HEVC SDR, and HEVC HDR10 decoding; AMD and QSV still require physical-hardware
 acceptance on supported GPUs.
 
-Version 0.5.2 bounds decoder input backlog by age (150 ms), count (12 frames),
+Version 0.5.3 gives Linux VA/QSV decoders a bounded startup allowance (750 ms,
+with recovery thresholds of 60 compressed frames or 8 MiB). After repeated stalls, the session switches
+to the matching software decoder at a fresh keyframe without reconnecting or
+re-authenticating. F8 reports the decoder actually in use. You can also choose
+**Decoder: software** in the launcher's **Connection settings**. Software decoding
+uses more CPU and is not a guarantee of sufficient throughput at every resolution.
+The underlying Arch VA stall has not been reproduced locally; this is a recovery
+and fallback fix, not a claim that the driver problem is solved. Mac decoder
+selection and recovery are unchanged.
+
+Version 0.5.2 bounds steady-state decoder input backlog by age (150 ms), count (12 frames),
 and compressed size (8 MiB). Overload clears the decoder pipeline and abandons
 the current GOP, resuming at a fresh keyframe group rather than dropping arbitrary
 dependent frames. Output already older than 250 ms is discarded before presentation.

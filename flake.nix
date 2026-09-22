@@ -102,7 +102,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "teleport";
-            version = "0.5.2";
+            version = "0.5.3";
             src = pkgs.lib.fileset.toSource {
               root = ./.;
               fileset = pkgs.lib.fileset.unions [
