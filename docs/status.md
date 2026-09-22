@@ -1,5 +1,11 @@
 # Version 0.2 implementation status
 
+Version 0.2.1 adds one-time code pairing with saved trust. Start the host with
+`--pair` and a persistent identity directory; the client verifies the code exchange
+and saves credentials automatically. No manual file transfer is required. See
+[pairing.md](pairing.md) for the TCP firewall requirement, security maturity,
+five-minute/five-attempt limits, and recovery.
+
 This is a tested development milestone, not completion of every production
 requirement. Both endpoints must run application protocol version 2.
 

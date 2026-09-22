@@ -19,7 +19,7 @@ On the **Linux machine**, from a terminal inside your graphical session:
 
 ```sh
 nix run . -- doctor
-nix run . -- host --listen 0.0.0.0:4443 \
+nix run . -- host --listen 0.0.0.0:4443 --pair \
   --identity-dir "$HOME/.local/state/teleport/host" \
   --restore-token "$HOME/.local/state/teleport/host/portal-restore.json"
 ```
@@ -29,34 +29,53 @@ keyboard/mouse control. The host uses the RemoteDesktop/ScreenCast portals and
 PipeWire directly; it does not capture through XWayland. `--source auto` selects
 the portal for Wayland and X11 capture/XTest for an X11 session.
 
-Allow **UDP 4443** from your Mac through the host firewall. Teleport does not
+Allow **UDP 4443** for streaming and **TCP 4443** for initial code pairing
+from your Mac through the host firewall. Teleport does not
 change firewall rules. On NixOS, for example, add this to your own configuration
 and rebuild (restrict access to your trusted interface/network as appropriate):
 
 ```nix
 networking.firewall.allowedUDPPorts = [ 4443 ];
+networking.firewall.allowedTCPPorts = [ 4443 ]; # initial code pairing only
 ```
 
-On the **Mac**, securely copy the pairing file using your existing SSH access,
-then run the native client:
+On the **Mac**, run the native client:
+
+```sh
+nix run .
+```
+
+Enter `LINUX_IP:4443` and the six-digit code shown in the Linux host terminal.
+Click **Pair & save host**, then **Connect / reconnect**. Next time just select
+the saved host and connect—no code or trust prompt. Keep the host's identity
+directory unchanged so saved trust survives restarts. An identity mismatch is
+never accepted automatically; explicitly pair again only after checking the host.
+
+The code is valid for five minutes, one successful enrollment, and at most five
+TCP connection attempts. Restart the host with `--pair` for a new code if it
+expires or is consumed. The temporary TCP listener closes afterwards; subsequent
+desktop connections need only UDP. Without `--pair`, no enrollment port opens.
+Treat the displayed code as a secret and don't publish terminal/service logs.
+Code pairing remains experimental LAN/VPN functionality; see
+[pairing security and limitations](docs/pairing.md).
+
+CLI pairing is also available; it asks for the code on stdin rather than putting
+it in process arguments:
+
+```sh
+nix run . -- pair LINUX_IP:4443
+```
+
+Manual file import remains available through **Use file** or drag-and-drop.
+To use that alternative, copy the file over an existing trusted SSH connection:
 
 ```sh
 scp YOUR_USER@LINUX_IP:.local/state/teleport/host/pairing.json ./pairing.json
 chmod 600 pairing.json
-nix run .
-```
-
-In the native connection window, enter `LINUX_IP:4443`, drop the pairing file
-onto it (or paste its absolute path), then click **Import & trust pairing** and
-**Connect / reconnect**. It remembers trusted hosts in private local files.
-For direct command-line access:
-
-```sh
 nix run . -- client LINUX_IP:4443 --pairing-file pairing.json --reconnect
 ```
 
-Replace `YOUR_USER` and `LINUX_IP`. If SSH isn't configured, transfer the file
-through another trusted channel. Do not commit or share the pairing file: it
+Replace `YOUR_USER` and `LINUX_IP`. Do not commit or share the pairing file: it
 grants desktop control. Its host certificate fingerprint is verified before
 the secret is sent. Media and input travel over TLS-protected QUIC.
 

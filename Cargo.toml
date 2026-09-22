@@ -1,6 +1,6 @@
 [package]
 name = "teleport"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Native Linux desktop sharing over Media over QUIC"
@@ -14,6 +14,8 @@ gstreamer-app = { version = "0.24", features = ["v1_24"] }
 gstreamer-video = { version = "0.24", features = ["v1_24"] }
 sdl2 = { version = "0.38", features = ["ttf"] }
 subtle = "2"
+spake2 = "0.4"
+ring = "0.17"
 moq-net = "=0.2.20"
 moq-native = { version = "=0.19.17", default-features = false, features = ["quinn", "ring"] }
 bytes = "1"

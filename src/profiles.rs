@@ -90,6 +90,12 @@ fn private_write(path: &Path, data: &[u8]) -> Result<()> {
 }
 
 pub fn import(address: &str, source: &Path, profiles: &mut Vec<Profile>) -> Result<Profile> {
+    check_private_file(source)?;
+    let pairing = crate::protocol::Pairing::read(source)?;
+    save_pairing(address, &pairing, profiles)
+}
+
+pub fn validate_address(address: &str) -> Result<()> {
     ensure!(
         !address.is_empty()
             && !address.contains(['/', '@', '?', '#'])
@@ -101,9 +107,29 @@ pub fn import(address: &str, source: &Path, profiles: &mut Vec<Profile>) -> Resu
         url.host_str().is_some() && url.port().is_some(),
         "include the port, e.g. desktop.local:4443"
     );
-    check_private_file(source)?;
-    let pairing = crate::protocol::Pairing::read(source)?;
-    let pairing_file = directory()?.join(format!("pairing-{:016x}.json", rand::random::<u64>()));
+    Ok(())
+}
+
+/// Save only credentials received through an authenticated pairing exchange or
+/// explicitly imported from a trusted file. Network discovery is not trust.
+pub fn save_pairing(
+    address: &str,
+    pairing: &crate::protocol::Pairing,
+    profiles: &mut Vec<Profile>,
+) -> Result<Profile> {
+    save_pairing_in(address, pairing, profiles, &directory()?)
+}
+
+fn save_pairing_in(
+    address: &str,
+    pairing: &crate::protocol::Pairing,
+    profiles: &mut Vec<Profile>,
+    directory: &Path,
+) -> Result<Profile> {
+    validate_address(address)?;
+    pairing.validate()?;
+    prepare_directory(directory)?;
+    let pairing_file = directory.join(format!("pairing-{:016x}.json", rand::random::<u64>()));
     private_write(&pairing_file, &serde_json::to_vec(&pairing)?)?;
     let profile = Profile {
         address: address.to_owned(),
@@ -114,7 +140,7 @@ pub fn import(address: &str, source: &Path, profiles: &mut Vec<Profile>) -> Resu
     updated.retain(|p| p.address != address);
     updated.push(profile.clone());
     private_write(
-        &directory()?.join("profiles.json"),
+        &directory.join("profiles.json"),
         &serde_json::to_vec_pretty(&updated)?,
     )?;
     *profiles = updated;
@@ -123,6 +149,80 @@ pub fn import(address: &str, source: &Path, profiles: &mut Vec<Profile>) -> Resu
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn verified_pairing_is_saved_privately_and_replaces_selected_host() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut profiles = Vec::new();
+        let mut pairing = crate::protocol::Pairing {
+            token: "aa".repeat(32),
+            fingerprint: "bb".repeat(32),
+        };
+        let old = super::save_pairing_in(
+            "desktop.local:4443",
+            &pairing,
+            &mut profiles,
+            directory.path(),
+        )
+        .unwrap();
+        super::check_private_file(&old.pairing_file).unwrap();
+        super::check_private_file(&directory.path().join("profiles.json")).unwrap();
+        pairing.token = "cc".repeat(32);
+        let new = super::save_pairing_in(
+            "desktop.local:4443",
+            &pairing,
+            &mut profiles,
+            directory.path(),
+        )
+        .unwrap();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].pairing_file, new.pairing_file);
+        assert_ne!(old.pairing_file, new.pairing_file);
+        assert_eq!(
+            crate::protocol::Pairing::read(&new.pairing_file)
+                .unwrap()
+                .token,
+            pairing.token
+        );
+        assert!(
+            super::save_pairing_in(
+                "https://desktop.local:4443",
+                &pairing,
+                &mut profiles,
+                directory.path(),
+            )
+            .is_err()
+        );
+        pairing.token = "bad".into();
+        assert!(
+            super::save_pairing_in(
+                "desktop.local:4443",
+                &pairing,
+                &mut profiles,
+                directory.path(),
+            )
+            .is_err()
+        );
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].pairing_file, new.pairing_file);
+    }
+
+    #[test]
+    fn addresses_require_a_host_and_port_without_url_credentials() {
+        for address in ["desktop.local:4443", "192.168.1.2:4443", "[::1]:4443"] {
+            assert!(super::validate_address(address).is_ok(), "{address}");
+        }
+        for address in [
+            "",
+            "desktop.local",
+            "user@desktop.local:4443",
+            "desktop.local:4443/path",
+            "desktop.local:4443?query",
+            " desktop.local:4443",
+        ] {
+            assert!(super::validate_address(address).is_err(), "{address}");
+        }
+    }
+
     #[test]
     #[cfg(unix)]
     fn refuses_symlinks_and_public_credentials() {

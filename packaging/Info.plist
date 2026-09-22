@@ -4,8 +4,8 @@
   <key>CFBundleName</key><string>Teleport</string>
   <key>CFBundleDisplayName</key><string>Teleport</string>
   <key>CFBundleIdentifier</key><string>dev.teleport.desktop</string>
-  <key>CFBundleVersion</key><string>2</string>
-  <key>CFBundleShortVersionString</key><string>0.2.0</string>
+  <key>CFBundleVersion</key><string>3</string>
+  <key>CFBundleShortVersionString</key><string>0.2.1</string>
   <key>CFBundleExecutable</key><string>teleport</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>NSHighResolutionCapable</key><true/>

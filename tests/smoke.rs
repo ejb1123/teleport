@@ -13,6 +13,116 @@ impl Drop for Process {
     }
 }
 
+#[test]
+#[ignore = "requires local TCP/UDP sockets and GStreamer plugins"]
+fn one_time_code_saves_trust_and_connects_without_file_transfer() {
+    use std::io::{BufRead, Write};
+    let temp = tempfile::tempdir().unwrap();
+    let identity = temp.path().join("identity");
+    let config = temp.path().join("client-config");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let mut host = Process(
+        teleport()
+            .args([
+                "host",
+                "--source",
+                "test",
+                "--encoder",
+                "software",
+                "--pair",
+                "--listen",
+                &address,
+                "--identity-dir",
+            ])
+            .arg(&identity)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = host.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if let Some(rest) = line.strip_prefix("Pairing code: ") {
+                let code = rest.split_whitespace().next().unwrap().to_owned();
+                let _ = sender.send(code);
+            }
+        }
+    });
+    let code = receiver
+        .recv_timeout(Duration::from_secs(15))
+        .expect("host did not display a code");
+    let enroll = |code: &str| {
+        let mut child = teleport()
+            .args(["pair", &address])
+            .env("XDG_CONFIG_HOME", &config)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        writeln!(child.stdin.take().unwrap(), "{code}").unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let wrong = if code == "000-000" {
+        "111111"
+    } else {
+        "000000"
+    };
+    assert!(!enroll(wrong).status.success(), "wrong code accepted");
+    assert!(!config.join("teleport/profiles.json").exists());
+    let output = enroll(&code);
+    assert!(
+        output.status.success(),
+        "pairing failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains(&code),
+        "client echoed secret code"
+    );
+    let profiles: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config.join("teleport/profiles.json")).unwrap())
+            .unwrap();
+    let credential = profiles[0]["pairing_file"].as_str().unwrap();
+    let saved = std::fs::read(credential).unwrap();
+    let host_credential: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(identity.join("pairing.json")).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&saved).unwrap(),
+        host_credential
+    );
+    assert!(!enroll(&code).status.success(), "used code accepted again");
+    assert_eq!(
+        std::fs::read(credential).unwrap(),
+        saved,
+        "failed pairing modified saved trust"
+    );
+    for _ in 0..2 {
+        let output = teleport()
+            .args([
+                "client",
+                &address,
+                "--headless-frames",
+                "15",
+                "--pairing-file",
+                credential,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "saved-pairing desktop connection failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
 /// Strip development-shell discovery paths when exercising a packaged binary.
 fn teleport() -> Command {
     if let Some(binary) = std::env::var_os("TELEPORT_TEST_BINARY") {

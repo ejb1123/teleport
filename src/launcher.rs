@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+type PairingReceiver = std::sync::mpsc::Receiver<(String, Result<crate::protocol::Pairing>)>;
+
 pub fn font_path() -> Result<PathBuf> {
     let candidates = [
         std::env::var_os("TELEPORT_FONT").map(PathBuf::from),
@@ -50,14 +52,51 @@ pub fn run() -> Result<()> {
         .map(|p| p.address.clone())
         .unwrap_or_default();
     let mut pairing_path = String::new();
+    let mut pairing_code = String::new();
+    let mut use_file = false;
+    let mut pending_pairing: Option<PairingReceiver> = None;
     let mut focused = 0;
-    let mut status = "Import a pairing file received securely from your Linux host.".to_owned();
+    let mut status = if selected.is_some() {
+        "Saved host ready. Click Connect; no pairing code needed."
+    } else {
+        "Start the host with --pair, then enter its code once."
+    }
+    .to_owned();
     let mut child: Option<Child> = None;
     let mut progress = None;
     let mut clipboard = false;
     let mut mute = false;
     let mut profile_index = profiles.len().saturating_sub(1);
     'ui: loop {
+        if let Some(receiver) = &pending_pairing {
+            match receiver.try_recv() {
+                Ok((host, result)) => {
+                    pending_pairing = None;
+                    pairing_code.clear();
+                    match result.and_then(|pairing| {
+                        crate::profiles::save_pairing(&host, &pairing, &mut profiles)
+                    }) {
+                        Ok(profile) => {
+                            address = host;
+                            selected = Some(profile);
+                            profile_index = profiles.len() - 1;
+                            status =
+                                "Host verified and saved. Click Connect; no code needed next time."
+                                    .into();
+                        }
+                        Err(_) => {
+                            status = "Pairing failed. Check host/code, TCP port, or restart host with --pair.".into();
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    pending_pairing = None;
+                    pairing_code.clear();
+                    status = "Pairing worker stopped. Start a new pairing attempt.".into();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
         if let Some(receiver) = &progress {
             while let Ok(message) = std::sync::mpsc::Receiver::<String>::try_recv(receiver) {
                 status = message;
@@ -83,15 +122,20 @@ pub fn run() -> Result<()> {
                 Event::TextInput { text, .. } => {
                     let field = if focused == 0 {
                         &mut address
+                    } else if !use_file {
+                        &mut pairing_code
                     } else {
                         &mut pairing_path
                     };
-                    if field.len() + text.len() <= 2048 {
+                    if focused == 1 && !use_file {
+                        append_code(field, &text);
+                    } else if field.len() + text.len() <= 2048 {
                         field.push_str(&text);
                     }
                 }
                 Event::DropFile { filename, .. } => {
                     pairing_path = filename;
+                    use_file = true;
                     focused = 1;
                 }
                 Event::KeyDown {
@@ -104,6 +148,8 @@ pub fn run() -> Result<()> {
                 } => {
                     if focused == 0 {
                         address.pop();
+                    } else if !use_file {
+                        pairing_code.pop();
                     } else {
                         pairing_path.pop();
                     }
@@ -122,15 +168,24 @@ pub fn run() -> Result<()> {
                     if let Ok(text) = video.clipboard().clipboard_text() {
                         let field = if focused == 0 {
                             &mut address
+                        } else if !use_file {
+                            &mut pairing_code
                         } else {
                             &mut pairing_path
                         };
-                        if text.len() <= 2048 {
+                        if focused == 1 && !use_file {
+                            field.clear();
+                            append_code(field, &text);
+                        } else if text.len() <= 2048 {
                             *field = text.trim().to_owned();
                         }
                     }
                 }
                 Event::MouseButtonDown { x, y, .. } => {
+                    if (635..780).contains(&x) && (138..166).contains(&y) {
+                        use_file = !use_file;
+                        focused = 1;
+                    }
                     if (90..132).contains(&y) {
                         focused = 0;
                     }
@@ -154,6 +209,30 @@ pub fn run() -> Result<()> {
                 _ => {}
             }
             match action {
+                Some(0) if pending_pairing.is_some() => {}
+                Some(0) if !use_file => {
+                    let host = address.trim().to_owned();
+                    if let Err(error) = crate::profiles::validate_address(&host) {
+                        status = format!("Invalid address: {error}");
+                    } else if pairing_code.len() != 6 {
+                        status = "Enter the six-digit code shown by your Linux host.".into();
+                    } else {
+                        let code = std::mem::take(&mut pairing_code);
+                        let (sender, receiver) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let result = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .map_err(anyhow::Error::from)
+                                .and_then(|runtime| {
+                                    runtime.block_on(crate::pairing::pair(&host, &code))
+                                });
+                            let _ = sender.send((host, result));
+                        });
+                        pending_pairing = Some(receiver);
+                        status = "Verifying host with your code…".into();
+                    }
+                }
                 Some(0) => match crate::profiles::import(
                     address.trim(),
                     &PathBuf::from(pairing_path.trim()),
@@ -233,7 +312,9 @@ pub fn run() -> Result<()> {
                             Err(error) => status = format!("Could not launch client: {error}"),
                         }
                     } else {
-                        status = "Import and trust a pairing file for this address first.".into();
+                        status =
+                            "Pair with this host using its code first, or import a pairing file."
+                                .into();
                     }
                 }
                 Some(3) => {
@@ -267,16 +348,22 @@ pub fn run() -> Result<()> {
                     .map_err(anyhow::Error::msg)?;
             }
         }
+        canvas.set_draw_color(Color::RGB(44, 82, 110));
+        canvas
+            .fill_rect(Rect::new(635, 138, 145, 28))
+            .map_err(anyhow::Error::msg)?;
         let labels = [
             (20, 20, "Teleport • Native remote desktop".into()),
             (20, 65, "Host address (hostname:port)".into()), (30, 100, address.clone()),
-            (20, 145, "Pairing file path — paste a path or drop the file here".into()), (30, 180, pairing_path.clone()),
-            (35, 242, "Import & trust pairing".into()), (425, 242, "Next saved host".into()),
+            (20, 145, if use_file { "Pairing file path — paste or drop file" } else { "One-time pairing code (from Linux host)" }.into()),
+            (647, 142, if use_file { "Use code" } else { "Use file" }.into()),
+            (30, 180, if use_file { pairing_path.clone() } else { pairing_code.clone() }),
+            (35, 242, if pending_pairing.is_some() { "Pairing…" } else if use_file { "Import & trust pairing" } else { "Pair & save host" }.into()), (425, 242, "Next saved host".into()),
             (20, 308, format!("[{}] Share text clipboard", if clipboard { "x" } else { " " })),
             (410, 308, format!("[{}] Mute audio", if mute { "x" } else { " " })),
             (35, 378, if child.is_some() { "Session running" } else { "Connect / reconnect" }.into()),
             (425, 378, "Disconnect".into()),
-            (20, 480, "Only trust pairing files obtained from your host securely.".into()),
+            (20, 480, "Pair once with your host's code. Saved hosts reconnect with pinned identity.".into()),
             (20, 510, "Tab switches fields • Ctrl/Cmd+V pastes • Closing this window keeps the session open".into()),
         ];
         for (x, y, text) in labels
@@ -301,4 +388,34 @@ pub fn run() -> Result<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
     Ok(())
+}
+
+fn append_code(code: &mut String, text: &str) {
+    // Do not silently convert arbitrary clipboard text into a valid code.
+    if text
+        .bytes()
+        .all(|b| b.is_ascii_digit() || b.is_ascii_whitespace() || b == b'-')
+    {
+        let digits: String = text.chars().filter(char::is_ascii_digit).collect();
+        if code.len() + digits.len() <= 6 {
+            code.push_str(&digits);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn code_entry_is_bounded_and_normalizes_separators() {
+        let mut code = String::new();
+        super::append_code(&mut code, "123-456\n");
+        assert_eq!(code, "123456");
+        super::append_code(&mut code, "7");
+        assert_eq!(code, "123456");
+        code.clear();
+        super::append_code(&mut code, "code 123456");
+        assert!(code.is_empty());
+        super::append_code(&mut code, "1234567");
+        assert!(code.is_empty());
+    }
 }

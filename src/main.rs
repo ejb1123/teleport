@@ -10,6 +10,7 @@ mod host;
 mod identity;
 mod launcher;
 mod media;
+mod pairing;
 mod profiles;
 mod protocol;
 
@@ -27,6 +28,8 @@ struct Cli {
 enum Command {
     /// Open the native saved-host connection window.
     Launcher,
+    /// Pair once using the short-lived code shown by a host started with --pair.
+    Pair { address: String },
     /// Share a Linux desktop (or a synthetic test screen).
     #[cfg(target_os = "linux")]
     Host(host::Options),
@@ -52,6 +55,17 @@ fn main() -> Result<()> {
         Some(Command::Host(options)) => runtime.block_on(host::run(options)),
         Some(Command::Client(options)) => client::run(options, &runtime),
         Some(Command::Doctor) => media::doctor(),
+        Some(Command::Pair { address }) => {
+            use std::io::{BufRead, Read, Write};
+            print!("Pairing code from the host: ");
+            std::io::stdout().flush()?;
+            let mut code = String::new();
+            std::io::stdin().lock().take(128).read_line(&mut code)?;
+            let pairing = runtime.block_on(pairing::pair(&address, &code))?;
+            let profile = profiles::save_pairing(&address, &pairing, &mut profiles::load()?)?;
+            println!("Paired and saved: {}", profile.pairing_file.display());
+            Ok(())
+        }
         Some(Command::Launcher) | None => launcher::run(),
     }
 }

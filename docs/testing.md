@@ -1,10 +1,27 @@
 # Manual acceptance checks
 
+## Code-pairing validation (v0.2.1)
+
+Local Linux verification passed: 18 unit tests, three ignored media/pairing tests,
+four network/input integrations, and two native UI integrations. The Nix release
+package built; all six network/UI tests also passed against its wrapped binary
+with development GStreamer discovery paths removed. The GUI pairing test waits
+for rendered controls before injecting text, and passed repeated parallel runs.
+Physical macOS code-pairing acceptance remains pending.
+
 Use a LAN or VPN with UDP 4443 reachable. Start the host from its graphical
 session and securely copy the newly generated pairing file. The README has
 the full commands. Keep host and client on the same revision.
 
 ## macOS client
+
+For code pairing, start the host with `--pair` and its persistent identity
+directory; allow TCP 4443 for enrollment and UDP 4443 for desktop streaming.
+Enter the address/code in the launcher, click **Pair & save host**, then connect.
+Close/reopen the launcher and confirm saved-host connections need no code.
+Wrong or used codes must fail without replacing saved credentials. Never disable
+certificate verification to work around an identity mismatch; re-pair explicitly
+after verifying the real host. File import remains available through **Use file**.
 
 1. Run `nix develop`, `cargo build --release --locked`, and `teleport doctor`
    (use `./target/release/teleport` when running a Cargo build).

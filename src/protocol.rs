@@ -10,7 +10,7 @@ pub const INPUT_TIMEOUT: Duration = Duration::from_secs(3);
 pub const MAX_TEXT: usize = 64 * 1024;
 pub const MAX_CONTROL: usize = MAX_TEXT * 6 + 1024;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Pairing {
     pub token: String,
     pub fingerprint: String,
@@ -19,12 +19,17 @@ pub struct Pairing {
 impl Pairing {
     pub fn read(path: &Path) -> Result<Self> {
         let pairing: Self = serde_json::from_slice(&std::fs::read(path)?)?;
+        pairing.validate()?;
+        Ok(pairing)
+    }
+
+    pub fn validate(&self) -> Result<()> {
         ensure!(
-            pairing.token.len() == 64 && pairing.token.bytes().all(|b| b.is_ascii_hexdigit()),
+            self.token.len() == 64 && self.token.bytes().all(|b| b.is_ascii_hexdigit()),
             "invalid pairing token"
         );
-        moq_native::tls::parse_fingerprint(&pairing.fingerprint)?;
-        Ok(pairing)
+        moq_native::tls::parse_fingerprint(&self.fingerprint)?;
+        Ok(())
     }
 }
 

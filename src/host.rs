@@ -47,6 +47,9 @@ pub struct Options {
     /// Allow explicit text clipboard send/fetch requests from the paired client.
     #[arg(long)]
     pub clipboard: bool,
+    /// Open one-time code enrollment on TCP at the same port for five minutes.
+    #[arg(long)]
+    pub pair: bool,
 }
 
 pub async fn run(options: Options) -> Result<()> {
@@ -112,7 +115,17 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
     } else {
         crate::identity::write_new(pairing_path, &serde_json::to_vec_pretty(&pairing)?)?;
     }
-    tracing::info!(address = %server.local_addr()?, pairing_file = %pairing_path.display(), "Host ready; copy pairing file securely to your client. UDP port must be reachable.");
+    tracing::info!(address = %server.local_addr()?, pairing_file = %pairing_path.display(), "Host ready; use saved trust, a --pair code, or securely import the pairing file. UDP port must be reachable.");
+    let _enrollment = if options.pair {
+        if options.identity_dir.is_none() {
+            tracing::warn!(
+                "Use --identity-dir to keep paired clients trusted across host restarts"
+            );
+        }
+        Some(crate::pairing::start(server.local_addr()?, pairing.clone()).await?)
+    } else {
+        None
+    };
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {

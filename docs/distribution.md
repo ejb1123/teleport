@@ -2,10 +2,16 @@
 
 ## Native launcher
 
-Run `nix run .` (no arguments) to open the native connection screen. Enter a
-`host:port` address and paste a pairing file's absolute path, or drop the file
-onto the window. Click **Import & trust pairing** only for a file obtained from
-your host over a trusted channel, such as SSH. Then click **Connect / reconnect**.
+Run the Linux host with `--pair --identity-dir PATH` to show a short-lived code.
+Run `nix run .` (no arguments) on the client to open the native connection screen.
+Enter `host:port` and that code, click **Pair & save host**, then **Connect / reconnect**.
+Saved hosts connect without another pairing prompt. Initial enrollment also needs
+TCP on the host's port (normally 4443); normal streaming still uses UDP.
+See [pairing security](pairing.md) for expiry and limits.
+
+Alternatively, click **Use file** and paste a pairing file's absolute path, or
+drop it onto the window. Click **Import & trust pairing** only for a file obtained
+from your host over a trusted channel, such as SSH.
 Pairing imports must be regular files readable only by your account; if necessary,
 run `chmod 600 /path/to/pairing.json` first. Symlinked profile directories and
 credential files are rejected.
