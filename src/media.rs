@@ -523,6 +523,7 @@ pub fn encoder(
 
 pub struct Image {
     pub decoded_at: Instant,
+    pub decoder_recovery: u64,
     pub video_group: Option<u64>,
     pub data: Vec<u8>,
     pub width: u32,
@@ -589,7 +590,7 @@ pub fn decoder_with_stats(
     let fragment = decoder::fragment(decoder, codec);
     let conversion = decoder::output_fragment(format);
     let pipeline = Pipeline(gst::parse::launch(&format!(
-        "appsrc name=in is-live=true format=time do-timestamp=true max-bytes=16777216 block=false \
+        "appsrc name=in is-live=true format=time do-timestamp=true max-bytes=8388608 block=false \
         caps={caps},stream-format=byte-stream,alignment=au \
         ! {fragment} ! {conversion} \
         ! appsink name=frames sync=false max-buffers=1 drop=true"
@@ -606,6 +607,29 @@ pub fn decoder_with_stats(
         .unwrap()
         .downcast::<AppSink>()
         .unwrap();
+    let entered_stats = stats.clone();
+    source
+        .static_pad("src")
+        .context("missing decoder input pad")?
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(key) = info.buffer().and_then(|buffer| video_reference(buffer)) {
+                entered_stats.decoder_entered(key);
+            }
+            gst::PadProbeReturn::Ok
+        });
+    let output_stats = stats.clone();
+    pipeline
+        .0
+        .by_name("video_decoder")
+        .context("missing decoder")?
+        .static_pad("src")
+        .context("missing decoder output pad")?
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(key) = info.buffer().and_then(|buffer| video_reference(buffer)) {
+                output_stats.decoder_output(key);
+            }
+            gst::PadProbeReturn::Ok
+        });
     let image: LatestImage = Arc::new(Mutex::new(None));
     let latest = image.clone();
     let hdr_pipeline = format.hdr().then(|| pipeline.0.downgrade());
@@ -617,6 +641,19 @@ pub fn decoder_with_stats(
                     let pipeline = weak.upgrade().ok_or(gst::FlowError::Error)?;
                     decoder::verify_hdr_decoder_output(&pipeline)
                         .map_err(|_| gst::FlowError::Error)?;
+                }
+                let key = sample.buffer().and_then(|buffer| {
+                    video_reference(buffer).or_else(|| buffer.pts().map(|pts| pts.nseconds()))
+                });
+                // Do not present seconds-old output even if a driver holds frames
+                // internally. Receive-side recovery will resume at a fresh GOP.
+                if key
+                    .and_then(|key| stats.frame_age(key))
+                    .is_some_and(|age| age > Duration::from_millis(250))
+                {
+                    stats.decoded(key);
+                    stats.stale_frames.fetch_add(1, Ordering::Relaxed);
+                    return Ok(gst::FlowSuccess::Ok);
                 }
                 let info = gstreamer_video::VideoInfo::from_caps(
                     sample.caps().ok_or(gst::FlowError::Error)?,
@@ -662,9 +699,14 @@ pub fn decoder_with_stats(
                         None,
                     )
                 };
-                let video_group = stats.decoded(sample.buffer().and_then(|buffer| {
-                    video_reference(buffer).or_else(|| buffer.pts().map(|pts| pts.nseconds()))
-                }));
+                let stale_after_copy = key
+                    .and_then(|key| stats.frame_age(key))
+                    .is_some_and(|age| age > Duration::from_millis(250));
+                let video_group = stats.decoded(key);
+                if stale_after_copy {
+                    stats.stale_frames.fetch_add(1, Ordering::Relaxed);
+                    return Ok(gst::FlowSuccess::Ok);
+                }
                 let mut latest = latest.lock().unwrap();
                 if latest.is_some() {
                     stats.overwritten_frames.fetch_add(1, Ordering::Relaxed);
@@ -672,12 +714,16 @@ pub fn decoder_with_stats(
                 *latest = Some(Image {
                     hdr,
                     decoded_at: Instant::now(),
+                    decoder_recovery: stats.decoder_recoveries.load(Ordering::Relaxed),
                     video_group,
                     data,
                     width: info.width(),
                     height: info.height(),
                     stride: frame.plane_stride()[0] as usize,
                 });
+                if video_group.is_some() {
+                    stats.ready_frames.fetch_add(1, Ordering::Relaxed);
+                }
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
@@ -696,11 +742,19 @@ pub async fn receive_video_with_stats(
     let monitor = async {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut previous_recoveries = stats.decoder_recoveries.load(Ordering::Relaxed);
         loop {
             interval.tick().await;
-            let queue_ms = source
+            let mut queue_ms = source
                 .current_level_time()
                 .map_or(0, |time| time.mseconds().min(u32::MAX as u64) as u32);
+            let recoveries = stats.decoder_recoveries.load(Ordering::Relaxed);
+            if recoveries != previous_recoveries {
+                // A reset emptied the queue, but must not conceal overload from
+                // the host's adaptive bitrate controller at its next sample.
+                queue_ms = queue_ms.max(MAX_DECODE_BACKLOG_AGE.as_millis() as u32);
+            }
+            previous_recoveries = recoveries;
             let dropped_groups = dropped.swap(0, Ordering::Relaxed);
             stats
                 .decoder_queue_bytes
@@ -719,6 +773,109 @@ pub async fn receive_video_with_stats(
     }
 }
 
+const MAX_DECODE_BACKLOG_AGE: Duration = Duration::from_millis(150);
+const MAX_DECODE_BACKLOG_FRAMES: u64 = 12;
+const MAX_DECODE_BACKLOG_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Default)]
+struct RecoveryBudget {
+    recent: std::collections::VecDeque<Instant>,
+    fresh_frames: u64,
+    without_progress: u32,
+}
+
+impl RecoveryBudget {
+    fn attempt(&mut self, fresh_frames: u64, now: Instant) -> Result<()> {
+        while self
+            .recent
+            .front()
+            .is_some_and(|at| now.duration_since(*at) > Duration::from_secs(5))
+        {
+            self.recent.pop_front();
+        }
+        if fresh_frames != self.fresh_frames {
+            self.without_progress = 0;
+            self.fresh_frames = fresh_frames;
+        }
+        ensure!(
+            self.recent.len() < 5 && self.without_progress < 5,
+            "decoder repeatedly exceeded latency budget; reduce resolution/FPS, try H.265, or use --software-decoder"
+        );
+        self.recent.push_back(now);
+        self.without_progress += 1;
+        Ok(())
+    }
+}
+
+fn decoder_backlogged(source: &AppSrc, stats: &crate::stats::StreamStats) -> bool {
+    let frames = source.current_level_buffers();
+    frames >= MAX_DECODE_BACKLOG_FRAMES
+        || source.current_level_bytes() >= MAX_DECODE_BACKLOG_BYTES
+        || (frames > 0
+            && stats
+                .oldest_queued_age()
+                .is_some_and(|age| age > MAX_DECODE_BACKLOG_AGE))
+}
+
+fn decoder_needs_recovery(
+    source: &AppSrc,
+    stats: &crate::stats::StreamStats,
+    stale_checkpoint: u64,
+) -> bool {
+    decoder_backlogged(source, stats)
+        || stats
+            .stale_frames
+            .load(Ordering::Relaxed)
+            .saturating_sub(stale_checkpoint)
+            >= 3
+}
+
+async fn reset_decoder(source: &AppSrc, stats: Arc<crate::stats::StreamStats>) -> Result<()> {
+    let pipeline = source
+        .parent()
+        .context("decoder source has no pipeline")?
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| anyhow::anyhow!("decoder parent is not a pipeline"))?;
+    // A state reset clears appsrc, parser, decoder surfaces and queued callbacks
+    // together. Never leak/drop arbitrary dependent compressed frames in appsrc.
+    // State changes may wait for a driver; keep them off Tokio's I/O workers.
+    // Aborting an async receive task must not leave its blocking reset free to
+    // resurrect the pipeline after the session owner has torn it down.
+    struct PendingReset {
+        pipeline: gst::Pipeline,
+        active: Arc<Mutex<bool>>,
+        complete: bool,
+    }
+    impl Drop for PendingReset {
+        fn drop(&mut self) {
+            if !self.complete {
+                let mut active = self.active.lock().unwrap();
+                *active = false;
+                let _ = self.pipeline.set_state(gst::State::Null);
+            }
+        }
+    }
+    let mut guard = PendingReset {
+        pipeline: pipeline.clone(),
+        active: Arc::new(Mutex::new(true)),
+        complete: false,
+    };
+    let active = guard.active.clone();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let active = active.lock().unwrap();
+        if !*active {
+            return Ok(());
+        }
+        pipeline.set_state(gst::State::Ready)?;
+        stats.reset_pending();
+        pipeline.set_state(gst::State::Playing)?;
+        Ok(())
+    })
+    .await??;
+    guard.complete = true;
+    Ok(())
+}
+
 async fn receive_video_inner(
     mut track: moq_net::track::Subscriber,
     source: AppSrc,
@@ -727,6 +884,8 @@ async fn receive_video_inner(
 ) -> Result<()> {
     let mut current: Option<moq_net::group::Consumer> = None;
     let mut sequence = None;
+    let mut stale_checkpoint = stats.stale_frames.load(Ordering::Relaxed);
+    let mut recoveries = RecoveryBudget::default();
     let record_drop = |count: u32| {
         stats
             .skipped_groups
@@ -765,10 +924,23 @@ async fn receive_video_inner(
             }
             MediaEvent::Frame(frame) => match frame {
                 Ok(Some(bytes)) => {
-                    ensure!(
-                        source.current_level_bytes() < 16 * 1024 * 1024,
-                        "decoder is not keeping up"
-                    );
+                    if decoder_needs_recovery(&source, &stats, stale_checkpoint) {
+                        recoveries
+                            .attempt(stats.ready_frames.load(Ordering::Relaxed), Instant::now())?;
+                        tracing::warn!(
+                            queued_bytes = source.current_level_bytes(),
+                            queued_frames = source.current_level_buffers(),
+                            "decoder backlog exceeded latency budget; resetting at next keyframe group"
+                        );
+                        // Abandon the complete remainder of this GOP, including
+                        // this frame. next_media_event accepts only a newer group;
+                        // the host starts every group with an independent keyframe.
+                        current = None;
+                        record_drop(1);
+                        reset_decoder(&source, stats.clone()).await?;
+                        stale_checkpoint = stats.stale_frames.load(Ordering::Relaxed);
+                        continue;
+                    }
                     let video_group = sequence.context("video frame arrived without a group")?;
                     let pts = stats.received(bytes.len(), video_group);
                     let mut buffer = gst::Buffer::from_slice(bytes);
@@ -934,6 +1106,25 @@ pub fn doctor() -> Result<()> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_requires_fresh_progress_even_when_failures_are_slow() {
+        let now = Instant::now();
+        let mut budget = RecoveryBudget::default();
+        for index in 0..5 {
+            budget
+                .attempt(1, now + Duration::from_secs(index * 4))
+                .unwrap();
+        }
+        assert!(budget.attempt(1, now + Duration::from_secs(20)).is_err());
+        // Stale outputs do not count as fresh progress; a real ready frame does.
+        assert!(budget.attempt(2, now + Duration::from_secs(24)).is_ok());
+        let mut rapid = RecoveryBudget::default();
+        for index in 0..5 {
+            rapid.attempt(index, now).unwrap();
+        }
+        assert!(rapid.attempt(6, now).is_err());
+    }
 
     const TEST_ENCODERS: [EncoderKind; 4] = [
         EncoderKind::Software,
@@ -1321,6 +1512,186 @@ mod tests {
                 );
                 eprintln!("60/60 generation timestamps matched for {codec:?} {kind:?}");
             }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires GStreamer appsrc; checks delayed internal-output pressure"]
+    async fn stale_internal_output_recovers_even_with_empty_input_queue() -> Result<()> {
+        gst::init()?;
+        let pipeline = Pipeline(
+            gst::parse::launch("appsrc name=in is-live=true ! fakesink sync=false")?
+                .downcast::<gst::Pipeline>()
+                .unwrap(),
+        );
+        let input = pipeline
+            .0
+            .by_name("in")
+            .unwrap()
+            .downcast::<AppSrc>()
+            .unwrap();
+        pipeline.0.set_state(gst::State::Playing)?;
+        let stats = Arc::new(crate::stats::StreamStats::default());
+        assert_eq!(input.current_level_buffers(), 0);
+        assert!(!decoder_needs_recovery(&input, &stats, 0));
+        // Model a driver accepting input promptly but delivering late output.
+        stats.stale_frames.store(3, Ordering::Relaxed);
+        assert!(decoder_needs_recovery(&input, &stats, 0));
+        reset_decoder(&input, stats.clone()).await?;
+        assert_eq!(stats.snapshot().decoder_recoveries, 1);
+        assert!(!decoder_needs_recovery(&input, &stats, 3));
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires GStreamer; exercises cancellation of a blocked state reset"]
+    async fn cancelled_decoder_reset_finishes_in_null_state() -> Result<()> {
+        gst::init()?;
+        let pipeline = Pipeline(gst::parse::launch(
+            "appsrc name=in is-live=true format=time ! identity name=slow ! fakesink sync=false"
+        )?.downcast::<gst::Pipeline>().unwrap());
+        let input = pipeline
+            .0
+            .by_name("in")
+            .unwrap()
+            .downcast::<AppSrc>()
+            .unwrap();
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = entered.clone();
+        pipeline
+            .0
+            .by_name("slow")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                signal.store(true, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(250));
+                gst::PadProbeReturn::Ok
+            });
+        pipeline.0.set_state(gst::State::Playing)?;
+        input.push_buffer(gst::Buffer::from_slice(vec![0u8; 16]))?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !entered.load(Ordering::Relaxed) {
+            ensure!(Instant::now() < deadline, "probe never blocked");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let reset = tokio::spawn(async move {
+            reset_decoder(&input, Arc::new(crate::stats::StreamStats::default())).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        reset.abort();
+        let _ = reset.await;
+        // Any detached worker has completed or observed cancellation before this
+        // assertion. It cannot set Playing after cleanup.
+        assert_eq!(pipeline.0.current_state(), gst::State::Null);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires GStreamer software codecs; injects a decoder stall"]
+    async fn decoder_backlog_discards_gop_and_recovers_at_fresh_keyframe() -> Result<()> {
+        gst::init()?;
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            let encoder = Pipeline(gst::parse::launch(&format!(
+                "videotestsrc num-buffers=20 ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! {} ! {} config-interval=-1 ! {},stream-format=byte-stream,alignment=au ! appsink name=out sync=false",
+                encoder_fragment(EncoderKind::Software, 30, 1000, codec), parser(codec), compressed_caps(codec)
+            ))?.downcast::<gst::Pipeline>().unwrap());
+            let output = encoder
+                .0
+                .by_name("out")
+                .unwrap()
+                .downcast::<AppSink>()
+                .unwrap();
+            encoder.0.set_state(gst::State::Playing)?;
+            let mut frames = Vec::new();
+            for _ in 0..20 {
+                let sample = output
+                    .try_pull_sample(gst::ClockTime::from_seconds(3))
+                    .context("encoder stalled")?;
+                frames.push(bytes::Bytes::copy_from_slice(
+                    sample.buffer().unwrap().map_readable()?.as_slice(),
+                ));
+            }
+            let stats = Arc::new(crate::stats::StreamStats::default());
+            let (pipeline, input, image) = decoder_with_stats(true, stats.clone(), codec)?;
+            let stall = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let entered_probe = entered.clone();
+            let slow = stall.clone();
+            pipeline
+                .0
+                .by_name("video_decoder")
+                .unwrap()
+                .static_pad("sink")
+                .unwrap()
+                .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                    if slow.load(Ordering::Relaxed) {
+                        entered_probe.store(true, Ordering::Relaxed);
+                        std::thread::sleep(Duration::from_millis(400));
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+            let origin = moq_net::Origin::random().produce();
+            let mut broadcast =
+                origin.create_broadcast("backlog", moq_net::broadcast::Route::new())?;
+            let mut track = broadcast.create_track("video", moq_net::track::Info::default())?;
+            let subscriber = track.subscribe(None);
+            let reader_stats = stats.clone();
+            let task = tokio::spawn(async move {
+                receive_video_inner(subscriber, input, Arc::new(AtomicU32::new(0)), reader_stats)
+                    .await
+            });
+            let mut old = track.create_group(moq_net::group::Info { sequence: 1 })?;
+            old.write_frame(moq_net::Timestamp::now(), frames[0].clone())?;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !entered.load(Ordering::Relaxed) {
+                ensure!(Instant::now() < deadline, "test stall was not entered");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            for bytes in &frames[1..3] {
+                old.write_frame(moq_net::Timestamp::now(), bytes.clone())?;
+            }
+            // Exercise the age limit while well below byte/frame limits.
+            tokio::time::sleep(Duration::from_millis(180)).await;
+            old.write_frame(moq_net::Timestamp::now(), frames[3].clone())?;
+            old.finish()?;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while stats.decoder_recoveries.load(Ordering::Relaxed) == 0 {
+                ensure!(
+                    Instant::now() < deadline,
+                    "backlog did not recover for {codec:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            stall.store(false, Ordering::Relaxed);
+            // Publish only a keyframe from a fresh group, not the abandoned GOP's
+            // dependent frames. Recovery must produce output without an EOS drain.
+            let mut fresh = track.create_group(moq_net::group::Info { sequence: 2 })?;
+            fresh.write_frame(moq_net::Timestamp::now(), frames[0].clone())?;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if image
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|frame| frame.video_group == Some(2))
+                {
+                    break;
+                }
+                ensure!(
+                    Instant::now() < deadline,
+                    "no fresh frame after {codec:?} recovery"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(stats.snapshot().decode_us < 250_000);
+            assert!(stats.snapshot().queue_us > 0);
+            assert!(stats.snapshot().decoder_us > 0);
+            assert!(stats.snapshot().conversion_us > 0);
+            task.abort();
+            let _ = task.await;
         }
         Ok(())
     }

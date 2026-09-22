@@ -323,7 +323,7 @@ fn connect_window(
         .load_font(crate::launcher::font_path()?, 18)
         .map_err(anyhow::Error::msg)?;
     let window = video
-        .window("Teleport — connecting", 760, 275)
+        .window("Teleport - Connecting", 760, 275)
         .position_centered()
         .build()?;
     let mut canvas = crate::windowing::software(window)?;
@@ -607,8 +607,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     _ => (),
                 }
             }
-            if let Some(frame) = image.lock().unwrap().take().filter(|frame| {
+            // Never hold the decoder's latest-frame lock during rendering or
+            // subsequent network work: it would backpressure raw frame delivery.
+            let next_frame = { image.lock().unwrap().take() };
+            if let Some(frame) = next_frame.filter(|frame| {
                 initial_ready
+                    && frame.decoder_recovery
+                        == stream_stats
+                            .decoder_recoveries
+                            .load(std::sync::atomic::Ordering::Relaxed)
                     && frame.width == desktop.width
                     && frame.height == desktop.height
                     && video_generation_matches(desktop.video_start_group, frame.video_group)
@@ -690,6 +697,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             received_frames = snapshot.received_frames,
             decoded_frames = snapshot.decoded_frames,
             receive_to_decode_us = snapshot.decode_us,
+            input_queue_us = snapshot.queue_us,
+            parse_decode_download_us = snapshot.decoder_us,
+            conversion_copy_us = snapshot.conversion_us,
+            decoder_recoveries = snapshot.decoder_recoveries,
+            stale_frames = snapshot.stale_frames,
             skipped_groups = snapshot.skipped_groups,
             overwritten_frames = snapshot.overwritten_frames,
             unmatched_frames = snapshot.unmatched_frames,
@@ -703,7 +715,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let (sdl, video) = crate::windowing::init()?;
     let make_window = || -> Result<sdl2::video::Window> {
         let mut window = video
-            .window("Teleport — connecting video", 1280, 720)
+            .window("Teleport - Remote Desktop", 1280, 720)
             .position_centered()
             .resizable()
             .allow_highdpi()
@@ -1054,11 +1066,14 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         if let Some(event) = motion {
             send(&events, event)?;
         }
-        if let Some(frame) =
-            image.lock().unwrap().take().filter(|frame| {
-                video_generation_matches(desktop.video_start_group, frame.video_group)
-            })
-        {
+        let next_frame = { image.lock().unwrap().take() };
+        if let Some(frame) = next_frame.filter(|frame| {
+            frame.decoder_recovery
+                == stream_stats
+                    .decoder_recoveries
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && video_generation_matches(desktop.video_start_group, frame.video_group)
+        }) {
             redraw = true;
             decoded_age = frame.decoded_at.elapsed();
             protocol::validate_video_size(frame.width, frame.height)?;
@@ -1147,13 +1162,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 || "Waiting / unavailable".into(),
                 |rtt| format!("{:.1} ms", rtt.as_secs_f64() * 1000.0),
             );
-            let decode = if snapshot.decode_us == 0 {
-                "Unavailable".into()
-            } else {
-                format!(
-                    "{:.2} ms (latest frame)",
-                    snapshot.decode_us as f64 / 1000.0
-                )
+            let timing = |microseconds: u64| {
+                if microseconds == 0 {
+                    "Unavailable".into()
+                } else {
+                    format!("{:.2} ms (latest frame)", microseconds as f64 / 1000.0)
+                }
             };
             let encode = if host_encode_us == 0 {
                 "Unavailable".into()
@@ -1182,7 +1196,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     host_bitrate as f64 / 1000.0
                 ),
                 format!("Host encode           {encode}"),
-                format!("Receive to decode     {decode}"),
+                format!("Receive to ready      {}", timing(snapshot.decode_us)),
+                format!("Compressed queue      {}", timing(snapshot.queue_us)),
+                format!("Parse/decode/download {}", timing(snapshot.decoder_us)),
+                format!("Convert / copy        {}", timing(snapshot.conversion_us)),
                 format!(
                     "Decoded frame wait    {:.2} ms (latest frame)",
                     decoded_age.as_secs_f64() * 1000.0
@@ -1197,24 +1214,17 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     snapshot.skipped_groups, snapshot.overwritten_frames
                 ),
                 format!("Unmatched timestamps  {}", snapshot.unmatched_frames),
+                format!(
+                    "Decoder recoveries    {}   |   Stale frames {}",
+                    snapshot.decoder_recoveries, snapshot.stale_frames
+                ),
+                "Decode includes scheduling/download, not pure GPU time.".into(),
                 "RTT includes control scheduling, not just network transit.".into(),
                 "Capture, scanout and end-to-end latency: unmeasured.".into(),
             ];
             if let Some(headroom) = hdr_headroom {
                 stats_lines.push(format!("HDR display headroom  {headroom:.2} × SDR white"));
             }
-            canvas.window_mut().set_title(&format!(
-                "Teleport — display {}/{} · {}×{} · {fps:.0} fps{}",
-                desktop.active_monitor + 1,
-                desktop.monitors.len(),
-                size.0,
-                size.1,
-                if options.forward_ssh_agent {
-                    " · SSH AGENT SHARED"
-                } else {
-                    ""
-                },
-            ))?;
             stats = Instant::now();
             frames = 0;
         }
@@ -1320,6 +1330,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 size.1,
                 desktop.dynamic_range.label()
             )
+        };
+        let status = if options.forward_ssh_agent {
+            format!("SSH AGENT SHARED | {status}")
+        } else {
+            status
         };
         session_text(
             &mut canvas,

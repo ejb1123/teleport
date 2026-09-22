@@ -20,6 +20,14 @@ Version 0.5.0 adds opt-in **existing Linux account login** through PAM, with pin
 TLS and one-session credentials. See [system login setup](docs/system-login.md).
 It attaches to a running desktop; boot/login-screen session creation is not included.
 
+Version 0.5.2 makes the launcher saved-desktop-first: **Add desktop** saves a name
+and `host:port` without contacting the host or asking for credentials. Select it
+and **Connect** to sign in. First contact presents the full SHA-256 host fingerprint
+for explicit approval; compare it with the host through trusted SSH or locally.
+Approved fingerprints are remembered, and changed identities are blocked rather
+than silently replaced. Linux passwords are never saved; paired-device credentials
+remain reusable and revocable. Connection quality settings are collapsed by default.
+
 Version 0.4.1 added an explicit **password + U2F touch** enrollment path for the
 YubiKey NEO and isolates the Linux package from conflicting system SDL/font
 configuration (including Arch). See [NEO setup and limitations](docs/yubikey-neo.md).
@@ -30,7 +38,8 @@ Version 0.3 adds a redesigned native launcher, selectable stream resolution/FPS/
 bitrate, and a **Stats for nerds** overlay (toolbar or **F8**). Launcher connections
 default to native monitor resolution, 60 FPS and 20 Mbps; preferences apply on
 connection. Both endpoints need the new build for quality negotiation and host
-telemetry. The title reports actual streamed pixels, not the client window size.
+telemetry. The F8 overlay reports actual streamed pixels, not the client window size;
+the native title stays plain and stable.
 **SDR H.264 and H.265/HEVC are the tested baseline.** An experimental patched-KWin
 HDR path and Mac Metal/EDR renderer are available; see [HDR status](docs/hdr.md).
 `nix run . -- doctor --hdr` tests synthetic codecs. A passing codec probe is not HDR
@@ -72,12 +81,13 @@ On the **Mac**, run the native client:
 nix run .
 ```
 
-For code pairing, choose **Use pairing code**, then enter `LINUX_IP:4443` and the
-six-digit code shown in the Linux host terminal.
-Click **Pair & save**, then **Connect to desktop**. Next time just select
-the saved host and connect—no code or trust prompt. Keep the host's identity
+Choose **Add desktop**, enter a name and `LINUX_IP:4443`, then save it.
+Choose **Connect**, select **Pairing code**, and enter the six-digit code shown
+in the Linux host terminal. After **Continue**, verify and approve the host
+fingerprint; the native session opens automatically. Next time select the saved
+desktop and connect without another code or trust prompt. Keep the host's identity
 directory unchanged so saved trust survives restarts. An identity mismatch is
-never accepted automatically; explicitly pair again only after checking the host.
+blocked and cannot be overwritten by signing in or pairing again.
 
 The code is valid for five minutes, one successful enrollment, and at most five
 TCP connection attempts. On updated persistent hosts, use **Host settings** or
@@ -95,7 +105,8 @@ it in process arguments:
 nix run . -- pair LINUX_IP:4443
 ```
 
-Manual file import remains available through **Import pairing file** or drag-and-drop.
+Manual file import remains available through **Pairing file** on the sign-in screen
+or drag-and-drop onto that screen.
 To use that alternative, copy the file over an existing trusted SSH connection:
 
 ```sh
@@ -115,8 +126,8 @@ local. **Ctrl+Alt+Q** quits the client locally. Losing window focus releases all
 remote keys/buttons; disconnects and expired heartbeats do the same on the host.
 
 The session toolbar provides **Display**, **Audio**, **Send text**, **Get text**,
-**Stats**, **Full screen**, **Reconnect**, and **Disconnect**. The title shows display, size,
-displayed FPS, and action status. Toolbar clicks are local and never forwarded
+**Stats**, **Full screen**, **Reconnect**, and **Disconnect**. The title stays plain;
+changing diagnostics are in F8, with action status in the toolbar. Toolbar clicks are local and never forwarded
 to the remote desktop. A connection window shows failures and has Retry/Cancel.
 
 Stop the host with Ctrl+C. With `--identity-dir`, the certificate and pairing
@@ -201,6 +212,23 @@ acceptance remains required. Intel VA-API has been hardware-tested for H.264,
 HEVC SDR, and HEVC HDR10 decoding; AMD and QSV still require physical-hardware
 acceptance on supported GPUs.
 
+Version 0.5.2 bounds decoder input backlog by age (150 ms), count (12 frames),
+and compressed size (8 MiB). Overload clears the decoder pipeline and abandons
+the current GOP, resuming at a fresh keyframe group rather than dropping arbitrary
+dependent frames. Output already older than 250 ms is discarded before presentation.
+These are recovery thresholds, not an end-to-end latency guarantee: a slow driver
+can still cause pauses or repeated recovery. The stats overlay separates compressed
+queue time, parse/decode/download, and conversion/copy, and counts recoveries and
+stale output. These client-local stages are not pure GPU execution measurements.
+
+macOS Nix builds include an app-local GStreamer HEVC fix: its VideoToolbox output
+queue follows the SPS reordering requirement instead of unconditionally retaining
+up to 15 frames. Zero-reorder streams can be delivered immediately; streams with
+B-frame reordering retain their required queue, and unsupported/malformed SPS keeps
+the conservative fallback. The exact parsing/queue logic is regression-tested on
+Linux; the patched decoder still requires physical Mac build/runtime acceptance.
+No system GStreamer or running host service is replaced by building the app.
+
 `--bitrate 8000` is the starting bitrate and adaptive ceiling, in kbit/s.
 Receiver queue pressure and skipped video groups reduce the bitrate, with slow
 recovery when the connection clears. This conservative heuristic is not a
@@ -242,9 +270,9 @@ to separate networking/decoding problems from portal/capture problems.
   `--fps`, and `--bitrate` (kilobits/second). Aspect ratio is retained.
 - Auto hardware encoding with CPU x264/x265 fallback, low-delay settings and short
   keyframe groups. Frames still copy through CPU memory; zero-copy rendering
-  is not implemented. FPS in the title is decoded/displayed frame
+  is not implemented. FPS in the stats overlay is decoded/displayed frame
   rate, **not** end-to-end latency.
-- macOS probes VideoToolbox; Linux probes NVIDIA/VA decoding, with software
+- macOS probes VideoToolbox; Linux probes NVIDIA/VA/QSV decoding, with software
   fallback for H.264 and H.265. Actual NVIDIA output has been tested locally.
 - KDE/GNOME require working RemoteDesktop and ScreenCast portal backends.
   Other Wayland compositors may lack remote input support. This prototype uses

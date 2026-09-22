@@ -1,0 +1,28 @@
+--- a/sys/applemedia/vtdec.c
++++ b/sys/applemedia/vtdec.c
+@@ -1606,6 +1606,8 @@
+   return ret;
+ }
+ 
++#include "gst-vtdec-hevc-reorder.h"
++
+ static gboolean
+ compute_hevc_decode_picture_buffer_size (GstVtdec * vtdec,
+     GstBuffer * codec_data, int *length)
+@@ -1619,6 +1621,16 @@
+   if (vtdec->video_info.width == 0 || vtdec->video_info.height == 0)
+     return FALSE;
+ 
++  /* This is the output reorder queue, not VideoToolbox's reference DPB.
++   * Honor all SPS/temporal-layer reordering bounds, including zero for
++   * low-delay HEVC. Keep the old conservative bound if parsing fails. */
++  if (gst_vtdec_hevc_reorder_depth (codec_data, length)) {
++    *length = gst_vtdec_hevc_queue_threshold (*length);
++    return TRUE;
++  }
++  GST_WARNING_OBJECT (vtdec,
++      "Cannot derive HEVC reorder depth from SPS; using conservative DPB");
++
+   /* A.4.2 */
+   pic_size_samples_y = vtdec->video_info.width * vtdec->video_info.height;
+   if (pic_size_samples_y <= (max_luma_ps >> 2))

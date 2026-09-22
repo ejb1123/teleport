@@ -54,7 +54,7 @@ pub(super) fn fragment(decoder: &str, codec: VideoCodec) -> String {
     // copy, and QSV's allocator_download_frame handles its VA download. Do not
     // insert vapostproc unconditionally: no scaling/tone mapping is wanted here,
     // and another transform must not silently reduce precision or lose identity.
-    format!("{parser}{parsed_caps} ! {decoder}{options} ! video/x-raw")
+    format!("{parser}{parsed_caps} ! {decoder} name=video_decoder{options} ! video/x-raw")
 }
 
 pub(super) fn select(force_software: bool, format: VideoFormat) -> Result<&'static str> {
@@ -296,7 +296,10 @@ mod tests {
                 let pipeline = fragment(decoder, codec);
                 assert_eq!(
                     pipeline,
-                    format!("{} ! {decoder} ! video/x-raw", parser(codec))
+                    format!(
+                        "{} ! {decoder} name=video_decoder ! video/x-raw",
+                        parser(codec)
+                    )
                 );
                 assert!(!pipeline.contains("memory:"));
                 assert!(!pipeline.contains("tone-mapping"));

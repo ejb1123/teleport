@@ -60,10 +60,17 @@ TCP (login) and UDP (streaming) on the host port over your intended network only
 
 1. Obtain the certificate fingerprint from **Host settings**, or from
    `teleport host-admin status` over an already trusted SSH connection.
-2. Choose **Use Linux account** in the launcher. Enter the address, Linux username
-   and password, and verified 64-hex fingerprint. For an exactly matching saved
-   host, a blank fingerprint uses the already-pinned identity.
-3. Click **Log in once**, then **Connect** within 60 seconds.
+2. **Add desktop** with a name and `HOST:4443`, then choose **Connect** and
+   **Linux account**. Enter the Linux username and password and click **Continue**.
+3. On first contact, compare the full displayed SHA-256 fingerprint with your
+   trusted source and explicitly approve it. The certificate-observation connection
+   sends no credentials and deliberately aborts TLS; approval saves only the pin.
+   Login then opens a new, strictly pinned TLS connection and launches the session.
+   Later logins reuse the pin automatically, but still ask for the Linux password.
+   Changed certificates are blocked, not silently replaced or re-approved.
+
+This is Teleport's TLS certificate fingerprint, not the SSH server's host key.
+SSH is only one trusted way to read and compare it on the host.
 
 CLI equivalent (password prompted privately):
 

@@ -48,8 +48,10 @@ nix build
 ./result/bin/teleport
 ```
 
-Enter `HOST:4443`, the Teleport username and passphrase, then **Log in & save**.
-Choose **Connect to desktop**. The client saves a device credential and the
+Choose **Add desktop**, save a name and `HOST:4443`, then **Connect**.
+Select **Teleport account**, enter the username and passphrase, and **Continue**.
+On first contact verify and approve the displayed host fingerprint; the native
+session opens automatically. The client saves a device credential and the
 host's certificate fingerprint, not your passphrase. Subsequent connections use
 that saved identity without another password prompt.
 

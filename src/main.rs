@@ -28,7 +28,7 @@ mod system_login;
 mod system_pam;
 mod windowing;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 
@@ -159,7 +159,14 @@ fn main() -> Result<()> {
             let pairing =
                 runtime.block_on(access::login(&address, &username, &password, &device_name))?;
             let profile = profiles::save_pairing(&address, &pairing, &mut profiles::load()?)?;
-            println!("Logged in and saved: {}", profile.pairing_file.display());
+            println!(
+                "Logged in and saved: {}",
+                profile
+                    .pairing_file
+                    .as_ref()
+                    .context("login did not save credentials")?
+                    .display()
+            );
             Ok(())
         }
         Some(Command::Client(options)) => client::run(options, &runtime),
@@ -178,7 +185,14 @@ fn main() -> Result<()> {
             std::io::stdin().lock().take(128).read_line(&mut code)?;
             let pairing = runtime.block_on(pairing::pair(&address, &code))?;
             let profile = profiles::save_pairing(&address, &pairing, &mut profiles::load()?)?;
-            println!("Paired and saved: {}", profile.pairing_file.display());
+            println!(
+                "Paired and saved: {}",
+                profile
+                    .pairing_file
+                    .as_ref()
+                    .context("pairing did not save credentials")?
+                    .display()
+            );
             Ok(())
         }
         Some(Command::Launcher) | None => launcher::run(),

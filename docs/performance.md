@@ -14,12 +14,17 @@ heartbeats, and cache their selection for that client process.
 | Video Mbps | Encoded access-unit bytes received per interval, excluding QUIC/TLS/control/audio overhead |
 | Received / decoded / displayed FPS | Counts at each corresponding client stage; displaying a frame is not proof it scanned out |
 | Host encoder time | Latest matched encoder sink/output PTS interval, including buffering inside that encoder; unavailable if timestamps do not match |
-| Receive to decoded | Latest complete access unit entering appsrc until decoded pixels are copied to the client frame slot; includes queue, decode, conversion and copy |
+| Receive to ready | Latest complete access unit entering appsrc until decoded pixels have been copied for the client frame slot; includes queue, decode, conversion and copy |
+| Compressed queue | That same frame's appsrc enqueue-to-output interval, before parsing |
+| Parse/decode/download | That same frame's appsrc output to decoder raw-output pad; includes parser/driver scheduling, not pure GPU execution |
+| Convert / copy | That same frame's raw decoder output to copied display pixels; mapping may also perform deferred GPU downloads |
 | Decoded frame wait | Time in the client frame slot until the render loop begins processing it, before texture upload |
 | Decoder queue | Encoded bytes waiting in appsrc; not a measurement of every internal decoder queue |
 | Skipped groups | MoQ GOPs superseded, missing, or incomplete; not a packet-loss percentage |
 | Superseded frames | Decoded frames replaced in the latest-frame slot before the renderer consumed them |
 | Unmatched timestamps | Frames whose exact local receive identity could not be recovered; their receive/decode timing and video generation are unavailable |
+| Decoder recoveries | Pipeline resets after compressed backlog exceeds the age/count/size budget; the entire remaining GOP is skipped and reception resumes at a new keyframe group |
+| Stale frames | Output discarded because it was already more than 250 ms old before publication |
 
 No cross-machine wall-clock subtraction is used. Capture latency, one-way network
 latency, GPU presentation/scanout, and input-to-photon latency are **not measured**.
@@ -28,6 +33,17 @@ high-speed-camera test remains the acceptance method for input-to-photon latency
 An unchanged desktop may produce fewer captured frames; requested FPS is a cap,
 not a promise of unique frames. Values shown for the latest frame are samples,
 not percentiles. HDR codec diagnostics are separate from performance telemetry.
+
+Version 0.5.2 recovers when compressed input backlog exceeds 150 ms, 12 frames,
+or 8 MiB. A recovery is also reported as pressure to the host's bitrate controller,
+even though clearing the queue makes its next instantaneous measurement small.
+This prevents stale-input accumulation; it does not guarantee that an overloaded
+GPU/CPU can sustain the requested resolution or FPS. Repeated recoveries mean
+reduce those settings and compare the same-frame timing stages. A hardware decoder
+name does not imply that color conversion, downloads or texture upload are free.
+Mac HEVC builds additionally patch VideoToolbox's output buffering to use SPS
+reordering requirements. The native session title is deliberately stable; use F8
+for changing diagnostics.
 
 Quality changes restart the video encoder for that authenticated session and
 release held input. A MoQ video-group barrier accompanies the updated desktop

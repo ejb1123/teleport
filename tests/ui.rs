@@ -84,6 +84,13 @@ fn desktop_window(
                 {
                     let title = String::from_utf8_lossy(&property.value);
                     if title.contains(title_fragment) {
+                        // Stable titles appear before SDL's first paint (and
+                        // before a failed accelerated window is recreated).
+                        if title_fragment == "Teleport - Remote Desktop"
+                            && !rendered_pixel(connection, window, 5, 5, 0x151b26)
+                        {
+                            continue;
+                        }
                         return window;
                     }
                     if !title.is_empty() {
@@ -201,32 +208,117 @@ fn type_ascii(connection: &RustConnection, root: u32, window: u32, text: &str) {
     connection.flush().unwrap();
 }
 
-fn rendered_pixel(connection: &RustConnection, window: u32, x: i16, y: i16, rgb: u32) -> bool {
+fn rendered_rgb(connection: &RustConnection, window: u32, x: i16, y: i16) -> Option<u32> {
     let Ok(cookie) =
         connection.get_image(xproto::ImageFormat::Z_PIXMAP, window, x, y, 1, 1, u32::MAX)
     else {
-        return false;
+        return None;
     };
     let Ok(image) = cookie.reply() else {
-        return false;
+        return None;
     };
     let Ok(bytes) = <[u8; 4]>::try_from(image.data.as_slice()) else {
-        return false;
+        return None;
     };
     let pixel = if connection.setup().image_byte_order == xproto::ImageOrder::LSB_FIRST {
         u32::from_le_bytes(bytes)
     } else {
         u32::from_be_bytes(bytes)
     };
-    pixel & 0xffffff == rgb
+    Some(pixel & 0xffffff)
+}
+
+fn rendered_pixel(connection: &RustConnection, window: u32, x: i16, y: i16, rgb: u32) -> bool {
+    rendered_rgb(connection, window, x, y) == Some(rgb)
 }
 
 fn wait_field_focus(connection: &RustConnection, window: u32, y: i16) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !rendered_pixel(connection, window, 304, y, 0x5bdfc9) {
+        if Instant::now() >= deadline {
+            dump_window(connection, window);
+        }
         assert!(
             Instant::now() < deadline,
-            "launcher never rendered focused field"
+            "launcher never rendered focused field at y={y}"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+fn dump_window(connection: &RustConnection, window: u32) {
+    use std::io::Write;
+    let geometry = connection.get_geometry(window).unwrap().reply().unwrap();
+    let image = connection
+        .get_image(
+            xproto::ImageFormat::Z_PIXMAP,
+            window,
+            0,
+            0,
+            geometry.width,
+            geometry.height,
+            u32::MAX,
+        )
+        .unwrap()
+        .reply()
+        .unwrap();
+    let mut file = tempfile::Builder::new()
+        .prefix("teleport-ui-failure-")
+        .suffix(".ppm")
+        .tempfile_in("/tmp")
+        .unwrap();
+    writeln!(file, "P6\n{} {}\n255", geometry.width, geometry.height).unwrap();
+    for bytes in image.data.chunks_exact(4) {
+        let pixel = if connection.setup().image_byte_order == xproto::ImageOrder::LSB_FIRST {
+            u32::from_le_bytes(bytes.try_into().unwrap())
+        } else {
+            u32::from_be_bytes(bytes.try_into().unwrap())
+        };
+        file.write_all(&[(pixel >> 16) as u8, (pixel >> 8) as u8, pixel as u8])
+            .unwrap();
+    }
+    let (_, path) = file.keep().unwrap();
+    eprintln!("UI failure screenshot: {}", path.display());
+}
+
+fn add_desktop(connection: &RustConnection, root: u32, window: u32, name: &str, address: &str) {
+    click(connection, root, window, 100, 615);
+    wait_field_focus(connection, window, 220);
+    type_ascii(connection, root, window, name);
+    click(connection, root, window, 400, 320);
+    wait_field_focus(connection, window, 300);
+    type_ascii(connection, root, window, address);
+    click(connection, root, window, 500, 410);
+}
+
+fn wait_host_approval(connection: &RustConnection, window: u32) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !(rendered_pixel(connection, window, 304, 460, 0x141e2b)
+        && (rendered_pixel(connection, window, 304, 560, 0x5bdfc9)
+            || rendered_pixel(connection, window, 304, 560, 0x6defd9)))
+    {
+        if Instant::now() >= deadline {
+            dump_window(connection, window);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "first-contact fingerprint approval did not appear"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+fn wait_authentication_form(connection: &RustConnection, window: u32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(rendered_pixel(connection, window, 304, 340, 0x5bdfc9)
+        && rendered_pixel(connection, window, 304, 460, 0x5bdfc9))
+    {
+        if Instant::now() >= deadline {
+            dump_window(connection, window);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "authentication form did not appear"
         );
         std::thread::sleep(Duration::from_millis(30));
     }
@@ -428,34 +520,96 @@ fn launcher_authentication(password_mode: bool) {
         );
         std::thread::sleep(Duration::from_millis(30));
     };
-    click(&connection, root, window, 400, 200);
-    wait_field_focus(&connection, window, 180);
-    type_ascii(&connection, root, window, &address);
-    std::thread::sleep(Duration::from_millis(100));
-    if password_mode {
-        click(&connection, root, window, 400, 560);
-        type_ascii(&connection, root, window, "work");
-    } else {
-        // Password login is now the default; exercise the optional legacy code tab.
-        click(&connection, root, window, 650, 645);
-    }
-    click(&connection, root, window, 400, 603);
-    wait_field_focus(&connection, window, 585);
-    type_ascii(
-        &connection,
-        root,
-        window,
-        if password_mode { PASSWORD } else { &code },
-    );
-    std::thread::sleep(Duration::from_millis(100));
-    click(&connection, root, window, 870, 603);
+    add_desktop(&connection, root, window, "Work desktop", &address);
     let index = config.join("teleport/profiles.json");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !index.exists() {
+        assert!(Instant::now() < deadline, "desktop draft was not saved");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let draft: serde_json::Value = serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+    assert_eq!(draft[0]["name"], "Work desktop");
+    assert!(draft[0]["pairing_file"].is_null());
+    assert!(draft[0]["fingerprint"].is_null());
+    // Drafts survive an actual application restart without requiring auth.
+    launcher.0.kill().unwrap();
+    launcher.0.wait().unwrap();
+    launcher = Process(
+        teleport(&display_name)
+            .arg("launcher")
+            .env("XDG_CONFIG_HOME", &config)
+            .env("SDL_RENDER_DRIVER", "software")
+            .env("SDL_IM_MODULE", "none")
+            .env("XMODIFIERS", "@im=none")
+            .spawn()
+            .unwrap(),
+    );
+    let window = desktop_window(&connection, root, &mut launcher, "Teleport", None);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !rendered_pixel(&connection, window, 304, 272, 0x5bdfc9) {
+        assert!(
+            Instant::now() < deadline,
+            "saved desktop was not selectable after restart"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    click(&connection, root, window, 500, 294);
+    wait_authentication_form(&connection, window);
+    let sign_in = || {
+        click(
+            &connection,
+            root,
+            window,
+            if password_mode { 560 } else { 740 },
+            238,
+        );
+        if password_mode {
+            click(&connection, root, window, 400, 320);
+            wait_field_focus(&connection, window, 300);
+            type_ascii(&connection, root, window, "work");
+        }
+        click(&connection, root, window, 400, 400);
+        wait_field_focus(&connection, window, 380);
+        type_ascii(
+            &connection,
+            root,
+            window,
+            if password_mode { PASSWORD } else { &code },
+        );
+        click(&connection, root, window, 500, 480);
+    };
+    sign_in();
+    wait_host_approval(&connection, window);
+    // A queued/repeated click at the previous Continue position cannot approve
+    // a certificate, even if authentication completes between click edges.
+    click(&connection, root, window, 500, 480);
+    click(&connection, root, window, 500, 480);
+    std::thread::sleep(Duration::from_millis(100));
+    let before_approval: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+    assert!(before_approval[0]["pairing_file"].is_null());
+    assert!(before_approval[0]["fingerprint"].is_null());
+    if password_mode {
+        // Rejecting first contact never writes a pin or returned credential.
+        click(&connection, root, window, 870, 580);
+        std::thread::sleep(Duration::from_millis(100));
+        let rejected: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+        assert!(rejected[0]["pairing_file"].is_null());
+        assert!(rejected[0]["fingerprint"].is_null());
+        // Username is retained, but the password was cleared on cancellation.
+        click(&connection, root, window, 400, 400);
+        wait_field_focus(&connection, window, 380);
+        type_ascii(&connection, root, window, PASSWORD);
+        click(&connection, root, window, 500, 480);
+        wait_host_approval(&connection, window);
+    }
+    click(&connection, root, window, 500, 580);
     let deadline = Instant::now() + Duration::from_secs(15);
     let profiles: serde_json::Value = loop {
-        if let Some(profiles) = std::fs::read(&index)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        {
+        let profiles: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+        if profiles[0]["pairing_file"].is_string() {
             break profiles;
         }
         assert!(
@@ -464,7 +618,7 @@ fn launcher_authentication(password_mode: bool) {
         );
         assert!(
             Instant::now() < deadline,
-            "pairing button did not save a trusted host"
+            "approved host access was not saved"
         );
         std::thread::sleep(Duration::from_millis(30));
     };
@@ -484,8 +638,13 @@ fn launcher_authentication(password_mode: bool) {
     // Persistent hosts issue separately revocable credentials after code proof.
     assert_ne!(saved_pairing["token"], legacy["token"]);
     let window = desktop_window(&connection, root, &mut launcher, "Teleport", None);
-    click(&connection, root, window, 500, 294);
-    let desktop = desktop_window(&connection, root, &mut launcher, "display 1/2", None);
+    let desktop = desktop_window(
+        &connection,
+        root,
+        &mut launcher,
+        "Teleport - Remote Desktop",
+        None,
+    );
     assert_ne!(desktop, window);
     // The launcher's disconnect control owns and reaps the streaming child.
     connection
@@ -513,31 +672,24 @@ fn launcher_authentication(password_mode: bool) {
         std::thread::sleep(Duration::from_millis(30));
     }
     if password_mode {
-        // An explicit address alias reuses the pinned identity, not network trust.
+        // An alias is an ordinary saved desktop; explicitly importing an
+        // already trusted private file still shows first-contact approval.
         let alias = format!("127.0.0.1:0{}", address.rsplit(':').next().unwrap());
-        click(&connection, root, window, 400, 200);
-        // Xvfb has no window manager to restore keyboard focus after the
-        // streaming child closes. Focus before pressing the modifier too.
-        connection
-            .set_input_focus(xproto::InputFocus::PARENT, window, x11rb::CURRENT_TIME)
-            .unwrap()
-            .check()
-            .unwrap();
-        connection
-            .xtest_fake_input(xproto::KEY_PRESS_EVENT, 37, 0, root, 0, 0, 0)
-            .unwrap();
-        type_ascii(&connection, root, window, "a");
-        connection
-            .xtest_fake_input(xproto::KEY_RELEASE_EVENT, 37, 0, root, 0, 0, 0)
-            .unwrap();
-        connection.flush().unwrap();
-        type_ascii(&connection, root, window, &alias);
-        click(&connection, root, window, 870, 645);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        add_desktop(&connection, root, window, "Work alias", &alias);
+        click(&connection, root, window, 500, 294);
+        wait_authentication_form(&connection, window);
+        click(&connection, root, window, 915, 238);
+        click(&connection, root, window, 400, 400);
+        wait_field_focus(&connection, window, 380);
+        type_ascii(&connection, root, window, saved);
+        click(&connection, root, window, 500, 480);
+        wait_host_approval(&connection, window);
+        click(&connection, root, window, 500, 580);
+        let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let profiles: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
-            if profiles.as_array().unwrap().len() == 2 {
+            if profiles.as_array().unwrap().len() == 2 && profiles[1]["pairing_file"].is_string() {
                 assert_eq!(profiles[1]["address"], alias);
                 let aliased: serde_json::Value = serde_json::from_slice(
                     &std::fs::read(profiles[1]["pairing_file"].as_str().unwrap()).unwrap(),
@@ -548,10 +700,27 @@ fn launcher_authentication(password_mode: bool) {
             }
             assert!(
                 Instant::now() < deadline,
-                "saved identity alias was not created"
+                "approved identity alias was not saved"
             );
             std::thread::sleep(Duration::from_millis(30));
         }
+        let desktop = desktop_window(
+            &connection,
+            root,
+            &mut launcher,
+            "Teleport - Remote Desktop",
+            None,
+        );
+        assert_ne!(desktop, window);
+        connection
+            .configure_window(
+                window,
+                &xproto::ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        click(&connection, root, window, 870, 294);
     }
 }
 
@@ -627,7 +796,13 @@ fn native_toolbar_monitor_reconnect_disconnect_and_launcher() {
             .spawn()
             .unwrap(),
     );
-    let first = desktop_window(&connection, root, &mut client, "display 1/2", None);
+    let first = desktop_window(
+        &connection,
+        root,
+        &mut client,
+        "Teleport - Remote Desktop",
+        None,
+    );
     // Stats is rendered locally; opening it must not disrupt the session.
     click(&connection, root, first, 955, 28);
     let stats_deadline = Instant::now() + Duration::from_secs(10);
@@ -640,8 +815,35 @@ fn native_toolbar_monitor_reconnect_disconnect_and_launcher() {
     }
     click(&connection, root, first, 955, 28);
     click(&connection, root, first, 56, 28);
+    // Monitor 1 is a grayscale ball; monitor 2 is SMPTE color bars. Validate
+    // actual switched video, not a changing window title. The center top bar
+    // is green; tolerate codec/color-conversion rounding rather than exact RGB.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let switched = rendered_rgb(&connection, first, 640, 200).is_some_and(|rgb| {
+            ((rgb >> 8) & 255) > 128 && ((rgb >> 16) & 255) < 96 && (rgb & 255) < 96
+        });
+        if switched {
+            break;
+        }
+        assert!(
+            client.0.try_wait().unwrap().is_none(),
+            "client exited during monitor switch"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "monitor switch did not present SMPTE green video"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
     assert_eq!(
-        desktop_window(&connection, root, &mut client, "display 2/2", None),
+        desktop_window(
+            &connection,
+            root,
+            &mut client,
+            "Teleport - Remote Desktop",
+            None
+        ),
         first
     );
     connection
@@ -670,7 +872,13 @@ fn native_toolbar_monitor_reconnect_disconnect_and_launcher() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    let second = desktop_window(&connection, root, &mut client, "display", None);
+    let second = desktop_window(
+        &connection,
+        root,
+        &mut client,
+        "Teleport - Remote Desktop",
+        None,
+    );
     click(&connection, root, second, 1219, 28);
     wait_exit(&mut client);
 

@@ -16,6 +16,94 @@ const MAX_FRAME: usize = 4096;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(45);
 
+/// Observe an UNTRUSTED first-contact certificate for the user's approval UI.
+/// This deliberately rejects TLS after observing the certificate: it cannot
+/// return an authenticated stream or transmit application credentials. The
+/// subsequent login MUST use the separately approved pin on a new connection.
+pub async fn observe_fingerprint(address: &str) -> Result<String> {
+    use tokio_rustls::rustls;
+    crate::pairing::validate_address(address)?;
+    #[derive(Debug)]
+    struct Observe(std::sync::Mutex<Option<String>>);
+    impl rustls::client::danger::ServerCertVerifier for Observe {
+        fn verify_server_cert(
+            &self,
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            _: &[rustls::pki_types::CertificateDer<'_>],
+            _: &rustls::pki_types::ServerName<'_>,
+            _: &[u8],
+            _: rustls::pki_types::UnixTime,
+        ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error>
+        {
+            let pin = ring::digest::digest(&ring::digest::SHA256, cert.as_ref())
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            *self.0.lock().unwrap() = Some(pin);
+            Err(rustls::Error::General(
+                "first-contact observation is not trust".into(),
+            ))
+        }
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &rustls::pki_types::CertificateDer<'_>,
+            _: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+        {
+            Err(rustls::Error::General(
+                "observation cannot authenticate".into(),
+            ))
+        }
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            signature: &rustls::DigitallySignedStruct,
+        ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+        {
+            self.verify_tls12_signature(message, cert, signature)
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+    let observer = Arc::new(Observe(std::sync::Mutex::new(None)));
+    // Observation never accepts a certificate, so it must not require an OS CA
+    // store merely to construct the connector (Nix build sandboxes have none).
+    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])?
+    .dangerous()
+    .with_custom_certificate_verifier(observer.clone())
+    .with_no_client_auth();
+    tls.alpn_protocols = vec![ALPN.to_vec()];
+    tls.enable_early_data = false;
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let mut stream = TcpStream::connect(address).await?;
+        stream.write_all(MAGIC).await?;
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
+        let name = rustls::pki_types::ServerName::try_from("teleport.local")?;
+        let result = connector.connect(name, stream).await;
+        ensure!(
+            result.is_err(),
+            "identity observation unexpectedly authenticated"
+        );
+        observer
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .context("host did not offer a system-login certificate")
+    })
+    .await
+    .context("host identity discovery timed out")?
+}
+
 async fn read_frame(stream: &mut (impl AsyncRead + Unpin)) -> Result<Zeroizing<Vec<u8>>> {
     let size = stream.read_u32().await? as usize;
     ensure!(size > 0 && size <= MAX_FRAME, "invalid system login frame");
@@ -247,6 +335,39 @@ mod tests {
                 .await
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn first_contact_observes_pin_but_never_authenticates_or_sends_credentials() -> Result<()>
+    {
+        use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject};
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join("identity");
+        let identity = crate::identity::open(&directory)?;
+        let der = CertificateDer::from_pem_file(&identity.certificate)?;
+        let expected: String = ring::digest::digest(&ring::digest::SHA256, der.as_ref())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let config = Config::new(&directory, "/unused-test-helper".into())?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?.to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            let mut magic = [0; 8];
+            stream.read_exact(&mut magic).await?;
+            ensure!(&magic == MAGIC, "wrong magic");
+            ensure!(
+                config.acceptor.accept(stream).await.is_err(),
+                "observation must abort before application data is possible"
+            );
+            Ok::<(), anyhow::Error>(())
+        });
+        assert_eq!(observe_fingerprint(&address).await?, expected);
+        server.await??;
         Ok(())
     }
 

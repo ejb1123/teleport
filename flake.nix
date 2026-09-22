@@ -37,7 +37,12 @@
             gst_all_1.gstreamer
             gst_all_1.gst-plugins-base
             gst_all_1.gst-plugins-good
-            gst_all_1.gst-plugins-bad
+            (
+              if pkgs.stdenv.hostPlatform.isDarwin then
+                import ./nix/gst-applemedia-lowlatency.nix { inherit pkgs; }
+              else
+                gst_all_1.gst-plugins-bad
+            )
             gst_all_1.gst-plugins-ugly
             gst_all_1.gst-libav
             SDL2
@@ -81,7 +86,10 @@
         let
           pkgs = import nixpkgs { inherit system; };
         in
-        pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        {
+          applemedia-lowlatency = import ./nix/gst-applemedia-lowlatency-check.nix { inherit pkgs; };
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           pipewire-hdr = import ./nix/pipewire-hdr-check.nix { inherit pkgs; };
         }
       );
@@ -94,7 +102,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "teleport";
-            version = "0.5.1";
+            version = "0.5.2";
             src = pkgs.lib.fileset.toSource {
               root = ./.;
               fileset = pkgs.lib.fileset.unions [
@@ -130,7 +138,7 @@
                 ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
                   --unset LD_LIBRARY_PATH --unset LD_PRELOAD \
                   --unset SDL_DYNAMIC_API --unset SDL3_DYNAMIC_API \
-                  --set FONTCONFIG_FILE "${pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; }}" \
+                  --set FONTCONFIG_FILE "${import ./nix/fontconfig.nix { inherit pkgs; }}" \
                   --set FONTCONFIG_PATH "${pkgs.fontconfig.out}/etc/fonts" \
                   --set-default LIBVA_DRIVERS_PATH "${deps.vaDrivers}/lib/dri" \
                   ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isx86_64 ''--set-default ONEVPL_PRIORITY_PATH "${pkgs.vpl-gpu-rt}/lib"''} \

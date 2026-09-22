@@ -2,8 +2,10 @@
 
 Start the host from your graphical-session terminal with `--pair` and a persistent
 `--identity-dir`. After portal approval it prints a random six-digit code. Enter
-the host's address and that code in the native launcher; **Pair & save host**
-stores private credentials, and **Connect / reconnect** opens the desktop.
+the host's address under **Add desktop** in the native launcher. **Connect** opens
+sign-in; select **Pairing code**, enter the code, and **Continue**. Verify and
+approve the first-contact host fingerprint to save private credentials and open
+the desktop automatically. A changed saved fingerprint is blocked.
 No manual file transfer or subsequent trust prompt is needed. The existing file
 import workflow remains available. This does not change Wayland consent rules.
 
@@ -21,8 +23,9 @@ import workflow remains available. This does not change Wayland consent rules.
   before saving it in the existing 0700 profile directory and 0600 files.
 - Subsequent MoQ connections still strictly pin the saved TLS certificate.
   Changed identities fail; there is no trust-all certificate verifier or automatic
-  fallback. Entering a fresh host code is an explicit re-pair action and may
-  replace the saved profile for that address.
+  fallback. A fresh host code can renew credentials for the same identity, but
+  cannot replace a saved fingerprint. Investigate unexpected identity changes
+  before explicitly removing old trust.
 
 ## Limits and recovery
 

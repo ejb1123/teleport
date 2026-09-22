@@ -9,8 +9,6 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-type PairingReceiver = std::sync::mpsc::Receiver<(String, bool, Result<crate::protocol::Pairing>)>;
-
 fn session_profile(
     address: &str,
     pairing: &crate::protocol::Pairing,
@@ -37,13 +35,16 @@ fn session_profile(
     options.open(&path)?.write_all(&serialized)?;
     Ok((
         crate::profiles::Profile {
+            name: String::new(),
             address: address.into(),
-            pairing_file: path,
+            pairing_file: Some(path),
+            fingerprint: Some(pairing.fingerprint.clone()),
         },
         directory,
     ))
 }
 
+#[cfg(test)]
 fn system_fingerprint(
     address: &str,
     explicit: &str,
@@ -54,8 +55,9 @@ fn system_fingerprint(
             .iter()
             .find(|profile| profile.address == address)
             .context("a trusted host fingerprint is required")?;
-        crate::profiles::check_private_file(&profile.pairing_file)?;
-        crate::protocol::Pairing::read(&profile.pairing_file)?.fingerprint
+        profile
+            .trusted_fingerprint()?
+            .context("approve this desktop's fingerprint first")?
     } else {
         explicit.trim().to_ascii_lowercase()
     };
@@ -84,29 +86,147 @@ pub fn font_path() -> Result<PathBuf> {
         .context("No UI font found; run through Nix or set TELEPORT_FONT to a .ttf font")
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Home,
+    Add,
+    Auth,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthMode {
+    Linux,
+    Teleport,
+    Code,
+    File,
+}
+struct Approval {
+    address: String,
+    fingerprint: String,
+    pairing: Option<crate::protocol::Pairing>,
+    presented: bool,
+}
+
+impl Approval {
+    fn accepts_click(&self, clicks: u8) -> bool {
+        self.presented && clicks == 1
+    }
+}
+
+fn approval_confirm_rect() -> Rect {
+    Rect::new(304, 560, 448, 44)
+}
+
+#[derive(Default)]
+struct AgentConsent {
+    address: String,
+    enabled: bool,
+    pending: Option<std::time::Instant>,
+}
+
+impl AgentConsent {
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+    fn select(&mut self, address: &str) {
+        if self.address != address {
+            self.clear();
+            self.address = address.into();
+        }
+    }
+    fn enabled_for(&self, address: &str) -> bool {
+        self.enabled && !address.is_empty() && self.address == address
+    }
+    fn awaiting_for(&self, address: &str, now: std::time::Instant) -> bool {
+        self.address == address
+            && self
+                .pending
+                .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(10))
+    }
+    fn click(&mut self, address: &str, now: std::time::Instant) {
+        self.select(address);
+        if self.enabled {
+            self.clear();
+        } else if !address.is_empty() && self.awaiting_for(address, now) {
+            self.enabled = true;
+            self.pending = None;
+        } else if !address.is_empty() {
+            self.pending = Some(now);
+        }
+    }
+}
+impl Drop for Approval {
+    fn drop(&mut self) {
+        if let Some(pairing) = &mut self.pairing {
+            pairing.token.zeroize();
+        }
+    }
+}
+enum WorkerResult {
+    Observed(Result<String>),
+    Authenticated(bool, Result<crate::protocol::Pairing>),
+}
+type WorkerReceiver = std::sync::mpsc::Receiver<(String, WorkerResult)>;
+
+fn authenticated_profile(
+    address: &str,
+    pairing: &crate::protocol::Pairing,
+    session_only: bool,
+    profiles: &mut Vec<crate::profiles::Profile>,
+    ephemeral: &mut Option<tempfile::TempDir>,
+) -> Result<crate::profiles::Profile> {
+    let trusted = profiles
+        .iter()
+        .find(|p| p.address == address)
+        .context("desktop is no longer saved")?
+        .trusted_fingerprint()?
+        .context("approve this desktop's fingerprint first")?;
+    anyhow::ensure!(
+        moq_native::tls::parse_fingerprint(&trusted)?
+            == moq_native::tls::parse_fingerprint(&pairing.fingerprint)?,
+        "HOST IDENTITY CHANGED: connection blocked; saved trust was not replaced"
+    );
+    if session_only {
+        let (mut profile, directory) = session_profile(address, pairing)?;
+        profile.name = profiles
+            .iter()
+            .find(|p| p.address == address)
+            .map_or_else(String::new, |p| p.name.clone());
+        *ephemeral = Some(directory);
+        Ok(profile)
+    } else {
+        *ephemeral = None;
+        crate::profiles::save_pairing(address, pairing, profiles)
+    }
+}
+
 #[allow(non_snake_case)]
 pub fn run() -> Result<()> {
-    let ADDRESS = Rect::new(304, 178, 688, 48);
     let CONNECT = Rect::new(304, 272, 448, 44);
     let DISCONNECT = Rect::new(764, 272, 228, 44);
-    let CLIPBOARD = Rect::new(304, 326, 228, 28);
-    let MUTE = Rect::new(544, 326, 176, 28);
-    let SSH_AGENT = Rect::new(732, 326, 260, 28);
-    let PAIR_FIELD = Rect::new(304, 582, 448, 44);
-    let PAIR_BUTTON = Rect::new(764, 582, 228, 44);
-    let FILE_MODE = Rect::new(304, 632, 220, 26);
-    let PASSWORD_MODE = Rect::new(540, 632, 220, 26);
-    let USERNAME = Rect::new(304, 546, 448, 30);
-    let SYSTEM_MODE = Rect::new(764, 546, 228, 30);
-    let FINGERPRINT = Rect::new(304, 664, 688, 34);
-    let HOST_SETTINGS = Rect::new(16, 704, 224, 40);
-    let TRUST_ALIAS = Rect::new(764, 632, 228, 26);
     let NEW_HOST = Rect::new(16, 592, 224, 44);
-    let RESOLUTION = Rect::new(304, 428, 180, 38);
-    let FPS = Rect::new(496, 428, 88, 38);
-    let QUALITY = Rect::new(596, 428, 106, 38);
-    let CODEC = Rect::new(714, 428, 110, 38);
-    let RANGE = Rect::new(836, 428, 156, 38);
+    let HOST_SETTINGS = Rect::new(16, 704, 224, 40);
+    let SETTINGS = Rect::new(304, 342, 220, 36);
+    let SIGN_IN = Rect::new(540, 342, 220, 36);
+    let NAME = Rect::new(304, 220, 688, 44);
+    let ADDRESS = Rect::new(304, 300, 688, 44);
+    let SAVE = Rect::new(304, 390, 448, 44);
+    let CANCEL_ADD = Rect::new(764, 390, 228, 44);
+    let USERNAME = Rect::new(304, 300, 688, 44);
+    let SECRET = Rect::new(304, 380, 688, 44);
+    let AUTH = Rect::new(304, 460, 448, 44);
+    let CANCEL_AUTH = Rect::new(764, 460, 228, 44);
+    let APPROVE = approval_confirm_rect();
+    let REJECT = Rect::new(764, 560, 228, 44);
+    debug_assert!(!APPROVE.has_intersection(AUTH));
+    let mode_rect = |index: usize| Rect::new(304 + index as i32 * 174, 220, 166, 38);
+    let pref_rect = |index: usize| {
+        Rect::new(
+            304 + (index % 3) as i32 * 232,
+            456 + (index / 3) as i32 * 54,
+            220,
+            38,
+        )
+    };
     let (sdl, video) = crate::windowing::init()?;
     let ttf = sdl2::ttf::init().map_err(anyhow::Error::msg)?;
     let font = ttf
@@ -131,263 +251,324 @@ pub fn run() -> Result<()> {
     video.text_input().start();
     let mut profiles = crate::profiles::load()?;
     let mut selected = profiles.last().cloned();
-    let mut address = selected
-        .as_ref()
-        .map(|p| p.address.clone())
-        .unwrap_or_default();
-    let mut pairing_path = String::new();
-    let mut pairing_code = String::new();
+    let mut page = Page::Home;
+    let mut mode = AuthMode::Linux;
+    let mut name = String::new();
+    let mut address = String::new();
     let mut username = String::new();
-    let mut password = Zeroizing::new(String::new());
-    let mut use_password = true;
-    let mut use_system = false;
-    let mut pinned_fingerprint = String::new();
-    let mut ephemeral: Option<tempfile::TempDir> = None;
-    let mut use_file = false;
-    let mut pending_pairing: Option<PairingReceiver> = None;
-    let mut focused = 0;
+    let mut secret = Zeroizing::new(String::new());
+    let mut focused = 0usize;
     let mut select_all = false;
     let mut host_offset = profiles.len().saturating_sub(7);
-    let started = std::time::Instant::now();
-    let mut status = if selected.is_some() {
-        "Saved host ready. Click Connect; no pairing code needed."
-    } else {
-        "Log in with your Teleport account, or choose a one-time pairing code."
-    }
-    .to_owned();
+    let mut status =
+        "Add a desktop with its name and address. Sign in when you connect.".to_owned();
+    let mut worker: Option<WorkerReceiver> = None;
+    let mut approval: Option<Approval> = None;
+    let mut ephemeral: Option<tempfile::TempDir> = None;
     let mut child: Option<Child> = None;
-    let mut progress = None;
+    let mut progress: Option<std::sync::mpsc::Receiver<String>> = None;
+    let mut connect_requested = false;
+    let mut auth_requested = false;
+    let mut settings = false;
+    let mut resolution = 0usize;
+    let mut frame_rate = 1usize;
+    let mut quality = 1usize;
+    let mut codec = 0usize;
+    let mut hdr = false;
     let mut clipboard = false;
     let mut mute = false;
-    let mut forward_agent = false;
-    let mut agent_confirmation: Option<std::time::Instant> = None;
-    let mut agent_target = String::new();
-    let mut resolution = 0;
-    let mut frame_rate = 1;
-    let mut quality = 1;
-    let mut codec = 0;
-    let mut hdr = false;
+    let mut agent_consent = AgentConsent::default();
+    let started = std::time::Instant::now();
+
     'ui: loop {
-        if let Some(receiver) = &pending_pairing {
+        agent_consent.select(
+            selected
+                .as_ref()
+                .map_or("", |profile| profile.address.as_str()),
+        );
+        if let Some(receiver) = &worker {
             match receiver.try_recv() {
-                Ok((host, system, result)) => {
-                    pending_pairing = None;
-                    pairing_code.clear();
-                    password.zeroize();
-                    match result.and_then(|pairing| {
-                        if system {
-                            let (profile, directory) = session_profile(&host, &pairing)?;
-                            ephemeral = Some(directory);
-                            Ok(profile)
-                        } else {
-                            ephemeral = None;
-                            crate::profiles::save_pairing(&host, &pairing, &mut profiles)
+                Ok((host, outcome)) => {
+                    worker = None;
+                    let result: Result<()> = (|| {
+                        match outcome {
+                            WorkerResult::Observed(result) => {
+                                let fingerprint = result?;
+                                if let Some(pin) = profiles
+                                    .iter()
+                                    .find(|p| p.address == host)
+                                    .context("desktop missing")?
+                                    .trusted_fingerprint()?
+                                {
+                                    anyhow::ensure!(
+                                        pin.eq_ignore_ascii_case(&fingerprint),
+                                        "HOST IDENTITY CHANGED: saved trust was not replaced"
+                                    );
+                                    auth_requested = true;
+                                } else {
+                                    status = "Verify the host fingerprint, then approve or cancel."
+                                        .into();
+                                    approval = Some(Approval {
+                                        address: host,
+                                        fingerprint,
+                                        pairing: None,
+                                        presented: false,
+                                    });
+                                }
+                            }
+                            WorkerResult::Authenticated(session, result) => {
+                                secret.zeroize();
+                                let mut pairing = result?;
+                                pairing.validate()?;
+                                let pin = profiles
+                                    .iter()
+                                    .find(|p| p.address == host)
+                                    .context("desktop missing")?
+                                    .trusted_fingerprint()?;
+                                if let Some(pin) = pin {
+                                    if !pin.eq_ignore_ascii_case(&pairing.fingerprint) {
+                                        pairing.token.zeroize();
+                                        anyhow::bail!(
+                                            "HOST IDENTITY CHANGED: saved trust was not replaced"
+                                        );
+                                    }
+                                    selected = Some(authenticated_profile(
+                                        &host,
+                                        &pairing,
+                                        session,
+                                        &mut profiles,
+                                        &mut ephemeral,
+                                    )?);
+                                    pairing.token.zeroize();
+                                    page = Page::Home;
+                                    connect_requested = true;
+                                } else {
+                                    anyhow::ensure!(
+                                        !session,
+                                        "Linux password login requires prior host approval"
+                                    );
+                                    status = "Verify the host fingerprint, then approve or cancel."
+                                        .into();
+                                    approval = Some(Approval {
+                                        address: host,
+                                        fingerprint: pairing.fingerprint.clone(),
+                                        pairing: Some(pairing),
+                                        presented: false,
+                                    });
+                                }
+                            }
                         }
-                    }) {
-                        Ok(profile) => {
-                            forward_agent = false;
-                            agent_confirmation = None;
-                            address = host;
-                            selected = Some(profile);
-                            host_offset = profiles.len().saturating_sub(7);
-                            status = if system { "Linux account authenticated. Click Connect once; nothing is saved and reconnect is disabled." } else { "Host verified and saved. Click Connect; no code needed next time." }.into();
-                        }
-                        Err(_) => {
-                            status = if system {
-                                "Linux login failed. Check the trusted fingerprint, account, host PAM configuration and network."
-                            } else if use_password {
-                                "Login failed. Check account/network and, if required, connect and touch your enrolled U2F key."
-                            } else {
-                                "Pairing failed. Check host/code, TCP port, or open a new code in Host settings."
-                            }.into();
-                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        secret.zeroize();
+                        status = format!("Connection blocked: {error}");
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    pending_pairing = None;
-                    pairing_code.clear();
-                    password.zeroize();
-                    status = "Pairing worker stopped. Start a new pairing attempt.".into();
+                    worker = None;
+                    secret.zeroize();
+                    status = "Connection worker stopped. Try again.".into();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
         }
         if let Some(receiver) = &progress {
-            while let Ok(message) = std::sync::mpsc::Receiver::<String>::try_recv(receiver) {
+            while let Ok(message) = receiver.try_recv() {
                 status = message;
             }
         }
         if let Some(process) = child.as_mut()
             && let Some(exit) = process.try_wait()?
         {
-            status = if exit.success() {
-                "Session ended. Connect to start again.".into()
-            } else {
-                format!(
-                    "Connection exited ({exit}). Check host, pairing and UDP 4443; see terminal for details."
-                )
-            };
             child = None;
-            if ephemeral.take().is_some() {
-                selected = None;
-                status = "Session ended. Log in again with your Linux account.".into();
-            }
             progress = None;
-            forward_agent = false;
-            agent_confirmation = None;
+            if ephemeral.take().is_some() {
+                selected = profiles
+                    .iter()
+                    .find(|p| selected.as_ref().is_some_and(|s| s.address == p.address))
+                    .cloned();
+            }
+            agent_consent.clear();
+            if exit.success() {
+                status = "Disconnected. Your desktop is saved for next time.".into();
+            } else {
+                page = Page::Auth;
+                status = "Connection failed. Check the network, or sign in again. Saved identity remains pinned.".into();
+            }
         }
         for event in events.poll_iter() {
-            if agent_target != address {
-                forward_agent = false;
-                agent_confirmation = None;
+            if matches!(event, Event::Quit { .. }) {
+                break 'ui;
             }
-            let mut action = None;
-            match event {
-                Event::Quit { .. } => break 'ui,
-                Event::TextInput { text, .. } => {
-                    let field = if focused == 0 {
-                        &mut address
-                    } else if focused == 2 {
-                        &mut username
-                    } else if focused == 3 {
-                        &mut pinned_fingerprint
-                    } else if use_password {
-                        &mut *password
-                    } else if !use_file {
-                        &mut pairing_code
-                    } else {
-                        &mut pairing_path
-                    };
-                    if select_all {
-                        field.zeroize();
-                        select_all = false;
+            if let Some(pending) = approval.as_ref() {
+                if let Event::MouseButtonDown {
+                    x,
+                    y,
+                    mouse_btn: sdl2::mouse::MouseButton::Left,
+                    clicks,
+                    ..
+                } = event
+                {
+                    if !pending.accepts_click(clicks) {
+                        continue;
                     }
-                    if focused == 1 && !use_file && !use_password {
-                        append_code(field, &text);
-                    } else if field.len() + text.len() <= 2048 {
-                        field.push_str(&text);
+                    if hit(REJECT, x, y) {
+                        approval = None;
+                        secret.zeroize();
+                        status = "Host approval cancelled. No new trust was saved.".into();
+                    } else if hit(APPROVE, x, y) {
+                        let host = pending.address.clone();
+                        let pin = pending.fingerprint.clone();
+                        match crate::profiles::approve_fingerprint(&host, &pin, &mut profiles) {
+                            Ok(profile) => {
+                                selected = Some(profile);
+                                let mut pending = approval.take().unwrap();
+                                if let Some(mut pairing) = pending.pairing.take() {
+                                    match authenticated_profile(
+                                        &host,
+                                        &pairing,
+                                        false,
+                                        &mut profiles,
+                                        &mut ephemeral,
+                                    ) {
+                                        Ok(profile) => {
+                                            selected = Some(profile);
+                                            page = Page::Home;
+                                            connect_requested = true;
+                                        }
+                                        Err(error) => {
+                                            status = format!("Could not save access: {error}")
+                                        }
+                                    }
+                                    pairing.token.zeroize();
+                                } else {
+                                    auth_requested = true;
+                                }
+                            }
+                            Err(error) => {
+                                approval = None;
+                                secret.zeroize();
+                                status = format!("Connection blocked: {error}");
+                            }
+                        }
                     }
                 }
-                Event::DropFile { filename, .. } => {
-                    pairing_path = filename;
-                    use_file = true;
-                    use_password = false;
-                    use_system = false;
-                    password.zeroize();
-                    focused = 1;
+                continue;
+            }
+            if worker.is_some() {
+                continue;
+            }
+            match event {
+                Event::KeyDown {
+                    keycode: Some(Keycode::Escape),
+                    ..
+                } => {
+                    page = Page::Home;
+                    secret.zeroize();
                 }
                 Event::KeyDown {
                     keycode: Some(Keycode::Tab),
                     ..
-                } => {
-                    focused = if use_password {
-                        match focused {
-                            0 => 2,
-                            2 => 1,
-                            1 if use_system => 3,
-                            _ => 0,
-                        }
-                    } else {
-                        1 - focused.min(1)
-                    };
+                } if page != Page::Home => {
+                    focused = 1 - focused.min(1);
                     select_all = false;
-                }
-                Event::KeyDown {
-                    keycode: Some(Keycode::Return | Keycode::KpEnter),
-                    ..
-                } => {
-                    action = Some(
-                        if selected
-                            .as_ref()
-                            .is_some_and(|p| p.address == address.trim())
-                            && focused == 0
-                        {
-                            2
-                        } else {
-                            0
-                        },
-                    );
                 }
                 Event::KeyDown {
                     keycode: Some(Keycode::A),
                     keymod,
                     ..
                 } if shortcut(keymod) => select_all = true,
+                Event::TextInput { text, .. } if page != Page::Home => {
+                    let field: &mut String = match (page, focused) {
+                        (Page::Add, 0) => &mut name,
+                        (Page::Add, _) => &mut address,
+                        (_, 0) if matches!(mode, AuthMode::Linux | AuthMode::Teleport) => {
+                            &mut username
+                        }
+                        _ => &mut secret,
+                    };
+                    if select_all {
+                        field.zeroize();
+                        select_all = false;
+                    }
+                    if page == Page::Auth && mode == AuthMode::Code {
+                        append_code(field, &text);
+                    } else if field.len() + text.len() <= 2048 {
+                        field.push_str(&text);
+                    }
+                }
                 Event::KeyDown {
                     keycode: Some(Keycode::Backspace),
                     ..
-                } => {
-                    if select_all {
-                        if focused == 0 {
-                            address.clear();
-                        } else if focused == 2 {
-                            username.clear();
-                        } else if focused == 3 {
-                            pinned_fingerprint.clear();
-                        } else if use_password {
-                            password.zeroize();
-                        } else if use_file {
-                            pairing_path.clear();
-                        } else {
-                            pairing_code.clear();
+                } if page != Page::Home => {
+                    let field: &mut String = match (page, focused) {
+                        (Page::Add, 0) => &mut name,
+                        (Page::Add, _) => &mut address,
+                        (_, 0) if matches!(mode, AuthMode::Linux | AuthMode::Teleport) => {
+                            &mut username
                         }
+                        _ => &mut secret,
+                    };
+                    if select_all {
+                        field.zeroize();
                         select_all = false;
-                        continue;
-                    }
-                    if focused == 0 {
-                        address.pop();
-                    } else if focused == 2 {
-                        username.pop();
-                    } else if focused == 3 {
-                        pinned_fingerprint.pop();
-                    } else if use_password {
-                        password.pop();
-                    } else if !use_file {
-                        pairing_code.pop();
                     } else {
-                        pairing_path.pop();
+                        field.pop();
                     }
                 }
                 Event::KeyDown {
                     keycode: Some(Keycode::V),
                     keymod,
                     ..
-                } if keymod.intersects(
-                    sdl2::keyboard::Mod::LCTRLMOD
-                        | sdl2::keyboard::Mod::RCTRLMOD
-                        | sdl2::keyboard::Mod::LGUIMOD
-                        | sdl2::keyboard::Mod::RGUIMOD,
-                ) =>
-                {
+                } if shortcut(keymod) && page != Page::Home => {
                     if let Ok(text) = video.clipboard().clipboard_text() {
-                        select_all = false;
-                        let field = if focused == 0 {
-                            &mut address
-                        } else if focused == 2 {
-                            &mut username
-                        } else if focused == 3 {
-                            &mut pinned_fingerprint
-                        } else if use_password {
-                            &mut *password
-                        } else if !use_file {
-                            &mut pairing_code
-                        } else {
-                            &mut pairing_path
+                        let field: &mut String = match (page, focused) {
+                            (Page::Add, 0) => &mut name,
+                            (Page::Add, _) => &mut address,
+                            (_, 0) if matches!(mode, AuthMode::Linux | AuthMode::Teleport) => {
+                                &mut username
+                            }
+                            _ => &mut secret,
                         };
-                        if focused == 1 && !use_file && !use_password {
-                            field.clear();
-                            append_code(field, &text);
-                        } else if text.len() <= 2048 {
+                        if text.len() <= 2048 {
                             field.zeroize();
-                            *field = if focused == 1 && use_password {
-                                text
+                            if page == Page::Auth && mode == AuthMode::Code {
+                                append_code(field, &text);
                             } else {
-                                text.trim().to_owned()
-                            };
+                                field.push_str(&text);
+                            }
+                            select_all = false;
                         }
                     }
                 }
-                Event::MouseWheel { y, .. } => {
+                Event::DropFile { filename, .. } if page == Page::Auth => {
+                    mode = AuthMode::File;
+                    *secret = filename;
+                    focused = 1;
+                }
+                Event::KeyDown {
+                    keycode: Some(Keycode::Return | Keycode::KpEnter),
+                    ..
+                } => match page {
+                    Page::Home => connect_requested = true,
+                    Page::Auth => auth_requested = true,
+                    Page::Add => match crate::profiles::save_desktop(
+                        name.trim(),
+                        address.trim(),
+                        &mut profiles,
+                    ) {
+                        Ok(profile) => {
+                            agent_consent.select(&profile.address);
+                            selected = Some(profile);
+                            page = Page::Home;
+                            host_offset = profiles.len().saturating_sub(7);
+                            status = "Desktop saved. Click Connect to sign in.".into();
+                        }
+                        Err(error) => status = format!("Could not add desktop: {error}"),
+                    },
+                },
+                Event::MouseWheel { y, .. } if page == Page::Home => {
                     if y < 0 {
                         host_offset = (host_offset + 1).min(profiles.len().saturating_sub(7));
                     } else {
@@ -398,277 +579,282 @@ pub fn run() -> Result<()> {
                     x,
                     y,
                     mouse_btn: sdl2::mouse::MouseButton::Left,
+                    clicks: 1,
                     ..
                 } => {
                     select_all = false;
-                    if child.is_none() {
-                        if hit(RESOLUTION, x, y) {
-                            resolution = (resolution + 1) % 5;
-                        }
-                        if hit(FPS, x, y) {
-                            frame_rate = (frame_rate + 1) % 3;
-                        }
-                        if hit(QUALITY, x, y) {
-                            quality = (quality + 1) % 3;
-                        }
-                        if hit(CODEC, x, y) {
-                            codec = (codec + 1) % 2;
-                            if codec == 0 {
-                                hdr = false;
+                    match page {
+                        Page::Add => {
+                            if hit(NAME, x, y) {
+                                focused = 0;
+                            }
+                            if hit(ADDRESS, x, y) {
+                                focused = 1;
+                            }
+                            if hit(CANCEL_ADD, x, y) {
+                                page = Page::Home;
+                            }
+                            if hit(SAVE, x, y) {
+                                match crate::profiles::save_desktop(
+                                    name.trim(),
+                                    address.trim(),
+                                    &mut profiles,
+                                ) {
+                                    Ok(profile) => {
+                                        agent_consent.select(&profile.address);
+                                        selected = Some(profile);
+                                        page = Page::Home;
+                                        host_offset = profiles.len().saturating_sub(7);
+                                        status = "Desktop saved. Click Connect to sign in.".into();
+                                    }
+                                    Err(error) => {
+                                        status = format!("Could not add desktop: {error}")
+                                    }
+                                }
                             }
                         }
-                        if hit(RANGE, x, y) && cfg!(target_os = "macos") {
-                            hdr = !hdr;
-                            if hdr {
-                                codec = 1;
-                                status = "Experimental HDR requires patched KWin and an HDR-capable Mac display.".into();
+                        Page::Auth => {
+                            if hit(USERNAME, x, y) {
+                                focused = 0;
+                            }
+                            if hit(SECRET, x, y) {
+                                focused = 1;
+                            }
+                            if hit(AUTH, x, y) {
+                                auth_requested = true;
+                            }
+                            if hit(CANCEL_AUTH, x, y) {
+                                page = Page::Home;
+                                secret.zeroize();
+                            }
+                            for (index, value) in [
+                                AuthMode::Linux,
+                                AuthMode::Teleport,
+                                AuthMode::Code,
+                                AuthMode::File,
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            {
+                                if hit(mode_rect(index), x, y) {
+                                    mode = value;
+                                    secret.zeroize();
+                                    focused =
+                                        if matches!(mode, AuthMode::Linux | AuthMode::Teleport) {
+                                            0
+                                        } else {
+                                            1
+                                        };
+                                }
                             }
                         }
-                    }
-                    if hit(NEW_HOST, x, y) && child.is_none() && pending_pairing.is_none() {
-                        forward_agent = false;
-                        agent_confirmation = None;
-                        selected = None;
-                        ephemeral = None;
-                        address.clear();
-                        pairing_code.clear();
-                        password.zeroize();
-                        focused = 0;
-                        status =
-                            "Enter your host address, then log in or use a one-time code.".into();
-                    }
-                    for (index, profile) in profiles.iter().enumerate().skip(host_offset).take(7) {
-                        if hit(
-                            Rect::new(16, 146 + ((index - host_offset) as i32) * 60, 224, 52),
-                            x,
-                            y,
-                        ) && child.is_none()
-                            && pending_pairing.is_none()
-                        {
-                            selected = Some(profile.clone());
-                            ephemeral = None;
-                            forward_agent = false;
-                            agent_confirmation = None;
-                            address = profile.address.clone();
-                            focused = 0;
-                            status =
-                                "Saved identity selected. Ready for a secure connection.".into();
-                        }
-                    }
-                    if hit(FILE_MODE, x, y) && pending_pairing.is_none() {
-                        use_file = !use_file;
-                        use_password = false;
-                        use_system = false;
-                        password.zeroize();
-                        focused = 1;
-                    }
-                    if hit(PASSWORD_MODE, x, y) && pending_pairing.is_none() {
-                        use_password = !use_password;
-                        use_system = false;
-                        use_file = false;
-                        password.zeroize();
-                        focused = if use_password { 2 } else { 1 };
-                    }
-                    if hit(USERNAME, x, y) && use_password {
-                        focused = 2;
-                    }
-                    if hit(SYSTEM_MODE, x, y) && pending_pairing.is_none() && child.is_none() {
-                        use_system = !use_system;
-                        use_password = true;
-                        use_file = false;
-                        password.zeroize();
-                        selected = None;
-                        ephemeral = None;
-                        focused = 2;
-                        status = "Linux account login requires a trusted SHA-256 host fingerprint. Session only; no saved device trust.".into();
-                    }
-                    if hit(FINGERPRINT, x, y) && use_system {
-                        focused = 3;
-                    }
-                    if hit(TRUST_ALIAS, x, y)
-                        && child.is_none()
-                        && pending_pairing.is_none()
-                        && ephemeral.is_none()
-                        && let Some(profile) =
-                            selected.as_ref().filter(|p| p.address != address.trim())
-                    {
-                        let credential = profile.pairing_file.clone();
-                        match crate::profiles::import(address.trim(), &credential, &mut profiles) {
-                            Ok(profile) => {
-                                selected = Some(profile);
-                                host_offset = profiles.len().saturating_sub(7);
-                                status = "Saved this address with the selected host's identity. TLS identity must still match.".into();
+                        Page::Home => {
+                            if hit(NEW_HOST, x, y) && child.is_none() {
+                                agent_consent.clear();
+                                page = Page::Add;
+                                name.clear();
+                                address.clear();
+                                focused = 0;
                             }
-                            Err(error) => status = format!("Could not save address: {error}"),
-                        }
-                    }
-                    if hit(HOST_SETTINGS, x, y) && cfg!(target_os = "linux") {
-                        match Command::new(std::env::current_exe()?)
-                            .arg("host-manager")
-                            .spawn()
-                        {
-                            Ok(mut process) => {
-                                std::thread::spawn(move || {
-                                    let _ = process.wait();
-                                });
+                            for (index, profile) in
+                                profiles.iter().enumerate().skip(host_offset).take(7)
+                            {
+                                if hit(
+                                    Rect::new(16, 146 + (index - host_offset) as i32 * 60, 224, 52),
+                                    x,
+                                    y,
+                                ) && child.is_none()
+                                {
+                                    selected = Some(profile.clone());
+                                    ephemeral = None;
+                                    agent_consent.clear();
+                                }
                             }
-                            Err(error) => status = format!("Could not open host settings: {error}"),
+                            if hit(CONNECT, x, y) && child.is_none() {
+                                connect_requested = true;
+                            }
+                            if hit(SIGN_IN, x, y) && child.is_none() && selected.is_some() {
+                                page = Page::Auth;
+                                secret.zeroize();
+                                focused = 0;
+                            }
+                            if hit(SETTINGS, x, y) {
+                                settings = !settings;
+                            }
+                            if hit(DISCONNECT, x, y)
+                                && let Some(mut process) = child.take()
+                            {
+                                let _ = process.kill();
+                                let _ = process.wait();
+                                progress = None;
+                                if ephemeral.take().is_some() {
+                                    selected = profiles
+                                        .iter()
+                                        .find(|p| {
+                                            selected
+                                                .as_ref()
+                                                .is_some_and(|s| s.address == p.address)
+                                        })
+                                        .cloned();
+                                }
+                                agent_consent.clear();
+                                status = "Disconnected.".into();
+                            }
+                            if settings && child.is_none() {
+                                if hit(pref_rect(0), x, y) {
+                                    resolution = (resolution + 1) % 5;
+                                }
+                                if hit(pref_rect(1), x, y) {
+                                    frame_rate = (frame_rate + 1) % 3;
+                                }
+                                if hit(pref_rect(2), x, y) {
+                                    quality = (quality + 1) % 3;
+                                }
+                                if hit(pref_rect(3), x, y) {
+                                    codec = 1 - codec;
+                                    if codec == 0 {
+                                        hdr = false;
+                                    }
+                                }
+                                if hit(pref_rect(4), x, y) && cfg!(target_os = "macos") {
+                                    hdr = !hdr;
+                                    if hdr {
+                                        codec = 1;
+                                    }
+                                }
+                                if hit(pref_rect(5), x, y) {
+                                    clipboard = !clipboard;
+                                }
+                                if hit(pref_rect(6), x, y) {
+                                    mute = !mute;
+                                }
+                                if hit(pref_rect(7), x, y) {
+                                    let target = selected
+                                        .as_ref()
+                                        .map_or("", |profile| profile.address.as_str());
+                                    agent_consent.click(target, std::time::Instant::now());
+                                    if agent_consent.awaiting_for(target, std::time::Instant::now())
+                                    {
+                                        status = "This host can request signatures with your SSH keys. Click Confirm SSH again to allow this session.".into();
+                                    }
+                                }
+                            }
+                            if hit(HOST_SETTINGS, x, y) && cfg!(target_os = "linux") {
+                                match Command::new(std::env::current_exe()?)
+                                    .arg("host-manager")
+                                    .spawn()
+                                {
+                                    Ok(mut process) => {
+                                        std::thread::spawn(move || {
+                                            let _ = process.wait();
+                                        });
+                                    }
+                                    Err(error) => {
+                                        status = format!("Could not open host settings: {error}")
+                                    }
+                                }
+                            }
                         }
-                    }
-                    if hit(ADDRESS, x, y) {
-                        focused = 0;
-                    }
-                    if hit(PAIR_FIELD, x, y) {
-                        focused = 1;
-                    }
-                    if hit(PAIR_BUTTON, x, y) && pending_pairing.is_none() && child.is_none() {
-                        action = Some(0);
-                    }
-                    if hit(CLIPBOARD, x, y) && child.is_none() {
-                        clipboard = !clipboard;
-                    }
-                    if hit(MUTE, x, y) && child.is_none() {
-                        mute = !mute;
-                    }
-                    if hit(SSH_AGENT, x, y) && child.is_none() {
-                        if forward_agent {
-                            forward_agent = false;
-                            agent_confirmation = None;
-                            status = "SSH agent forwarding disabled.".into();
-                        } else if agent_confirmation
-                            .is_some_and(|at| at.elapsed() < Duration::from_secs(10))
-                        {
-                            forward_agent = true;
-                            agent_confirmation = None;
-                            status = "SSH agent enabled for the next session only. Disconnect ends forwarding. Host must also allow it.".into();
-                        } else {
-                            agent_target = address.clone();
-                            agent_confirmation = Some(std::time::Instant::now());
-                            status = "Trust this host: it can request SSH authentication with your loaded keys. Click Confirm SSH agent within 10 seconds to enable.".into();
-                        }
-                    }
-                    if hit(CONNECT, x, y)
-                        && child.is_none()
-                        && pending_pairing.is_none()
-                        && selected
-                            .as_ref()
-                            .is_some_and(|p| p.address == address.trim())
-                    {
-                        action = Some(2);
-                    }
-                    if hit(DISCONNECT, x, y) && child.is_some() {
-                        action = Some(3);
                     }
                 }
                 _ => {}
             }
-            match action {
-                Some(0) if pending_pairing.is_some() || child.is_some() => {}
-                Some(0) if use_password => {
-                    let host = address.trim().to_owned();
-                    if let Err(error) = crate::profiles::validate_address(&host) {
-                        status = format!("Invalid address: {error}");
-                    } else if username.trim().is_empty() || password.is_empty() {
-                        status = if use_system {
-                            "Enter your Linux username and current Linux password."
-                        } else {
-                            "Enter your Teleport username and password (not your Linux login)."
-                        }
-                        .into();
-                    } else {
-                        let system = use_system;
-                        let pin = if system {
-                            match system_fingerprint(&host, &pinned_fingerprint, &profiles) {
-                                Ok(pin) => pin,
-                                Err(_) => {
-                                    status = "Enter the 64-hex SHA-256 fingerprint from trusted SSH host-admin status, or use an exactly matching saved host.".into();
-                                    continue;
+        }
+
+        if auth_requested && worker.is_none() && approval.is_none() && child.is_none() {
+            auth_requested = false;
+            if let Some(profile) = selected.clone() {
+                let host = profile.address.clone();
+                let result: Result<()> = (|| {
+                    let pin = profile.trusted_fingerprint()?;
+                    if mode == AuthMode::Linux && pin.is_none() {
+                        let (sender, receiver) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let result = tokio::runtime::Builder::new_multi_thread()
+                                .enable_all()
+                                .build()
+                                .map_err(anyhow::Error::from)
+                                .and_then(|runtime| {
+                                    runtime
+                                        .block_on(crate::system_login::observe_fingerprint(&host))
+                                });
+                            let _ = sender.send((host, WorkerResult::Observed(result)));
+                        });
+                        worker = Some(receiver);
+                        status =
+                            "Reading the host certificate. No password is sent before approval."
+                                .into();
+                        return Ok(());
+                    }
+                    anyhow::ensure!(
+                        !secret.is_empty(),
+                        "enter a password, pairing code, or file path"
+                    );
+                    if matches!(mode, AuthMode::Linux | AuthMode::Teleport) {
+                        anyhow::ensure!(!username.trim().is_empty(), "enter your username");
+                    }
+                    let user = username.trim().to_owned();
+                    let credential = Zeroizing::new(std::mem::take(&mut *secret));
+                    let auth_mode = mode;
+                    let (sender, receiver) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let result = tokio::runtime::Builder::new_multi_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(anyhow::Error::from)
+                            .and_then(|runtime| match auth_mode {
+                                AuthMode::Linux => runtime.block_on(crate::system_login::login(
+                                    &host,
+                                    &user,
+                                    &credential,
+                                    pin.as_deref().unwrap(),
+                                )),
+                                AuthMode::Teleport => runtime.block_on(crate::access::login(
+                                    &host,
+                                    &user,
+                                    &credential,
+                                    &format!("{} client", std::env::consts::OS),
+                                )),
+                                AuthMode::Code => {
+                                    runtime.block_on(crate::pairing::pair(&host, &credential))
                                 }
-                            }
-                        } else {
-                            String::new()
-                        };
-                        let username = username.trim().to_owned();
-                        let secret = Zeroizing::new(std::mem::take(&mut *password));
-                        let (sender, receiver) = std::sync::mpsc::channel();
-                        std::thread::spawn(move || {
-                            let result = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .map_err(anyhow::Error::from)
-                                .and_then(|runtime| {
-                                    if system {
-                                        runtime.block_on(crate::system_login::login(
-                                            &host, &username, &secret, &pin,
-                                        ))
-                                    } else {
-                                        runtime.block_on(crate::access::login(
-                                            &host,
-                                            &username,
-                                            &secret,
-                                            &format!("{} client", std::env::consts::OS),
-                                        ))
-                                    }
-                                });
-                            let _ = sender.send((host, system, result));
-                        });
-                        pending_pairing = Some(receiver);
-                        status = if system { "Verifying the pinned host, then authenticating your Linux account…" } else { "Authenticating account… If this host requires U2F, touch your enrolled key when it flashes." }.into();
-                    }
+                                AuthMode::File => {
+                                    let path = std::path::Path::new(credential.trim());
+                                    crate::profiles::check_private_file(path)?;
+                                    crate::protocol::Pairing::read(path)
+                                }
+                            });
+                        let _ = sender.send((
+                            host,
+                            WorkerResult::Authenticated(auth_mode == AuthMode::Linux, result),
+                        ));
+                    });
+                    worker = Some(receiver);
+                    status =
+                        "Authenticating. Touch your security key if this host requires it.".into();
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    secret.zeroize();
+                    status = format!("Sign-in blocked: {error}");
                 }
-                Some(0) if !use_file => {
-                    let host = address.trim().to_owned();
-                    if let Err(error) = crate::profiles::validate_address(&host) {
-                        status = format!("Invalid address: {error}");
-                    } else if pairing_code.len() != 6 {
-                        status = "Enter the six-digit code shown by your Linux host.".into();
-                    } else {
-                        let code = std::mem::take(&mut pairing_code);
-                        let (sender, receiver) = std::sync::mpsc::channel();
-                        std::thread::spawn(move || {
-                            let result = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .map_err(anyhow::Error::from)
-                                .and_then(|runtime| {
-                                    runtime.block_on(crate::pairing::pair(&host, &code))
-                                });
-                            let _ = sender.send((host, false, result));
-                        });
-                        pending_pairing = Some(receiver);
-                        status = "Verifying host with your code…".into();
-                    }
-                }
-                Some(0) => match crate::profiles::import(
-                    address.trim(),
-                    &PathBuf::from(pairing_path.trim()),
-                    &mut profiles,
-                ) {
-                    Ok(profile) => {
-                        ephemeral = None;
-                        selected = Some(profile);
-                        host_offset = profiles.len().saturating_sub(7);
-                        status = "Pairing imported and trusted. Ready to connect.".into();
-                        forward_agent = false;
-                        agent_confirmation = None;
-                    }
-                    Err(error) => status = format!("Import failed: {error}"),
-                },
-                Some(2) if child.is_none() && pending_pairing.is_none() => {
-                    if let Some(profile) = selected.as_ref().filter(|p| p.address == address.trim())
-                    {
-                        if let Err(error) =
-                            crate::profiles::check_private_file(&profile.pairing_file)
-                        {
-                            status = format!("Pairing unavailable: {error}");
-                            continue;
-                        }
+            }
+        }
+        if connect_requested && worker.is_none() && approval.is_none() && child.is_none() {
+            connect_requested = false;
+            if let Some(profile) = selected.as_ref() {
+                if let Some(credential) = &profile.pairing_file {
+                    let result: Result<Child> = (|| {
+                        profile
+                            .trusted_fingerprint()?
+                            .context("host identity is not approved")?;
+                        crate::profiles::check_private_file(credential)?;
                         let mut command = Command::new(std::env::current_exe()?);
                         command
                             .arg("client")
                             .arg(&profile.address)
                             .arg("--pairing-file")
-                            .arg(&profile.pairing_file)
+                            .arg(credential)
                             .arg("--width")
                             .arg([0, 1920, 2560, 1280, 3840][resolution].to_string())
                             .arg("--fps")
@@ -679,89 +865,60 @@ pub fn run() -> Result<()> {
                             .arg(["h264", "h265"][codec])
                             .arg("--dynamic-range")
                             .arg(if hdr { "hdr10" } else { "sdr" });
-                        if forward_agent {
-                            command.arg("--forward-ssh-agent");
-                        } else if ephemeral.is_none() {
-                            command.arg("--reconnect");
-                        }
                         if clipboard {
                             command.arg("--clipboard");
                         }
                         if mute {
                             command.arg("--mute");
                         }
-                        command.stdin(Stdio::null()).stdout(Stdio::piped());
-                        match command.spawn() {
-                            Ok(mut process) => {
-                                let output = process
-                                    .stdout
-                                    .take()
-                                    .context("client output pipe missing")?;
-                                let (sender, receiver) = std::sync::mpsc::sync_channel(16);
-                                std::thread::spawn(move || {
-                                    for line in BufReader::new(output).lines().map_while(Result::ok)
-                                    {
-                                        // Only fixed, non-sensitive statuses reach the UI.
-                                        println!("{line}");
-                                        let message = if line.contains("desktop connected") {
-                                            Some("Connected — native desktop session is ready.")
-                                        } else if line.contains("connecting with pinned TLS") {
-                                            Some("Connecting with the host's trusted certificate…")
-                                        } else if line.contains("reconnect")
-                                            || line.contains("connection failed")
-                                        {
-                                            Some(
-                                                "Connection interrupted; retrying. Check host/network or disconnect.",
-                                            )
-                                        } else {
-                                            None
-                                        };
-                                        if let Some(message) = message {
-                                            let _ = sender.try_send(message.to_owned());
-                                        }
-                                    }
-                                });
-                                progress = Some(receiver);
-                                child = Some(process);
-                                status =
-                                    "Connecting… session opens in a separate native window.".into();
-                            }
-                            Err(error) => status = format!("Could not launch client: {error}"),
+                        if agent_consent.enabled_for(&profile.address) {
+                            command.arg("--forward-ssh-agent");
                         }
-                    } else {
-                        status =
-                            "Log in to this host, use its one-time code, or import a pairing file."
-                                .into();
+                        command.stdin(Stdio::null()).stdout(Stdio::piped());
+                        Ok(command.spawn()?)
+                    })();
+                    match result {
+                        Ok(mut process) => {
+                            let output = process.stdout.take().context("missing client output")?;
+                            let (sender, receiver) = std::sync::mpsc::sync_channel(16);
+                            std::thread::spawn(move || {
+                                for line in BufReader::new(output).lines().map_while(Result::ok) {
+                                    println!("{line}");
+                                    if line.contains("desktop connected") {
+                                        let _ = sender.try_send(
+                                            "Connected. Your native desktop is ready.".to_owned(),
+                                        );
+                                    }
+                                }
+                            });
+                            progress = Some(receiver);
+                            child = Some(process);
+                            page = Page::Home;
+                            status = "Connecting with the saved host identity...".into();
+                        }
+                        Err(error) => {
+                            status = format!("Connection blocked: {error}");
+                            page = Page::Auth;
+                        }
                     }
+                } else {
+                    page = Page::Auth;
+                    focused = 0;
+                    status = "Choose how to sign in. Passwords are never saved.".into();
                 }
-                Some(3) => {
-                    if let Some(mut process) = child.take() {
-                        let _ = process.kill();
-                        let _ = process.wait();
-                    }
-                    status = "Disconnected. Connect to start again.".into();
-                    progress = None;
-                    if ephemeral.take().is_some() {
-                        selected = None;
-                        status = "Session ended. Log in again with your Linux account.".into();
-                    }
-                }
-                _ => {}
+            } else {
+                status = "Add or select a desktop first.".into();
             }
         }
+
         canvas.set_draw_color(Color::RGB(12, 18, 27));
         canvas.clear();
         let mouse = events.mouse_state();
-        // SDL transforms mouse events to logical coordinates, but MouseState
-        // remains in window coordinates. Apply the same letterbox transform
-        // for hover feedback after a resize (including Retina windows).
-        let (window_width, window_height) = canvas.window().size();
-        let scale = (window_width as f32 / 1040.0)
-            .min(window_height as f32 / 832.0)
-            .max(0.001);
+        let (w, h) = canvas.window().size();
+        let scale = (w as f32 / 1040.0).min(h as f32 / 832.0).max(0.001);
         let pointer = (
-            ((mouse.x() as f32 - (window_width as f32 - 1040.0 * scale) / 2.0) / scale) as i32,
-            ((mouse.y() as f32 - (window_height as f32 - 832.0 * scale) / 2.0) / scale) as i32,
+            ((mouse.x() as f32 - (w as f32 - 1040.0 * scale) / 2.0) / scale) as i32,
+            ((mouse.y() as f32 - (h as f32 - 832.0 * scale) / 2.0) / scale) as i32,
         );
         let mut ui = Painter {
             canvas: &mut canvas,
@@ -770,313 +927,301 @@ pub fn run() -> Result<()> {
             pointer,
         };
         ui.panel(Rect::new(0, 0, 256, 832), Color::RGB(17, 25, 36))?;
-        ui.panel(Rect::new(280, 124, 736, 240), Color::RGB(20, 30, 43))?;
-        ui.panel(Rect::new(280, 388, 736, 92), Color::RGB(20, 30, 43))?;
-        ui.panel(Rect::new(280, 500, 736, 204), Color::RGB(20, 30, 43))?;
-        ui.text(
-            &small_font,
-            "STREAM PREFERENCES · APPLIED ON CONNECTION",
-            304,
-            402,
-            680,
-            MUTED,
-        )?;
-        ui.button(
-            RESOLUTION,
-            [
-                "Native resolution",
-                "1080p width",
-                "1440p width",
-                "720p width",
-                "4K width",
-            ][resolution],
-            child.is_none(),
-            false,
-        )?;
-        ui.button(
-            FPS,
-            ["30 fps", "60 fps", "120 fps"][frame_rate],
-            child.is_none(),
-            false,
-        )?;
-        ui.button(
-            QUALITY,
-            ["8 Mbps", "20 Mbps", "40 Mbps"][quality],
-            child.is_none(),
-            false,
-        )?;
-        ui.button(CODEC, ["H.264", "H.265"][codec], child.is_none(), false)?;
-        ui.button(
-            RANGE,
-            if hdr { "HDR · preview" } else { "SDR" },
-            child.is_none() && cfg!(target_os = "macos"),
-            hdr,
-        )?;
         ui.text(&title_font, "teleport", 24, 30, 210, INK)?;
-        ui.text(&small_font, "YOUR DESKTOP, ANYWHERE", 24, 74, 220, MUTED)?;
-        ui.text(&small_font, "SAVED HOSTS", 24, 118, 210, MUTED)?;
-        if profiles.is_empty() {
-            ui.text(&font, "No hosts yet", 24, 160, 205, INK)?;
-            ui.text(
-                &small_font,
-                "Pair once. Connect anytime.",
-                24,
-                188,
-                210,
-                MUTED,
-            )?;
-        }
+        ui.text(&small_font, "YOUR DESKTOPS", 24, 118, 210, MUTED)?;
         for (index, profile) in profiles.iter().enumerate().skip(host_offset).take(7) {
-            let rect = Rect::new(16, 146 + ((index - host_offset) as i32) * 60, 224, 52);
+            let rect = Rect::new(16, 146 + (index - host_offset) as i32 * 60, 224, 52);
+            ui.button(
+                rect,
+                "",
+                page == Page::Home && worker.is_none() && approval.is_none(),
+                false,
+            )?;
             let active = selected
                 .as_ref()
                 .is_some_and(|p| p.address == profile.address);
-            ui.button(rect, "", true, false)?;
             if active {
-                ui.panel(
-                    Rect::new(rect.x(), rect.y() + 6, 3, rect.height() - 12),
-                    ACCENT,
-                )?;
+                ui.panel(Rect::new(rect.x(), rect.y() + 6, 3, 40), ACCENT)?;
             }
-            ui.text(&font, &profile.address, 28, rect.y() + 6, 194, INK)?;
-            ui.text(
-                &small_font,
-                if active {
-                    "Selected · verified identity"
-                } else {
-                    "Verified identity"
-                },
-                28,
-                rect.y() + 30,
-                194,
-                if active { ACCENT } else { MUTED },
-            )?;
+            ui.text(&font, profile.label(), 28, rect.y() + 6, 194, INK)?;
+            ui.text(&small_font, &profile.address, 28, rect.y() + 30, 194, MUTED)?;
         }
-        ui.button(NEW_HOST, "+  Add a host", true, false)?;
-        ui.text(&small_font, "Native · Encrypted", 24, 678, 220, MUTED)?;
-        ui.text(&title_font, "Your next connection", 284, 30, 700, INK)?;
+        if profiles.is_empty() {
+            ui.text(&font, "No desktops yet", 24, 160, 210, INK)?;
+        }
+        ui.button(
+            NEW_HOST,
+            "+ Add desktop",
+            page == Page::Home && child.is_none(),
+            true,
+        )?;
+        if cfg!(target_os = "linux") {
+            ui.button(HOST_SETTINGS, "Host settings", page == Page::Home, false)?;
+        }
+        ui.text(&small_font, "Native. Encrypted.", 24, 780, 210, MUTED)?;
+        ui.text(&title_font, "Your desktops", 284, 30, 700, INK)?;
         ui.text(
             &font,
-            "Pick a saved desktop, or securely pair a new one.",
+            "Save an address now. Sign in when you connect.",
             284,
             78,
             700,
             MUTED,
         )?;
-        ui.text(&small_font, "HOST ADDRESS", 304, 148, 500, MUTED)?;
-        ui.field(
-            ADDRESS,
-            &address,
-            "desktop.local:4443",
-            focused == 0,
-            select_all && focused == 0,
-            started.elapsed().as_millis() % 1000 < 500,
-        )?;
-        ui.text(
-            &small_font,
-            if selected
-                .as_ref()
-                .is_some_and(|p| p.address == address.trim())
-            {
-                "Verified host · identity checked on every connection"
-            } else {
-                "New address · log in below, or explicitly reuse the selected host's identity"
-            },
-            304,
-            238,
-            680,
-            MUTED,
-        )?;
-        let ready = selected
-            .as_ref()
-            .is_some_and(|p| p.address == address.trim());
-        ui.button(
-            CONNECT,
-            if child.is_some() {
-                "Session running"
-            } else {
-                "Connect to desktop"
-            },
-            ready && child.is_none() && pending_pairing.is_none(),
-            true,
-        )?;
-        ui.button(DISCONNECT, "Disconnect", child.is_some(), false)?;
-        ui.button(
-            SSH_AGENT,
-            if forward_agent {
-                "[x] SSH agent (session)"
-            } else if agent_confirmation.is_some_and(|at| at.elapsed() < Duration::from_secs(10)) {
-                "Confirm SSH agent"
-            } else {
-                "[ ] SSH agent"
-            },
-            child.is_none(),
-            forward_agent,
-        )?;
-        ui.button(
-            CLIPBOARD,
-            if clipboard {
-                "[x] Share clipboard"
-            } else {
-                "[ ] Share clipboard"
-            },
-            child.is_none(),
-            false,
-        )?;
-        ui.button(
-            MUTE,
-            if mute {
-                "[x] Mute audio"
-            } else {
-                "[ ] Mute audio"
-            },
-            child.is_none(),
-            false,
-        )?;
-        ui.text(
-            &font,
-            if use_system {
-                "Linux account · this session only"
-            } else if use_password {
-                "Sign in to your host"
-            } else {
-                "Pair a new host"
-            },
-            304,
-            520,
-            400,
-            INK,
-        )?;
-        if use_password {
-            ui.field(
-                USERNAME,
-                &username,
-                if use_system {
-                    "Linux username (for example ej)"
-                } else {
-                    "Teleport username"
-                },
-                focused == 2,
-                select_all && focused == 2,
-                started.elapsed().as_millis() % 1000 < 500,
-            )?;
-        } else {
+        ui.panel(Rect::new(280, 124, 736, 580), Color::RGB(20, 30, 43))?;
+        let caret = started.elapsed().as_millis() % 1000 < 500;
+        if let Some(pending) = &approval {
+            ui.text(&title_font, "Approve this desktop?", 304, 164, 688, INK)?;
+            ui.text(&font, &pending.address, 304, 220, 688, INK)?;
             ui.text(
                 &small_font,
-                "Run teleport host --pair on Linux. Enter the code shown there.",
+                "FIRST CONTACT - SHA-256 HOST FINGERPRINT",
                 304,
-                550,
-                440,
-                MUTED,
+                276,
+                688,
+                ACCENT,
             )?;
-        }
-        let masked = "•".repeat(password.chars().count().min(256));
-        ui.field(
-            PAIR_FIELD,
-            if use_password {
-                &masked
-            } else if use_file {
-                &pairing_path
-            } else {
-                &pairing_code
-            },
-            if use_system {
-                "Current Linux password"
-            } else if use_password {
-                "Persistent password / passphrase"
-            } else if use_file {
-                "Paste or drop a pairing file"
-            } else {
-                "Six-digit code"
-            },
-            focused == 1,
-            select_all && focused == 1,
-            started.elapsed().as_millis() % 1000 < 500,
-        )?;
-        ui.button(
-            PAIR_BUTTON,
-            if pending_pairing.is_some() {
-                "Verifying…"
-            } else if use_system {
-                "Log in once"
-            } else if use_password {
-                "Log in & save"
-            } else if use_file {
-                "Import & trust"
-            } else {
-                "Pair & save"
-            },
-            pending_pairing.is_none() && child.is_none(),
-            false,
-        )?;
-        ui.button(
-            FILE_MODE,
-            if use_file {
-                "Use one-time code"
-            } else {
-                "Import pairing file"
-            },
-            pending_pairing.is_none(),
-            false,
-        )?;
-        ui.button(
-            PASSWORD_MODE,
-            if use_password {
-                "Use one-time code"
-            } else {
-                "Use password"
-            },
-            pending_pairing.is_none(),
-            false,
-        )?;
-        ui.button(
-            SYSTEM_MODE,
-            if use_system {
-                "Use Teleport account"
-            } else {
-                "Use Linux account"
-            },
-            pending_pairing.is_none() && child.is_none(),
-            use_system,
-        )?;
-        if ephemeral.is_none()
-            && selected
-                .as_ref()
-                .is_some_and(|p| p.address != address.trim())
-        {
-            ui.button(
-                TRUST_ALIAS,
-                "Use saved identity",
-                child.is_none() && pending_pairing.is_none(),
-                false,
+            ui.text(&font, &pending.fingerprint[..32], 304, 312, 688, INK)?;
+            ui.text(&font, &pending.fingerprint[32..], 304, 344, 688, INK)?;
+            ui.text(
+                &font,
+                "Compare this fingerprint using trusted SSH or the host's screen.",
+                304,
+                400,
+                688,
+                INK,
             )?;
-        }
-        if cfg!(target_os = "linux") {
-            ui.button(HOST_SETTINGS, "Host settings", true, false)?;
-        }
-        if use_system {
-            ui.field(
-                FINGERPRINT,
-                &pinned_fingerprint,
-                "Trusted SHA-256 fingerprint (blank uses exact saved host)",
-                focused == 3,
-                select_all && focused == 3,
-                started.elapsed().as_millis() % 1000 < 500,
-            )?;
-        } else {
             ui.text(
                 &small_font,
-                "Saved device credentials. Your password is not saved on this client.",
+                "An observed certificate alone does not prove who owns this desktop.",
                 304,
-                664,
-                680,
+                430,
+                688,
                 MUTED,
             )?;
+            ui.button(APPROVE, "Approve fingerprint and continue", true, true)?;
+            ui.button(REJECT, "Cancel", true, false)?;
+        } else {
+            match page {
+                Page::Add => {
+                    ui.text(&title_font, "Add desktop", 304, 148, 688, INK)?;
+                    ui.text(&small_font, "NAME", 304, 194, 688, MUTED)?;
+                    ui.field(
+                        NAME,
+                        &name,
+                        "My Linux desktop",
+                        focused == 0,
+                        select_all && focused == 0,
+                        caret,
+                    )?;
+                    ui.text(&small_font, "ADDRESS", 304, 274, 688, MUTED)?;
+                    ui.field(
+                        ADDRESS,
+                        &address,
+                        "desktop.local:4443",
+                        focused == 1,
+                        select_all && focused == 1,
+                        caret,
+                    )?;
+                    ui.button(SAVE, "Save desktop", true, true)?;
+                    ui.button(CANCEL_ADD, "Cancel", true, false)?;
+                    ui.text(
+                        &font,
+                        "No password or pairing code is needed to save a desktop.",
+                        304,
+                        470,
+                        688,
+                        MUTED,
+                    )?;
+                }
+                Page::Auth => {
+                    ui.text(&title_font, "Sign in to your desktop", 304, 148, 688, INK)?;
+                    if let Some(profile) = &selected {
+                        ui.text(&small_font, &profile.address, 304, 192, 688, MUTED)?;
+                    }
+                    for (index, (value, label)) in [
+                        (AuthMode::Linux, "Linux account"),
+                        (AuthMode::Teleport, "Teleport account"),
+                        (AuthMode::Code, "Pairing code"),
+                        (AuthMode::File, "Pairing file"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        ui.button(mode_rect(index), label, worker.is_none(), mode == value)?;
+                    }
+                    if matches!(mode, AuthMode::Linux | AuthMode::Teleport) {
+                        ui.text(&small_font, "USERNAME", 304, 274, 688, MUTED)?;
+                        ui.field(
+                            USERNAME,
+                            &username,
+                            if mode == AuthMode::Linux {
+                                "Linux username, for example ej"
+                            } else {
+                                "Teleport username"
+                            },
+                            focused == 0,
+                            select_all && focused == 0,
+                            caret,
+                        )?;
+                    } else {
+                        ui.text(
+                            &font,
+                            if mode == AuthMode::Code {
+                                "Enter the six-digit code displayed by the host."
+                            } else {
+                                "Choose a private pairing file from a trusted source."
+                            },
+                            304,
+                            310,
+                            688,
+                            MUTED,
+                        )?;
+                    }
+                    let masked = "*".repeat(secret.chars().count().min(256));
+                    ui.field(
+                        SECRET,
+                        if matches!(mode, AuthMode::Linux | AuthMode::Teleport) {
+                            &masked
+                        } else {
+                            &secret
+                        },
+                        match mode {
+                            AuthMode::Linux => "Current Linux password",
+                            AuthMode::Teleport => "Teleport password",
+                            AuthMode::Code => "Six-digit pairing code",
+                            AuthMode::File => "Path to pairing file",
+                        },
+                        focused == 1,
+                        select_all && focused == 1,
+                        caret,
+                    )?;
+                    ui.button(
+                        AUTH,
+                        if worker.is_some() {
+                            "Please wait..."
+                        } else {
+                            "Continue"
+                        },
+                        worker.is_none(),
+                        true,
+                    )?;
+                    ui.button(CANCEL_AUTH, "Cancel", worker.is_none(), false)?;
+                    ui.text(&small_font,if mode==AuthMode::Linux{"Linux login is session-only. We remember the desktop, never the password."}else{"Successful pairing saves device access. Your password is never stored."},304,550,688,MUTED)?;
+                }
+                Page::Home => {
+                    ui.text(
+                        &title_font,
+                        selected
+                            .as_ref()
+                            .map_or("Ready when you are", |p| p.label()),
+                        304,
+                        156,
+                        688,
+                        INK,
+                    )?;
+                    ui.text(
+                        &font,
+                        selected
+                            .as_ref()
+                            .map_or("Add your first desktop to get started.", |p| {
+                                p.address.as_str()
+                            }),
+                        304,
+                        212,
+                        688,
+                        MUTED,
+                    )?;
+                    ui.button(
+                        CONNECT,
+                        if child.is_some() {
+                            "Session running"
+                        } else {
+                            "Connect"
+                        },
+                        selected.is_some() && child.is_none() && worker.is_none(),
+                        true,
+                    )?;
+                    ui.button(DISCONNECT, "Disconnect", child.is_some(), false)?;
+                    ui.button(
+                        SETTINGS,
+                        if settings {
+                            "Hide settings"
+                        } else {
+                            "Connection settings"
+                        },
+                        true,
+                        false,
+                    )?;
+                    ui.button(
+                        SIGN_IN,
+                        "Sign in again",
+                        selected.is_some() && child.is_none(),
+                        false,
+                    )?;
+                    if settings {
+                        ui.text(&small_font, "STREAM SETTINGS", 304, 420, 688, MUTED)?;
+                        let labels = [
+                            [
+                                "Native resolution",
+                                "1080p width",
+                                "1440p width",
+                                "720p width",
+                                "4K width",
+                            ][resolution],
+                            ["30 fps", "60 fps", "120 fps"][frame_rate],
+                            ["8 Mbps", "20 Mbps", "40 Mbps"][quality],
+                            ["H.264", "H.265"][codec],
+                            if hdr { "HDR preview" } else { "SDR" },
+                            if clipboard {
+                                "Clipboard on"
+                            } else {
+                                "Clipboard off"
+                            },
+                            if mute { "Audio muted" } else { "Audio on" },
+                            if agent_consent.enabled_for(
+                                selected
+                                    .as_ref()
+                                    .map_or("", |profile| profile.address.as_str()),
+                            ) {
+                                "SSH agent on"
+                            } else if agent_consent.awaiting_for(
+                                selected
+                                    .as_ref()
+                                    .map_or("", |profile| profile.address.as_str()),
+                                std::time::Instant::now(),
+                            ) {
+                                "Confirm SSH"
+                            } else {
+                                "SSH agent off"
+                            },
+                        ];
+                        for (index, label) in labels.into_iter().enumerate() {
+                            ui.button(
+                                pref_rect(index),
+                                label,
+                                child.is_none() && (index != 4 || cfg!(target_os = "macos")),
+                                false,
+                            )?;
+                        }
+                    } else {
+                        ui.text(
+                            &font,
+                            "Your connection stays native and encrypted.",
+                            304,
+                            438,
+                            688,
+                            MUTED,
+                        )?;
+                        ui.text(&small_font,"Resolution, video quality, clipboard and SSH sharing are in Connection settings.",304,474,688,MUTED)?;
+                    }
+                }
+            }
         }
-        ui.panel(Rect::new(280, 716, 736, 60), Color::RGB(17, 37, 44))?;
+        ui.panel(Rect::new(280, 716, 736, 70), Color::RGB(17, 37, 44))?;
         let surface = small_font.render(&status).blended_wrapped(INK, 688)?;
         let texture = textures.create_texture_from_surface(&surface)?;
-        let height = surface.height().min(44);
+        let height = surface.height().min(54);
         ui.canvas
             .copy(
                 &texture,
@@ -1084,21 +1229,14 @@ pub fn run() -> Result<()> {
                 Rect::new(304, 726, surface.width(), height),
             )
             .map_err(anyhow::Error::msg)?;
-        ui.text(
-            &small_font,
-            if ephemeral.is_some() {
-                "One-session Linux login · Closing disconnects and removes the temporary credential"
-            } else {
-                "Enter to connect / pair · Tab to switch fields · Closing keeps your session open"
-            },
-            284,
-            796,
-            724,
-            MUTED,
-        )?;
         canvas.present();
+        // Queued input preceding the first actual presentation cannot consent.
+        if let Some(pending) = approval.as_mut() {
+            pending.presented = true;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
+    secret.zeroize();
     if ephemeral.is_some()
         && let Some(mut process) = child.take()
     {
@@ -1107,7 +1245,6 @@ pub fn run() -> Result<()> {
     }
     Ok(())
 }
-
 const INK: Color = Color::RGB(231, 240, 246);
 const MUTED: Color = Color::RGB(146, 166, 185);
 const ACCENT: Color = Color::RGB(91, 223, 201);
@@ -1280,6 +1417,50 @@ fn append_code(code: &mut String, text: &str) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn host_approval_requires_presented_prompt_and_single_deliberate_click() {
+        let mut approval = super::Approval {
+            address: "desktop:4443".into(),
+            fingerprint: "aa".repeat(32),
+            pairing: None,
+            presented: false,
+        };
+        assert!(!approval.accepts_click(1));
+        assert!(!approval.accepts_click(2));
+        approval.presented = true;
+        assert!(approval.accepts_click(1));
+        assert!(!approval.accepts_click(2));
+        assert!(!approval.accepts_click(3));
+        let submit = sdl2::rect::Rect::new(304, 460, 448, 44);
+        assert!(!super::approval_confirm_rect().has_intersection(submit));
+        assert!(!super::approval_confirm_rect().contains_point((500, 480)));
+    }
+
+    #[test]
+    fn ssh_consent_and_pending_confirmation_are_bound_to_exact_address() {
+        let mut consent = super::AgentConsent::default();
+        let now = std::time::Instant::now();
+        consent.click("first:4443", now);
+        assert!(consent.awaiting_for("first:4443", now));
+        assert!(!consent.awaiting_for("second:4443", now));
+        consent.click("second:4443", now);
+        assert!(!consent.enabled_for("second:4443"));
+        consent.click("second:4443", now);
+        assert!(consent.enabled_for("second:4443"));
+        // Even before the UI's next select/clear, spawning another address is forbidden.
+        assert!(!consent.enabled_for("first:4443"));
+        consent.select("first:4443");
+        assert!(!consent.enabled_for("second:4443"));
+        assert!(!consent.awaiting_for("second:4443", now));
+        consent.click("first:4443", now);
+        consent.clear(); // Add desktop, disconnect, or session exit.
+        consent.click("first:4443", now);
+        assert!(!consent.enabled_for("first:4443"));
+        assert!(consent.awaiting_for("first:4443", now));
+        consent.click("first:4443", now + std::time::Duration::from_secs(11));
+        assert!(!consent.enabled_for("first:4443"));
+    }
+
+    #[test]
     fn linux_login_pin_requires_explicit_trust_and_session_file_is_temporary() -> anyhow::Result<()>
     {
         let pairing = crate::protocol::Pairing {
@@ -1287,9 +1468,9 @@ mod tests {
             fingerprint: "b".repeat(64),
         };
         let (profile, directory) = super::session_profile("desktop:4443", &pairing)?;
-        crate::profiles::check_private_file(&profile.pairing_file)?;
+        crate::profiles::check_private_file(profile.pairing_file.as_ref().unwrap())?;
         assert_eq!(
-            crate::protocol::Pairing::read(&profile.pairing_file)?.token,
+            crate::protocol::Pairing::read(profile.pairing_file.as_ref().unwrap())?.token,
             pairing.token
         );
         assert!(super::system_fingerprint("desktop:4443", "", &[]).is_err());
@@ -1308,7 +1489,7 @@ mod tests {
             super::system_fingerprint("desktop:4443", "bad", std::slice::from_ref(&profile))
                 .is_err()
         );
-        let path = profile.pairing_file.clone();
+        let path = profile.pairing_file.clone().unwrap();
         drop(directory);
         assert!(!path.exists());
         Ok(())
