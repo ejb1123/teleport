@@ -174,20 +174,32 @@ Opus and the client's audio output; use **Audio** or `--mute` to mute playback.
 This is output audio only, with no microphone forwarding and no tight A/V sync
 guarantee. `--audio-source test` generates a diagnostic tone.
 
-The host defaults to `--encoder auto`: it probes VA-API and NVIDIA encoding,
-then falls back to CPU x264 (H.264) or x265 (H.265) if neither can encode. Force `--encoder software`,
-`--encoder nvidia`, or `--encoder vaapi` for diagnosis. This is hardware
+The host defaults to `--encoder auto`: it probes Intel Quick Sync (QSV),
+AMD/Intel VA-API, then NVIDIA encoding before falling back to CPU x264 (H.264)
+or x265 (H.265). Force `--encoder qsv` (alias `quick-sync`), `--encoder vaapi`,
+`--encoder nvidia`, or `--encoder software` for diagnosis. Both VA-API and QSV
+support H.264, HEVC SDR, and HEVC Main10 HDR when the GPU supports them. This is hardware
 **encoding**, not a zero-copy pipeline; capture/conversion still use CPU memory.
-The installed plugins and system GPU drivers must support the selected backend.
+The installed plugins and GPU drivers must support the selected backend.
+Linux Nix builds bundle matching Mesa/Intel VA drivers, and x86-64 builds include
+Intel's oneVPL GPU runtime for QSV. The host still needs a working kernel GPU
+driver and permission to access `/dev/dri/renderD*` (usually the `render` group).
+Older Intel GPUs may work through VA-API but not the modern QSV runtime.
+Explicit `LIBVA_DRIVERS_PATH`, `LIBVA_DRIVER_NAME`, and `ONEVPL_PRIORITY_PATH`
+overrides are respected. Driver-specific GStreamer caches avoid reusing stale
+"no hardware found" results from previous package versions. Run `teleport doctor`
+to see available encoder/decoder factories; availability is not a hardware test.
 
-Clients probe actual hardware decoding before connecting: NVIDIA then VA on Linux,
+Clients probe actual hardware decoding before connecting: NVIDIA, VA-API, then QSV on Linux,
 and VideoToolbox on macOS. Failed probes fall back to the codec's software decoder.
 The stats overlay shows the selected decoder by name. `--software-decoder` forces
 CPU decoding. The probe checks a small synthetic stream; a device can still fail
 at larger resolutions or after a driver/device change. If that happens, reconnect
 with software decoding. Hardware decode currently downloads RGB for SDL upload;
 this is accelerated decoding, not a zero-copy render path. Physical Mac HEVC
-acceptance remains required.
+acceptance remains required. Intel VA-API has been hardware-tested for H.264,
+HEVC SDR, and HEVC HDR10 decoding; AMD and QSV still require physical-hardware
+acceptance on supported GPUs.
 
 `--bitrate 8000` is the starting bitrate and adaptive ceiling, in kbit/s.
 Receiver queue pressure and skipped video groups reduce the bitrate, with slow

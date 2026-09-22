@@ -163,6 +163,9 @@ pub enum EncoderKind {
     #[default]
     Auto,
     Software,
+    /// Intel Quick Sync (oneVPL); VA-API remains available as a fallback.
+    #[value(alias = "quick-sync")]
+    Qsv,
     Vaapi,
     Nvidia,
 }
@@ -184,6 +187,16 @@ fn encoder_fragment(
         ),
         (EncoderKind::Software, VideoCodec::H265) => format!(
             "x265enc name=video_encoder tune=zerolatency speed-preset=superfast bitrate={bitrate} key-int-max={gop} option-string=pools=4:frame-threads=2:log-level=error ! video/x-h265,profile={profile}"
+        ),
+        // GStreamer 1.26 QSV: low-latency sets AsyncDepth=1. CBR avoids
+        // look-ahead, and zero B frames prevents frame reordering. The codecs
+        // intentionally use different IDR intervals: AVC uses 0, HEVC uses 1
+        // for every I-frame to be independently decodable across MoQ groups.
+        (EncoderKind::Qsv, VideoCodec::H264) => format!(
+            "qsvh264enc name=video_encoder bitrate={bitrate} gop-size={gop} idr-interval=0 b-frames=0 low-latency=true target-usage=7 rate-control=cbr"
+        ),
+        (EncoderKind::Qsv, VideoCodec::H265) => format!(
+            "qsvh265enc name=video_encoder bitrate={bitrate} gop-size={gop} idr-interval=1 b-frames=0 low-latency=true target-usage=7 rate-control=cbr ! video/x-h265,profile={profile}"
         ),
         (EncoderKind::Vaapi, VideoCodec::H264) => format!(
             "vah264enc name=video_encoder bitrate={bitrate} key-int-max={gop} b-frames=0 rate-control=cbr"
@@ -315,7 +328,9 @@ fn select_encoder(
         return Ok(kind);
     }
     let choices: &[EncoderKind] = if matches!(kind, EncoderKind::Auto) {
-        &[EncoderKind::Vaapi, EncoderKind::Nvidia]
+        // Prefer Intel's low-latency path when available, then generic VA-API
+        // (AMD/Intel), then NVIDIA. Every choice must produce an actual frame.
+        &[EncoderKind::Qsv, EncoderKind::Vaapi, EncoderKind::Nvidia]
     } else {
         std::slice::from_ref(&kind)
     };
@@ -879,6 +894,8 @@ pub fn doctor() -> Result<()> {
     }
     println!("GStreamer {}", gst::version_string());
     for name in [
+        "qsvh264enc",
+        "qsvh265enc",
         "vah264enc",
         "nvh264enc",
         "h265parse",
@@ -889,6 +906,8 @@ pub fn doctor() -> Result<()> {
         "nvh265dec",
         "vah264dec",
         "vah265dec",
+        "qsvh264dec",
+        "qsvh265dec",
         "vtdec_hw",
         "avdec_h265",
         "opusenc",
@@ -916,6 +935,70 @@ pub fn doctor() -> Result<()> {
 mod tests {
     use super::*;
 
+    const TEST_ENCODERS: [EncoderKind; 4] = [
+        EncoderKind::Software,
+        EncoderKind::Qsv,
+        EncoderKind::Vaapi,
+        EncoderKind::Nvidia,
+    ];
+
+    #[test]
+    fn qsv_cli_and_low_latency_fragments_preserve_codec_precision() {
+        use clap::ValueEnum;
+        for value in ["qsv", "quick-sync"] {
+            assert!(matches!(
+                EncoderKind::from_str(value, false).unwrap(),
+                EncoderKind::Qsv
+            ));
+        }
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            let fragment = encoder_fragment(EncoderKind::Qsv, 60, 8000, codec);
+            assert!(fragment.starts_with(match codec {
+                VideoCodec::H264 => "qsvh264enc ",
+                VideoCodec::H265 => "qsvh265enc ",
+            }));
+            for property in [
+                "bitrate=8000",
+                "gop-size=15",
+                "b-frames=0",
+                "low-latency=true",
+                "target-usage=7",
+                "rate-control=cbr",
+            ] {
+                assert!(
+                    fragment.contains(property),
+                    "missing {property}: {fragment}"
+                );
+            }
+            assert!(fragment.contains(match codec {
+                VideoCodec::H264 => "idr-interval=0",
+                VideoCodec::H265 => "idr-interval=1",
+            }));
+            assert_eq!(encoder_pixel_format(EncoderKind::Qsv, codec), "NV12");
+        }
+        let hdr = VideoFormat {
+            codec: VideoCodec::H265,
+            dynamic_range: DynamicRange::Hdr10,
+        };
+        assert_eq!(encoder_pixel_format(EncoderKind::Qsv, hdr), "P010_10LE");
+        assert!(encoder_fragment(EncoderKind::Qsv, 60, 8000, hdr).ends_with("profile=main-10"));
+        assert!(
+            encoder_fragment(EncoderKind::Qsv, 60, 8000, VideoCodec::H265)
+                .ends_with("profile=main")
+        );
+        assert!(
+            encoder_fragment(EncoderKind::Qsv, 1, 8000, VideoCodec::H264).contains("gop-size=1")
+        );
+        assert!(
+            VideoFormat {
+                codec: VideoCodec::H264,
+                dynamic_range: DynamicRange::Hdr10
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
     fn test_encoder_available(kind: EncoderKind, format: impl Into<VideoFormat>) -> bool {
         if matches!(kind, EncoderKind::Software) {
             return true;
@@ -930,14 +1013,14 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires software/NVIDIA HEVC Main 10 and media plugins"]
+    #[ignore = "requires software/hardware HEVC Main 10 and media plugins"]
     async fn hdr_main10_stream_preserves_p010_levels_and_generation() -> Result<()> {
         gst::init()?;
         let format = VideoFormat {
             codec: VideoCodec::H265,
             dynamic_range: DynamicRange::Hdr10,
         };
-        for kind in [EncoderKind::Software, EncoderKind::Nvidia] {
+        for kind in TEST_ENCODERS {
             if !test_encoder_available(kind, format) {
                 continue;
             }
@@ -1069,11 +1152,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires software and NVIDIA video encoders"]
+    #[ignore = "requires software/hardware video encoders"]
     fn encoder_timings_use_segment_running_time() -> Result<()> {
         gst::init()?;
         for codec in [VideoCodec::H264, VideoCodec::H265] {
-            for kind in [EncoderKind::Software, EncoderKind::Nvidia] {
+            for kind in TEST_ENCODERS {
                 if !test_encoder_available(kind, codec) {
                     continue;
                 }
@@ -1173,7 +1256,7 @@ mod tests {
             .with_env_filter("teleport=debug")
             .try_init();
         for codec in [VideoCodec::H264, VideoCodec::H265] {
-            for kind in [EncoderKind::Software, EncoderKind::Nvidia] {
+            for kind in TEST_ENCODERS {
                 if !test_encoder_available(kind, codec) {
                     continue;
                 }
@@ -1276,7 +1359,12 @@ mod tests {
     fn selected_encoder_produces_decodable_video_and_updates_bitrate() -> Result<()> {
         gst::init()?;
         for codec in [VideoCodec::H264, VideoCodec::H265] {
-            for requested in [EncoderKind::Auto, EncoderKind::Software] {
+            for requested in std::iter::once(EncoderKind::Auto).chain(TEST_ENCODERS) {
+                if !matches!(requested, EncoderKind::Auto)
+                    && !test_encoder_available(requested, codec)
+                {
+                    continue;
+                }
                 let kind = select_encoder(requested, 640, 480, 30, 1_000, codec)?;
                 eprintln!("actual selected encoder: {kind:?}");
                 let format = encoder_pixel_format(kind, codec);
@@ -1299,9 +1387,17 @@ mod tests {
                     sink.try_pull_sample(gst::ClockTime::from_seconds(3))
                         .is_some()
                 );
-                // Not all VA drivers permit live mutation; the API must report this rather
-                // than claim it succeeded. Software and NVENC advertise mutable bitrate.
-                if !matches!(kind, EncoderKind::Vaapi) {
+                // Respect the installed plugin's advertised live mutation support.
+                // QSV 1.26 and some VA drivers do not advertise this capability.
+                let supports_live_bitrate = pipeline
+                    .0
+                    .by_name("video_encoder")
+                    .unwrap()
+                    .find_property("bitrate")
+                    .unwrap()
+                    .flags()
+                    .contains(gst::PARAM_FLAG_MUTABLE_PLAYING);
+                if supports_live_bitrate {
                     pipeline.set_video_bitrate(750)?;
                     assert_eq!(
                         pipeline
@@ -1315,6 +1411,8 @@ mod tests {
                         sink.try_pull_sample(gst::ClockTime::from_seconds(3))
                             .is_some()
                     );
+                } else {
+                    assert!(pipeline.set_video_bitrate(750).is_err());
                 }
                 pipeline.error()?;
             }

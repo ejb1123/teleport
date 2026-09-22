@@ -15,6 +15,17 @@
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       environment = pkgs: {
+        vaDrivers = pkgs.buildEnv {
+          name = "teleport-va-drivers";
+          paths = [
+            pkgs.mesa
+          ]
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isx86_64 [
+            pkgs.intel-media-driver
+            pkgs.intel-vaapi-driver
+          ];
+          pathsToLink = [ "/lib/dri" ];
+        };
         tools = with pkgs; [
           pkg-config
           cmake
@@ -121,6 +132,9 @@
                   --unset SDL_DYNAMIC_API --unset SDL3_DYNAMIC_API \
                   --set FONTCONFIG_FILE "${pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; }}" \
                   --set FONTCONFIG_PATH "${pkgs.fontconfig.out}/etc/fonts" \
+                  --set-default LIBVA_DRIVERS_PATH "${deps.vaDrivers}/lib/dri" \
+                  ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isx86_64 ''--set-default ONEVPL_PRIORITY_PATH "${pkgs.vpl-gpu-rt}/lib"''} \
+                  --run 'export GST_REGISTRY="''${GST_REGISTRY:-''${XDG_CACHE_HOME:-$HOME/.cache}/teleport/${builtins.baseNameOf (toString deps.vaDrivers)}-registry.bin}"' \
                 ''} \
                 --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : "${pkgs.lib.makeSearchPath "lib/gstreamer-1.0" (map pkgs.lib.getLib deps.media)}" \
                 --set TELEPORT_FONT "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf" \
@@ -174,6 +188,11 @@
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
             TELEPORT_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";
             TELEPORT_LIBFIDO2 = "${pkgs.lib.getLib pkgs.libfido2}/lib/libfido2${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
+            shellHook = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              export LIBVA_DRIVERS_PATH="''${LIBVA_DRIVERS_PATH:-${deps.vaDrivers}/lib/dri}"
+              ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isx86_64 ''export ONEVPL_PRIORITY_PATH="''${ONEVPL_PRIORITY_PATH:-${pkgs.vpl-gpu-rt}/lib}"''}
+              export GST_REGISTRY="''${GST_REGISTRY:-''${XDG_CACHE_HOME:-$HOME/.cache}/teleport/${builtins.baseNameOf (toString deps.vaDrivers)}-registry.bin}"
+            '';
           };
         }
       );
