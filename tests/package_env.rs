@@ -22,6 +22,9 @@ fn mesa_runtime_fixture(
     let mut command = std::process::Command::new("bash");
     command
         .env_clear()
+        // Nix's sandbox has no /bin/bash; keep executable discovery while
+        // clearing the graphics variables this fixture is meant to control.
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("LD_LIBRARY_PATH", "/foreign/lib")
         .env("LD_PRELOAD", "")
         .args(["-c", &format!(
