@@ -1,0 +1,4 @@
+# Opt-in policy for the same-user Teleport helper. No session creation.
+# Install root-owned mode 0644 as /etc/pam.d/teleport on Arch only.
+auth       include      system-auth
+account    include      system-auth

@@ -46,6 +46,7 @@
             pkgs.libxtst
             pkgs.wl-clipboard
             pkgs.xclip
+            pkgs.pam
           ];
       };
     in
@@ -82,7 +83,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "teleport";
-            version = "0.4.2";
+            version = "0.5.0";
             src = pkgs.lib.fileset.toSource {
               root = ./.;
               fileset = pkgs.lib.fileset.unions [
@@ -101,6 +102,18 @@
             ];
             dontUseCmakeConfigure = true;
             buildInputs = deps.media;
+            postBuild = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              $CC -O2 -Wall -Wextra -Werror packaging/pam/teleport-pam.c -o teleport-pam -lpam
+            '';
+            preCheck = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              $CC -O2 -Wall -Wextra -Werror packaging/pam/test-teleport-pam.c -o test-teleport-pam
+              ./test-teleport-pam
+            '';
+            postInstall = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              install -Dm755 teleport-pam $out/libexec/teleport-pam
+              install -Dm644 packaging/pam/teleport-pam.c $out/share/teleport/teleport-pam.c
+              install -Dm644 packaging/pam/teleport.arch $out/share/teleport/teleport.pam.arch
+            '';
             postFixup = ''
               wrapProgram $out/bin/teleport \
                 ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''

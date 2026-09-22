@@ -362,6 +362,23 @@ mod server {
         record: Mutex<Record>,
         sources: Mutex<HashMap<IpAddr, Vec<u64>>>,
         slots: tokio::sync::Semaphore,
+        system_sessions: Mutex<HashMap<Vec<u8>, SystemSession>>,
+    }
+    struct SystemSession {
+        generation: u64,
+        deadline: std::time::Instant,
+        active: bool,
+    }
+    pub struct SessionLease {
+        state: Arc<ServerState>,
+        hash: Vec<u8>,
+    }
+    impl Drop for SessionLease {
+        fn drop(&mut self) {
+            if let Ok(mut sessions) = self.state.system_sessions.lock() {
+                sessions.remove(&self.hash);
+            }
+        }
     }
     fn now() -> u64 {
         SystemTime::now()
@@ -434,6 +451,7 @@ mod server {
                 record: Mutex::new(record),
                 sources: Mutex::new(HashMap::new()),
                 slots: tokio::sync::Semaphore::new(4),
+                system_sessions: Mutex::new(HashMap::new()),
             }))
         }
 
@@ -602,6 +620,16 @@ mod server {
                 return true;
             }
             let hash = token_hash(token);
+            if self.system_login_allowed()
+                && let Ok(generation) = self.system_generation()
+                && let Ok(sessions) = self.system_sessions.lock()
+                && sessions.get(&hash).is_some_and(|s| {
+                    s.generation == generation
+                        && (s.active || s.deadline > std::time::Instant::now())
+                })
+            {
+                return true;
+            }
             self.record
                 .lock()
                 .map(|r| {
@@ -610,6 +638,96 @@ mod server {
                     })
                 })
                 .unwrap_or(false)
+        }
+
+        pub fn system_login_allowed(&self) -> bool {
+            // Never introduce a password-only alternative around configured
+            // password+U2F enrollment. PAM-specific MFA needs its own UI.
+            self.record.lock().is_ok_and(|r| r.u2f.is_none())
+        }
+
+        pub fn system_generation(&self) -> Result<u64> {
+            Ok(self
+                .record
+                .lock()
+                .map_err(|_| anyhow::anyhow!("access unavailable"))?
+                .generation)
+        }
+
+        pub fn system_admit(&self, ip: IpAddr) -> Result<()> {
+            self.admit(ip)
+        }
+
+        pub fn issue_system_session(&self, generation: u64) -> Result<Pairing> {
+            let record = self
+                .record
+                .lock()
+                .map_err(|_| anyhow::anyhow!("access unavailable"))?;
+            ensure!(
+                record.generation == generation && record.u2f.is_none(),
+                "login failed"
+            );
+            let mut sessions = self
+                .system_sessions
+                .lock()
+                .map_err(|_| anyhow::anyhow!("access unavailable"))?;
+            sessions.retain(|_, s| {
+                s.generation == generation && (s.active || s.deadline > std::time::Instant::now())
+            });
+            ensure!(sessions.len() < 16, "login temporarily unavailable");
+            let token = crate::identity::token();
+            sessions.insert(
+                token_hash(&token),
+                SystemSession {
+                    generation,
+                    deadline: std::time::Instant::now() + Duration::from_secs(60),
+                    active: false,
+                },
+            );
+            Ok(Pairing {
+                token,
+                fingerprint: self.legacy.fingerprint.clone(),
+            })
+        }
+
+        /// System tickets are claimed exactly once; dropping the lease destroys
+        /// them on disconnect, cancellation or failed stream setup. Saved trust
+        /// remains reusable and its lease removal is a no-op.
+        pub fn begin_session(self: &Arc<Self>, token: &str) -> Result<SessionLease> {
+            ensure!(
+                token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()),
+                "unauthorized session"
+            );
+            let hash = token_hash(token);
+            // Atomic authorization and claim; absence from the ticket map must
+            // never turn a concurrently revoked ticket into reusable trust.
+            let record = self
+                .record
+                .lock()
+                .map_err(|_| anyhow::anyhow!("access unavailable"))?;
+            let saved = bool::from(token.as_bytes().ct_eq(self.legacy.token.as_bytes()))
+                | record.devices.iter().fold(false, |accepted, d| {
+                    accepted | bool::from(d.token_hash.ct_eq(&hash))
+                });
+            let mut sessions = self
+                .system_sessions
+                .lock()
+                .map_err(|_| anyhow::anyhow!("access unavailable"))?;
+            if !saved {
+                let session = sessions.get_mut(&hash).context("unauthorized session")?;
+                ensure!(
+                    record.u2f.is_none()
+                        && session.generation == record.generation
+                        && !session.active
+                        && session.deadline > std::time::Instant::now(),
+                    "system login ticket already used or expired"
+                );
+                session.active = true;
+            }
+            Ok(SessionLease {
+                state: self.clone(),
+                hash,
+            })
         }
 
         fn admit(&self, ip: IpAddr) -> Result<()> {
@@ -1008,6 +1126,43 @@ mod server {
             assert!(!state.status().u2f_required);
             assert!(state.authorized(&state.legacy.token));
             task.abort();
+            Ok(())
+        }
+
+        #[test]
+        fn system_tickets_are_single_session_expiring_revocable_and_memory_only() -> Result<()> {
+            let (_temporary, state) = state()?;
+            let generation = state.system_generation()?;
+            let ticket = state.issue_system_session(generation)?;
+            assert!(state.authorized(&ticket.token));
+            let reopened = ServerState::open(state.path.parent().unwrap(), state.legacy.clone())?;
+            assert!(!reopened.authorized(&ticket.token));
+            assert!(!fs::read_to_string(&state.path)?.contains(&ticket.token));
+            let lease = state.begin_session(&ticket.token)?;
+            assert!(state.begin_session(&ticket.token).is_err());
+            assert!(state.authorized(&ticket.token));
+            drop(lease);
+            assert!(!state.authorized(&ticket.token));
+            assert!(state.begin_session(&ticket.token).is_err());
+
+            let expired = state.issue_system_session(generation)?;
+            state
+                .system_sessions
+                .lock()
+                .unwrap()
+                .get_mut(&token_hash(&expired.token))
+                .unwrap()
+                .deadline = std::time::Instant::now() - Duration::from_secs(1);
+            assert!(!state.authorized(&expired.token));
+            assert!(state.begin_session(&expired.token).is_err());
+            let active = state.issue_system_session(generation)?;
+            let _lease = state.begin_session(&active.token)?;
+            state.revoke_all_devices()?;
+            assert!(!state.authorized(&active.token));
+            assert!(state.issue_system_session(generation).is_err());
+            // Old explicitly saved trust still works and is not consumed.
+            drop(state.begin_session(&state.legacy.token)?);
+            assert!(state.authorized(&state.legacy.token));
             Ok(())
         }
 

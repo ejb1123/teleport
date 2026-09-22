@@ -1,6 +1,6 @@
 [package]
 name = "teleport"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Native Linux desktop sharing over Media over QUIC"
@@ -32,6 +32,8 @@ rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -40,9 +42,6 @@ ashpd = { version = "0.11", default-features = false, features = ["tokio"] }
 x11rb = { version = "0.13", features = ["xtest", "randr"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 base64 = "0.22"
-
-[dev-dependencies]
-tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.3"

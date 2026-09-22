@@ -3458,7 +3458,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "teleport"
-version = "0.4.2"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -3493,6 +3493,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -3615,6 +3616,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0c85f2c3ef0b1cd58b36682f4b17aaa995f0e5db534d85692b4903abce21f67"
+dependencies = [
+ "rustls",
+ "tokio",
 ]
 
 [[package]]

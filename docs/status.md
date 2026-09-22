@@ -1,5 +1,22 @@
 # Implementation status
 
+## Version 0.5.0: Existing Linux account authentication
+
+Opt-in host-native PAM authentication now accepts the desktop owner's existing
+Linux username/password. Native launcher and `login-system` CLI require a verified
+host fingerprint before sending credentials over TLS. Tickets are held in host
+memory, expire unused after 60 seconds, can be claimed once, and are removed on
+disconnect. No system password or permanent device credential is saved.
+
+The NixOS module has `systemLogin = true`; Arch hosts install a helper linked to
+Arch PAM. Both default off. Authentication and account checks run in a bounded,
+same-UID helper, never the privileged media/network process. Synthetic tests cover
+rejected passwords/accounts, wrong certificate pins, U2F downgrade refusal,
+revocation and ticket lifecycle. Actual account/distribution acceptance remains a
+supervised deployment test; no live PAM policy/service was changed during development.
+This is running-desktop access, not pre-login session creation. See
+[setup and security limits](system-login.md).
+
 ## Version 0.4.2: Linux window startup
 
 Local Linux windows now prefer X11/XWayland when DISPLAY is available, unless

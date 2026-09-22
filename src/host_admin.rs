@@ -75,6 +75,8 @@ pub struct Response {
     pub username: Option<String>,
     #[serde(default)]
     pub u2f_required: bool,
+    #[serde(default)]
+    pub system_login: bool,
     pub devices: Vec<Device>,
     pub pairing_open: bool,
     pub code: Option<String>,
@@ -226,6 +228,7 @@ pub struct Control {
     network: Mutex<Network>,
     changed: Arc<Notify>,
     epoch: AtomicU64,
+    system: Option<crate::system_login::Config>,
 }
 pub struct Service {
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -317,6 +320,7 @@ impl Control {
             fingerprint: self.pairing.fingerprint.clone(),
             username: status.username,
             u2f_required: status.u2f_required,
+            system_login: self.system.is_some() && self.access.system_login_allowed(),
             devices: status
                 .devices
                 .into_iter()
@@ -344,7 +348,10 @@ impl Control {
                 }) {
                     network.code = None;
                 }
-                if network.code.is_none() && self.access.status().username.is_none() {
+                if network.code.is_none()
+                    && self.access.status().username.is_none()
+                    && self.system.is_none()
+                {
                     network.listener = None;
                 } else {
                     self.bind(&mut network).await?;
@@ -375,6 +382,9 @@ impl Control {
                 .context("enrollment protocol header timed out")??;
                 if &magic == b"TPAUTH01" {
                     crate::access::handle(stream, self.access.clone()).await?;
+                } else if &magic == b"TPSYS001" {
+                    let config = self.system.as_ref().context("system login is disabled")?;
+                    crate::system_login::handle(stream, config, self.access.clone()).await?;
                 } else if &magic == b"TPPAIR01" {
                     let attempt = {
                         let mut network = self.network.lock().await;
@@ -412,14 +422,28 @@ impl Control {
         }
     }
 }
+#[cfg(test)]
 pub async fn start(
     directory: &Path,
     address: std::net::SocketAddr,
     pairing: crate::protocol::Pairing,
     access: Arc<crate::access::ServerState>,
 ) -> Result<(Service, Arc<Control>)> {
+    start_with_system(directory, address, pairing, access, None).await
+}
+
+pub async fn start_with_system(
+    directory: &Path,
+    address: std::net::SocketAddr,
+    pairing: crate::protocol::Pairing,
+    access: Arc<crate::access::ServerState>,
+    helper: Option<PathBuf>,
+) -> Result<(Service, Arc<Control>)> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     check_directory(directory)?;
+    let system = helper
+        .map(|path| crate::system_login::Config::new(directory, path))
+        .transpose()?;
     let path = directory.join("admin.sock");
     let (_directory, address_path) = socket_address(directory)?;
     if let Ok(metadata) = std::fs::symlink_metadata(&path) {
@@ -447,8 +471,9 @@ pub async fn start(
         }),
         changed: Arc::new(Notify::new()),
         epoch: AtomicU64::new(0),
+        system,
     });
-    if control.access.status().username.is_some() {
+    if control.access.status().username.is_some() || control.system.is_some() {
         control.bind(&mut *control.network.lock().await).await?;
     }
     let admin = control.clone();

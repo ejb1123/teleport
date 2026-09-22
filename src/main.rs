@@ -23,6 +23,9 @@ mod protocol;
 mod security_key;
 mod ssh_agent;
 mod stats;
+mod system_login;
+#[cfg(target_os = "linux")]
+mod system_pam;
 mod windowing;
 
 use anyhow::Result;
@@ -54,6 +57,17 @@ enum Command {
         username: String,
         #[arg(long, default_value = "Teleport client")]
         device_name: String,
+    },
+    /// Log in once using the Linux host user's existing password (requires PAM setup).
+    LoginSystem {
+        address: String,
+        #[arg(long)]
+        username: String,
+        /// Host SHA-256 certificate fingerprint obtained over a trusted channel.
+        #[arg(long)]
+        fingerprint: String,
+        #[arg(long)]
+        software_renderer: bool,
     },
     /// Open local host settings. Does not expose administration over the network.
     #[cfg(target_os = "linux")]
@@ -92,6 +106,42 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     // SDL's macOS window/event loop must stay on the main OS thread.
     match cli.command {
+        Some(Command::LoginSystem {
+            address,
+            username,
+            fingerprint,
+            software_renderer,
+        }) => {
+            use std::io::Write;
+            moq_native::tls::parse_fingerprint(&fingerprint)?;
+            let password =
+                zeroize::Zeroizing::new(rpassword::prompt_password("Linux account password: ")?);
+            let pairing = runtime.block_on(system_login::login(
+                &address,
+                &username,
+                &password,
+                &fingerprint,
+            ))?;
+            drop(password);
+            let mut credential = tempfile::NamedTempFile::new()?;
+            let data = zeroize::Zeroizing::new(serde_json::to_vec(&pairing)?);
+            credential.write_all(&data)?;
+            credential.flush()?;
+            let mut child = std::process::Command::new(std::env::current_exe()?);
+            child
+                .arg("client")
+                .arg(address)
+                .arg("--pairing-file")
+                .arg(credential.path());
+            if software_renderer {
+                child.arg("--software-renderer");
+            }
+            anyhow::ensure!(
+                child.status()?.success(),
+                "desktop client exited unsuccessfully"
+            );
+            Ok(())
+        }
         Some(Command::SecurityKey { command }) => security_key::run(command),
         #[cfg(target_os = "linux")]
         Some(Command::Host(options)) => runtime.block_on(host::run(options)),

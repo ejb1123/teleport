@@ -1,5 +1,9 @@
 # Host settings and persistent login
 
+For the host's existing Linux username/password instead of a separate Teleport
+account, see [Linux system login](system-login.md). It is opt-in and grants one
+session, not saved-device trust.
+
 These features require the updated host and client. They do not change the Linux
 login password, unlock a logged-out graphical session, or replace portal consent.
 Use a trusted LAN/VPN; the authentication integration has not had an independent

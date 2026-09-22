@@ -6,6 +6,10 @@
 }:
 let
   cfg = config.services.teleport-desktop;
+  pamHelper = pkgs.runCommand "teleport-system-pam" { buildInputs = [ pkgs.pam ]; } ''
+    mkdir -p $out/libexec
+    $CC -O2 -Wall -Wextra -Werror ${cfg.package}/share/teleport/teleport-pam.c -o $out/libexec/teleport-pam -lpam
+  '';
 in
 {
   options.services.teleport-desktop = {
@@ -29,6 +33,7 @@ in
       default = [ ];
       description = "Additional host arguments. Clipboard and audio are opt-in.";
     };
+    systemLogin = lib.mkEnableOption "existing Linux password login for allowed users' running desktops";
   };
   config = lib.mkIf cfg.enable {
     assertions = [
@@ -38,6 +43,7 @@ in
       }
     ];
     environment.systemPackages = [ cfg.package ];
+    security.pam.services.teleport = lib.mkIf cfg.systemLogin { };
     systemd.user.services.teleport-desktop = {
       description = "Teleport remote desktop host (graphical session)";
       wantedBy = [ "graphical-session.target" ];
@@ -45,7 +51,7 @@ in
       partOf = [ "graphical-session.target" ];
       unitConfig.ConditionUser = map (user: "|${user}") cfg.users;
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/teleport host --listen ${lib.escapeShellArg cfg.listen} --identity-dir %h/.local/state/teleport/host --restore-token %h/.local/state/teleport/host/portal-restore.json ${lib.escapeShellArgs cfg.extraArgs}";
+        ExecStart = "${cfg.package}/bin/teleport host --listen ${lib.escapeShellArg cfg.listen} --identity-dir %h/.local/state/teleport/host --restore-token %h/.local/state/teleport/host/portal-restore.json ${lib.optionalString cfg.systemLogin "--system-auth-helper ${pamHelper}/libexec/teleport-pam"} ${lib.escapeShellArgs cfg.extraArgs}";
         Restart = "on-failure";
         RestartSec = 10;
         UMask = "0077";

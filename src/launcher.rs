@@ -9,7 +9,62 @@ use std::{
 };
 use zeroize::{Zeroize, Zeroizing};
 
-type PairingReceiver = std::sync::mpsc::Receiver<(String, Result<crate::protocol::Pairing>)>;
+type PairingReceiver = std::sync::mpsc::Receiver<(String, bool, Result<crate::protocol::Pairing>)>;
+
+fn session_profile(
+    address: &str,
+    pairing: &crate::protocol::Pairing,
+) -> Result<(crate::profiles::Profile, tempfile::TempDir)> {
+    use std::io::Write;
+    pairing.validate()?;
+    let directory = tempfile::Builder::new()
+        .prefix("teleport-session-")
+        .tempdir()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    let path = directory.path().join("session.json");
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let serialized = Zeroizing::new(serde_json::to_vec(pairing)?);
+    options.open(&path)?.write_all(&serialized)?;
+    Ok((
+        crate::profiles::Profile {
+            address: address.into(),
+            pairing_file: path,
+        },
+        directory,
+    ))
+}
+
+fn system_fingerprint(
+    address: &str,
+    explicit: &str,
+    profiles: &[crate::profiles::Profile],
+) -> Result<String> {
+    let fingerprint = if explicit.trim().is_empty() {
+        let profile = profiles
+            .iter()
+            .find(|profile| profile.address == address)
+            .context("a trusted host fingerprint is required")?;
+        crate::profiles::check_private_file(&profile.pairing_file)?;
+        crate::protocol::Pairing::read(&profile.pairing_file)?.fingerprint
+    } else {
+        explicit.trim().to_ascii_lowercase()
+    };
+    anyhow::ensure!(
+        fingerprint.len() == 64 && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "expected a SHA-256 fingerprint"
+    );
+    Ok(fingerprint.to_ascii_lowercase())
+}
 
 pub fn font_path() -> Result<PathBuf> {
     let candidates = [
@@ -42,6 +97,8 @@ pub fn run() -> Result<()> {
     let FILE_MODE = Rect::new(304, 632, 220, 26);
     let PASSWORD_MODE = Rect::new(540, 632, 220, 26);
     let USERNAME = Rect::new(304, 546, 448, 30);
+    let SYSTEM_MODE = Rect::new(764, 546, 228, 30);
+    let FINGERPRINT = Rect::new(304, 664, 688, 34);
     let HOST_SETTINGS = Rect::new(16, 704, 224, 40);
     let TRUST_ALIAS = Rect::new(764, 632, 228, 26);
     let NEW_HOST = Rect::new(16, 592, 224, 44);
@@ -83,6 +140,9 @@ pub fn run() -> Result<()> {
     let mut username = String::new();
     let mut password = Zeroizing::new(String::new());
     let mut use_password = true;
+    let mut use_system = false;
+    let mut pinned_fingerprint = String::new();
+    let mut ephemeral: Option<tempfile::TempDir> = None;
     let mut use_file = false;
     let mut pending_pairing: Option<PairingReceiver> = None;
     let mut focused = 0;
@@ -110,12 +170,19 @@ pub fn run() -> Result<()> {
     'ui: loop {
         if let Some(receiver) = &pending_pairing {
             match receiver.try_recv() {
-                Ok((host, result)) => {
+                Ok((host, system, result)) => {
                     pending_pairing = None;
                     pairing_code.clear();
                     password.zeroize();
                     match result.and_then(|pairing| {
-                        crate::profiles::save_pairing(&host, &pairing, &mut profiles)
+                        if system {
+                            let (profile, directory) = session_profile(&host, &pairing)?;
+                            ephemeral = Some(directory);
+                            Ok(profile)
+                        } else {
+                            ephemeral = None;
+                            crate::profiles::save_pairing(&host, &pairing, &mut profiles)
+                        }
                     }) {
                         Ok(profile) => {
                             forward_agent = false;
@@ -123,12 +190,12 @@ pub fn run() -> Result<()> {
                             address = host;
                             selected = Some(profile);
                             host_offset = profiles.len().saturating_sub(7);
-                            status =
-                                "Host verified and saved. Click Connect; no code needed next time."
-                                    .into();
+                            status = if system { "Linux account authenticated. Click Connect once; nothing is saved and reconnect is disabled." } else { "Host verified and saved. Click Connect; no code needed next time." }.into();
                         }
                         Err(_) => {
-                            status = if use_password {
+                            status = if system {
+                                "Linux login failed. Check the trusted fingerprint, account, host PAM configuration and network."
+                            } else if use_password {
                                 "Login failed. Check account/network and, if required, connect and touch your enrolled U2F key."
                             } else {
                                 "Pairing failed. Check host/code, TCP port, or open a new code in Host settings."
@@ -161,6 +228,10 @@ pub fn run() -> Result<()> {
                 )
             };
             child = None;
+            if ephemeral.take().is_some() {
+                selected = None;
+                status = "Session ended. Log in again with your Linux account.".into();
+            }
             progress = None;
             forward_agent = false;
             agent_confirmation = None;
@@ -178,6 +249,8 @@ pub fn run() -> Result<()> {
                         &mut address
                     } else if focused == 2 {
                         &mut username
+                    } else if focused == 3 {
+                        &mut pinned_fingerprint
                     } else if use_password {
                         &mut *password
                     } else if !use_file {
@@ -199,6 +272,7 @@ pub fn run() -> Result<()> {
                     pairing_path = filename;
                     use_file = true;
                     use_password = false;
+                    use_system = false;
                     password.zeroize();
                     focused = 1;
                 }
@@ -210,6 +284,7 @@ pub fn run() -> Result<()> {
                         match focused {
                             0 => 2,
                             2 => 1,
+                            1 if use_system => 3,
                             _ => 0,
                         }
                     } else {
@@ -247,6 +322,8 @@ pub fn run() -> Result<()> {
                             address.clear();
                         } else if focused == 2 {
                             username.clear();
+                        } else if focused == 3 {
+                            pinned_fingerprint.clear();
                         } else if use_password {
                             password.zeroize();
                         } else if use_file {
@@ -261,6 +338,8 @@ pub fn run() -> Result<()> {
                         address.pop();
                     } else if focused == 2 {
                         username.pop();
+                    } else if focused == 3 {
+                        pinned_fingerprint.pop();
                     } else if use_password {
                         password.pop();
                     } else if !use_file {
@@ -286,6 +365,8 @@ pub fn run() -> Result<()> {
                             &mut address
                         } else if focused == 2 {
                             &mut username
+                        } else if focused == 3 {
+                            &mut pinned_fingerprint
                         } else if use_password {
                             &mut *password
                         } else if !use_file {
@@ -344,10 +425,11 @@ pub fn run() -> Result<()> {
                             }
                         }
                     }
-                    if hit(NEW_HOST, x, y) {
+                    if hit(NEW_HOST, x, y) && child.is_none() && pending_pairing.is_none() {
                         forward_agent = false;
                         agent_confirmation = None;
                         selected = None;
+                        ephemeral = None;
                         address.clear();
                         pairing_code.clear();
                         password.zeroize();
@@ -360,8 +442,11 @@ pub fn run() -> Result<()> {
                             Rect::new(16, 146 + ((index - host_offset) as i32) * 60, 224, 52),
                             x,
                             y,
-                        ) {
+                        ) && child.is_none()
+                            && pending_pairing.is_none()
+                        {
                             selected = Some(profile.clone());
+                            ephemeral = None;
                             forward_agent = false;
                             agent_confirmation = None;
                             address = profile.address.clone();
@@ -373,11 +458,13 @@ pub fn run() -> Result<()> {
                     if hit(FILE_MODE, x, y) && pending_pairing.is_none() {
                         use_file = !use_file;
                         use_password = false;
+                        use_system = false;
                         password.zeroize();
                         focused = 1;
                     }
                     if hit(PASSWORD_MODE, x, y) && pending_pairing.is_none() {
                         use_password = !use_password;
+                        use_system = false;
                         use_file = false;
                         password.zeroize();
                         focused = if use_password { 2 } else { 1 };
@@ -385,9 +472,23 @@ pub fn run() -> Result<()> {
                     if hit(USERNAME, x, y) && use_password {
                         focused = 2;
                     }
+                    if hit(SYSTEM_MODE, x, y) && pending_pairing.is_none() && child.is_none() {
+                        use_system = !use_system;
+                        use_password = true;
+                        use_file = false;
+                        password.zeroize();
+                        selected = None;
+                        ephemeral = None;
+                        focused = 2;
+                        status = "Linux account login requires a trusted SHA-256 host fingerprint. Session only; no saved device trust.".into();
+                    }
+                    if hit(FINGERPRINT, x, y) && use_system {
+                        focused = 3;
+                    }
                     if hit(TRUST_ALIAS, x, y)
                         && child.is_none()
                         && pending_pairing.is_none()
+                        && ephemeral.is_none()
                         && let Some(profile) =
                             selected.as_ref().filter(|p| p.address != address.trim())
                     {
@@ -420,7 +521,7 @@ pub fn run() -> Result<()> {
                     if hit(PAIR_FIELD, x, y) {
                         focused = 1;
                     }
-                    if hit(PAIR_BUTTON, x, y) && pending_pairing.is_none() {
+                    if hit(PAIR_BUTTON, x, y) && pending_pairing.is_none() && child.is_none() {
                         action = Some(0);
                     }
                     if hit(CLIPBOARD, x, y) && child.is_none() {
@@ -448,6 +549,7 @@ pub fn run() -> Result<()> {
                     }
                     if hit(CONNECT, x, y)
                         && child.is_none()
+                        && pending_pairing.is_none()
                         && selected
                             .as_ref()
                             .is_some_and(|p| p.address == address.trim())
@@ -461,16 +563,31 @@ pub fn run() -> Result<()> {
                 _ => {}
             }
             match action {
-                Some(0) if pending_pairing.is_some() => {}
+                Some(0) if pending_pairing.is_some() || child.is_some() => {}
                 Some(0) if use_password => {
                     let host = address.trim().to_owned();
                     if let Err(error) = crate::profiles::validate_address(&host) {
                         status = format!("Invalid address: {error}");
                     } else if username.trim().is_empty() || password.is_empty() {
-                        status =
+                        status = if use_system {
+                            "Enter your Linux username and current Linux password."
+                        } else {
                             "Enter your Teleport username and password (not your Linux login)."
-                                .into();
+                        }
+                        .into();
                     } else {
+                        let system = use_system;
+                        let pin = if system {
+                            match system_fingerprint(&host, &pinned_fingerprint, &profiles) {
+                                Ok(pin) => pin,
+                                Err(_) => {
+                                    status = "Enter the 64-hex SHA-256 fingerprint from trusted SSH host-admin status, or use an exactly matching saved host.".into();
+                                    continue;
+                                }
+                            }
+                        } else {
+                            String::new()
+                        };
                         let username = username.trim().to_owned();
                         let secret = Zeroizing::new(std::mem::take(&mut *password));
                         let (sender, receiver) = std::sync::mpsc::channel();
@@ -480,17 +597,23 @@ pub fn run() -> Result<()> {
                                 .build()
                                 .map_err(anyhow::Error::from)
                                 .and_then(|runtime| {
-                                    runtime.block_on(crate::access::login(
-                                        &host,
-                                        &username,
-                                        &secret,
-                                        &format!("{} client", std::env::consts::OS),
-                                    ))
+                                    if system {
+                                        runtime.block_on(crate::system_login::login(
+                                            &host, &username, &secret, &pin,
+                                        ))
+                                    } else {
+                                        runtime.block_on(crate::access::login(
+                                            &host,
+                                            &username,
+                                            &secret,
+                                            &format!("{} client", std::env::consts::OS),
+                                        ))
+                                    }
                                 });
-                            let _ = sender.send((host, result));
+                            let _ = sender.send((host, system, result));
                         });
                         pending_pairing = Some(receiver);
-                        status = "Authenticating account… If this host requires U2F, touch your enrolled key when it flashes.".into();
+                        status = if system { "Verifying the pinned host, then authenticating your Linux account…" } else { "Authenticating account… If this host requires U2F, touch your enrolled key when it flashes." }.into();
                     }
                 }
                 Some(0) if !use_file => {
@@ -510,7 +633,7 @@ pub fn run() -> Result<()> {
                                 .and_then(|runtime| {
                                     runtime.block_on(crate::pairing::pair(&host, &code))
                                 });
-                            let _ = sender.send((host, result));
+                            let _ = sender.send((host, false, result));
                         });
                         pending_pairing = Some(receiver);
                         status = "Verifying host with your code…".into();
@@ -522,6 +645,7 @@ pub fn run() -> Result<()> {
                     &mut profiles,
                 ) {
                     Ok(profile) => {
+                        ephemeral = None;
                         selected = Some(profile);
                         host_offset = profiles.len().saturating_sub(7);
                         status = "Pairing imported and trusted. Ready to connect.".into();
@@ -530,7 +654,7 @@ pub fn run() -> Result<()> {
                     }
                     Err(error) => status = format!("Import failed: {error}"),
                 },
-                Some(2) if child.is_none() => {
+                Some(2) if child.is_none() && pending_pairing.is_none() => {
                     if let Some(profile) = selected.as_ref().filter(|p| p.address == address.trim())
                     {
                         if let Err(error) =
@@ -557,7 +681,7 @@ pub fn run() -> Result<()> {
                             .arg(if hdr { "hdr10" } else { "sdr" });
                         if forward_agent {
                             command.arg("--forward-ssh-agent");
-                        } else {
+                        } else if ephemeral.is_none() {
                             command.arg("--reconnect");
                         }
                         if clipboard {
@@ -617,6 +741,10 @@ pub fn run() -> Result<()> {
                     }
                     status = "Disconnected. Connect to start again.".into();
                     progress = None;
+                    if ephemeral.take().is_some() {
+                        selected = None;
+                        status = "Session ended. Log in again with your Linux account.".into();
+                    }
                 }
                 _ => {}
             }
@@ -644,7 +772,7 @@ pub fn run() -> Result<()> {
         ui.panel(Rect::new(0, 0, 256, 832), Color::RGB(17, 25, 36))?;
         ui.panel(Rect::new(280, 124, 736, 240), Color::RGB(20, 30, 43))?;
         ui.panel(Rect::new(280, 388, 736, 92), Color::RGB(20, 30, 43))?;
-        ui.panel(Rect::new(280, 500, 736, 194), Color::RGB(20, 30, 43))?;
+        ui.panel(Rect::new(280, 500, 736, 204), Color::RGB(20, 30, 43))?;
         ui.text(
             &small_font,
             "STREAM PREFERENCES · APPLIED ON CONNECTION",
@@ -769,7 +897,7 @@ pub fn run() -> Result<()> {
             } else {
                 "Connect to desktop"
             },
-            ready && child.is_none(),
+            ready && child.is_none() && pending_pairing.is_none(),
             true,
         )?;
         ui.button(DISCONNECT, "Disconnect", child.is_some(), false)?;
@@ -807,7 +935,9 @@ pub fn run() -> Result<()> {
         )?;
         ui.text(
             &font,
-            if use_password {
+            if use_system {
+                "Linux account · this session only"
+            } else if use_password {
                 "Sign in to your host"
             } else {
                 "Pair a new host"
@@ -821,7 +951,11 @@ pub fn run() -> Result<()> {
             ui.field(
                 USERNAME,
                 &username,
-                "Teleport username",
+                if use_system {
+                    "Linux username (for example ej)"
+                } else {
+                    "Teleport username"
+                },
                 focused == 2,
                 select_all && focused == 2,
                 started.elapsed().as_millis() % 1000 < 500,
@@ -832,7 +966,7 @@ pub fn run() -> Result<()> {
                 "Run teleport host --pair on Linux. Enter the code shown there.",
                 304,
                 550,
-                680,
+                440,
                 MUTED,
             )?;
         }
@@ -846,7 +980,9 @@ pub fn run() -> Result<()> {
             } else {
                 &pairing_code
             },
-            if use_password {
+            if use_system {
+                "Current Linux password"
+            } else if use_password {
                 "Persistent password / passphrase"
             } else if use_file {
                 "Paste or drop a pairing file"
@@ -861,6 +997,8 @@ pub fn run() -> Result<()> {
             PAIR_BUTTON,
             if pending_pairing.is_some() {
                 "Verifying…"
+            } else if use_system {
+                "Log in once"
             } else if use_password {
                 "Log in & save"
             } else if use_file {
@@ -868,7 +1006,7 @@ pub fn run() -> Result<()> {
             } else {
                 "Pair & save"
             },
-            pending_pairing.is_none(),
+            pending_pairing.is_none() && child.is_none(),
             false,
         )?;
         ui.button(
@@ -891,9 +1029,20 @@ pub fn run() -> Result<()> {
             pending_pairing.is_none(),
             false,
         )?;
-        if selected
-            .as_ref()
-            .is_some_and(|p| p.address != address.trim())
+        ui.button(
+            SYSTEM_MODE,
+            if use_system {
+                "Use Teleport account"
+            } else {
+                "Use Linux account"
+            },
+            pending_pairing.is_none() && child.is_none(),
+            use_system,
+        )?;
+        if ephemeral.is_none()
+            && selected
+                .as_ref()
+                .is_some_and(|p| p.address != address.trim())
         {
             ui.button(
                 TRUST_ALIAS,
@@ -905,14 +1054,25 @@ pub fn run() -> Result<()> {
         if cfg!(target_os = "linux") {
             ui.button(HOST_SETTINGS, "Host settings", true, false)?;
         }
-        ui.text(
-            &small_font,
-            "Saved device credentials. Your password is not saved on this client.",
-            304,
-            664,
-            680,
-            MUTED,
-        )?;
+        if use_system {
+            ui.field(
+                FINGERPRINT,
+                &pinned_fingerprint,
+                "Trusted SHA-256 fingerprint (blank uses exact saved host)",
+                focused == 3,
+                select_all && focused == 3,
+                started.elapsed().as_millis() % 1000 < 500,
+            )?;
+        } else {
+            ui.text(
+                &small_font,
+                "Saved device credentials. Your password is not saved on this client.",
+                304,
+                664,
+                680,
+                MUTED,
+            )?;
+        }
         ui.panel(Rect::new(280, 716, 736, 60), Color::RGB(17, 37, 44))?;
         let surface = small_font.render(&status).blended_wrapped(INK, 688)?;
         let texture = textures.create_texture_from_surface(&surface)?;
@@ -926,7 +1086,11 @@ pub fn run() -> Result<()> {
             .map_err(anyhow::Error::msg)?;
         ui.text(
             &small_font,
-            "Enter to connect / pair · Tab to switch fields · Closing keeps your session open",
+            if ephemeral.is_some() {
+                "One-session Linux login · Closing disconnects and removes the temporary credential"
+            } else {
+                "Enter to connect / pair · Tab to switch fields · Closing keeps your session open"
+            },
             284,
             796,
             724,
@@ -934,6 +1098,12 @@ pub fn run() -> Result<()> {
         )?;
         canvas.present();
         std::thread::sleep(Duration::from_millis(20));
+    }
+    if ephemeral.is_some()
+        && let Some(mut process) = child.take()
+    {
+        let _ = process.kill();
+        let _ = process.wait();
     }
     Ok(())
 }
@@ -1109,6 +1279,40 @@ fn append_code(code: &mut String, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn linux_login_pin_requires_explicit_trust_and_session_file_is_temporary() -> anyhow::Result<()>
+    {
+        let pairing = crate::protocol::Pairing {
+            token: "a".repeat(64),
+            fingerprint: "b".repeat(64),
+        };
+        let (profile, directory) = super::session_profile("desktop:4443", &pairing)?;
+        crate::profiles::check_private_file(&profile.pairing_file)?;
+        assert_eq!(
+            crate::protocol::Pairing::read(&profile.pairing_file)?.token,
+            pairing.token
+        );
+        assert!(super::system_fingerprint("desktop:4443", "", &[]).is_err());
+        assert!(
+            super::system_fingerprint("alias:4443", "", std::slice::from_ref(&profile)).is_err()
+        );
+        assert_eq!(
+            super::system_fingerprint("desktop:4443", "", std::slice::from_ref(&profile))?,
+            pairing.fingerprint
+        );
+        assert_eq!(
+            super::system_fingerprint("alias:4443", &"C".repeat(64), &[])?,
+            "c".repeat(64)
+        );
+        assert!(
+            super::system_fingerprint("desktop:4443", "bad", std::slice::from_ref(&profile))
+                .is_err()
+        );
+        let path = profile.pairing_file.clone();
+        drop(directory);
+        assert!(!path.exists());
+        Ok(())
+    }
     #[test]
     fn hit_testing_excludes_margins_and_adjacent_controls() {
         let button = sdl2::rect::Rect::new(304, 272, 448, 44);

@@ -35,6 +35,9 @@ pub struct Options {
     /// Persistent private identity directory; keeps paired clients valid across restarts.
     #[arg(long, conflicts_with = "pairing_file")]
     pub identity_dir: Option<PathBuf>,
+    /// Enable existing Linux-account login with an installed, host-native PAM helper.
+    #[arg(long, requires = "identity_dir")]
+    pub system_auth_helper: Option<PathBuf>,
     /// Opt in to saving/restoring compositor permissions (approval may still be required).
     #[arg(long)]
     pub restore_token: Option<PathBuf>,
@@ -62,6 +65,13 @@ pub struct Options {
 }
 
 pub async fn run(options: Options) -> Result<()> {
+    if let Some(helper) = &options.system_auth_helper {
+        crate::system_pam::validate_helper(helper)?;
+        ensure!(
+            unsafe { libc::getuid() } != 0,
+            "system login requires a non-root desktop host"
+        );
+    }
     ensure!(
         options.identity_dir.is_some() || !options.pairing_file.exists(),
         "pairing file already exists; choose a new --pairing-file (credentials rotate each host start)"
@@ -134,11 +144,12 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         (options.identity_dir.as_deref(), access.as_ref())
     {
         Some(
-            crate::host_admin::start(
+            crate::host_admin::start_with_system(
                 directory,
                 server.local_addr()?,
                 pairing.clone(),
                 access.clone(),
+                options.system_auth_helper.clone(),
             )
             .await?,
         )
@@ -184,6 +195,17 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
             tracing::warn!("rejected unauthorized client");
             continue;
         }
+        let _session_lease = if let Some(access) = &access {
+            match access.begin_session(&supplied) {
+                Ok(lease) => Some(lease),
+                Err(_) => {
+                    let _ = request.close(403).await;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         let result = tokio::select! {
             result = connection(request, options, capture) => result,
             _ = async { loop { tokio::time::sleep(Duration::from_secs(1)).await; if access.as_ref().is_some_and(|access| !access.authorized(&supplied)) { break; } } } => Err(anyhow::anyhow!("device access revoked")),

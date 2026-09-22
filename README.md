@@ -16,7 +16,11 @@ login accounts. Security-key login and peripheral forwarding have separate
 implementation and hardware-verification requirements; see
 [security-key design](docs/security-key-design.md).
 
-Version 0.4.1 adds an explicit **password + U2F touch** enrollment path for the
+Version 0.5.0 adds opt-in **existing Linux account login** through PAM, with pinned
+TLS and one-session credentials. See [system login setup](docs/system-login.md).
+It attaches to a running desktop; boot/login-screen session creation is not included.
+
+Version 0.4.1 added an explicit **password + U2F touch** enrollment path for the
 YubiKey NEO and isolates the Linux package from conflicting system SDL/font
 configuration (including Arch). See [NEO setup and limitations](docs/yubikey-neo.md).
 Saved devices still connect using their credentials; this is not a touch-per-session

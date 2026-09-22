@@ -302,7 +302,7 @@ pub fn run() -> Result<()> {
                 .as_ref()
                 .map(|s| {
                     format!(
-                        "Listen: {}   Login: {}{}",
+                        "Listen: {}   Teleport login: {}{}",
                         s.listen,
                         s.username.as_deref().unwrap_or("disabled"),
                         if s.u2f_required {
@@ -323,6 +323,16 @@ pub fn run() -> Result<()> {
             "HOST IDENTITY / verify this fingerprint on new clients",
             28,
             180,
+            864,
+        )?;
+        text(
+            if status.as_ref().is_some_and(|s| s.system_login) {
+                "Linux account login: enabled (desktop owner, one session)"
+            } else {
+                "Linux login: disabled; install PAM helper and enable it in service configuration"
+            },
+            28,
+            158,
             864,
         )?;
         text(
