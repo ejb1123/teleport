@@ -35,6 +35,9 @@ jobs:
       - name: Native toolbar and launcher interaction tests
         if: runner.os == 'Linux'
         run: nix develop --command cargo test --locked --test ui -- --ignored --nocapture
+      - name: Host settings, revocation and agent forwarding
+        if: runner.os == 'Linux'
+        run: nix develop --command cargo test --locked --test host_ui --test access_smoke --test forwarding_smoke -- --ignored --nocapture
       - name: Build wrapped native package
         run: nix build --print-build-logs
       - name: Check packaged media plugins
@@ -51,3 +54,6 @@ jobs:
       - name: Test packaged native UI
         if: runner.os == 'Linux'
         run: nix develop --command env TELEPORT_TEST_BINARY=./result/bin/teleport cargo test --locked --test ui -- --ignored --nocapture
+      - name: Test packaged host settings and forwarding
+        if: runner.os == 'Linux'
+        run: nix develop --command env TELEPORT_TEST_BINARY=./result/bin/teleport cargo test --locked --test host_ui --test access_smoke --test forwarding_smoke -- --ignored --nocapture

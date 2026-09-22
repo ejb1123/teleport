@@ -1,4 +1,43 @@
-# Version 0.3 implementation status
+# Implementation status
+
+## Version 0.4 development checkpoint
+
+Implemented: native Linux Host Settings, private same-user administration over
+Unix sockets, OPAQUE password enrollment, unique managed-device credentials,
+revocation of active sessions, and explicit reuse of a saved identity at another
+address. Existing shared credentials are retained for compatibility, not silently
+revoked by managed-device controls. See [access and migration](access.md).
+
+Experimental SSH-agent forwarding is implemented with explicit host/client opt-in,
+session-scoped sockets, client-side SSH-only request filtering and no automatic
+forwarding on reconnect. Real authenticated network forwarding/cleanup and a real
+OpenSSH Ed25519 signature through the relay pass locally. Destination-constrained
+keys and arbitrary signing are not supported. See [SSH-agent limits](ssh-agent.md).
+
+The native libfido2 adapter provides **offline diagnostics and proof-of-possession
+tests only**, not security-key login to Teleport or remote websites. Physical key
+acceptance remains pending. [Security-key design](security-key-design.md) separates
+that foundation from the still-unimplemented host authentication integration.
+
+Generic USB, PC/SC smartcard and remote WebAuthn/FIDO forwarding are **not yet
+implemented**. Their platform helpers, device consent and hardware acceptance
+requirements are recorded in [peripheral forwarding](peripheral-forwarding.md).
+Do not infer support from offline key diagnostics or SSH-agent support. No new
+privileged device helpers or forwarding kernel modules have been activated.
+
+The currently running production host remains on the previous release while
+these changes are tested. A package build does not deploy or restart it.
+
+Local verification (2026-09-22): all **79 tests** pass with normally ignored
+cases enabled (68 unit/media/authentication tests and 11 process/network/UI
+tests). This includes native libfido2 signature verification with synthetic
+ES256 fixtures, actual OpenSSH signing, active managed-device revocation, and
+real mouse/keyboard interaction with Host Settings and the launcher. Physical
+FIDO hardware was not available; no physical-key success is claimed. Linux
+strict Clippy and Rust/Nix formatting checks pass. Mac verification of this
+checkpoint remains pending CI and physical-device testing.
+
+## Version 0.3
 
 Version 0.3 adds a redesigned native launcher and toolbar, per-connection
 native/scaled resolution, FPS and bitrate selection, H.264/H.265 streaming, and
@@ -73,6 +112,15 @@ from the Mac. This is user-reported acceptance, not an automated password test;
 no lock policy was weakened. The user subsequently confirmed reconnecting while
 already locked also worked. Fresh login and reboot remain untested. Startup is still after graphical
 login, not access to the login screen.
+
+The v0.3.0 application at commit `35e5808` was subsequently deployed through the
+same declarative NixOS service, preserving identity and portal restoration.
+After activation, a real Wayland connection accepted native resolution, 60 FPS
+and 20 Mbps settings and decoded 15 frames at 2560×1440 using NVIDIA H.264
+encoding/decoding, with zero unmatched frame identities. This was a local host
+smoke test, not a physical Mac or sustained latency benchmark. The compositor
+package and running KDE session were unchanged; experimental KWin HDR was not
+enabled. The `be7ad5e` follow-up only fixes Mac linting of a Linux-only function.
 
 See [testing.md](testing.md) for real-device acceptance and
 [distribution.md](distribution.md) for installation and service setup.

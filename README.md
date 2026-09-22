@@ -9,6 +9,13 @@ It shares an existing graphical session, one client at a time. Start on a LAN
 or a VPN with direct UDP connectivity.
 See [implementation status](docs/status.md) for verified features and unfinished work.
 
+The current development build adds native Linux **Host settings**, persistent
+Teleport username/passphrase login and individually revocable device credentials.
+See [host setup and login](docs/access.md). These are Teleport accounts, not Linux
+login accounts. Security-key login and peripheral forwarding have separate
+implementation and hardware-verification requirements; see
+[security-key design](docs/security-key-design.md).
+
 Version 0.3 adds a redesigned native launcher, selectable stream resolution/FPS/
 bitrate, and a **Stats for nerds** overlay (toolbar or **F8**). Launcher connections
 default to native monitor resolution, 60 FPS and 20 Mbps; preferences apply on
@@ -39,14 +46,14 @@ keyboard/mouse control. The host uses the RemoteDesktop/ScreenCast portals and
 PipeWire directly; it does not capture through XWayland. `--source auto` selects
 the portal for Wayland and X11 capture/XTest for an X11 session.
 
-Allow **UDP 4443** for streaming and **TCP 4443** for initial code pairing
+Allow **UDP 4443** for streaming and **TCP 4443** for password or code enrollment
 from your Mac through the host firewall. Teleport does not
 change firewall rules. On NixOS, for example, add this to your own configuration
 and rebuild (restrict access to your trusted interface/network as appropriate):
 
 ```nix
 networking.firewall.allowedUDPPorts = [ 4443 ];
-networking.firewall.allowedTCPPorts = [ 4443 ]; # initial code pairing only
+networking.firewall.allowedTCPPorts = [ 4443 ]; # password / code enrollment
 ```
 
 On the **Mac**, run the native client:
@@ -55,16 +62,18 @@ On the **Mac**, run the native client:
 nix run .
 ```
 
-Enter `LINUX_IP:4443` and the six-digit code shown in the Linux host terminal.
+For code pairing, choose **Use pairing code**, then enter `LINUX_IP:4443` and the
+six-digit code shown in the Linux host terminal.
 Click **Pair & save**, then **Connect to desktop**. Next time just select
 the saved host and connect—no code or trust prompt. Keep the host's identity
 directory unchanged so saved trust survives restarts. An identity mismatch is
 never accepted automatically; explicitly pair again only after checking the host.
 
 The code is valid for five minutes, one successful enrollment, and at most five
-TCP connection attempts. Restart the host with `--pair` for a new code if it
-expires or is consumed. The temporary TCP listener closes afterwards; subsequent
-desktop connections need only UDP. Without `--pair`, no enrollment port opens.
+TCP connection attempts. On updated persistent hosts, use **Host settings** or
+`teleport host-admin open-pairing` for a new code without restarting. The TCP
+listener closes afterwards unless persistent password enrollment is enabled;
+subsequent desktop connections need only UDP.
 Treat the displayed code as a secret and don't publish terminal/service logs.
 Code pairing remains experimental LAN/VPN functionality; see
 [pairing security and limitations](docs/pairing.md).
@@ -103,10 +112,11 @@ to the remote desktop. A connection window shows failures and has Retry/Cancel.
 Stop the host with Ctrl+C. With `--identity-dir`, the certificate and pairing
 token survive host restarts, so your saved client pairing keeps working. Keep
 this directory private (0700); its credentials are 0600. Do not copy `key.pem`
-to clients. To revoke paired access, stop the host, move the old identity
-directory to a private backup location, then start with a new identity directory
-and re-pair trusted clients. Everyone with the same pairing file has the same
-access; per-client credentials/revocation are not yet implemented.
+to clients. Updated persistent hosts issue separate credentials for new password
+and code enrollments; revoke these in **Host settings**. Existing copies of the
+legacy host `pairing.json` still share access and are not covered by managed-device
+revocation. Invalidating those requires rotating the entire host identity and
+re-enrolling trusted clients. See [revocation details](docs/access.md#pairing-and-revocation).
 
 Without `--identity-dir`, use `--pairing-file NEW_FILENAME` for ephemeral
 credentials. This mode rotates credentials each start and refuses overwrites.

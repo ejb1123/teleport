@@ -1,6 +1,6 @@
 [package]
 name = "teleport"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Native Linux desktop sharing over Media over QUIC"
@@ -16,6 +16,14 @@ sdl2 = { version = "0.38", features = ["ttf"] }
 subtle = "2"
 spake2 = "0.4"
 ring = "0.17"
+opaque-ke = { version = "=4.0.1", features = ["argon2"] }
+argon2 = "0.5"
+sha2 = "0.10"
+rand08 = { package = "rand", version = "0.8" }
+rpassword = "7"
+zeroize = "1"
+libloading = "0.8"
+libc = "0.2"
 moq-net = "=0.2.20"
 moq-native = { version = "=0.19.17", default-features = false, features = ["quinn", "ring"] }
 bytes = "1"
@@ -32,7 +40,6 @@ ashpd = { version = "0.11", default-features = false, features = ["tokio"] }
 x11rb = { version = "0.13", features = ["xtest", "randr"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 base64 = "0.22"
-libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

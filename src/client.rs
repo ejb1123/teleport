@@ -19,6 +19,9 @@ use tokio::{runtime::Runtime, sync::mpsc};
 
 #[derive(Args, Clone)]
 pub struct Options {
+    /// Experimental: allow this host to request SSH authentication signatures from SSH_AUTH_SOCK.
+    #[arg(long, conflicts_with = "reconnect")]
+    pub forward_ssh_agent: bool,
     /// Host name or IP and UDP port, e.g. 192.168.1.20:4443.
     pub address: String,
     /// Private pairing file copied from the host.
@@ -77,6 +80,7 @@ pub struct Options {
 }
 
 struct Link {
+    ssh_agent: Option<crate::ssh_agent::Task>,
     session: moq_net::Session,
     _origin: moq_net::origin::Producer,
     _broadcast: moq_net::broadcast::Producer,
@@ -88,6 +92,10 @@ struct Link {
 }
 
 async fn connect(options: &Options) -> Result<Link> {
+    let agent_path = options
+        .forward_ssh_agent
+        .then(crate::ssh_agent::agent_path)
+        .transpose()?;
     let pairing = Pairing::read(&options.pairing_file)?;
     ensure!(
         !options.address.contains('/') && !options.address.contains('@'),
@@ -99,6 +107,9 @@ async fn connect(options: &Options) -> Result<Link> {
         .append_pair("codec", options.codec.track());
     if options.dynamic_range == protocol::DynamicRange::Hdr10 {
         url.query_pairs_mut().append_pair("range", "hdr10");
+    }
+    if options.forward_ssh_agent {
+        url.query_pairs_mut().append_pair("ssh-agent", "1");
     }
     let mut config = moq_native::ClientConfig::default();
     config.version = vec![protocol::WIRE_VERSION.parse().map_err(anyhow::Error::msg)?];
@@ -116,6 +127,14 @@ async fn connect(options: &Options) -> Result<Link> {
             .with_priority(255)
             .with_latency_max(protocol::INPUT_TIMEOUT),
     )?;
+    let agent_responses = if options.forward_ssh_agent {
+        Some(crate::ssh_agent::create_track(
+            &mut broadcast,
+            crate::ssh_agent::RESPONSE_TRACK,
+        )?)
+    } else {
+        None
+    };
     let client = config
         .init()?
         .with_publisher(&outgoing)
@@ -125,25 +144,44 @@ async fn connect(options: &Options) -> Result<Link> {
         .connect(url)
         .await
         .context("QUIC connection failed; check address, pairing file and UDP firewall")?;
-    let remote = incoming
-        .consume()
-        .announced_broadcast("desktop")
-        .await
-        .context("host did not announce desktop")?;
-    let mut metadata = remote.track("desktop")?.subscribe(None).await?;
-    let mut group = metadata
-        .recv_group()
-        .await?
-        .context("desktop metadata missing")?;
-    let desktop: Desktop = serde_json::from_slice(
-        &protocol::read_frame(&mut group, protocol::MAX_CONTROL)
-            .await?
-            .context("empty desktop metadata")?,
-    )?;
+    let incoming_broadcasts = incoming.consume();
+    let remote = tokio::select! {
+        result = incoming_broadcasts.announced_broadcast("desktop") => result.context("host did not announce desktop")?,
+        error = session.closed() => anyhow::bail!("host rejected or closed this session: {error}; check saved credentials and requested features{}", if options.forward_ssh_agent { "; SSH forwarding requires a current host with --allow-ssh-agent" } else { "" }),
+    };
+    let desktop: Desktop = tokio::select! {
+        result = async {
+            let mut metadata = remote.track("desktop")?.subscribe(None).await?;
+            let mut group = metadata.recv_group().await?.context("desktop metadata missing")?;
+            Ok::<_, anyhow::Error>(serde_json::from_slice(&protocol::read_frame(&mut group, protocol::MAX_CONTROL).await?.context("empty desktop metadata")?)?)
+        } => result?,
+        error = session.closed() => anyhow::bail!("host closed the session before desktop negotiation: {error}"),
+    };
     ensure!(
         desktop.version == protocol::VERSION,
         "incompatible Teleport version"
     );
+    ensure!(
+        !options.forward_ssh_agent || desktop.ssh_agent,
+        "host does not support or allow SSH agent forwarding; update it and explicitly enable --allow-ssh-agent"
+    );
+    let ssh_agent = match (agent_path, agent_responses) {
+        (Some(path), Some(responses)) => {
+            let requests = tokio::time::timeout(
+                Duration::from_secs(10),
+                remote
+                    .track(crate::ssh_agent::REQUEST_TRACK)?
+                    .subscribe(crate::ssh_agent::subscription()),
+            )
+            .await
+            .context("host SSH forwarding track missing")??;
+            tracing::warn!(
+                "SSH agent forwarding enabled: remote host may request SSH authentication signatures; disconnect to revoke"
+            );
+            Some(crate::ssh_agent::client(path, requests, responses))
+        }
+        _ => None,
+    };
     protocol::validate_video_size(desktop.width, desktop.height)?;
     ensure!(
         desktop.dynamic_range == options.dynamic_range,
@@ -177,6 +215,7 @@ async fn connect(options: &Options) -> Result<Link> {
         None
     };
     Ok(Link {
+        ssh_agent,
         session,
         _origin: outgoing,
         _broadcast: broadcast,
@@ -260,6 +299,9 @@ pub fn run(options: Options, runtime: &Runtime) -> Result<()> {
         };
         match run_session(&options, runtime, link) {
             Ok(false) => return Ok(()),
+            Ok(true) if options.forward_ssh_agent => anyhow::bail!(
+                "SSH forwarding was revoked; start a new client with --forward-ssh-agent to explicitly enable it again"
+            ),
             Ok(true) => last_error = Some("Reconnecting at your request".into()),
             Err(error) if options.reconnect && options.headless_frames.is_none() => {
                 tracing::warn!(%error, "session lost; reconnecting");
@@ -466,9 +508,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let audio_notices = updates_sender.clone();
     let network_stats = stream_stats.clone();
     let mut network = Network(runtime.spawn(async move {
+        let mut ssh_agent = link.ssh_agent;
         let _origin = link._origin;
         let _broadcast = link._broadcast;
         tokio::select! {
+            result = crate::ssh_agent::closed(&mut ssh_agent) => result,
             result = media::receive_video_with_stats(link.video, source, feedback, network_stats) => result,
             result = send_input(link.input, receiver) => result,
             result = receive_updates(link.updates, updates_sender) => result,
@@ -1157,11 +1201,16 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 stats_lines.push(format!("HDR display headroom  {headroom:.2} × SDR white"));
             }
             canvas.window_mut().set_title(&format!(
-                "Teleport — display {}/{} · {}×{} · {fps:.0} fps",
+                "Teleport — display {}/{} · {}×{} · {fps:.0} fps{}",
                 desktop.active_monitor + 1,
                 desktop.monitors.len(),
                 size.0,
                 size.1,
+                if options.forward_ssh_agent {
+                    " · SSH AGENT SHARED"
+                } else {
+                    ""
+                },
             ))?;
             stats = Instant::now();
             frames = 0;
@@ -1655,6 +1704,14 @@ mod tests {
         let base = ["test", "localhost:4443", "--pairing-file", "unused.json"];
         let parsed = Arguments::try_parse_from(base).unwrap();
         assert_eq!(parsed.options.codec, protocol::VideoCodec::H264);
+        assert!(!parsed.options.forward_ssh_agent);
+        assert!(
+            Arguments::try_parse_from(
+                base.into_iter()
+                    .chain(["--forward-ssh-agent", "--reconnect"])
+            )
+            .is_err()
+        );
         let parsed =
             Arguments::try_parse_from(base.into_iter().chain(["--codec", "h265"])).unwrap();
         assert_eq!(parsed.options.codec, protocol::VideoCodec::H265);

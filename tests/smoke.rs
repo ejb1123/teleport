@@ -184,10 +184,12 @@ fn one_time_code_saves_trust_and_connects_without_file_transfer() {
     let saved = std::fs::read(credential).unwrap();
     let host_credential: serde_json::Value =
         serde_json::from_slice(&std::fs::read(identity.join("pairing.json")).unwrap()).unwrap();
+    let device_credential: serde_json::Value = serde_json::from_slice(&saved).unwrap();
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&saved).unwrap(),
-        host_credential
+        device_credential["fingerprint"],
+        host_credential["fingerprint"]
     );
+    assert_ne!(device_credential["token"], host_credential["token"]);
     assert!(!enroll(&code).status.success(), "used code accepted again");
     assert_eq!(
         std::fs::read(credential).unwrap(),

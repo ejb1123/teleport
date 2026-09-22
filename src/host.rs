@@ -13,6 +13,9 @@ use subtle::ConstantTimeEq;
 
 #[derive(Args, Clone)]
 pub struct Options {
+    /// Experimental: permit clients that explicitly opt in to forward an SSH agent.
+    #[arg(long)]
+    pub allow_ssh_agent: bool,
     /// Bind address (UDP). Use 0.0.0.0:4443 for LAN access.
     #[arg(long, default_value = "127.0.0.1:4443")]
     pub listen: String,
@@ -122,7 +125,27 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         crate::identity::write_new(pairing_path, &serde_json::to_vec_pretty(&pairing)?)?;
     }
     tracing::info!(address = %server.local_addr()?, pairing_file = %pairing_path.display(), "Host ready; use saved trust, a --pair code, or securely import the pairing file. UDP port must be reachable.");
-    let _enrollment = if options.pair {
+    let access = options
+        .identity_dir
+        .as_deref()
+        .map(|directory| crate::access::ServerState::open(directory, pairing.clone()))
+        .transpose()?;
+    let admin = if let (Some(directory), Some(access)) =
+        (options.identity_dir.as_deref(), access.as_ref())
+    {
+        Some(
+            crate::host_admin::start(
+                directory,
+                server.local_addr()?,
+                pairing.clone(),
+                access.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+    let _enrollment = if options.pair && admin.is_none() {
         if options.identity_dir.is_none() {
             tracing::warn!(
                 "Use --identity-dir to keep paired clients trusted across host restarts"
@@ -132,6 +155,14 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
     } else {
         None
     };
+    if options.pair
+        && let Some((_, control)) = &admin
+    {
+        println!(
+            "Pairing code: {} (one use, expires in 5 minutes)",
+            control.open_pairing().await?
+        );
+    }
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
@@ -139,14 +170,23 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
             request = server.accept() => match request { Some(request) => request, None => break },
             _ = &mut shutdown => break,
         };
-        let expected = format!("/teleport/{}", pairing.token);
-        if !bool::from(request.path().as_bytes().ct_eq(expected.as_bytes())) {
+        let supplied = request
+            .path()
+            .strip_prefix("/teleport/")
+            .unwrap_or("")
+            .to_owned();
+        let authorized = access.as_ref().map_or_else(
+            || bool::from(supplied.as_bytes().ct_eq(pairing.token.as_bytes())),
+            |access| access.authorized(&supplied),
+        );
+        if !authorized {
             let _ = request.close(403).await;
             tracing::warn!("rejected unauthorized client");
             continue;
         }
         let result = tokio::select! {
             result = connection(request, options, capture) => result,
+            _ = async { loop { tokio::time::sleep(Duration::from_secs(1)).await; if access.as_ref().is_some_and(|access| !access.authorized(&supplied)) { break; } } } => Err(anyhow::anyhow!("device access revoked")),
             _ = &mut shutdown => { capture.release_all().await; break; }
         };
         capture.release_all().await;
@@ -175,6 +215,13 @@ async fn connection(
     // Stream preferences belong to this connection, not the next paired client.
     let mut negotiated = options.clone();
     let requested = requested_format(request.query(), options.codec)?;
+    let ssh_requested = url::form_urlencoded::parse(request.query().unwrap_or_default().as_bytes())
+        .any(|(key, value)| key == "ssh-agent" && value == "1");
+    ensure!(
+        !ssh_requested || options.allow_ssh_agent,
+        "SSH agent forwarding is disabled; host requires explicit --allow-ssh-agent"
+    );
+    negotiated.allow_ssh_agent = ssh_requested && options.allow_ssh_agent;
     negotiated.codec = requested.codec;
     negotiated.dynamic_range = requested.dynamic_range;
     let options = &mut negotiated;
@@ -194,6 +241,14 @@ async fn connection(
         "updates",
         moq_net::track::Info::default().with_ordered(true),
     )?;
+    let agent_requests = if options.allow_ssh_agent {
+        Some(crate::ssh_agent::create_track(
+            &mut broadcast,
+            crate::ssh_agent::REQUEST_TRACK,
+        )?)
+    } else {
+        None
+    };
     let audio_track = if options.audio_source.is_some() {
         Some(broadcast.create_track("opus", None)?)
     } else {
@@ -225,6 +280,26 @@ async fn connection(
     })
     .await
     .context("client did not open input track")??;
+    let mut ssh_agent = if let Some(requests) = agent_requests {
+        let responses = tokio::time::timeout(Duration::from_secs(10), async {
+            let remote = incoming
+                .consume()
+                .announced_broadcast("controls")
+                .await
+                .context("controls missing")?;
+            Ok::<_, anyhow::Error>(
+                remote
+                    .track(crate::ssh_agent::RESPONSE_TRACK)?
+                    .subscribe(crate::ssh_agent::subscription())
+                    .await?,
+            )
+        })
+        .await
+        .context("client SSH forwarding track missing")??;
+        Some(crate::ssh_agent::host(requests, responses)?)
+    } else {
+        None
+    };
     let mut video_start_group = 0;
     let info = desktop(options, capture, video_start_group)?;
     let mut pipeline = media::encoder(
@@ -267,6 +342,7 @@ async fn connection(
     let mut actual_bitrate = options.bitrate;
     loop {
         tokio::select! {
+            result = crate::ssh_agent::closed(&mut ssh_agent) => return result,
             result = &mut incoming => return result,
             error = session.closed() => anyhow::bail!("{error}"),
             _ = check.tick() => {
@@ -376,6 +452,7 @@ fn desktop(options: &Options, capture: &Capture, video_start_group: u64) -> Resu
         ((width as u64 * capture.height as u64 / capture.width as u64) as u32 / 2 * 2).max(2);
     protocol::validate_video_size(width, height)?;
     Ok(Desktop {
+        ssh_agent: options.allow_ssh_agent,
         dynamic_range: options.dynamic_range,
         codec: options.codec,
         codecs: vec![protocol::VideoCodec::H264, protocol::VideoCodec::H265],
@@ -405,8 +482,10 @@ fn requested_format(
     ensure!(query.len() <= 128, "video request too large");
     let mut codec = None;
     let mut range = None;
+    let mut ssh_agent = false;
     for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
         match key.as_ref() {
+            "ssh-agent" if !ssh_agent && value == "1" => ssh_agent = true,
             "codec" if codec.is_none() => {
                 codec = Some(match value.as_ref() {
                     "h264" => protocol::VideoCodec::H264,
@@ -532,6 +611,9 @@ mod tests {
         assert!(requested_format(Some("codec=h265&range=hdr10&range=sdr"), H264).is_err());
         assert!(requested_format(Some("codec=h265&range=hlg"), H264).is_err());
         assert!(requested_format(Some("unexpected=1"), H264).is_err());
+        assert!(requested_format(Some("ssh-agent=1"), H264).is_ok());
+        assert!(requested_format(Some("ssh-agent=0"), H264).is_err());
+        assert!(requested_format(Some("ssh-agent=1&ssh-agent=1"), H264).is_err());
         assert!(requested_format(Some(&"x".repeat(129)), H264).is_err());
         assert_eq!(
             requested_format(None, H265).unwrap().dynamic_range,

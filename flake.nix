@@ -31,6 +31,7 @@
             gst_all_1.gst-libav
             SDL2
             SDL2_ttf
+            libfido2
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             (import ./nix/pipewire-hdr.nix { inherit pkgs; })
@@ -81,7 +82,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "teleport";
-            version = "0.3.0";
+            version = "0.4.0";
             src = pkgs.lib.fileset.toSource {
               root = ./.;
               fileset = pkgs.lib.fileset.unions [
@@ -104,6 +105,7 @@
               wrapProgram $out/bin/teleport \
                 --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : "${pkgs.lib.makeSearchPath "lib/gstreamer-1.0" (map pkgs.lib.getLib deps.media)}" \
                 --set TELEPORT_FONT "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf" \
+                --set TELEPORT_LIBFIDO2 "${pkgs.lib.getLib pkgs.libfido2}/lib/libfido2${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}" \
                 ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''--prefix PATH : "${
                   pkgs.lib.makeBinPath [
                     pkgs.wl-clipboard
@@ -143,6 +145,7 @@
                 clippy
                 rust-analyzer
                 git
+                openssh
                 nixfmt
               ]
               ++ deps.tools
@@ -151,6 +154,7 @@
 
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
             TELEPORT_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";
+            TELEPORT_LIBFIDO2 = "${pkgs.lib.getLib pkgs.libfido2}/lib/libfido2${pkgs.stdenv.hostPlatform.extensions.sharedLibrary}";
           };
         }
       );

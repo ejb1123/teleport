@@ -74,6 +74,9 @@ impl Pairing {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Desktop {
+    /// SSH forwarding is separately negotiated; older hosts default to unsupported.
+    #[serde(default)]
+    pub ssh_agent: bool,
     #[serde(default)]
     pub dynamic_range: DynamicRange,
     #[serde(default)]

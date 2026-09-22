@@ -237,12 +237,31 @@ async fn serve(
 }
 
 #[cfg(target_os = "linux")]
-async fn accept(
+pub(crate) async fn accept(
     stream: &mut TcpStream,
     code: &str,
     pairing: &Pairing,
     used: &mut bool,
     deadline: tokio::time::Instant,
+) -> Result<()> {
+    accept_with_access(stream, code, pairing, used, deadline, None).await
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) struct DeviceEnrollment<'a> {
+    pub access: &'a crate::access::ServerState,
+    pub epoch: &'a std::sync::atomic::AtomicU64,
+    pub generation: u64,
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) async fn accept_with_access(
+    stream: &mut TcpStream,
+    code: &str,
+    pairing: &Pairing,
+    used: &mut bool,
+    deadline: tokio::time::Instant,
+    access: Option<DeviceEnrollment<'_>>,
 ) -> Result<()> {
     let mut magic = [0; 8];
     stream.read_exact(&mut magic).await?;
@@ -266,8 +285,23 @@ async fn accept(
         "pairing code expired"
     );
     // Consume before releasing credentials, even if the peer disconnects mid-write.
+    if let Some(access) = &access {
+        use std::sync::atomic::Ordering;
+        access
+            .epoch
+            .compare_exchange(
+                access.generation,
+                access.generation.wrapping_add(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .map_err(|_| anyhow::anyhow!("pairing code closed or replaced"))?;
+    }
     *used = true;
-    write_packet(stream, &keys.seal(pairing)?).await?;
+    let device = access
+        .map(|access| access.access.enroll_device("Code-paired device"))
+        .transpose()?;
+    write_packet(stream, &keys.seal(device.as_ref().unwrap_or(pairing))?).await?;
     Ok(())
 }
 

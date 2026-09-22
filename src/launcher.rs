@@ -7,6 +7,7 @@ use std::{
     process::{Child, Command, Stdio},
     time::Duration,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 type PairingReceiver = std::sync::mpsc::Receiver<(String, Result<crate::protocol::Pairing>)>;
 
@@ -35,9 +36,14 @@ pub fn run() -> Result<()> {
     let DISCONNECT = Rect::new(764, 272, 228, 44);
     let CLIPBOARD = Rect::new(304, 326, 228, 28);
     let MUTE = Rect::new(544, 326, 176, 28);
+    let SSH_AGENT = Rect::new(732, 326, 260, 28);
     let PAIR_FIELD = Rect::new(304, 582, 448, 44);
     let PAIR_BUTTON = Rect::new(764, 582, 228, 44);
     let FILE_MODE = Rect::new(304, 632, 220, 26);
+    let PASSWORD_MODE = Rect::new(540, 632, 220, 26);
+    let USERNAME = Rect::new(304, 546, 448, 30);
+    let HOST_SETTINGS = Rect::new(16, 704, 224, 40);
+    let TRUST_ALIAS = Rect::new(764, 632, 228, 26);
     let NEW_HOST = Rect::new(16, 592, 224, 44);
     let RESOLUTION = Rect::new(304, 428, 180, 38);
     let FPS = Rect::new(496, 428, 88, 38);
@@ -75,6 +81,9 @@ pub fn run() -> Result<()> {
         .unwrap_or_default();
     let mut pairing_path = String::new();
     let mut pairing_code = String::new();
+    let mut username = String::new();
+    let mut password = Zeroizing::new(String::new());
+    let mut use_password = true;
     let mut use_file = false;
     let mut pending_pairing: Option<PairingReceiver> = None;
     let mut focused = 0;
@@ -84,13 +93,16 @@ pub fn run() -> Result<()> {
     let mut status = if selected.is_some() {
         "Saved host ready. Click Connect; no pairing code needed."
     } else {
-        "Start the host with --pair, then enter its code once."
+        "Log in with your Teleport account, or choose a one-time pairing code."
     }
     .to_owned();
     let mut child: Option<Child> = None;
     let mut progress = None;
     let mut clipboard = false;
     let mut mute = false;
+    let mut forward_agent = false;
+    let mut agent_confirmation: Option<std::time::Instant> = None;
+    let mut agent_target = String::new();
     let mut resolution = 0;
     let mut frame_rate = 1;
     let mut quality = 1;
@@ -102,6 +114,7 @@ pub fn run() -> Result<()> {
                 Ok((host, result)) => {
                     pending_pairing = None;
                     pairing_code.clear();
+                    password.zeroize();
                     match result.and_then(|pairing| {
                         crate::profiles::save_pairing(&host, &pairing, &mut profiles)
                     }) {
@@ -114,13 +127,18 @@ pub fn run() -> Result<()> {
                                     .into();
                         }
                         Err(_) => {
-                            status = "Pairing failed. Check host/code, TCP port, or restart host with --pair.".into();
+                            status = if use_password {
+                                "Login failed. Check your Teleport account, host address, and TCP access."
+                            } else {
+                                "Pairing failed. Check host/code, TCP port, or open a new code in Host settings."
+                            }.into();
                         }
                     }
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     pending_pairing = None;
                     pairing_code.clear();
+                    password.zeroize();
                     status = "Pairing worker stopped. Start a new pairing attempt.".into();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
@@ -143,24 +161,34 @@ pub fn run() -> Result<()> {
             };
             child = None;
             progress = None;
+            forward_agent = false;
+            agent_confirmation = None;
         }
         for event in events.poll_iter() {
+            if agent_target != address {
+                forward_agent = false;
+                agent_confirmation = None;
+            }
             let mut action = None;
             match event {
                 Event::Quit { .. } => break 'ui,
                 Event::TextInput { text, .. } => {
                     let field = if focused == 0 {
                         &mut address
+                    } else if focused == 2 {
+                        &mut username
+                    } else if use_password {
+                        &mut *password
                     } else if !use_file {
                         &mut pairing_code
                     } else {
                         &mut pairing_path
                     };
                     if select_all {
-                        field.clear();
+                        field.zeroize();
                         select_all = false;
                     }
-                    if focused == 1 && !use_file {
+                    if focused == 1 && !use_file && !use_password {
                         append_code(field, &text);
                     } else if field.len() + text.len() <= 2048 {
                         field.push_str(&text);
@@ -169,13 +197,23 @@ pub fn run() -> Result<()> {
                 Event::DropFile { filename, .. } => {
                     pairing_path = filename;
                     use_file = true;
+                    use_password = false;
+                    password.zeroize();
                     focused = 1;
                 }
                 Event::KeyDown {
                     keycode: Some(Keycode::Tab),
                     ..
                 } => {
-                    focused = 1 - focused;
+                    focused = if use_password {
+                        match focused {
+                            0 => 2,
+                            2 => 1,
+                            _ => 0,
+                        }
+                    } else {
+                        1 - focused.min(1)
+                    };
                     select_all = false;
                 }
                 Event::KeyDown {
@@ -206,6 +244,10 @@ pub fn run() -> Result<()> {
                     if select_all {
                         if focused == 0 {
                             address.clear();
+                        } else if focused == 2 {
+                            username.clear();
+                        } else if use_password {
+                            password.zeroize();
                         } else if use_file {
                             pairing_path.clear();
                         } else {
@@ -216,6 +258,10 @@ pub fn run() -> Result<()> {
                     }
                     if focused == 0 {
                         address.pop();
+                    } else if focused == 2 {
+                        username.pop();
+                    } else if use_password {
+                        password.pop();
                     } else if !use_file {
                         pairing_code.pop();
                     } else {
@@ -237,16 +283,25 @@ pub fn run() -> Result<()> {
                         select_all = false;
                         let field = if focused == 0 {
                             &mut address
+                        } else if focused == 2 {
+                            &mut username
+                        } else if use_password {
+                            &mut *password
                         } else if !use_file {
                             &mut pairing_code
                         } else {
                             &mut pairing_path
                         };
-                        if focused == 1 && !use_file {
+                        if focused == 1 && !use_file && !use_password {
                             field.clear();
                             append_code(field, &text);
                         } else if text.len() <= 2048 {
-                            *field = text.trim().to_owned();
+                            field.zeroize();
+                            *field = if focused == 1 && use_password {
+                                text
+                            } else {
+                                text.trim().to_owned()
+                            };
                         }
                     }
                 }
@@ -289,12 +344,15 @@ pub fn run() -> Result<()> {
                         }
                     }
                     if hit(NEW_HOST, x, y) {
+                        forward_agent = false;
+                        agent_confirmation = None;
                         selected = None;
                         address.clear();
                         pairing_code.clear();
+                        password.zeroize();
                         focused = 0;
                         status =
-                            "Enter your host address, then pair with its one-time code.".into();
+                            "Enter your host address, then log in or use a one-time code.".into();
                     }
                     for (index, profile) in profiles.iter().enumerate().skip(host_offset).take(7) {
                         if hit(
@@ -303,15 +361,57 @@ pub fn run() -> Result<()> {
                             y,
                         ) {
                             selected = Some(profile.clone());
+                            forward_agent = false;
+                            agent_confirmation = None;
                             address = profile.address.clone();
                             focused = 0;
                             status =
                                 "Saved identity selected. Ready for a secure connection.".into();
                         }
                     }
-                    if hit(FILE_MODE, x, y) {
+                    if hit(FILE_MODE, x, y) && pending_pairing.is_none() {
                         use_file = !use_file;
+                        use_password = false;
+                        password.zeroize();
                         focused = 1;
+                    }
+                    if hit(PASSWORD_MODE, x, y) && pending_pairing.is_none() {
+                        use_password = !use_password;
+                        use_file = false;
+                        password.zeroize();
+                        focused = if use_password { 2 } else { 1 };
+                    }
+                    if hit(USERNAME, x, y) && use_password {
+                        focused = 2;
+                    }
+                    if hit(TRUST_ALIAS, x, y)
+                        && child.is_none()
+                        && pending_pairing.is_none()
+                        && let Some(profile) =
+                            selected.as_ref().filter(|p| p.address != address.trim())
+                    {
+                        let credential = profile.pairing_file.clone();
+                        match crate::profiles::import(address.trim(), &credential, &mut profiles) {
+                            Ok(profile) => {
+                                selected = Some(profile);
+                                host_offset = profiles.len().saturating_sub(7);
+                                status = "Saved this address with the selected host's identity. TLS identity must still match.".into();
+                            }
+                            Err(error) => status = format!("Could not save address: {error}"),
+                        }
+                    }
+                    if hit(HOST_SETTINGS, x, y) && cfg!(target_os = "linux") {
+                        match Command::new(std::env::current_exe()?)
+                            .arg("host-manager")
+                            .spawn()
+                        {
+                            Ok(mut process) => {
+                                std::thread::spawn(move || {
+                                    let _ = process.wait();
+                                });
+                            }
+                            Err(error) => status = format!("Could not open host settings: {error}"),
+                        }
                     }
                     if hit(ADDRESS, x, y) {
                         focused = 0;
@@ -327,6 +427,23 @@ pub fn run() -> Result<()> {
                     }
                     if hit(MUTE, x, y) && child.is_none() {
                         mute = !mute;
+                    }
+                    if hit(SSH_AGENT, x, y) && child.is_none() {
+                        if forward_agent {
+                            forward_agent = false;
+                            agent_confirmation = None;
+                            status = "SSH agent forwarding disabled.".into();
+                        } else if agent_confirmation
+                            .is_some_and(|at| at.elapsed() < Duration::from_secs(10))
+                        {
+                            forward_agent = true;
+                            agent_confirmation = None;
+                            status = "SSH agent enabled for the next session only. Disconnect ends forwarding. Host must also allow it.".into();
+                        } else {
+                            agent_target = address.clone();
+                            agent_confirmation = Some(std::time::Instant::now());
+                            status = "Trust this host: it can request SSH authentication with your loaded keys. Click Confirm SSH agent within 10 seconds to enable.".into();
+                        }
                     }
                     if hit(CONNECT, x, y)
                         && child.is_none()
@@ -344,6 +461,37 @@ pub fn run() -> Result<()> {
             }
             match action {
                 Some(0) if pending_pairing.is_some() => {}
+                Some(0) if use_password => {
+                    let host = address.trim().to_owned();
+                    if let Err(error) = crate::profiles::validate_address(&host) {
+                        status = format!("Invalid address: {error}");
+                    } else if username.trim().is_empty() || password.is_empty() {
+                        status =
+                            "Enter your Teleport username and password (not your Linux login)."
+                                .into();
+                    } else {
+                        let username = username.trim().to_owned();
+                        let secret = Zeroizing::new(std::mem::take(&mut *password));
+                        let (sender, receiver) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let result = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .map_err(anyhow::Error::from)
+                                .and_then(|runtime| {
+                                    runtime.block_on(crate::access::login(
+                                        &host,
+                                        &username,
+                                        &secret,
+                                        &format!("{} client", std::env::consts::OS),
+                                    ))
+                                });
+                            let _ = sender.send((host, result));
+                        });
+                        pending_pairing = Some(receiver);
+                        status = "Authenticating account and verifying host…".into();
+                    }
+                }
                 Some(0) if !use_file => {
                     let host = address.trim().to_owned();
                     if let Err(error) = crate::profiles::validate_address(&host) {
@@ -403,8 +551,12 @@ pub fn run() -> Result<()> {
                             .arg("--codec")
                             .arg(["h264", "h265"][codec])
                             .arg("--dynamic-range")
-                            .arg(if hdr { "hdr10" } else { "sdr" })
-                            .arg("--reconnect");
+                            .arg(if hdr { "hdr10" } else { "sdr" });
+                        if forward_agent {
+                            command.arg("--forward-ssh-agent");
+                        } else {
+                            command.arg("--reconnect");
+                        }
                         if clipboard {
                             command.arg("--clipboard");
                         }
@@ -451,7 +603,7 @@ pub fn run() -> Result<()> {
                         }
                     } else {
                         status =
-                            "Pair with this host using its code first, or import a pairing file."
+                            "Log in to this host, use its one-time code, or import a pairing file."
                                 .into();
                     }
                 }
@@ -597,7 +749,7 @@ pub fn run() -> Result<()> {
             {
                 "Verified host · identity checked on every connection"
             } else {
-                "New address · pair below before connecting"
+                "New address · log in below, or explicitly reuse the selected host's identity"
             },
             304,
             238,
@@ -619,6 +771,18 @@ pub fn run() -> Result<()> {
         )?;
         ui.button(DISCONNECT, "Disconnect", child.is_some(), false)?;
         ui.button(
+            SSH_AGENT,
+            if forward_agent {
+                "[x] SSH agent (session)"
+            } else if agent_confirmation.is_some_and(|at| at.elapsed() < Duration::from_secs(10)) {
+                "Confirm SSH agent"
+            } else {
+                "[ ] SSH agent"
+            },
+            child.is_none(),
+            forward_agent,
+        )?;
+        ui.button(
             CLIPBOARD,
             if clipboard {
                 "[x] Share clipboard"
@@ -638,23 +802,50 @@ pub fn run() -> Result<()> {
             child.is_none(),
             false,
         )?;
-        ui.text(&font, "Pair a new host", 304, 520, 400, INK)?;
         ui.text(
-            &small_font,
-            "Run teleport host --pair on Linux. Enter the code shown there.",
+            &font,
+            if use_password {
+                "Sign in to your host"
+            } else {
+                "Pair a new host"
+            },
             304,
-            550,
-            680,
-            MUTED,
+            520,
+            400,
+            INK,
         )?;
+        if use_password {
+            ui.field(
+                USERNAME,
+                &username,
+                "Teleport username",
+                focused == 2,
+                select_all && focused == 2,
+                started.elapsed().as_millis() % 1000 < 500,
+            )?;
+        } else {
+            ui.text(
+                &small_font,
+                "Run teleport host --pair on Linux. Enter the code shown there.",
+                304,
+                550,
+                680,
+                MUTED,
+            )?;
+        }
+        let masked = "•".repeat(password.chars().count().min(256));
         ui.field(
             PAIR_FIELD,
-            if use_file {
+            if use_password {
+                &masked
+            } else if use_file {
                 &pairing_path
             } else {
                 &pairing_code
             },
-            if use_file {
+            if use_password {
+                "Persistent password / passphrase"
+            } else if use_file {
                 "Paste or drop a pairing file"
             } else {
                 "Six-digit code"
@@ -667,6 +858,8 @@ pub fn run() -> Result<()> {
             PAIR_BUTTON,
             if pending_pairing.is_some() {
                 "Verifying…"
+            } else if use_password {
+                "Log in & save"
             } else if use_file {
                 "Import & trust"
             } else {
@@ -682,12 +875,36 @@ pub fn run() -> Result<()> {
             } else {
                 "Import pairing file"
             },
-            true,
+            pending_pairing.is_none(),
             false,
         )?;
+        ui.button(
+            PASSWORD_MODE,
+            if use_password {
+                "Use one-time code"
+            } else {
+                "Use password"
+            },
+            pending_pairing.is_none(),
+            false,
+        )?;
+        if selected
+            .as_ref()
+            .is_some_and(|p| p.address != address.trim())
+        {
+            ui.button(
+                TRUST_ALIAS,
+                "Use saved identity",
+                child.is_none() && pending_pairing.is_none(),
+                false,
+            )?;
+        }
+        if cfg!(target_os = "linux") {
+            ui.button(HOST_SETTINGS, "Host settings", true, false)?;
+        }
         ui.text(
             &small_font,
-            "One-time verification. No trust prompts on return visits.",
+            "Saved device credentials. Your password is not saved on this client.",
             304,
             664,
             680,

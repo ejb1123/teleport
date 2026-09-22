@@ -236,8 +236,20 @@ fn wait_field_focus(connection: &RustConnection, window: u32, y: i16) {
 #[test]
 #[ignore = "requires Xvfb, TCP/UDP and GStreamer runtime plugins"]
 fn native_launcher_pairs_with_code_and_connects_saved_host() {
+    launcher_authentication(false);
+}
+
+#[test]
+#[ignore = "requires Xvfb, TCP/UDP and GStreamer runtime plugins"]
+fn native_launcher_password_login_and_saved_identity_alias() {
+    launcher_authentication(true);
+}
+
+fn launcher_authentication(password_mode: bool) {
     use std::os::unix::fs::PermissionsExt;
-    let temp = tempfile::tempdir().unwrap();
+    // A pathname Unix socket must fit sockaddr_un even inside a deeply nested
+    // Nix development shell's TMPDIR.
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
     let config = temp.path().join("config");
     let identity = temp.path().join("identity");
     let mut display = Process(
@@ -302,6 +314,31 @@ fn native_launcher_pairs_with_code_and_connects_saved_host() {
     let code = receiver
         .recv_timeout(Duration::from_secs(15))
         .expect("host did not display a code");
+    const PASSWORD: &str = "Work test passphrase 2468";
+    if password_mode {
+        use std::io::{Read, Write};
+        let mut admin =
+            std::os::unix::net::UnixStream::connect(identity.join("admin.sock")).unwrap();
+        admin
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let request = serde_json::to_vec(
+            &serde_json::json!({"SetPassword": {"username": "work", "password": PASSWORD}}),
+        )
+        .unwrap();
+        admin
+            .write_all(&(request.len() as u32).to_be_bytes())
+            .unwrap();
+        admin.write_all(&request).unwrap();
+        let mut length = [0; 4];
+        admin.read_exact(&mut length).unwrap();
+        let length = u32::from_be_bytes(length) as usize;
+        assert!(length <= 65536);
+        let mut response = vec![0; length];
+        admin.read_exact(&mut response).unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+        assert!(response["error"].is_null(), "host password setup failed");
+    }
     let mut launcher = Process(
         teleport(&display_name)
             .arg("launcher")
@@ -330,9 +367,21 @@ fn native_launcher_pairs_with_code_and_connects_saved_host() {
     wait_field_focus(&connection, window, 180);
     type_ascii(&connection, root, window, &address);
     std::thread::sleep(Duration::from_millis(100));
+    if password_mode {
+        click(&connection, root, window, 400, 560);
+        type_ascii(&connection, root, window, "work");
+    } else {
+        // Password login is now the default; exercise the optional legacy code tab.
+        click(&connection, root, window, 650, 645);
+    }
     click(&connection, root, window, 400, 603);
     wait_field_focus(&connection, window, 585);
-    type_ascii(&connection, root, window, &code);
+    type_ascii(
+        &connection,
+        root,
+        window,
+        if password_mode { PASSWORD } else { &code },
+    );
     std::thread::sleep(Duration::from_millis(100));
     click(&connection, root, window, 870, 603);
     let index = config.join("teleport/profiles.json");
@@ -362,13 +411,13 @@ fn native_launcher_pairs_with_code_and_connects_saved_host() {
             0o600
         );
     }
-    assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&std::fs::read(saved).unwrap()).unwrap(),
-        serde_json::from_slice::<serde_json::Value>(
-            &std::fs::read(identity.join("pairing.json")).unwrap()
-        )
-        .unwrap()
-    );
+    let saved_pairing: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(saved).unwrap()).unwrap();
+    let legacy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(identity.join("pairing.json")).unwrap()).unwrap();
+    assert_eq!(saved_pairing["fingerprint"], legacy["fingerprint"]);
+    // Persistent hosts issue separately revocable credentials after code proof.
+    assert_ne!(saved_pairing["token"], legacy["token"]);
     let window = desktop_window(&connection, root, &mut launcher, "Teleport", None);
     click(&connection, root, window, 500, 294);
     let desktop = desktop_window(&connection, root, &mut launcher, "display 1/2", None);
@@ -397,6 +446,47 @@ fn native_launcher_pairs_with_code_and_connects_saved_host() {
             "launcher did not disconnect streaming child"
         );
         std::thread::sleep(Duration::from_millis(30));
+    }
+    if password_mode {
+        // An explicit address alias reuses the pinned identity, not network trust.
+        let alias = format!("127.0.0.1:0{}", address.rsplit(':').next().unwrap());
+        click(&connection, root, window, 400, 200);
+        // Xvfb has no window manager to restore keyboard focus after the
+        // streaming child closes. Focus before pressing the modifier too.
+        connection
+            .set_input_focus(xproto::InputFocus::PARENT, window, x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        connection
+            .xtest_fake_input(xproto::KEY_PRESS_EVENT, 37, 0, root, 0, 0, 0)
+            .unwrap();
+        type_ascii(&connection, root, window, "a");
+        connection
+            .xtest_fake_input(xproto::KEY_RELEASE_EVENT, 37, 0, root, 0, 0, 0)
+            .unwrap();
+        connection.flush().unwrap();
+        type_ascii(&connection, root, window, &alias);
+        click(&connection, root, window, 870, 645);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let profiles: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+            if profiles.as_array().unwrap().len() == 2 {
+                assert_eq!(profiles[1]["address"], alias);
+                let aliased: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(profiles[1]["pairing_file"].as_str().unwrap()).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(aliased, saved_pairing);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "saved identity alias was not created"
+            );
+            std::thread::sleep(Duration::from_millis(30));
+        }
     }
 }
 
