@@ -467,17 +467,211 @@ async fn receive_updates(
     }
 }
 
+type SessionWindow = (
+    sdl2::Sdl,
+    sdl2::VideoSubsystem,
+    sdl2::render::Canvas<sdl2::video::Window>,
+);
+
+fn session_window(options: &Options) -> Result<SessionWindow> {
+    let (sdl, video) = crate::windowing::init()?;
+    let make_window = || -> Result<sdl2::video::Window> {
+        let mut window = video
+            .window("Teleport - Remote Desktop", 1280, 720)
+            .position_centered()
+            .resizable()
+            .allow_highdpi()
+            .build()?;
+        window
+            .set_minimum_size(700, 240)
+            .map_err(anyhow::Error::msg)?;
+        Ok(window)
+    };
+    let canvas = if options.software_renderer {
+        crate::windowing::software(make_window()?)?
+    } else {
+        match make_window()?.into_canvas().accelerated().build() {
+            Ok(canvas) => canvas,
+            Err(error) => {
+                tracing::warn!(%error, "Accelerated window renderer unavailable; trying software presentation");
+                crate::windowing::software(make_window()?)?
+            }
+        }
+    };
+    tracing::info!(
+        backend = video.current_video_driver(),
+        renderer = canvas.info().name,
+        accelerated = renderer_accelerated(&canvas),
+        "session window renderer"
+    );
+    Ok((sdl, video, canvas))
+}
+
+fn renderer_accelerated(canvas: &sdl2::render::Canvas<sdl2::video::Window>) -> bool {
+    canvas.info().flags & sdl2::sys::SDL_RendererFlags::SDL_RENDERER_ACCELERATED as u32 != 0
+}
+
+fn graphics_renderer(video: &sdl2::VideoSubsystem) -> Option<String> {
+    // ACCELERATED describes the renderer API, not the physical GPU. Never take
+    // ownership of this context: SDL's renderer owns and destroys it.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        if sdl2::sys::SDL_GL_GetCurrentContext().is_null() {
+            return None;
+        }
+        let address = video.gl_get_proc_address("glGetString");
+        if address.is_null() {
+            return None;
+        }
+        let get_string: unsafe extern "system" fn(u32) -> *const u8 = std::mem::transmute(address);
+        let renderer = get_string(0x1F01); // GL_RENDERER with SDL's current context.
+        if renderer.is_null() {
+            return None;
+        }
+        Some(
+            std::ffi::CStr::from_ptr(renderer.cast())
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = video;
+        None
+    }
+}
+
+fn supports_nv12(canvas: &sdl2::render::Canvas<sdl2::video::Window>) -> bool {
+    if !renderer_accelerated(canvas)
+        || !canvas
+            .info()
+            .texture_formats
+            .contains(&PixelFormatEnum::NV12)
+    {
+        return false;
+    }
+    set_nv12_conversion();
+    let creator = canvas.texture_creator();
+    let probe = (|| -> Result<()> {
+        let mut texture = creator.create_texture_streaming(PixelFormatEnum::NV12, 16, 16)?;
+        update_nv12(
+            &mut texture,
+            &media::Nv12Image {
+                y: vec![16; 256],
+                uv: vec![128; 128],
+                y_stride: 16,
+                uv_stride: 16,
+            },
+            16,
+            16,
+        )
+    })();
+    if let Err(error) = probe {
+        tracing::warn!(%error, "NV12 texture upload unavailable; retaining RGB presentation");
+        false
+    } else {
+        true
+    }
+}
+
+fn set_nv12_conversion() {
+    // SDL2-compat can attach colorspace at texture creation, so set this before
+    // creating the texture as well as before uploading it.
+    unsafe {
+        sdl2::sys::SDL_SetYUVConversionMode(
+            sdl2::sys::SDL_YUV_CONVERSION_MODE::SDL_YUV_CONVERSION_BT709,
+        );
+    }
+}
+
+fn update_nv12(
+    texture: &mut sdl2::render::Texture<'_>,
+    frame: &media::Nv12Image,
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    protocol::validate_video_size(width, height)?;
+    ensure!(
+        width.is_multiple_of(2) && height.is_multiple_of(2),
+        "NV12 requires even dimensions"
+    );
+    for (plane, stride, rows) in [
+        (&frame.y, frame.y_stride, height as usize),
+        (&frame.uv, frame.uv_stride, height as usize / 2),
+    ] {
+        let required = stride
+            .checked_mul(rows - 1)
+            .and_then(|size| size.checked_add(width as usize))
+            .context("NV12 plane size overflow")?;
+        ensure!(
+            stride >= width as usize && stride <= i32::MAX as usize && plane.len() >= required,
+            "invalid NV12 plane layout"
+        );
+    }
+    let query = texture.query();
+    ensure!(
+        query.format == PixelFormatEnum::NV12 && query.width == width && query.height == height,
+        "NV12 texture does not match the frame"
+    );
+    // Decoder output explicitly negotiates limited-range BT.709. SDL's AUTO
+    // heuristic chooses by dimensions, which is wrong for resized HD sources.
+    // Safety: the live texture and both checked, stride-aware planes outlive
+    // this synchronous upload; SDL receives no pointers to temporary storage.
+    let result = unsafe {
+        sdl2::sys::SDL_SetYUVConversionMode(
+            sdl2::sys::SDL_YUV_CONVERSION_MODE::SDL_YUV_CONVERSION_BT709,
+        );
+        sdl2::sys::SDL_UpdateNVTexture(
+            texture.raw(),
+            std::ptr::null(),
+            frame.y.as_ptr(),
+            frame.y_stride as i32,
+            frame.uv.as_ptr(),
+            frame.uv_stride as i32,
+        )
+    };
+    ensure!(result == 0, "NV12 upload failed: {}", sdl2::get_error());
+    Ok(())
+}
+
 fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool> {
     tracing::info!(width = link.desktop.width, height = link.desktop.height, source = %link.desktop.source, "desktop connected; Ctrl+Alt+Q quits locally");
+    // Choose the presentation format from the actual renderer, not the decoder
+    // name. NV12 is useful only when SDL can convert it with its GPU renderer.
+    let mut window_state = if options.headless_frames.is_none() {
+        Some(session_window(options)?)
+    } else {
+        None
+    };
+    let prefer_nv12 = if let Some((_, _, canvas)) = window_state.as_mut() {
+        let enabled = cfg!(target_os = "linux")
+            && link.desktop.dynamic_range == protocol::DynamicRange::Sdr
+            && supports_nv12(canvas);
+        tracing::info!(
+            renderer = canvas.info().name,
+            accelerated = renderer_accelerated(canvas),
+            nv12 = enabled,
+            "local video presentation"
+        );
+        enabled
+    } else {
+        false
+    };
     let stream_stats = std::sync::Arc::new(crate::stats::StreamStats::default());
-    let (pipeline, source, image) = media::decoder_with_stats(
-        options.software_decoder,
-        stream_stats.clone(),
-        media::VideoFormat {
-            codec: link.desktop.codec,
-            dynamic_range: link.desktop.dynamic_range,
-        },
-    )?;
+    let format = media::VideoFormat {
+        codec: link.desktop.codec,
+        dynamic_range: link.desktop.dynamic_range,
+    };
+    let (pipeline, source, image) = if prefer_nv12 {
+        media::decoder_with_stats_output(
+            options.software_decoder,
+            stream_stats.clone(),
+            format,
+            true,
+        )?
+    } else {
+        media::decoder_with_stats(options.software_decoder, stream_stats.clone(), format)?
+    };
     let (events, receiver) = mpsc::channel(256);
     let feedback = events.clone();
     let mut desktop = link.desktop.clone();
@@ -712,34 +906,20 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         );
         return Ok(false);
     }
-    let (sdl, video) = crate::windowing::init()?;
-    let make_window = || -> Result<sdl2::video::Window> {
-        let mut window = video
-            .window("Teleport - Remote Desktop", 1280, 720)
-            .position_centered()
-            .resizable()
-            .allow_highdpi()
-            .build()?;
-        window
-            .set_minimum_size(700, 240)
-            .map_err(anyhow::Error::msg)?;
-        Ok(window)
-    };
+    let (sdl, video, mut canvas) = window_state.take().context("session window missing")?;
+    let graphics_name =
+        graphics_renderer(&video).unwrap_or_else(|| "Not exposed by this backend".into());
+    tracing::info!(graphics = %graphics_name, "local graphics device");
+    if ["llvmpipe", "softpipe", "software rasterizer"]
+        .iter()
+        .any(|name| graphics_name.to_ascii_lowercase().contains(name))
+    {
+        tracing::warn!("OpenGL is running on the CPU; check local graphics driver integration");
+    }
     let ttf = sdl2::ttf::init().map_err(anyhow::Error::msg)?;
     let font = ttf
         .load_font(crate::launcher::font_path()?, 28)
         .map_err(anyhow::Error::msg)?;
-    let mut canvas = if options.software_renderer {
-        crate::windowing::software(make_window()?)?
-    } else {
-        match make_window()?.into_canvas().accelerated().build() {
-            Ok(canvas) => canvas,
-            Err(error) => {
-                tracing::warn!(%error, "Accelerated window renderer unavailable; trying software presentation");
-                crate::windowing::software(make_window()?)?
-            }
-        }
-    };
     let creator = canvas.texture_creator();
     let mut hdr_presenter = if desktop.dynamic_range == protocol::DynamicRange::Hdr10 {
         Some(crate::hdr_present::HdrPresenter::new(canvas.window())?)
@@ -1079,13 +1259,27 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             protocol::validate_video_size(frame.width, frame.height)?;
             if size != (frame.width, frame.height) && frame.hdr.is_none() {
                 size = (frame.width, frame.height);
+                if frame.nv12.is_some() {
+                    set_nv12_conversion();
+                }
                 texture = Some(creator.create_texture_streaming(
-                    PixelFormatEnum::RGB24,
+                    if frame.nv12.is_some() {
+                        PixelFormatEnum::NV12
+                    } else {
+                        PixelFormatEnum::RGB24
+                    },
                     size.0,
                     size.1,
                 )?);
             }
-            if frame.hdr.is_none() {
+            if let Some(nv12) = &frame.nv12 {
+                update_nv12(
+                    texture.as_mut().context("missing NV12 texture")?,
+                    nv12,
+                    frame.width,
+                    frame.height,
+                )?;
+            } else if frame.hdr.is_none() {
                 texture.as_mut().context("missing SDR texture")?.update(
                     None,
                     &frame.data,
@@ -1190,6 +1384,16 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 format!(
                     "Client decoder        {}",
                     stream_stats.decoder.lock().unwrap()
+                ),
+                format!("Renderer              {}", canvas.info().name),
+                format!("Graphics device       {graphics_name}"),
+                format!(
+                    "Pixel path            {}",
+                    if prefer_nv12 {
+                        "NV12 upload / renderer color conversion"
+                    } else {
+                        "RGB CPU conversion / upload"
+                    }
                 ),
                 format!(
                     "Encoder target        {:.2} Mbps",
@@ -1639,6 +1843,56 @@ fn pointer(x: i32, y: i32, window: (u32, u32), image: (u32, u32)) -> Option<(f64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires an isolated X11 display and SDL OpenGL renderer"]
+    fn nv12_renderer_upload_preserves_color_and_rejects_invalid_planes() -> Result<()> {
+        let sdl = sdl2::init().map_err(anyhow::Error::msg)?;
+        let video = sdl.video().map_err(anyhow::Error::msg)?;
+        let window = video
+            .window("Teleport NV12 test", 16, 16)
+            .hidden()
+            .build()?;
+        let mut canvas = window.into_canvas().accelerated().build()?;
+        ensure!(
+            supports_nv12(&canvas),
+            "test renderer must expose native NV12 textures"
+        );
+        let creator = canvas.texture_creator();
+        set_nv12_conversion();
+        let mut texture = creator.create_texture_streaming(PixelFormatEnum::NV12, 16, 16)?;
+        let mut frame = media::Nv12Image {
+            y: vec![63; 32 * 15 + 16],
+            uv: [102, 240].repeat((32 * 7 + 16) / 2),
+            y_stride: 32,
+            uv_stride: 32,
+        };
+        update_nv12(&mut texture, &frame, 16, 16)?;
+        canvas
+            .copy(&texture, None, None)
+            .map_err(anyhow::Error::msg)?;
+        let pixels = canvas
+            .read_pixels(None, PixelFormatEnum::RGB24)
+            .map_err(anyhow::Error::msg)?;
+        for pixel in pixels.chunks_exact(3) {
+            ensure!(
+                pixel[0] > 240 && pixel[1] < 15 && pixel[2] < 15,
+                "BT709 red rendered incorrectly: {pixel:?}"
+            );
+        }
+        // Borrowing the GL diagnostic context must not destroy it.
+        let _ = graphics_renderer(&video);
+        canvas
+            .copy(&texture, None, None)
+            .map_err(anyhow::Error::msg)?;
+        frame.uv.pop();
+        assert!(update_nv12(&mut texture, &frame, 16, 16).is_err());
+        frame.uv.push(240);
+        frame.y_stride = usize::MAX;
+        assert!(update_nv12(&mut texture, &frame, 16, 16).is_err());
+        assert!(update_nv12(&mut texture, &frame, 15, 16).is_err());
+        Ok(())
+    }
     #[test]
     fn letterbox_coordinates() {
         assert!(pointer(0, 0, (1000, 1000), (1920, 1080)).is_none());

@@ -1,5 +1,104 @@
 #![cfg(target_os = "linux")]
 
+fn mesa_runtime_fixture(
+    system_driver: bool,
+    nvidia: bool,
+    overrides: &[(&str, &str)],
+) -> Vec<String> {
+    let temp = tempfile::tempdir().unwrap();
+    let system_path = temp.path().join("system-driver");
+    let nvidia_path = temp.path().join("nvidia-module");
+    if system_driver {
+        std::fs::create_dir(&system_path).unwrap();
+    }
+    if nvidia {
+        std::fs::create_dir(&nvidia_path).unwrap();
+    }
+    // Exercise the exact shipped shell logic without modifying /run or /sys.
+    let script = include_str!("../nix/mesa-runtime.sh")
+        .replace("/run/opengl-driver/lib", system_path.to_str().unwrap())
+        .replace("/sys/module/nvidia", nvidia_path.to_str().unwrap())
+        .replace("@mesa@", "/nix/store/teleport-test-mesa");
+    let mut command = std::process::Command::new("bash");
+    command
+        .env_clear()
+        .env("LD_LIBRARY_PATH", "/foreign/lib")
+        .env("LD_PRELOAD", "")
+        .args(["-c", &format!(
+            r#"unset LD_LIBRARY_PATH LD_PRELOAD
+{script}
+printf '%s\n' "${{LD_LIBRARY_PATH-<unset>}}" "${{LD_PRELOAD-<unset>}}" "${{LIBGL_DRIVERS_PATH-<unset>}}" "${{__EGL_VENDOR_LIBRARY_FILENAMES-<unset>}}" "${{__EGL_VENDOR_LIBRARY_DIRS-<unset>}}" "${{LIBGL_ALWAYS_SOFTWARE-<unset>}}"
+"#
+        )]);
+    for (name, value) in overrides {
+        command.env(name, value);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn mesa_runtime_supplies_only_pinned_drivers_on_non_nixos() {
+    assert_eq!(
+        mesa_runtime_fixture(false, false, &[]),
+        [
+            "/nix/store/teleport-test-mesa/lib",
+            "<unset>",
+            "/nix/store/teleport-test-mesa/lib/dri",
+            "/nix/store/teleport-test-mesa/share/glvnd/egl_vendor.d/50_mesa.json",
+            "<unset>",
+            "<unset>",
+        ]
+    );
+}
+
+#[test]
+fn mesa_runtime_leaves_nixos_and_nvidia_stacks_unchanged() {
+    for (system_driver, nvidia) in [(true, false), (false, true), (true, true)] {
+        assert_eq!(
+            mesa_runtime_fixture(system_driver, nvidia, &[]),
+            ["<unset>"; 6]
+        );
+    }
+}
+
+#[test]
+fn mesa_runtime_preserves_explicit_dri_and_egl_overrides() {
+    for egl_variable in [
+        "__EGL_VENDOR_LIBRARY_FILENAMES",
+        "__EGL_VENDOR_LIBRARY_DIRS",
+    ] {
+        // An explicitly empty override also must not be replaced.
+        for value in ["/custom/vendor", ""] {
+            let output = mesa_runtime_fixture(
+                false,
+                false,
+                &[("LIBGL_DRIVERS_PATH", "/custom/dri"), (egl_variable, value)],
+            );
+            assert_eq!(output[0], "/nix/store/teleport-test-mesa/lib");
+            assert_eq!(output[1], "<unset>");
+            assert_eq!(output[2], "/custom/dri");
+            if egl_variable == "__EGL_VENDOR_LIBRARY_FILENAMES" {
+                assert_eq!(output[3], value);
+                assert_eq!(output[4], "<unset>");
+            } else {
+                assert_eq!(output[3], "<unset>");
+                assert_eq!(output[4], value);
+            }
+            assert_eq!(output[5], "<unset>");
+        }
+    }
+}
+
 /// Model an Arch shell overriding the Nix SDL runtime. The inert shared object
 /// is a valid ELF library but deliberately not SDL3. No real device is modified.
 #[test]

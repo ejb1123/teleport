@@ -530,6 +530,51 @@ pub struct Image {
     pub height: u32,
     pub stride: usize,
     pub hdr: Option<HdrImage>,
+    pub nv12: Option<Nv12Image>,
+}
+
+/// CPU-mappable NV12 planes for an accelerated SDL YUV texture. This avoids
+/// CPU RGB conversion, but is not a zero-copy GPU surface import.
+pub struct Nv12Image {
+    pub y: Vec<u8>,
+    pub uv: Vec<u8>,
+    pub y_stride: usize,
+    pub uv_stride: usize,
+}
+
+impl Nv12Image {
+    fn copy_planes(
+        width: u32,
+        height: u32,
+        y: &[u8],
+        uv: &[u8],
+        y_stride: i32,
+        uv_stride: i32,
+    ) -> Result<Self> {
+        crate::protocol::validate_video_size(width, height)?;
+        ensure!(
+            width.is_multiple_of(2) && height.is_multiple_of(2),
+            "NV12 dimensions must be even"
+        );
+        ensure!(y_stride > 0 && uv_stride > 0, "invalid NV12 plane stride");
+        let checked_plane = |plane: &[u8], stride: usize, rows: usize| -> Result<usize> {
+            ensure!(stride >= width as usize, "NV12 stride shorter than row");
+            let length = stride
+                .checked_mul(rows - 1)
+                .and_then(|n| n.checked_add(width as usize))
+                .context("NV12 plane length overflow")?;
+            ensure!(length <= plane.len(), "truncated NV12 plane");
+            Ok(length)
+        };
+        let y_length = checked_plane(y, y_stride as usize, height as usize)?;
+        let uv_length = checked_plane(uv, uv_stride as usize, height as usize / 2)?;
+        Ok(Self {
+            y: y[..y_length].to_vec(),
+            uv: uv[..uv_length].to_vec(),
+            y_stride: y_stride as usize,
+            uv_stride: uv_stride as usize,
+        })
+    }
 }
 
 pub struct HdrImage {
@@ -580,6 +625,15 @@ pub fn decoder_with_stats(
     stats: Arc<crate::stats::StreamStats>,
     format: impl Into<VideoFormat>,
 ) -> Result<(Pipeline, AppSrc, LatestImage)> {
+    decoder_with_stats_output(force_software, stats, format, false)
+}
+
+pub fn decoder_with_stats_output(
+    force_software: bool,
+    stats: Arc<crate::stats::StreamStats>,
+    format: impl Into<VideoFormat>,
+    prefer_nv12: bool,
+) -> Result<(Pipeline, AppSrc, LatestImage)> {
     let format = format.into();
     format.validate()?;
     let codec = format.codec;
@@ -588,7 +642,8 @@ pub fn decoder_with_stats(
     tracing::info!(decoder, ?codec, "video decoder");
     let caps = compressed_caps(codec);
     let fragment = decoder::fragment(decoder, codec);
-    let conversion = decoder::output_fragment(format);
+    let nv12_output = cfg!(target_os = "linux") && prefer_nv12 && !format.hdr();
+    let conversion = decoder::output_fragment_for(format, nv12_output);
     let pipeline = Pipeline(gst::parse::launch(&format!(
         "appsrc name=in is-live=true format=time do-timestamp=true max-bytes=8388608 block=false \
         caps={caps},stream-format=byte-stream,alignment=au \
@@ -658,7 +713,32 @@ pub fn decoder_with_stats(
                 )
                 .map_err(|_| gst::FlowError::Error)?;
                 use gstreamer_video::prelude::*;
-                let (data, hdr) = if format.hdr() {
+                let nv12 = if nv12_output {
+                    if info.format() != gstreamer_video::VideoFormat::Nv12
+                        || info.colorimetry()
+                            != "bt709"
+                                .parse::<gstreamer_video::VideoColorimetry>()
+                                .unwrap()
+                    {
+                        return Err(gst::FlowError::Error);
+                    }
+                    Some(
+                        Nv12Image::copy_planes(
+                            info.width(),
+                            info.height(),
+                            frame.plane_data(0).map_err(|_| gst::FlowError::Error)?,
+                            frame.plane_data(1).map_err(|_| gst::FlowError::Error)?,
+                            frame.plane_stride()[0],
+                            frame.plane_stride()[1],
+                        )
+                        .map_err(|_| gst::FlowError::Error)?,
+                    )
+                } else {
+                    None
+                };
+                let (data, hdr) = if nv12_output {
+                    (Vec::new(), None)
+                } else if format.hdr() {
                     let strides = frame.plane_stride();
                     if strides[0] <= 0 || strides[1] <= 0 {
                         return Err(gst::FlowError::Error);
@@ -701,6 +781,7 @@ pub fn decoder_with_stats(
                 }
                 *latest = Some(Image {
                     hdr,
+                    nv12,
                     decoded_at: Instant::now(),
                     decoder_recovery: stats.decoder_recoveries.load(Ordering::Relaxed),
                     video_group,
@@ -1223,6 +1304,128 @@ pub fn doctor() -> Result<()> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    #[test]
+    fn nv12_output_opt_in_preserves_hdr_and_default_rgb_contracts() {
+        let hdr = super::VideoFormat {
+            codec: VideoCodec::H265,
+            dynamic_range: DynamicRange::Hdr10,
+        };
+        assert_eq!(
+            decoder::output_fragment_for(hdr, true),
+            decoder::output_fragment(hdr)
+        );
+        let sdr = VideoCodec::H264.into();
+        assert!(decoder::output_fragment_for(sdr, false).contains("format=RGB"));
+        if cfg!(target_os = "linux") {
+            assert!(
+                decoder::output_fragment_for(sdr, true).contains("format=NV12,colorimetry=bt709")
+            );
+        } else {
+            assert_eq!(
+                decoder::output_fragment_for(sdr, true),
+                decoder::output_fragment(sdr)
+            );
+        }
+    }
+
+    #[test]
+    fn nv12_planes_reject_invalid_layout_before_copying() {
+        use super::Nv12Image;
+        let y = vec![16; 32];
+        let uv = vec![128; 16];
+        let planes = Nv12Image::copy_planes(4, 4, &y, &uv, 8, 8).unwrap();
+        assert_eq!(planes.y.len(), 28);
+        assert_eq!(planes.uv.len(), 12);
+        assert_eq!((planes.y_stride, planes.uv_stride), (8, 8));
+        for (width, height, ys, uvs) in [
+            (3, 4, 8, 8),
+            (4, 3, 8, 8),
+            (4, 4, -8, 8),
+            (4, 4, 8, 0),
+            (4, 4, 3, 8),
+            (4, 4, 8, 3),
+        ] {
+            assert!(Nv12Image::copy_planes(width, height, &y, &uv, ys, uvs).is_err());
+        }
+        assert!(Nv12Image::copy_planes(4, 4, &y[..27], &uv, 8, 8).is_err());
+        assert!(Nv12Image::copy_planes(4, 4, &y, &uv[..11], 8, 8).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires GStreamer software codecs"]
+    fn nv12_sdr_roundtrip_preserves_planes_color_and_identity() -> Result<()> {
+        gst::init()?;
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            let encoder = Pipeline(gst::parse::launch(&format!(
+                "videotestsrc num-buffers=1 pattern=red ! video/x-raw,format=I420,colorimetry=bt709,width=320,height=180,framerate=30/1 ! {} ! {} ! {},stream-format=byte-stream,alignment=au ! appsink name=encoded sync=false",
+                encoder_fragment(EncoderKind::Software, 30, 1000, codec), parser(codec), compressed_caps(codec)
+            ))?.downcast::<gst::Pipeline>().unwrap());
+            let sink = encoder
+                .0
+                .by_name("encoded")
+                .unwrap()
+                .downcast::<AppSink>()
+                .unwrap();
+            encoder.0.set_state(gst::State::Playing)?;
+            let sample = sink
+                .try_pull_sample(gst::ClockTime::from_seconds(3))
+                .context("no red fixture")?;
+            let bytes = sample.buffer().unwrap().map_readable()?;
+            for prefer_nv12 in [false, true] {
+                let stats = Arc::new(crate::stats::StreamStats::default());
+                stats.decoder_recoveries.store(3, Ordering::Relaxed);
+                let (pipeline, input, image) =
+                    decoder_with_stats_output(true, stats.clone(), codec, prefer_nv12)?;
+                let key = stats.received(bytes.len(), 77);
+                let mut buffer = gst::Buffer::from_mut_slice(bytes.to_vec());
+                stamp_video_buffer(buffer.get_mut().unwrap(), key);
+                input.push_buffer(buffer)?;
+                input.end_of_stream()?;
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let frame = loop {
+                    if let Some(frame) = image.lock().unwrap().take() {
+                        break frame;
+                    }
+                    pipeline.error()?;
+                    ensure!(
+                        Instant::now() < deadline,
+                        "no decoded red frame for {codec:?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                assert_eq!(frame.video_group, Some(77));
+                assert_eq!(frame.decoder_recovery, 3);
+                assert_eq!((frame.width, frame.height), (320, 180));
+                assert!(frame.hdr.is_none());
+                if prefer_nv12 {
+                    assert!(frame.data.is_empty());
+                    let nv12 = frame.nv12.context("missing NV12 planes")?;
+                    let close = |got: u8, reference: u8| {
+                        assert!(got.abs_diff(reference) <= 8, "{got} != {reference}")
+                    };
+                    // Limited-range BT709 red, independent of row padding.
+                    for row in 0..180 {
+                        for col in 0..320 {
+                            close(nv12.y[row * nv12.y_stride + col], 63);
+                        }
+                    }
+                    for row in 0..90 {
+                        for col in (0..320).step_by(2) {
+                            close(nv12.uv[row * nv12.uv_stride + col], 102);
+                            close(nv12.uv[row * nv12.uv_stride + col + 1], 240);
+                        }
+                    }
+                } else {
+                    assert!(frame.nv12.is_none());
+                    assert!(frame.data[0] > 240 && frame.data[1] < 15 && frame.data[2] < 15);
+                }
+                assert!(stats.snapshot().decode_us > 0);
+            }
+        }
+        Ok(())
+    }
+
     use super::*;
 
     #[test]
@@ -1256,7 +1459,11 @@ mod tests {
         }
     }
 
-    async fn exercise_decoder_replacement(hardware: bool, encoder_kind: EncoderKind) -> Result<()> {
+    async fn exercise_decoder_replacement(
+        hardware: bool,
+        encoder_kind: EncoderKind,
+        prefer_nv12: bool,
+    ) -> Result<()> {
         gst::init()?;
         for (codec, va, software) in [
             (VideoCodec::H264, "vah264dec", "avdec_h264"),
@@ -1291,7 +1498,8 @@ mod tests {
                 ));
             }
             let stats = Arc::new(crate::stats::StreamStats::default());
-            let (pipeline, input, image) = decoder_with_stats(true, stats.clone(), codec)?;
+            let (pipeline, input, image) =
+                decoder_with_stats_output(true, stats.clone(), codec, prefer_nv12)?;
             if hardware {
                 // Explicitly select VA even on systems whose default candidate
                 // is NVDEC. Production replacement only targets software.
@@ -1343,6 +1551,7 @@ mod tests {
                 assert_eq!(frame.video_group, Some(group));
                 assert_eq!((frame.width, frame.height), (1280, 720));
                 assert_eq!(frame.decoder_recovery, group - 70);
+                assert_eq!(frame.nv12.is_some(), prefer_nv12);
                 assert_eq!(stats.unmatched_frames.load(Ordering::Relaxed), 0);
                 let snapshot = stats.snapshot();
                 assert!(snapshot.decoder_us > 0);
@@ -1366,19 +1575,123 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires GStreamer software codecs; checks live replacement without EOS"]
     async fn software_decoder_replacement_preserves_live_frames() -> Result<()> {
-        exercise_decoder_replacement(false, EncoderKind::Software).await
+        exercise_decoder_replacement(false, EncoderKind::Software, false).await
     }
 
     #[tokio::test]
     #[ignore = "requires available VA decoders; exercises sustained 720p60 fallback"]
     async fn va_decoder_fallback_preserves_live_frames() -> Result<()> {
-        exercise_decoder_replacement(true, EncoderKind::Software).await
+        exercise_decoder_replacement(true, EncoderKind::Software, false).await
     }
 
     #[tokio::test]
     #[ignore = "requires NVIDIA encoder and VA decoder hardware"]
     async fn nvidia_to_va_decoder_fallback_preserves_live_frames() -> Result<()> {
-        exercise_decoder_replacement(true, EncoderKind::Nvidia).await
+        exercise_decoder_replacement(true, EncoderKind::Nvidia, false).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires available VA decoders; sustained NV12 720p60 and live fallback"]
+    async fn nv12_va_decoder_fallback_preserves_live_frames() -> Result<()> {
+        exercise_decoder_replacement(true, EncoderKind::Software, true).await
+    }
+
+    #[tokio::test]
+    #[ignore = "requires GStreamer software codecs; sustained NV12 720p60 live replacement"]
+    async fn nv12_software_decoder_replacement_preserves_live_frames() -> Result<()> {
+        exercise_decoder_replacement(false, EncoderKind::Software, true).await
+    }
+
+    #[test]
+    #[ignore = "requires GStreamer software codecs; injects a slow raw-frame consumer"]
+    fn nv12_raw_queue_bounds_slow_conversion_without_dropping_compressed_frames() -> Result<()> {
+        gst::init()?;
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            let encoder = Pipeline(gst::parse::launch(&format!(
+                "videotestsrc num-buffers=1 ! video/x-raw,format=I420,colorimetry=bt709,width=320,height=180,framerate=60/1 ! {} ! {} ! {},stream-format=byte-stream,alignment=au ! appsink name=out sync=false",
+                encoder_fragment(EncoderKind::Software, 60, 1000, codec), parser(codec), compressed_caps(codec)
+            ))?.downcast::<gst::Pipeline>().unwrap());
+            let output = encoder
+                .0
+                .by_name("out")
+                .unwrap()
+                .downcast::<AppSink>()
+                .unwrap();
+            encoder.0.set_state(gst::State::Playing)?;
+            let sample = output
+                .try_pull_sample(gst::ClockTime::from_seconds(3))
+                .context("no queue fixture")?;
+            let bytes = sample.buffer().unwrap().map_readable()?;
+            let stats = Arc::new(crate::stats::StreamStats::default());
+            let (pipeline, input, image) =
+                decoder_with_stats_output(true, stats.clone(), codec, true)?;
+            let queue = pipeline
+                .0
+                .by_name("decoded_queue")
+                .context("missing bounded raw queue")?;
+            let stalled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let first = stalled.clone();
+            queue
+                .static_pad("src")
+                .unwrap()
+                .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                    if !first.swap(true, Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(150));
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+            let decoded = Arc::new(AtomicU32::new(0));
+            let seen = decoded.clone();
+            pipeline
+                .0
+                .by_name("video_decoder")
+                .unwrap()
+                .static_pad("src")
+                .unwrap()
+                .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    gst::PadProbeReturn::Ok
+                });
+            for group in 1..=30 {
+                let key = stats.received(bytes.len(), group);
+                let mut buffer = gst::Buffer::from_mut_slice(bytes.to_vec());
+                stamp_video_buffer(buffer.get_mut().unwrap(), key);
+                input.push_buffer(buffer)?;
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while decoded.load(Ordering::Relaxed) < 30 {
+                pipeline.error()?;
+                assert!(queue.property::<u32>("current-level-buffers") <= 1);
+                ensure!(
+                    Instant::now() < deadline,
+                    "compressed input stopped draining"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(stalled.load(Ordering::Relaxed));
+            assert_eq!(input.current_level_buffers(), 0);
+            let frame = loop {
+                if let Some(frame) = image.lock().unwrap().take()
+                    && frame.video_group == Some(30)
+                {
+                    break frame;
+                }
+                pipeline.error()?;
+                ensure!(
+                    Instant::now() < deadline,
+                    "latest raw-frame identity did not progress"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            assert!(frame.nv12.is_some());
+            assert_eq!(frame.decoder_recovery, 0);
+            assert!(
+                stats.snapshot().decoded_frames < 30,
+                "slow consumer should drop raw frames"
+            );
+            assert_eq!(stats.unmatched_frames.load(Ordering::Relaxed), 0);
+        }
+        Ok(())
     }
 
     #[tokio::test]

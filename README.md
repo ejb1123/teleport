@@ -212,6 +212,23 @@ acceptance remains required. Intel VA-API has been hardware-tested for H.264,
 HEVC SDR, and HEVC HDR10 decoding; AMD and QSV still require physical-hardware
 acceptance on supported GPUs.
 
+Version 0.5.4 uses NV12 textures for Linux SDR when the actual accelerated SDL
+renderer advertises NV12 and passes a texture-upload check. This removes the CPU
+YUV-to-RGB conversion from the usual VA path; SDL performs it during rendering.
+A one-frame leaky queue **after decoding** prevents a slow downloader/converter
+from building an unlimited raw-frame backlog. Compressed dependent frames are
+never dropped individually. RGB remains the fallback for unsupported/software
+renderers; Mac and HDR pixel paths are unchanged.
+
+This is **not zero-copy**: decoded NV12 planes still pass through CPU memory and
+are uploaded to SDL. Non-BT.709 sources may also require YUV color conversion.
+The log and F8 report the renderer, pixel path and OpenGL device where exposed;
+an SDL "accelerated" flag alone does not prove physical GPU rendering (llvmpipe
+is a CPU implementation). On non-NixOS Intel/AMD systems, the wrapper now supplies
+matching packaged Mesa GLX/EGL libraries as well as VA drivers. NixOS graphics
+stacks and systems with a loaded proprietary NVIDIA module are left unchanged.
+Explicit DRI/EGL overrides are respected. Physical Arch acceptance is still needed.
+
 Version 0.5.3 gives Linux VA/QSV decoders a bounded startup allowance (750 ms,
 with recovery thresholds of 60 compressed frames or 8 MiB). After repeated stalls, the session switches
 to the matching software decoder at a fresh keyframe without reconnecting or

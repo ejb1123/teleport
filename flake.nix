@@ -102,7 +102,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "teleport";
-            version = "0.5.3";
+            version = "0.5.4";
             src = pkgs.lib.fileset.toSource {
               root = ./.;
               fileset = pkgs.lib.fileset.unions [
@@ -111,6 +111,7 @@
                 ./src
                 ./tests
                 ./packaging
+                ./nix/mesa-runtime.sh
               ];
             };
             cargoLock.lockFile = ./Cargo.lock;
@@ -137,6 +138,7 @@
               wrapProgram $out/bin/teleport \
                 ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
                   --unset LD_LIBRARY_PATH --unset LD_PRELOAD \
+                  --run '. ${pkgs.replaceVars ./nix/mesa-runtime.sh { mesa = pkgs.mesa; }}' \
                   --unset SDL_DYNAMIC_API --unset SDL3_DYNAMIC_API \
                   --set FONTCONFIG_FILE "${import ./nix/fontconfig.nix { inherit pkgs; }}" \
                   --set FONTCONFIG_PATH "${pkgs.fontconfig.out}/etc/fonts" \

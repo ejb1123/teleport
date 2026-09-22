@@ -117,10 +117,19 @@ fn synthetic_encoder(format: VideoFormat) -> &'static str {
 }
 
 pub(super) fn output_fragment(format: VideoFormat) -> &'static str {
+    output_fragment_for(format, false)
+}
+
+pub(super) fn output_fragment_for(format: VideoFormat, prefer_nv12: bool) -> &'static str {
     if format.hdr() {
         // Restrict precision and transfer before videoconvert: it must never
         // silently promote an 8-bit/SDR decoded buffer into the HDR output caps.
         "capsfilter name=hdr_decoded caps=\"video/x-raw,format=(string){P010_10LE,I420_10LE,AYUV64},colorimetry=bt2100-pq;video/x-raw,format=(string){ARGB64_BE,RGBA64_LE},colorimetry=1:1:14:7\" ! videoconvert ! video/x-raw,format=P010_10LE,colorimetry=bt2100-pq,chroma-site=jpeg,width=[2,7680],height=[2,8192]"
+    } else if cfg!(target_os = "linux") && prefer_nv12 {
+        // VA decoders already produce NV12: videoconvert can pass it through.
+        // Keep conversion for software decoders that produce planar I420. SDL
+        // performs the final YUV-to-RGB conversion in its accelerated renderer.
+        "queue name=decoded_queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! videoconvert ! video/x-raw,format=NV12,colorimetry=bt709,width=[2,7680],height=[2,8192]"
     } else {
         "videoconvert ! video/x-raw,format=RGB,width=[2,7680],height=[2,8192]"
     }

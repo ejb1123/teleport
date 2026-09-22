@@ -28,6 +28,16 @@ heartbeats, and cache their selection for that client process.
 
 No cross-machine wall-clock subtraction is used. Capture latency, one-way network
 latency, GPU presentation/scanout, and input-to-photon latency are **not measured**.
+
+With the Linux SDR NV12 renderer path (0.5.4), `Convert / copy` measures the
+post-decode raw queue plus any YUV normalization/download and CPU plane copy;
+it does **not** include SDL's later YUV-to-RGB rendering. The raw queue retains
+only the latest decoded frame; skipped raw frames may leave unmatched receive
+ledger entries until their bounded eviction, but cannot corrupt codec references.
+The normal NV12 path halves unpadded pixel bytes versus RGB24, while retaining
+CPU mapping/copying and GPU upload. This is not a fully GPU-resident pipeline.
+Use the renderer/device log and F8 to distinguish GPU-backed OpenGL from CPU
+renderers such as llvmpipe. X11 versus Wayland alone does not determine that.
 Do not add these partial numbers and label the sum end-to-end latency. A physical
 high-speed-camera test remains the acceptance method for input-to-photon latency.
 An unchanged desktop may produce fewer captured frames; requested FPS is a cap,
