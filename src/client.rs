@@ -955,6 +955,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut previous_bytes = 0;
     let mut previous_received = 0_u64;
     let mut previous_decoded = 0_u64;
+    let mut wheel = WheelAccumulator::default();
     let mut probe_id = 0_u64;
     let mut pending_probe: Option<(u64, Instant)> = None;
     let mut last_probe = Instant::now() - Duration::from_secs(1);
@@ -1023,6 +1024,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         "host changed codec during an active session; reconnect to change codec"
                     );
                     desktop = next;
+                    wheel = WheelAccumulator::default();
                     *image.lock().unwrap() = None;
                     hdr_frame = None;
                     hdr_frame_pending = false;
@@ -1051,7 +1053,6 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             }
         }
         let mut motion = None;
-        let pointer_in_toolbar = event_pump.mouse_state().y() < TOOLBAR_HEIGHT as i32;
         for event in event_pump.poll_iter() {
             redraw = true;
             // Both edges stay local, so the remote never receives a stray F8 release.
@@ -1068,9 +1069,6 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 if matches!(event, SdlEvent::KeyDown { repeat: false, .. }) {
                     show_stats = !show_stats;
                 }
-                continue;
-            }
-            if pointer_in_toolbar && matches!(event, SdlEvent::MouseWheel { .. }) {
                 continue;
             }
             if matches!(event, SdlEvent::KeyDown { keycode: Some(Keycode::Q), keymod, .. } if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD) && keymod.intersects(Mod::LALTMOD | Mod::RALTMOD))
@@ -1218,23 +1216,35 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     })
                 }
                 SdlEvent::MouseWheel {
-                    x, y, direction, ..
+                    x,
+                    y,
+                    precise_x,
+                    precise_y,
+                    mouse_x,
+                    mouse_y,
+                    direction,
+                    ..
                 } => {
-                    let sign = if direction == sdl2::mouse::MouseWheelDirection::Flipped {
-                        -1
-                    } else {
-                        1
-                    };
-                    Some(Event::Scroll {
-                        x: x.clamp(-20, 20) * sign,
-                        y: y.clamp(-20, 20) * sign,
-                    })
+                    // Use this event's cursor position, not the end-of-batch
+                    // mouse state. Never let a coalesced motion follow a wheel
+                    // event and rewind the remote pointer after scrolling.
+                    motion = None;
+                    for event in wheel.events(
+                        (x, y),
+                        (precise_x, precise_y),
+                        direction == sdl2::mouse::MouseWheelDirection::Flipped,
+                        desktop_pointer(mouse_x, mouse_y, canvas.window().size(), size),
+                    )? {
+                        send(&events, event)?;
+                    }
+                    None
                 }
                 SdlEvent::Window {
                     win_event: WindowEvent::FocusLost,
                     ..
                 } => {
                     motion = None;
+                    wheel = WheelAccumulator::default();
                     Some(Event::ReleaseAll)
                 }
                 _ => None,
@@ -1657,6 +1667,63 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
 
 const TOOLBAR_HEIGHT: u32 = 82;
 
+#[derive(Default)]
+struct WheelAccumulator {
+    remainder: [f64; 2],
+}
+
+impl WheelAccumulator {
+    fn events(
+        &mut self,
+        integer: (i32, i32),
+        precise: (f32, f32),
+        flipped: bool,
+        position: Option<(f64, f64)>,
+    ) -> Result<Vec<Event>> {
+        let Some((x, y)) = position else {
+            *self = Self::default();
+            return Ok(Vec::new());
+        };
+        let mut steps = [0_i32; 2];
+        for (index, (integer, precise)) in [(integer.0, precise.0), (integer.1, precise.1)]
+            .into_iter()
+            .enumerate()
+        {
+            // Precise deltas replace, not supplement, SDL's integer values.
+            // Older backends may supply only the integer field.
+            let delta = if precise.is_finite() && precise != 0.0 {
+                f64::from(precise)
+            } else {
+                f64::from(integer)
+            };
+            ensure!(
+                delta.abs() <= 200.0,
+                "wheel event exceeds bounded input budget"
+            );
+            let total = self.remainder[index] + if flipped { -delta } else { delta };
+            // SDL supplies f32 values: tolerate rounding at a whole-notch
+            // boundary without repeatedly discarding small touchpad deltas.
+            steps[index] = (total + total.signum() * 1e-6).trunc() as i32;
+            self.remainder[index] = total - f64::from(steps[index]);
+            if self.remainder[index].abs() < 1e-6 {
+                self.remainder[index] = 0.0;
+            }
+        }
+        if steps == [0, 0] {
+            return Ok(Vec::new());
+        }
+        let mut events = vec![Event::Motion { x, y }];
+        while steps != [0, 0] {
+            let x = steps[0].clamp(-20, 20);
+            let y = steps[1].clamp(-20, 20);
+            events.push(Event::Scroll { x, y });
+            steps[0] -= x;
+            steps[1] -= y;
+        }
+        Ok(events)
+    }
+}
+
 struct HdrOverlayPixels {
     rect: Rect,
     width: u32,
@@ -1843,6 +1910,64 @@ fn pointer(x: i32, y: i32, window: (u32, u32), image: (u32, u32)) -> Option<(f64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wheel_notches_preserve_direction_amount_and_motion_order() -> Result<()> {
+        let mut wheel = WheelAccumulator::default();
+        for (integer, precise, flipped, expected) in [
+            ((0, 1), (0.0, 1.0), false, (0, 1)),
+            ((1, -1), (1.0, -1.0), true, (-1, 1)),
+            ((45, -23), (0.0, 0.0), false, (45, -23)),
+        ] {
+            let events = wheel.events(integer, precise, flipped, Some((0.3, 0.7)))?;
+            assert!(matches!(events[0], Event::Motion { x, y } if x == 0.3 && y == 0.7));
+            let mut total = (0, 0);
+            for event in &events[1..] {
+                event.validate()?;
+                if let Event::Scroll { x, y } = event {
+                    total.0 += x;
+                    total.1 += y;
+                } else {
+                    panic!("unexpected wheel translation");
+                }
+            }
+            assert_eq!(total, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn wheel_fractions_accumulate_without_double_counting_and_reset_outside_desktop() -> Result<()>
+    {
+        let mut wheel = WheelAccumulator::default();
+        for _ in 0..3 {
+            // The integer field must not get counted in addition to precise.
+            assert!(
+                wheel
+                    .events((0, 1), (0.0, 0.25), false, Some((0.5, 0.5)))?
+                    .is_empty()
+            );
+        }
+        let events = wheel.events((0, 1), (0.0, 0.25), false, Some((0.5, 0.5)))?;
+        assert!(matches!(events[1], Event::Scroll { x: 0, y: 1 }));
+        assert!(
+            wheel
+                .events((0, 0), (0.0, 0.75), false, Some((0.5, 0.5)))?
+                .is_empty()
+        );
+        assert!(wheel.events((0, 1), (0.0, 1.0), false, None)?.is_empty());
+        assert!(
+            wheel
+                .events((0, 0), (0.0, 0.25), false, Some((0.5, 0.5)))?
+                .is_empty()
+        );
+        assert!(
+            wheel
+                .events((i32::MIN, 0), (0.0, 0.0), true, Some((0.5, 0.5)))
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     #[ignore = "requires an isolated X11 display and SDL OpenGL renderer"]

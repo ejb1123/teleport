@@ -31,7 +31,12 @@ after verifying the real host. File import remains available through **Use file*
    Shift, Ctrl, Option/Alt, Command/Super, arrows, Backspace, and Enter.
 4. Check pointer alignment at all four corners, especially with a scaled
    HiDPI host monitor and letterboxing in the client window.
-5. Check left/middle/right click, dragging and two-finger scrolling.
+5. Check left/middle/right click, dragging and two-finger scrolling. Move between
+   two scrollable panes and scroll immediately: the host must receive pointer
+   motion before the wheel event. Check each notch, both axes, natural direction
+   and fast wheel bursts. Trackpad fractions accumulate into whole host wheel
+   steps (the current protocol is discrete, not smooth pixel scrolling). Wheels
+   over the local toolbar or letterbox margins must not scroll the remote app.
 6. Hold a modifier, switch focus away from the client, then return. The host
    must not have a stuck modifier. Repeat by closing the client while holding
    a key, and by interrupting connectivity. Heartbeat timeout is three seconds.
