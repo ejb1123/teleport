@@ -317,19 +317,16 @@ fn connect_window(
     runtime: &Runtime,
     previous: Option<&str>,
 ) -> Result<Option<Link>> {
-    let sdl = sdl2::init().map_err(anyhow::Error::msg)?;
-    let video = sdl.video().map_err(anyhow::Error::msg)?;
+    let (sdl, video) = crate::windowing::init()?;
     let ttf = sdl2::ttf::init().map_err(anyhow::Error::msg)?;
     let font = ttf
         .load_font(crate::launcher::font_path()?, 18)
         .map_err(anyhow::Error::msg)?;
-    let mut canvas = video
+    let window = video
         .window("Teleport — connecting", 760, 275)
         .position_centered()
-        .build()?
-        .into_canvas()
-        .software()
         .build()?;
+    let mut canvas = crate::windowing::software(window)?;
     let creator = canvas.texture_creator();
     let mut pump = sdl.event_pump().map_err(anyhow::Error::msg)?;
     let mut status = previous
@@ -703,28 +700,34 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         );
         return Ok(false);
     }
-    let sdl = sdl2::init().map_err(anyhow::Error::msg)?;
-    let video = sdl.video().map_err(anyhow::Error::msg)?;
-    let mut window = video
-        .window("Teleport — connecting video", 1280, 720)
-        .position_centered()
-        .resizable()
-        .allow_highdpi()
-        .build()?;
-    window
-        .set_minimum_size(700, 240)
-        .map_err(anyhow::Error::msg)?;
+    let (sdl, video) = crate::windowing::init()?;
+    let make_window = || -> Result<sdl2::video::Window> {
+        let mut window = video
+            .window("Teleport — connecting video", 1280, 720)
+            .position_centered()
+            .resizable()
+            .allow_highdpi()
+            .build()?;
+        window
+            .set_minimum_size(700, 240)
+            .map_err(anyhow::Error::msg)?;
+        Ok(window)
+    };
     let ttf = sdl2::ttf::init().map_err(anyhow::Error::msg)?;
     let font = ttf
         .load_font(crate::launcher::font_path()?, 28)
         .map_err(anyhow::Error::msg)?;
-    let builder = window.into_canvas();
     let mut canvas = if options.software_renderer {
-        builder.software()
+        crate::windowing::software(make_window()?)?
     } else {
-        builder.accelerated()
-    }
-    .build()?;
+        match make_window()?.into_canvas().accelerated().build() {
+            Ok(canvas) => canvas,
+            Err(error) => {
+                tracing::warn!(%error, "Accelerated window renderer unavailable; trying software presentation");
+                crate::windowing::software(make_window()?)?
+            }
+        }
+    };
     let creator = canvas.texture_creator();
     let mut hdr_presenter = if desktop.dynamic_range == protocol::DynamicRange::Hdr10 {
         Some(crate::hdr_present::HdrPresenter::new(canvas.window())?)

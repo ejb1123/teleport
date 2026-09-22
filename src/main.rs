@@ -23,6 +23,7 @@ mod protocol;
 mod security_key;
 mod ssh_agent;
 mod stats;
+mod windowing;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

@@ -302,3 +302,12 @@ cancellation and unavailable permissions are errors, not automatic fallbacks
 to privileged capture. Use `RUST_LOG=teleport=debug` for application diagnostics.
 On the client, `--software-decoder` bypasses hardware decoding and
 `--software-renderer` bypasses the GPU renderer for troubleshooting.
+
+Linux local windows prefer X11/XWayland when `DISPLAY` is available; launcher,
+host settings and connection progress use software presentation without requiring
+the host GPU libraries. Streaming still tries an accelerated renderer first and
+retries software presentation if renderer creation returns an error. Hardware
+decoding and native Wayland host capture are independent of this window policy.
+Explicit `SDL_VIDEODRIVER`/`SDL_VIDEO_DRIVER` selections are respected; use
+`SDL_VIDEODRIVER=wayland` to opt into native Wayland windows (which still need a
+working graphics presentation stack). macOS window selection is unchanged.

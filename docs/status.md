@@ -1,5 +1,20 @@
 # Implementation status
 
+## Version 0.4.2: Linux window startup
+
+Local Linux windows now prefer X11/XWayland when DISPLAY is available, unless
+an SDL video driver was explicitly selected. Launcher, host settings and
+connection progress use an explicit software renderer with CPU framebuffer
+presentation on X11. Streaming still attempts acceleration, then retries
+software if renderer creation returns an error. This does not change host
+capture or decoder selection; macOS backend selection is unchanged.
+
+Regression tests verify painted launcher/settings windows without GPU libraries
+or user SDL flags, and streaming toolbar/monitor/reconnect behavior after forced
+accelerated-renderer failure. Pure Wayland windows still require a working
+graphics presentation stack; process crashes inside graphics drivers are not
+recoverable by the renderer-error fallback.
+
 ## Version 0.4.1: Arch environment isolation and NEO enrollment
 
 The Linux package now isolates its SDL libraries and Fontconfig configuration

@@ -245,6 +245,71 @@ fn native_launcher_password_login_and_saved_identity_alias() {
     launcher_authentication(true);
 }
 
+/// No user SDL flags: a Wayland session with XWayland must have a CPU-only
+/// local UI path even when the Nix application cannot load the host GPU stack.
+#[test]
+#[ignore = "requires Xvfb and GStreamer runtime plugins"]
+fn local_windows_start_without_gpu_or_sdl_workarounds() {
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let mut display = Process(
+        Command::new("Xvfb")
+            .args([
+                "-displayfd",
+                "1",
+                "-screen",
+                "0",
+                "1600x1000x24",
+                "-nolisten",
+                "tcp",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut number = String::new();
+    std::io::BufReader::new(display.0.stdout.take().unwrap())
+        .read_line(&mut number)
+        .unwrap();
+    let display_name = format!(":{}", number.trim());
+    let (connection, screen) = x11rb::connect(Some(&display_name)).unwrap();
+    let root = connection.setup().roots[screen].root;
+    for (command, title) in [
+        ("launcher", "Teleport"),
+        ("host-manager", "Teleport Host Settings"),
+    ] {
+        let mut process = Process(
+            teleport(&display_name)
+                .arg(command)
+                .env("XDG_CONFIG_HOME", temp.path().join("config"))
+                .env("XDG_STATE_HOME", temp.path().join("state"))
+                .env("WAYLAND_DISPLAY", "wayland-unavailable-test")
+                .env_remove("SDL_VIDEODRIVER")
+                .env_remove("SDL_VIDEO_DRIVER")
+                .env_remove("SDL_RENDER_DRIVER")
+                .env_remove("SDL_FRAMEBUFFER_ACCELERATION")
+                .env("SDL_OPENGL_LIBRARY", "/nonexistent/libGL.so")
+                .env("SDL_VIDEO_EGL_DRIVER", "/nonexistent/libEGL.so")
+                .env("SDL_VULKAN_LIBRARY", "/nonexistent/libvulkan.so")
+                .spawn()
+                .unwrap(),
+        );
+        let window = desktop_window(&connection, root, &mut process, title, None);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                process.0.try_wait().unwrap().is_none(),
+                "UI exited after window creation"
+            );
+            // Both windows paint a navy background away from controls.
+            if rendered_pixel(&connection, window, 900, 5, 0x0c121b) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "UI never painted its background");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
 fn launcher_authentication(password_mode: bool) {
     use std::os::unix::fs::PermissionsExt;
     // A pathname Unix socket must fit sockaddr_un even inside a deeply nested
@@ -553,14 +618,12 @@ fn native_toolbar_monitor_reconnect_disconnect_and_launcher() {
     }
     let mut client = Process(
         teleport(&display_name)
-            .args([
-                "client",
-                &address,
-                "--software-renderer",
-                "--software-decoder",
-                "--pairing-file",
-            ])
+            .args(["client", &address, "--software-decoder", "--pairing-file"])
             .arg(&pairing)
+            // Force accelerated creation to fail. The connecting UI must
+            // ignore this hint; the stream must retry software presentation.
+            .env("SDL_RENDER_DRIVER", "opengl")
+            .env("SDL_OPENGL_LIBRARY", "/nonexistent/libGL.so")
             .spawn()
             .unwrap(),
     );

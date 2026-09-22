@@ -14,8 +14,7 @@ enum Action {
 }
 pub fn run() -> Result<()> {
     let directory = host_admin::default_directory()?;
-    let sdl = sdl2::init().map_err(anyhow::Error::msg)?;
-    let video = sdl.video().map_err(anyhow::Error::msg)?;
+    let (sdl, video) = crate::windowing::init()?;
     let ttf = sdl2::ttf::init().map_err(anyhow::Error::msg)?;
     let font = ttf
         .load_font(crate::launcher::font_path()?, 16)
@@ -26,7 +25,7 @@ pub fn run() -> Result<()> {
         .allow_highdpi()
         .resizable()
         .build()?;
-    let mut canvas = window.into_canvas().software().build()?;
+    let mut canvas = crate::windowing::software(window)?;
     canvas.set_logical_size(920, 800)?;
     let textures = canvas.texture_creator();
     let mut events = sdl.event_pump().map_err(anyhow::Error::msg)?;
