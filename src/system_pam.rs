@@ -90,11 +90,18 @@ pub fn validate_helper(helper: &Path) -> Result<std::path::PathBuf> {
     for directory in helper.ancestors().skip(1) {
         let metadata = directory.metadata()?;
         ensure!(
-            metadata.uid() == 0 && metadata.mode() & 0o022 == 0,
+            trusted_directory(metadata.uid(), metadata.mode()),
             "PAM helper directory must be root-owned and not writable by group/others"
         );
     }
     Ok(helper)
+}
+
+fn trusted_directory(uid: u32, mode: u32) -> bool {
+    // Nix's store is root:nixbld 1775. Sticky directories do not permit
+    // another user to replace the root-owned next component, whose ownership
+    // is checked separately above. Non-sticky writable ancestors are unsafe.
+    uid == 0 && (mode & 0o022 == 0 || mode & 0o1000 != 0)
 }
 
 async fn run_worker(helper: &Path, frame: Zeroizing<Vec<u8>>, timeout: Duration) -> Result<()> {
@@ -147,6 +154,14 @@ async fn run_worker(helper: &Path, frame: Zeroizing<Vec<u8>>, timeout: Duration)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn root_owned_sticky_store_ancestors_are_safe() {
+        assert!(trusted_directory(0, 0o1775));
+        assert!(trusted_directory(0, 0o755));
+        assert!(!trusted_directory(0, 0o775));
+        assert!(!trusted_directory(1000, 0o1755));
+        assert!(!trusted_directory(1000, 0o755));
+    }
     #[test]
     fn rejects_invalid_credentials_and_encodes_lengths() {
         assert!(request("ej", "").is_err());
