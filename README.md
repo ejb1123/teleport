@@ -4,9 +4,10 @@ An experimental **native** remote desktop: Linux host, macOS/Linux client,
 Rust + SDL + GStreamer, with Media over QUIC for video and input. No browser,
 Electron, WebRTC, external relay, or account is required.
 
-This is a first working prototype, not a Parsec performance replacement yet.
+This is an experimental implementation, not a production Parsec replacement yet.
 It shares an existing graphical session, one client at a time. Start on a LAN
 or a VPN with direct UDP connectivity.
+See [implementation status](docs/status.md) for verified features and unfinished work.
 
 ## Quick start: Linux → Mac
 
@@ -17,14 +18,13 @@ The initial build downloads and compiles dependencies and can take several minut
 On the **Linux machine**, from a terminal inside your graphical session:
 
 ```sh
-nix develop
-cargo build --release --locked
-./target/release/teleport doctor
-./target/release/teleport host --listen 0.0.0.0:4443 \
-  --pairing-file /tmp/teleport-pairing.json
+nix run . -- doctor
+nix run . -- host --listen 0.0.0.0:4443 \
+  --identity-dir "$HOME/.local/state/teleport/host" \
+  --restore-token "$HOME/.local/state/teleport/host/portal-restore.json"
 ```
 
-On Wayland, choose **one monitor** in the local permission dialog and grant
+On Wayland, choose the **monitors you want to share** in the local permission dialog and grant
 keyboard/mouse control. The host uses the RemoteDesktop/ScreenCast portals and
 PipeWire directly; it does not capture through XWayland. `--source auto` selects
 the portal for Wayland and X11 capture/XTest for an X11 session.
@@ -41,10 +41,18 @@ On the **Mac**, securely copy the pairing file using your existing SSH access,
 then run the native client:
 
 ```sh
-scp YOUR_USER@LINUX_IP:/tmp/teleport-pairing.json ./pairing.json
+scp YOUR_USER@LINUX_IP:.local/state/teleport/host/pairing.json ./pairing.json
 chmod 600 pairing.json
-nix develop
-cargo run --release --locked -- client LINUX_IP:4443 --pairing-file pairing.json
+nix run .
+```
+
+In the native connection window, enter `LINUX_IP:4443`, drop the pairing file
+onto it (or paste its absolute path), then click **Import & trust pairing** and
+**Connect / reconnect**. It remembers trusted hosts in private local files.
+For direct command-line access:
+
+```sh
+nix run . -- client LINUX_IP:4443 --pairing-file pairing.json --reconnect
 ```
 
 Replace `YOUR_USER` and `LINUX_IP`. If SSH isn't configured, transfer the file
@@ -58,10 +66,52 @@ Mac Command maps to Linux Super, Option maps to Alt. Some OS shortcuts remain
 local. **Ctrl+Alt+Q** quits the client locally. Losing window focus releases all
 remote keys/buttons; disconnects and expired heartbeats do the same on the host.
 
-Stop the host with Ctrl+C. Credentials rotate on every host start, and the host
-refuses to overwrite an existing pairing file. Use a new filename on restart
-(and copy that new file to the Mac). A reconnect while the host stays running
-uses the same pairing file and capture permission.
+The session toolbar provides **Monitor >**, **Audio**, **Send text**, **Get text**,
+**Fullscreen**, **Reconnect**, and **Disconnect**. The title shows monitor, size,
+displayed FPS, and action status. Toolbar clicks are local and never forwarded
+to the remote desktop. A connection window shows failures and has Retry/Cancel.
+
+Stop the host with Ctrl+C. With `--identity-dir`, the certificate and pairing
+token survive host restarts, so your saved client pairing keeps working. Keep
+this directory private (0700); its credentials are 0600. Do not copy `key.pem`
+to clients. To revoke paired access, stop the host, move the old identity
+directory to a private backup location, then start with a new identity directory
+and re-pair trusted clients. Everyone with the same pairing file has the same
+access; per-client credentials/revocation are not yet implemented.
+
+Without `--identity-dir`, use `--pairing-file NEW_FILENAME` for ephemeral
+credentials. This mode rotates credentials each start and refuses overwrites.
+`--restore-token` requests remembered Wayland permission, **not** a bypass:
+your compositor may prompt again. Only already-authorized monitors can be
+switched. Monitor hotplug needs a host restart. Unattended operation is limited
+to an existing logged-in graphical session, not login-screen/reboot access.
+
+## Audio, clipboard and quality
+
+Clipboard transfers are explicit text-only actions, limited to 64 KiB. Enable
+`--clipboard` on the host and the client (or the launcher's clipboard toggle).
+**Send text** copies the local clipboard to Linux; **Get text** copies Linux's
+clipboard locally. No continuous clipboard scraping or automatic synchronization.
+Linux clipboard helpers run in the graphical session and are included by Nix.
+
+Audio is off by default. List output monitors with `pactl list short sources`,
+then add `--audio-source YOUR_OUTPUT.monitor` to the host command. Never choose
+a microphone: only explicit `.monitor` names are accepted. Audio uses low-delay
+Opus and the client's audio output; use **Audio** or `--mute` to mute playback.
+This is output audio only, with no microphone forwarding and no tight A/V sync
+guarantee. `--audio-source test` generates a diagnostic tone.
+
+The host defaults to `--encoder auto`: it probes VA-API and NVIDIA encoding,
+then falls back to CPU x264 if neither can encode. Force `--encoder software`,
+`--encoder nvidia`, or `--encoder vaapi` for diagnosis. This is hardware
+**encoding**, not a zero-copy pipeline; capture/conversion still use CPU memory.
+The installed plugins and system GPU drivers must support the selected backend.
+
+`--bitrate 8000` is the starting bitrate and adaptive ceiling, in kbit/s.
+Receiver queue pressure and skipped video groups reduce the bitrate, with slow
+recovery when the connection clears. This conservative heuristic is not a
+full bandwidth estimator. `--fixed-bitrate` disables it; encoders that cannot
+change bitrate during playback also stay fixed, with a warning.
 
 ## Nix package
 
@@ -82,7 +132,7 @@ is pinned to retain Intel Mac support; later upgrades must revisit that target.
 This produces an animated test screen without desktop access or input injection:
 
 ```sh
-./target/release/teleport host --source test --listen 0.0.0.0:4443 \
+nix run . -- host --source test --listen 0.0.0.0:4443 \
   --pairing-file /tmp/teleport-test-pairing.json
 ```
 
@@ -95,23 +145,26 @@ to separate networking/decoding problems from portal/capture problems.
   coordinates; video, keyboard, three mouse buttons, and scrolling.
 - Default 1280-pixel stream width, 60 fps cap, 8 Mbps H.264. Tune with `--width`,
   `--fps`, and `--bitrate` (kilobits/second). Aspect ratio is retained.
-- CPU x264 encoding with no B-frames or lookahead; short keyframe groups. This
-  baseline still copies frames through CPU memory. GPU encoding and zero-copy
-  rendering are not implemented. FPS in the title is decoded/displayed frame
+- Auto hardware encoding with CPU x264 fallback, low-delay settings and short
+  keyframe groups. Frames still copy through CPU memory; zero-copy rendering
+  is not implemented. FPS in the title is decoded/displayed frame
   rate, **not** end-to-end latency.
 - macOS selects GStreamer's VideoToolbox hardware decoder when available;
   otherwise software H.264 decoding. Linux currently uses software decoding.
 - KDE/GNOME require working RemoteDesktop and ScreenCast portal backends.
   Other Wayland compositors may lack remote input support. This prototype uses
   portal input notification methods, not libei yet.
-- Local approval is required when starting a Wayland host. No login-screen,
-  reboot recovery, saved portal permission, or unattended-access guarantee.
-- No audio, clipboard/file transfer, gamepad, virtual display, HDR, IME,
-  multi-monitor switching, adaptive bitrate, or automatic NAT traversal yet.
-- Direct LAN/VPN connections only. A fixed bitrate above available bandwidth
+- Initial local approval is required for Wayland. Saved permission is opt-in
+  and compositor-dependent. No login-screen access or unattended-access guarantee.
+- No file transfer, gamepad, virtual display, HDR, IME, monitor hotplug,
+  keychain-backed credentials or automatic NAT traversal yet.
+- Direct LAN/VPN connections only. A bitrate above available bandwidth
   causes skipped video groups. Severe control loss/reordering disconnects the
   session instead of silently dropping keyboard/button events.
 - Windows is a future client target, not an implemented or tested platform.
+- A signed/notarized standalone Mac installer is not implemented. Nix provides
+  a native `.app` launcher that still depends on its Nix store closure; see
+  [installation and distribution](docs/distribution.md).
 
 ## Transport
 
@@ -123,6 +176,10 @@ The host publishes a `desktop` broadcast with metadata and an `h264` track.
 Each video group starts with an H.264 keyframe and inline SPS/PPS. The receiver
 cancels an older group when a newer group arrives. Frames are Annex B access
 units; this application's media framing is not Hang/CMAF interoperable.
+Application protocol version 2 adds monitors, audio, feedback and explicit
+clipboard controls. Update **both** host and client from the original prototype.
+An ordered `updates` track carries monitor acknowledgements and clipboard
+responses; an optional `opus` track carries independent audio packets.
 
 The client publishes a separate high-priority `controls/input` track with
 ordered JSON events, sequence numbers, and heartbeats. Control groups rotate
@@ -140,14 +197,17 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test --locked
 cargo test --locked --test smoke -- --ignored --nocapture
+cargo test --locked --test ui -- --ignored --nocapture
+cargo test --locked --bin teleport -- --ignored --nocapture
 nix build
 TELEPORT_TEST_BINARY=./result/bin/teleport cargo test --locked --test smoke -- --ignored --nocapture
 nix flake check --all-systems
 ```
 
-The ignored smoke test needs local UDP sockets and installed media plugins;
-it runs a synthetic host, decodes video through a native client without a
-window, reconnects, and checks invalid-token/certificate rejection.
+Ignored tests need local UDP sockets, media plugins, and Xvfb. They exercise
+video/audio, credential pinning, persistent identity across host restarts,
+monitor switching, real X11 input/clipboard, stuck-key release after a suspended
+client, and real native toolbar/launcher clicks on isolated displays.
 The packaged-binary variant strips GStreamer discovery environment variables
 to check that the wrapper works outside the development shell. Ordinary
 unit tests can run in the Nix build sandbox. Desktop permission dialogs and

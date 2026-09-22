@@ -1,0 +1,35 @@
+name: Build Nix distribution artifacts
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - uses: cachix/install-nix-action@b85815f71a6de0ddee80b8a80a98d43f4bcc66c7
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - run: nix build --print-build-logs
+      - run: ./result/bin/teleport doctor
+      - name: Export complete Nix closure (not a standalone installer)
+        shell: bash
+        run: |
+          teleport_store_paths=()
+          while IFS= read -r teleport_store_path; do
+            teleport_store_paths+=("$teleport_store_path")
+          done < <(nix-store --query --requisites ./result)
+          nix-store --export "${teleport_store_paths[@]}" | gzip > teleport-${{ runner.os }}-${{ runner.arch }}.nix-export.gz
+          shasum -a 256 teleport-*.nix-export.gz > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: teleport-nix-${{ runner.os }}-${{ runner.arch }}
+          path: |
+            teleport-*.nix-export.gz
+            SHA256SUMS

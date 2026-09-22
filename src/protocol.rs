@@ -2,11 +2,13 @@ use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{path::Path, time::Duration};
 
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const WIRE_VERSION: &str = "moq-lite-05";
 pub const VIDEO: &str = "h264";
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub const INPUT_TIMEOUT: Duration = Duration::from_secs(3);
+pub const MAX_TEXT: usize = 64 * 1024;
+pub const MAX_CONTROL: usize = MAX_TEXT * 6 + 1024;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct Pairing {
@@ -26,13 +28,33 @@ impl Pairing {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Desktop {
     pub version: u32,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
     pub source: String,
+    pub monitors: Vec<Monitor>,
+    pub active_monitor: usize,
+    pub audio: bool,
+    pub clipboard: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Monitor {
+    pub id: usize,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Update {
+    Desktop { desktop: Desktop },
+    Clipboard { text: String },
+    Notice { text: String },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -50,6 +72,10 @@ pub enum Event {
     Scroll { x: i32, y: i32 },
     ReleaseAll,
     Ping,
+    SelectMonitor { index: usize },
+    Feedback { queue_ms: u32, dropped_groups: u32 },
+    Clipboard { text: String },
+    ClipboardRequest,
 }
 
 impl Event {
@@ -68,6 +94,18 @@ impl Event {
                 x.abs_diff(0) <= 20 && y.abs_diff(0) <= 20,
                 "scroll out of range"
             ),
+            Self::SelectMonitor { index } => ensure!(*index < 64, "invalid monitor index"),
+            Self::Clipboard { text } => ensure!(
+                text.len() <= MAX_TEXT && !text.contains('\0'),
+                "clipboard text exceeds limit or contains NUL"
+            ),
+            Self::Feedback {
+                queue_ms,
+                dropped_groups,
+            } => ensure!(
+                *queue_ms <= 60_000 && *dropped_groups <= 100_000,
+                "invalid video feedback"
+            ),
             _ => (),
         }
         Ok(())
@@ -84,6 +122,39 @@ pub async fn read_frame(
     };
     ensure!(frame.size <= limit as u64, "frame exceeds {limit} bytes");
     Ok(Some(frame.read_all().await?))
+}
+
+/// Control/update history must not be skipped when QUIC streams reorder.
+pub async fn ordered_group(
+    track: &mut moq_net::track::Subscriber,
+    pending: &mut std::collections::BTreeMap<u64, moq_net::group::Consumer>,
+    expected: u64,
+) -> Result<moq_net::group::Consumer> {
+    use anyhow::Context;
+    if let Some(group) = pending.remove(&expected) {
+        return Ok(group);
+    }
+    loop {
+        let group = if pending.is_empty() {
+            track.recv_group().await?
+        } else {
+            tokio::time::timeout(INPUT_TIMEOUT, track.recv_group())
+                .await
+                .context("control reorder gap expired")??
+        }
+        .context("ordered track closed")?;
+        ensure!(
+            group.sequence >= expected && group.sequence - expected <= 16,
+            "control group outside reorder window"
+        );
+        if group.sequence == expected {
+            return Ok(group);
+        }
+        ensure!(
+            pending.insert(group.sequence, group).is_none(),
+            "duplicate control group"
+        );
+    }
 }
 
 /// SDL scancodes use USB HID usage IDs; the portal uses Linux evdev codes.

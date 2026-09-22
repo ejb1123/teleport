@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Teleport
+Comment=Native remote desktop over Media over QUIC
+Exec=teleport
+Terminal=false
+Categories=Network;RemoteAccess;
+StartupNotify=true

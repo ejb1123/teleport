@@ -1,11 +1,14 @@
 use crate::{
     capture::Capture,
     media,
-    protocol::{self, Desktop, Input, Pairing},
+    protocol::{self, Desktop, Event, Input, Pairing, Update},
 };
 use anyhow::{Context, Result, ensure};
 use clap::Args;
-use std::{io::Write, path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 use subtle::ConstantTimeEq;
 
 #[derive(Args)]
@@ -25,15 +28,43 @@ pub struct Options {
     /// H.264 bitrate in kilobits per second.
     #[arg(long, default_value_t = 8000, value_parser = clap::value_parser!(u32).range(500..=100000))]
     pub bitrate: u32,
+    /// Persistent private identity directory; keeps paired clients valid across restarts.
+    #[arg(long, conflicts_with = "pairing_file")]
+    pub identity_dir: Option<PathBuf>,
+    /// Opt in to saving/restoring compositor permissions (approval may still be required).
+    #[arg(long)]
+    pub restore_token: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)]
+    pub monitor: usize,
+    #[arg(long, value_enum, default_value_t = media::EncoderKind::Auto)]
+    pub encoder: media::EncoderKind,
+    /// Disable receiver-feedback bitrate adjustment.
+    #[arg(long)]
+    pub fixed_bitrate: bool,
+    /// Explicit PulseAudio/PipeWire output .monitor name; never records a microphone.
+    #[arg(long)]
+    pub audio_source: Option<String>,
+    /// Allow explicit text clipboard send/fetch requests from the paired client.
+    #[arg(long)]
+    pub clipboard: bool,
 }
 
 pub async fn run(options: Options) -> Result<()> {
     ensure!(
-        !options.pairing_file.exists(),
+        options.identity_dir.is_some() || !options.pairing_file.exists(),
         "pairing file already exists; choose a new --pairing-file (credentials rotate each host start)"
     );
     media::doctor()?;
-    let mut capture = Capture::open(&options.source).await?;
+    // Create the private directory before a portal restore token inside it is written.
+    if let Some(directory) = &options.identity_dir {
+        crate::identity::open(directory)?;
+    }
+    let mut capture = Capture::open_with_options(
+        &options.source,
+        options.restore_token.as_deref(),
+        options.monitor,
+    )
+    .await?;
     let result = serve(&options, &mut capture).await;
     capture.close().await;
     result
@@ -43,12 +74,22 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
     let mut config = moq_native::ServerConfig::default();
     config.bind = Some(options.listen.clone());
     config.version = vec![protocol::WIRE_VERSION.parse().map_err(anyhow::Error::msg)?];
-    config.tls.generate = vec!["teleport.local".into()];
+    let identity = options
+        .identity_dir
+        .as_deref()
+        .map(crate::identity::open)
+        .transpose()?;
+    if let Some(identity) = &identity {
+        config.tls.cert = vec![identity.certificate.clone()];
+        config.tls.key = vec![identity.key.clone()];
+    } else {
+        config.tls.generate = vec!["teleport.local".into()];
+    }
     let mut server = config.init()?;
-    let token = rand::random::<[u8; 32]>()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let token = identity
+        .as_ref()
+        .map(|i| i.token.clone())
+        .unwrap_or_else(crate::identity::token);
     let pairing = Pairing {
         token,
         fingerprint: server
@@ -58,16 +99,27 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
             .context("no certificate")?
             .clone(),
     };
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&options.pairing_file)?;
-    file.write_all(&serde_json::to_vec_pretty(&pairing)?)?;
-    file.sync_all()?;
-    tracing::info!(address = %server.local_addr()?, pairing_file = %options.pairing_file.display(), "Host ready; copy pairing file securely to your client. UDP port must be reachable.");
-    while let Some(request) = server.accept().await {
+    let pairing_path = identity
+        .as_ref()
+        .map(|i| &i.pairing)
+        .unwrap_or(&options.pairing_file);
+    if identity.is_some() && pairing_path.exists() {
+        let saved = Pairing::read(pairing_path)?;
+        ensure!(
+            saved.fingerprint == pairing.fingerprint && saved.token == pairing.token,
+            "persistent pairing does not match host certificate"
+        );
+    } else {
+        crate::identity::write_new(pairing_path, &serde_json::to_vec_pretty(&pairing)?)?;
+    }
+    tracing::info!(address = %server.local_addr()?, pairing_file = %pairing_path.display(), "Host ready; copy pairing file securely to your client. UDP port must be reachable.");
+    let shutdown = shutdown_signal();
+    tokio::pin!(shutdown);
+    loop {
+        let request = tokio::select! {
+            request = server.accept() => match request { Some(request) => request, None => break },
+            _ = &mut shutdown => break,
+        };
         let expected = format!("/teleport/{}", pairing.token);
         if !bool::from(request.path().as_bytes().ct_eq(expected.as_bytes())) {
             let _ = request.close(403).await;
@@ -76,7 +128,7 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         }
         let result = tokio::select! {
             result = connection(request, options, capture) => result,
-            _ = tokio::signal::ctrl_c() => { capture.release_all().await; break; }
+            _ = &mut shutdown => { capture.release_all().await; break; }
         };
         capture.release_all().await;
         if let Err(error) = result {
@@ -87,11 +139,21 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
     Ok(())
 }
 
+async fn shutdown_signal() -> Result<()> {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = terminate.recv() => (),
+    }
+    Ok(())
+}
+
 async fn connection(
     request: moq_native::Request,
     options: &Options,
     capture: &mut Capture,
 ) -> Result<()> {
+    capture.select_monitor(capture.active_monitor).await?;
     let outgoing = moq_net::Origin::random().produce();
     let incoming = moq_net::Origin::random().produce();
     let mut broadcast = outgoing.create_broadcast(
@@ -103,6 +165,15 @@ async fn connection(
         moq_net::track::Info::default().with_latency_max(Duration::from_millis(500)),
     )?;
     let mut metadata = broadcast.create_track("desktop", None)?;
+    let mut updates = broadcast.create_track(
+        "updates",
+        moq_net::track::Info::default().with_ordered(true),
+    )?;
+    let audio_track = if options.audio_source.is_some() {
+        Some(broadcast.create_track("opus", None)?)
+    } else {
+        None
+    };
     let session = request
         .with_publisher(&outgoing)
         .with_subscriber(incoming.clone())
@@ -129,38 +200,117 @@ async fn connection(
     })
     .await
     .context("client did not open input track")??;
+    let info = desktop(options, capture)?;
+    let mut pipeline = media::encoder(
+        &capture.pipeline_source(),
+        info.width,
+        info.height,
+        options.fps,
+        options.bitrate,
+        video.clone(),
+        options.encoder,
+    )?;
+    let audio = match (options.audio_source.as_deref(), audio_track) {
+        (Some(source), Some(track)) => Some(crate::audio::capture(source, track)?),
+        _ => None,
+    };
+    let mut group = metadata.append_group()?;
+    group.write_frame(moq_net::Timestamp::now(), serde_json::to_vec(&info)?)?;
+    group.finish()?;
+    tracing::info!(
+        width = info.width,
+        height = info.height,
+        fps = options.fps,
+        "native client connected"
+    );
+    let mut check = tokio::time::interval(Duration::from_millis(200));
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
+    let incoming = receive_input(input, sender);
+    tokio::pin!(incoming);
+    let mut adaptation = media::BitrateController::new(options.bitrate);
+    let mut adaptive = !options.fixed_bitrate;
+    let mut last_feedback = Instant::now();
+    let mut last_switch = Instant::now() - Duration::from_secs(1);
+    loop {
+        tokio::select! {
+            result = &mut incoming => return result,
+            error = session.closed() => anyhow::bail!("{error}"),
+            _ = check.tick() => { pipeline.error()?; if let Some(audio) = &audio { audio.error()?; } },
+            event = receiver.recv() => {
+                match event.context("input stream closed")? {
+                    Event::SelectMonitor { index } => {
+                        if index >= capture.monitors.len() || last_switch.elapsed() < Duration::from_millis(500) {
+                            publish_update(&mut updates, Update::Desktop { desktop: desktop(options, capture)? })?;
+                            continue;
+                        }
+                        last_switch = Instant::now();
+                        capture.release_all().await;
+                        // Stop the old source before opening another PipeWire node.
+                        drop(pipeline);
+                        capture.select_monitor(index).await?;
+                        let info = desktop(options, capture)?;
+                        pipeline = media::encoder(&capture.pipeline_source(), info.width, info.height, options.fps, options.bitrate, video.clone(), options.encoder)?;
+                        adaptation = media::BitrateController::new(options.bitrate);
+                        adaptive = !options.fixed_bitrate;
+                        last_feedback = Instant::now();
+                        publish_update(&mut updates, Update::Desktop { desktop: info })?;
+                    }
+                    Event::Feedback { queue_ms, dropped_groups } => {
+                        if adaptive && last_feedback.elapsed() >= Duration::from_millis(900) {
+                            last_feedback = Instant::now();
+                            if let Some(bitrate) = adaptation.observe(queue_ms, dropped_groups) {
+                                match pipeline.set_video_bitrate(bitrate) {
+                                    Ok(()) => tracing::info!(bitrate, queue_ms, dropped_groups, "adapted video bitrate"),
+                                    Err(error) => { adaptive = false; tracing::warn!(%error, "encoder does not support live bitrate changes; retaining fixed bitrate"); }
+                                }
+                            }
+                        }
+                    }
+                    Event::Clipboard { text } if options.clipboard => {
+                        let text = match crate::clipboard::write(&text).await { Ok(()) => "Clipboard sent to host".into(), Err(error) => format!("Clipboard unavailable: {error}") };
+                        publish_update(&mut updates, Update::Notice { text })?;
+                    }
+                    Event::ClipboardRequest if options.clipboard => {
+                        let update = match crate::clipboard::read().await { Ok(text) => Update::Clipboard { text }, Err(error) => Update::Notice { text: format!("Clipboard unavailable: {error}") } };
+                        publish_update(&mut updates, update)?;
+                    }
+                    Event::Clipboard { .. } | Event::ClipboardRequest => publish_update(&mut updates, Update::Notice { text: "Host clipboard is disabled; start host with --clipboard to opt in".into() })?,
+                    event => capture.input(event).await?,
+                }
+            },
+        }
+    }
+}
+
+fn desktop(options: &Options, capture: &Capture) -> Result<Desktop> {
     let width = options.width / 2 * 2;
     let height =
         ((width as u64 * capture.height as u64 / capture.width as u64) as u32 / 2 * 2).max(2);
     ensure!(height <= 4320, "scaled desktop exceeds maximum height");
-    let info = Desktop {
+    Ok(Desktop {
         version: protocol::VERSION,
         width,
         height,
         fps: options.fps,
         source: capture.name.into(),
-    };
-    let pipeline = media::encoder(
-        &capture.pipeline_source(),
-        width,
-        height,
-        options.fps,
-        options.bitrate,
-        video,
-    )?;
-    let mut group = metadata.append_group()?;
-    group.write_frame(moq_net::Timestamp::now(), serde_json::to_vec(&info)?)?;
-    group.finish()?;
-    tracing::info!(width, height, fps = options.fps, "native client connected");
-    let mut check = tokio::time::interval(Duration::from_millis(200));
-    tokio::select! {
-        result = receive_input(input, capture) => result,
-        error = session.closed() => anyhow::bail!("{error}"),
-        result = async { loop { check.tick().await; pipeline.error()?; } #[allow(unreachable_code)] Ok::<(), anyhow::Error>(()) } => result,
-    }
+        monitors: capture.monitors.clone(),
+        active_monitor: capture.active_monitor,
+        audio: options.audio_source.is_some(),
+        clipboard: options.clipboard,
+    })
 }
 
-async fn receive_input(mut track: moq_net::track::Subscriber, capture: &mut Capture) -> Result<()> {
+fn publish_update(track: &mut moq_net::track::Producer, update: Update) -> Result<()> {
+    let mut group = track.append_group()?;
+    group.write_frame(moq_net::Timestamp::now(), serde_json::to_vec(&update)?)?;
+    group.finish()?;
+    Ok(())
+}
+
+async fn receive_input(
+    mut track: moq_net::track::Subscriber,
+    sender: tokio::sync::mpsc::Sender<Event>,
+) -> Result<()> {
     let mut sequence = 0;
     let mut group_sequence = 0;
     let mut pending = std::collections::BTreeMap::new();
@@ -175,7 +325,7 @@ async fn receive_input(mut track: moq_net::track::Subscriber, capture: &mut Capt
         loop {
             let frame = tokio::time::timeout(
                 protocol::INPUT_TIMEOUT,
-                protocol::read_frame(&mut group, 1024),
+                protocol::read_frame(&mut group, protocol::MAX_CONTROL),
             )
             .await
             .context("input heartbeat expired")??;
@@ -186,7 +336,11 @@ async fn receive_input(mut track: moq_net::track::Subscriber, capture: &mut Capt
                 "input sequence gap; disconnecting to avoid stuck or reordered keys"
             );
             sequence += 1;
-            capture.input(input.event).await?;
+            input.event.validate()?;
+            sender
+                .send(input.event)
+                .await
+                .context("input handler closed")?;
         }
     }
 }
@@ -198,23 +352,7 @@ async fn ordered_group(
     pending: &mut std::collections::BTreeMap<u64, moq_net::group::Consumer>,
     expected: u64,
 ) -> Result<moq_net::group::Consumer> {
-    if let Some(group) = pending.remove(&expected) {
-        return Ok(group);
-    }
-    loop {
-        let group = track.recv_group().await?.context("input track closed")?;
-        ensure!(
-            group.sequence >= expected && group.sequence - expected <= 16,
-            "control group outside reorder window"
-        );
-        if group.sequence == expected {
-            return Ok(group);
-        }
-        ensure!(
-            pending.insert(group.sequence, group).is_none(),
-            "duplicate control group"
-        );
-    }
+    protocol::ordered_group(track, pending, expected).await
 }
 
 #[cfg(test)]

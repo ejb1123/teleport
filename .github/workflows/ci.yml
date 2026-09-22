@@ -20,16 +20,31 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Formatting
-        run: nix develop --command bash -c 'cargo fmt --check && nixfmt --check flake.nix'
+        run: nix develop --command bash -c 'cargo fmt --check && nixfmt --check flake.nix nix/module.nix'
       - name: Lints and unit tests
         run: nix develop --command bash -c 'cargo clippy --locked --all-targets -- -D warnings && cargo test --locked'
       - name: Real QUIC video, authentication, X11 input and native window tests
         if: runner.os == 'Linux'
         run: nix develop --command cargo test --locked --test smoke -- --ignored --nocapture
+      - name: Media pipeline integration tests
+        if: runner.os == 'Linux'
+        run: nix develop --command cargo test --locked --bin teleport -- --ignored --nocapture
+      - name: Native toolbar and launcher interaction tests
+        if: runner.os == 'Linux'
+        run: nix develop --command cargo test --locked --test ui -- --ignored --nocapture
       - name: Build wrapped native package
         run: nix build --print-build-logs
       - name: Check packaged media plugins
         run: ./result/bin/teleport doctor
+      - name: Check Linux desktop entry
+        if: runner.os == 'Linux'
+        run: test -f result/share/applications/teleport.desktop
+      - name: Check Nix-dependent Mac application launcher
+        if: runner.os == 'macOS'
+        run: test -x result/Applications/Teleport.app/Contents/MacOS/teleport
       - name: Test packaged host/client without development plugin paths
         if: runner.os == 'Linux'
         run: nix develop --command env TELEPORT_TEST_BINARY=./result/bin/teleport cargo test --locked --test smoke -- --ignored --nocapture
+      - name: Test packaged native UI
+        if: runner.os == 'Linux'
+        run: nix develop --command env TELEPORT_TEST_BINARY=./result/bin/teleport cargo test --locked --test ui -- --ignored --nocapture

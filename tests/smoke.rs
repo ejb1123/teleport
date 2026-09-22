@@ -137,6 +137,93 @@ fn native_moq_video() {
     }
 }
 
+/// Saved client credentials must survive a real server restart, and monitor
+/// switching must renegotiate dimensions instead of stretching stale frames.
+#[test]
+#[ignore = "requires local UDP sockets and GStreamer runtime plugins"]
+fn persistent_identity_and_monitor_switch() {
+    let temp = tempfile::tempdir().unwrap();
+    let identity = temp.path().join("identity");
+    let pairing = identity.join("pairing.json");
+    let saved_pairing = temp.path().join("client-pairing.json");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+
+    for attempt in 0..2 {
+        let mut host = Process(
+            teleport()
+                .args([
+                    "host",
+                    "--source",
+                    "test",
+                    "--listen",
+                    &address,
+                    "--width",
+                    "640",
+                    "--fps",
+                    "30",
+                    "--audio-source",
+                    "test",
+                    "--identity-dir",
+                ])
+                .arg(&identity)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(
+                host.0.try_wait().unwrap().is_none(),
+                "host exited during startup"
+            );
+            if std::fs::read(&pairing)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "host startup timed out");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if attempt == 0 {
+            std::fs::copy(&pairing, &saved_pairing).unwrap();
+        }
+        // On restart the pairing already exists before bind; allow startup to
+        // finish without modifying the client copy or trusting a new fingerprint.
+        std::thread::sleep(Duration::from_millis(500));
+        let output = teleport()
+            .args([
+                "client",
+                &address,
+                "--headless-frames",
+                "45",
+                "--smoke-switch-monitor",
+                "--smoke-audio",
+                "--pairing-file",
+            ])
+            .arg(&saved_pairing)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "persistent/switch client attempt {attempt} failed: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("SMOKE PASS"));
+        assert_eq!(
+            std::fs::read(&pairing).unwrap(),
+            std::fs::read(&saved_pairing).unwrap(),
+            "host identity changed across restart"
+        );
+        // Drop kills and reaps this host before the same port/identity is reused.
+        drop(host);
+    }
+}
+
 #[test]
 #[ignore = "requires Xvfb, local UDP sockets and GStreamer runtime plugins"]
 fn x11_capture_input_and_native_window() {
@@ -202,6 +289,7 @@ fn x11_capture_input_and_native_window() {
             .env("DISPLAY", &display_name)
             .args([
                 "host",
+                "--clipboard",
                 "--source",
                 "x11",
                 "--listen",
@@ -234,6 +322,8 @@ fn x11_capture_input_and_native_window() {
             "--headless-frames",
             "30",
             "--smoke-input",
+            "--clipboard",
+            "--smoke-clipboard",
             "--pairing-file",
         ])
         .arg(&pairing)
@@ -280,6 +370,58 @@ fn x11_capture_input_and_native_window() {
     );
     let pointer = connection.query_pointer(root).unwrap().reply().unwrap();
     assert!((pointer.root_x - 399).abs() <= 1 && (pointer.root_y - 299).abs() <= 1);
+
+    // Suspend only our isolated test client, simulating sleep/network loss while
+    // Ctrl is held. The host must release it without a clean client disconnect.
+    let mut sleeping_client = Process(
+        teleport()
+            .args([
+                "client",
+                &address,
+                "--headless-frames",
+                "10000",
+                "--smoke-input",
+                "--pairing-file",
+            ])
+            .arg(&pairing)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let keys = connection.query_keymap().unwrap().reply().unwrap().keys;
+        if keys[37 / 8] & (1 << (37 % 8)) != 0 {
+            break;
+        }
+        assert!(
+            sleeping_client.0.try_wait().unwrap().is_none(),
+            "sleep test client exited before holding Ctrl"
+        );
+        assert!(Instant::now() < deadline, "sleep test never held Ctrl");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        Command::new("kill")
+            .args(["-STOP", &sleeping_client.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let keys = connection.query_keymap().unwrap().reply().unwrap().keys;
+        if keys.iter().all(|byte| *byte == 0) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "heartbeat timeout did not release held Ctrl"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(sleeping_client);
+
     let output = teleport()
         .env_remove("WAYLAND_DISPLAY")
         .env("SDL_VIDEODRIVER", "x11")
@@ -300,5 +442,67 @@ fn x11_capture_input_and_native_window() {
         "native window failed: {} {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+
+    // A systemd service stop sends SIGTERM, not Ctrl+C. Terminate only our own
+    // host while its client holds Ctrl and verify graceful input cleanup.
+    let mut stopping_client = Process(
+        teleport()
+            .args([
+                "client",
+                &address,
+                "--headless-frames",
+                "10000",
+                "--smoke-input",
+                "--pairing-file",
+            ])
+            .arg(&pairing)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let keys = connection.query_keymap().unwrap().reply().unwrap().keys;
+        if keys[37 / 8] & (1 << (37 % 8)) != 0 {
+            break;
+        }
+        assert!(
+            stopping_client.0.try_wait().unwrap().is_none(),
+            "service-stop test client exited before holding Ctrl"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "service-stop test never held Ctrl"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &host.0.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = host.0.try_wait().unwrap() {
+            assert!(status.success(), "SIGTERM host shutdown failed: {status}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "SIGTERM host shutdown timed out");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        connection
+            .query_keymap()
+            .unwrap()
+            .reply()
+            .unwrap()
+            .keys
+            .iter()
+            .all(|byte| *byte == 0),
+        "SIGTERM did not release held Ctrl"
     );
 }

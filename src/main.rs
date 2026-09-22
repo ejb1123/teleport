@@ -1,9 +1,16 @@
+mod audio;
 #[cfg(target_os = "linux")]
 mod capture;
 mod client;
 #[cfg(target_os = "linux")]
+mod clipboard;
+#[cfg(target_os = "linux")]
 mod host;
+#[cfg(target_os = "linux")]
+mod identity;
+mod launcher;
 mod media;
+mod profiles;
 mod protocol;
 
 use anyhow::Result;
@@ -13,11 +20,13 @@ use clap::{Parser, Subcommand};
 #[command(version, about)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Open the native saved-host connection window.
+    Launcher,
     /// Share a Linux desktop (or a synthetic test screen).
     #[cfg(target_os = "linux")]
     Host(host::Options),
@@ -40,8 +49,9 @@ fn main() -> Result<()> {
     // SDL's macOS window/event loop must stay on the main OS thread.
     match cli.command {
         #[cfg(target_os = "linux")]
-        Command::Host(options) => runtime.block_on(host::run(options)),
-        Command::Client(options) => client::run(options, &runtime),
-        Command::Doctor => media::doctor(),
+        Some(Command::Host(options)) => runtime.block_on(host::run(options)),
+        Some(Command::Client(options)) => client::run(options, &runtime),
+        Some(Command::Doctor) => media::doctor(),
+        Some(Command::Launcher) | None => launcher::run(),
     }
 }

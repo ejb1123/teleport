@@ -30,6 +30,7 @@
             gst_all_1.gst-plugins-ugly
             gst_all_1.gst-libav
             SDL2
+            SDL2_ttf
           ]
           ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
             pkgs.pipewire
@@ -42,10 +43,13 @@
             pkgs.libxext
             pkgs.libxdamage
             pkgs.libxtst
+            pkgs.wl-clipboard
+            pkgs.xclip
           ];
       };
     in
     {
+      nixosModules.default = import ./nix/module.nix;
       packages = forAllSystems (
         system:
         let
@@ -55,7 +59,7 @@
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "teleport";
-            version = "0.1.0";
+            version = "0.2.0";
             src = pkgs.lib.fileset.toSource {
               root = ./.;
               fileset = pkgs.lib.fileset.unions [
@@ -63,6 +67,7 @@
                 ./Cargo.lock
                 ./src
                 ./tests
+                ./packaging
               ];
             };
             cargoLock.lockFile = ./Cargo.lock;
@@ -75,7 +80,24 @@
             buildInputs = deps.media;
             postFixup = ''
               wrapProgram $out/bin/teleport \
-                --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : "${pkgs.lib.makeSearchPath "lib/gstreamer-1.0" (map pkgs.lib.getLib deps.media)}"
+                --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : "${pkgs.lib.makeSearchPath "lib/gstreamer-1.0" (map pkgs.lib.getLib deps.media)}" \
+                --set TELEPORT_FONT "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf" \
+                ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''--prefix PATH : "${
+                  pkgs.lib.makeBinPath [
+                    pkgs.wl-clipboard
+                    pkgs.xclip
+                  ]
+                }"''} \
+                --set TELEPORT_PACKAGED 1
+            ''
+            + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              install -Dm644 packaging/teleport.desktop $out/share/applications/teleport.desktop
+              substituteInPlace $out/share/applications/teleport.desktop --replace-fail 'Exec=teleport' "Exec=$out/bin/teleport"
+            ''
+            + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+              mkdir -p $out/Applications/Teleport.app/Contents/MacOS
+              cp packaging/Info.plist $out/Applications/Teleport.app/Contents/Info.plist
+              makeWrapper $out/bin/teleport $out/Applications/Teleport.app/Contents/MacOS/teleport
             '';
             meta.mainProgram = "teleport";
           };
@@ -106,6 +128,7 @@
               ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.xorg-server ];
 
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+            TELEPORT_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";
           };
         }
       );
