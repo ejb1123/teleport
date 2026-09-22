@@ -27,10 +27,12 @@ fi
 [[ $XDG_DATA_HOME == "$TELEPORT_HDR_TEST_ROOT/data" ]]
 export WAYLAND_DISPLAY=teleport-hdr-test PIPEWIRE_RUNTIME_DIR="$XDG_RUNTIME_DIR"
 export QT_QPA_PLATFORM=offscreen KWIN_COMPOSE=O2
+export QT_FORCE_STDERR_LOGGING=1 QT_LOGGING_RULES="kwin_core.debug=true;kwin_screencast.debug=true;KWIN_UTILS.debug=true"
 mkdir -p "$XDG_DATA_HOME/applications"
 # A local trusted-helper declaration only in this synthetic session's data dir;
 # do not disable KWin's permission checks, or modify the user's applications.
 sed "s|@HELPER@|$nested_helper|g" "$(dirname "$0")/kwin-hdr-test.desktop.in" > "$XDG_DATA_HOME/applications/teleport-hdr-test.desktop"
+kbuildsycoca6 --noincremental > "$TELEPORT_HDR_TEST_ROOT/services.log" 2>&1
 nested_pipewire_pid= nested_kwin_pid= nested_surface_pid=
 cleanup() {
   for nested_pid in "$nested_surface_pid" "$nested_kwin_pid" "$nested_pipewire_pid"; do
@@ -50,6 +52,31 @@ for ((i=0;i<200;i++)); do [[ -S $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY ]] && break; s
 gst-launch-1.0 -q videotestsrc pattern=white is-live=true ! video/x-raw,width=128,height=128 ! waylandsink fullscreen=true > "$TELEPORT_HDR_TEST_ROOT/surface.log" 2>&1 &
 nested_surface_pid=$!
 sleep 2
-timeout 20 "$nested_helper" sdr
-timeout 20 "$nested_helper" hdr
-timeout 20 "$nested_helper" sdr
+qdbus org.kde.KWin /KWin supportInformation > "$TELEPORT_HDR_TEST_ROOT/compositor-info.log" 2> "$TELEPORT_HDR_TEST_ROOT/diagnostics.log"
+qdbus org.kde.KWin /Plugins > "$TELEPORT_HDR_TEST_ROOT/plugin-interface.log" 2>> "$TELEPORT_HDR_TEST_ROOT/diagnostics.log"
+qdbus org.kde.KWin /Plugins org.kde.KWin.Plugins.LoadedPlugins > "$TELEPORT_HDR_TEST_ROOT/plugins.log" 2>> "$TELEPORT_HDR_TEST_ROOT/diagnostics.log"
+capture() {
+  local mode=$1 capture_pid output_port input_port
+  timeout 25 "$nested_helper" "$mode" > "$TELEPORT_HDR_TEST_ROOT/capture-$mode.log" 2>&1 &
+  capture_pid=$!
+  # This graph has no session manager or hardware monitors. Explicitly link
+  # only the synthetic screencast and this test's capture stream.
+  for ((i=0;i<100;i++)); do
+    kill -0 "$capture_pid" 2>/dev/null || break
+    pw-link -o > "$TELEPORT_HDR_TEST_ROOT/output-ports.log"
+    pw-link -i > "$TELEPORT_HDR_TEST_ROOT/input-ports.log"
+    output_port=$(head -n 1 "$TELEPORT_HDR_TEST_ROOT/output-ports.log")
+    input_port=$(head -n 1 "$TELEPORT_HDR_TEST_ROOT/input-ports.log")
+    if [[ $output_port == .kwin_wayland-wrapped:output_* && $input_port == nested-capture:input_* ]]; then
+      pw-link "$output_port" "$input_port" 2>> "$TELEPORT_HDR_TEST_ROOT/link-$mode.log" && break
+    fi
+    sleep 0.1
+  done
+  local status=0
+  wait "$capture_pid" || status=$?
+  cat "$TELEPORT_HDR_TEST_ROOT/capture-$mode.log"
+  return "$status"
+}
+capture sdr
+capture hdr
+capture sdr

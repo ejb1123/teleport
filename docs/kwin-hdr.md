@@ -5,6 +5,15 @@ NixOS packages, not Teleport's independently pinned application dependencies.
 It does not weaken portal permissions or change unattended-access policy.
 Building the package does not change the running compositor.
 
+The final patched KWin 6.7.5 package has built successfully with the host's
+pinned NixOS dependencies. Its isolated NVIDIA virtual-output test also passed:
+SDR BGRA center white was 255/255/255, HDR `RGB10A2_LE` center white was
+594/594/594 (the expected 203-nit PQ value), and reconnecting in SDR returned
+255/255/255. HDR negotiation verified full-range RGB, BT.2020 primaries, and
+PQ transfer metadata. This demonstrates actual scene conversion and packed
+10-bit capture; the running desktop, real portal session, and Mac HDR panel
+have not been tested with the patched compositor.
+
 The application-local PipeWire conversion regression test is separately
 available as `import ./nix/pipewire-hdr-check.nix { inherit pkgs; }`. It checks
 the HDR negotiation roundtrip, all four colorimetry fields, SDR negotiation,
@@ -84,6 +93,34 @@ activate, or restart the patched compositor. A planned new graphical session
 is needed to run a deployed compositor package.
 
 ## Required acceptance tests
+
+The optional synthetic test does not attach to the live desktop or portal:
+
+```sh
+# Build the helper with the application's pinned dependencies.
+helper=$(nix build --no-link --print-out-paths --impure --expr '
+  let lock = builtins.fromJSON (builtins.readFile ./flake.lock);
+      pkgs = import (builtins.fetchTree lock.nodes.nixpkgs.locked) {
+        system = "x86_64-linux";
+      };
+  in import ./nix/kwin-hdr-nested-helper.nix { inherit pkgs; }
+')
+# Set this to the patched package built above, not the running system package.
+patched_kwin=/nix/store/REPLACE-WITH-PATCHED-KWIN
+nix develop --command bash nix/kwin-hdr-nested-test.sh \
+  "$patched_kwin" "$helper/bin/nested-capture"
+```
+
+The harness creates private runtime/configuration directories, a private D-Bus
+and PipeWire daemon, and a 128×128 virtual KWin output with a white test surface.
+It declares the helper's restricted interface in that private application
+directory using KWin's normal authorization mechanism; it does not disable
+permission checks. It starts no hardware-monitoring session manager and links
+only its private capture ports. It checks actual center-pixel values, not just
+caps: SDR white must be 255 and 203-nit PQ white approximately 594/1023 in each
+channel (with a small quantization tolerance), then SDR must work again. Logs
+are retained in the printed temporary directory. This is a synthetic scene
+conversion test, not a substitute for real portal or HDR display acceptance.
 
 A successful package build is not an HDR image-quality test. On a deliberately
 scheduled patched session, verify portal permission behavior and SDR capture
