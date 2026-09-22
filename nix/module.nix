@@ -6,10 +6,16 @@
 }:
 let
   cfg = config.services.teleport-desktop;
-  pamHelper = pkgs.runCommand "teleport-system-pam" { buildInputs = [ pkgs.pam ]; } ''
-    mkdir -p $out/libexec
-    $CC -O2 -Wall -Wextra -Werror ${cfg.package}/share/teleport/teleport-pam.c -o $out/libexec/teleport-pam -lpam
-  '';
+  pamHelper =
+    pkgs.runCommand "teleport-system-pam"
+      {
+        nativeBuildInputs = [ pkgs.stdenv.cc ];
+        buildInputs = [ pkgs.pam ];
+      }
+      ''
+        mkdir -p $out/libexec
+        cc -O2 -Wall -Wextra -Werror ${cfg.package}/share/teleport/teleport-pam.c -o $out/libexec/teleport-pam -lpam
+      '';
 in
 {
   options.services.teleport-desktop = {
