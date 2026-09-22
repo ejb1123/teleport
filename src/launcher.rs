@@ -119,6 +119,8 @@ pub fn run() -> Result<()> {
                         crate::profiles::save_pairing(&host, &pairing, &mut profiles)
                     }) {
                         Ok(profile) => {
+                            forward_agent = false;
+                            agent_confirmation = None;
                             address = host;
                             selected = Some(profile);
                             host_offset = profiles.len().saturating_sub(7);
@@ -524,6 +526,8 @@ pub fn run() -> Result<()> {
                         selected = Some(profile);
                         host_offset = profiles.len().saturating_sub(7);
                         status = "Pairing imported and trusted. Ready to connect.".into();
+                        forward_agent = false;
+                        agent_confirmation = None;
                     }
                     Err(error) => status = format!("Import failed: {error}"),
                 },
