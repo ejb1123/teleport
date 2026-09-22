@@ -215,6 +215,7 @@ fn compressed_caps(codec: VideoCodec) -> &'static str {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn validate_hdr_encoded(caps: &gst::CapsRef) -> Result<()> {
     let s = caps.structure(0).context("missing HEVC caps")?;
     ensure!(
