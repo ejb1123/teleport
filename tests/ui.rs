@@ -814,6 +814,71 @@ fn native_toolbar_monitor_reconnect_disconnect_and_launcher() {
         std::thread::sleep(Duration::from_millis(30));
     }
     click(&connection, root, first, 955, 28);
+    // Fullscreen fills the local display. Chrome overlays the video and hides
+    // after the pointer leaves it; returning to the top reveals local controls.
+    let original = connection.get_geometry(first).unwrap().reply().unwrap();
+    click(&connection, root, first, 1030, 28);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let fullscreen_width = loop {
+        let geometry = connection.get_geometry(first).unwrap().reply().unwrap();
+        if geometry.width == 1600 && geometry.height == 1000 {
+            break geometry.width;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fullscreen did not cover the display"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    };
+    let move_pointer = |x, y| {
+        let position = connection
+            .translate_coordinates(first, root, x, y)
+            .unwrap()
+            .reply()
+            .unwrap();
+        connection
+            .xtest_fake_input(
+                xproto::MOTION_NOTIFY_EVENT,
+                0,
+                0,
+                root,
+                position.dst_x,
+                position.dst_y,
+                0,
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+        connection.flush().unwrap();
+    };
+    move_pointer(500, 500);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rendered_pixel(&connection, first, 5, 5, 0x151b26) {
+        assert!(
+            Instant::now() < deadline,
+            "fullscreen toolbar did not collapse"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    move_pointer(800, 1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !rendered_pixel(&connection, first, 5, 5, 0x151b26) {
+        assert!(Instant::now() < deadline, "top edge did not reveal toolbar");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    click(&connection, root, first, fullscreen_width as i16 - 250, 28);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let geometry = connection.get_geometry(first).unwrap().reply().unwrap();
+        if geometry.width == original.width && geometry.height == original.height {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fullscreen did not restore window size"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
     click(&connection, root, first, 56, 28);
     // Monitor 1 is a grayscale ball; monitor 2 is SMPTE color bars. Validate
     // actual switched video, not a changing window title. The center top bar

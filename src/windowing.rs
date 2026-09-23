@@ -3,6 +3,15 @@ use anyhow::{Context, Result};
 use sdl2::{Sdl, VideoSubsystem, render::Canvas, video::Window};
 
 pub fn init() -> Result<(Sdl, VideoSubsystem)> {
+    // Separate native fullscreen Spaces can hide sibling monitor windows.
+    // Borderless desktop fullscreen keeps all mapped displays in one session.
+    // SDL requires this hint before creating any windows (including launcher).
+    #[cfg(target_os = "macos")]
+    sdl2::hint::set_with_priority(
+        "SDL_VIDEO_MAC_FULLSCREEN_SPACES",
+        "0",
+        &sdl2::hint::Hint::Override,
+    );
     // Prefer the GPU-independent X11 presentation path when XWayland is
     // available. Hints are process-local (not inherited by child processes),
     // and avoid mutating the environment after Tokio starts its threads.

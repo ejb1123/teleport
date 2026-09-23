@@ -165,7 +165,14 @@ ceiling of 7680 pixels wide, 8192 high and 33,554,432 total pixels. Actual encod
 hardware may have lower limits. Host CLI defaults remain 1280 wide for older
 clients; a new client's quality request overrides this for its own session.
 
-Stats distinguish control round-trip time, encoded-video payload bitrate,
+Fullscreen can now map independent remote monitors to multiple local displays
+within one authenticated session (requires an updated host). The toolbar overlays
+the desktop and collapses to the top edge; **Use one/all displays** controls the
+layout, and each window's display selector chooses its remote monitor. See
+[fullscreen mapping, limits and testing](docs/multi-monitor.md).
+
+Stats distinguish requested/accepted per-stream bitrate caps, the encoder's
+current target, control round-trip time, actual main-stream encoded-video payload bitrate,
 received/decoded/displayed FPS, skipped groups, superseded decoded frames,
 decoder input queue, receive-to-decoded time, decoded-frame wait, and host encoder
 time where timestamps survive. RTT includes scheduling; it is **not** one-way

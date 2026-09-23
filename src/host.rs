@@ -6,6 +6,7 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use clap::Args;
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -258,6 +259,14 @@ async fn connection(
         options.codec.track(),
         moq_net::track::Info::default().with_latency_max(Duration::from_millis(500)),
     )?;
+    let mut monitor_tracks = Vec::new();
+    for index in 0..capture.monitors.len().min(64) {
+        monitor_tracks.push(broadcast.create_track(
+            format!("monitor-{index}-{}", options.codec.track()),
+            moq_net::track::Info::default().with_latency_max(Duration::from_millis(500)),
+        )?);
+    }
+    let mut monitor_streams: BTreeMap<usize, MonitorEncoder> = BTreeMap::new();
     let mut metadata = broadcast.create_track("desktop", None)?;
     let mut updates = broadcast.create_track(
         "updates",
@@ -361,7 +370,6 @@ async fn connection(
     let mut encoder_metrics = pipeline.encoder_metrics()?;
     let mut telemetry_enabled = false;
     let mut last_telemetry = Instant::now();
-    let mut actual_bitrate = options.bitrate;
     loop {
         tokio::select! {
             result = crate::ssh_agent::closed(&mut ssh_agent) => return result,
@@ -369,18 +377,58 @@ async fn connection(
             error = session.closed() => anyhow::bail!("{error}"),
             _ = check.tick() => {
                 pipeline.error()?;
+                let failed: Vec<_> = monitor_streams.iter().filter_map(|(&index, stream)| stream.pipeline.error().err().map(|error| (index, error))).collect();
+                for (index, error) in failed {
+                    monitor_streams.remove(&index);
+                    capture.release_all().await;
+                    publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor stream stopped: {error}"), requested: false })?;
+                }
                 if let Some(audio) = &audio { audio.error()?; }
                 if telemetry_enabled && last_telemetry.elapsed() >= Duration::from_secs(1) {
                     last_telemetry = Instant::now();
                     publish_update(&mut updates, Update::Telemetry {
                         encode_us: encoder_metrics.encode_us.load(std::sync::atomic::Ordering::Relaxed),
-                        bitrate: actual_bitrate,
+                        bitrate: pipeline.video_bitrate()?,
                         encoder: encoder_metrics.encoder.clone(),
                     })?;
                 }
             },
             event = receiver.recv() => {
                 match event.context("input stream closed")? {
+                    Event::MonitorStream { index, enabled } => {
+                        if !enabled {
+                            monitor_streams.remove(&index);
+                            capture.release_all().await;
+                            publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: "Monitor stream disabled".into(), requested: true })?;
+                            continue;
+                        }
+                        if let Some(stream) = monitor_streams.get(&index) {
+                            publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
+                            continue;
+                        }
+                        if monitor_streams.len() >= 4 || index >= monitor_tracks.len() {
+                            publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: "Monitor unavailable or four additional streams already active".into(), requested: false })?;
+                            continue;
+                        }
+                        match monitor_encoder(options, capture, index, &monitor_tracks[index]).await {
+                            Ok(stream) => {
+                                publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
+                                monitor_streams.insert(index, stream);
+                            }
+                            Err(error) => publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor unavailable: {error}"), requested: false })?,
+                        }
+                    }
+                    Event::MonitorMotion { index, x, y } => {
+                        if monitor_streams.contains_key(&index)
+                            && let Err(error) = capture.monitor_motion(index, x, y).await {
+                            monitor_streams.remove(&index);
+                            capture.release_all().await;
+                            publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor input unavailable: {error}"), requested: false })?;
+                        }
+                    }
+                    // Auxiliary streams currently use fixed bitrate. Their
+                    // congestion must never adapt the independent primary.
+                    Event::MonitorFeedback { .. } => {}
                     Event::ConfigureVideo { width, fps, bitrate } => {
                         if last_configure.elapsed() < Duration::from_millis(500) {
                             publish_update(&mut updates, Update::Notice { text: "Video settings changed too quickly; try again".into() })?;
@@ -405,8 +453,18 @@ async fn connection(
                         capture.select_monitor(capture.active_monitor).await?;
                         pipeline = media::encoder(&capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), fps, bitrate, video.clone(), options.encoder, media::VideoFormat { codec: options.codec, dynamic_range: options.dynamic_range })?;
                         *options = requested;
+                        let active: Vec<_> = monitor_streams.keys().copied().collect();
+                        monitor_streams.clear();
+                        for index in active {
+                            match monitor_encoder(options, capture, index, &monitor_tracks[index]).await {
+                                Ok(stream) => {
+                                    publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
+                                    monitor_streams.insert(index, stream);
+                                }
+                                Err(error) => publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor reconfiguration failed: {error}"), requested: false })?,
+                            }
+                        }
                         encoder_metrics = pipeline.encoder_metrics()?;
-                        actual_bitrate = bitrate;
                         adaptation = media::BitrateController::new(bitrate);
                         adaptive = !options.fixed_bitrate;
                         last_feedback = Instant::now();
@@ -427,7 +485,6 @@ async fn connection(
                         pipeline = media::encoder(&capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, options.bitrate, video.clone(), options.encoder, media::VideoFormat { codec: options.codec, dynamic_range: options.dynamic_range })?;
                         adaptation = media::BitrateController::new(options.bitrate);
                         encoder_metrics = pipeline.encoder_metrics()?;
-                        actual_bitrate = options.bitrate;
                         adaptive = !options.fixed_bitrate;
                         last_feedback = Instant::now();
                         publish_update(&mut updates, Update::Desktop { desktop: info })?;
@@ -437,7 +494,7 @@ async fn connection(
                             last_feedback = Instant::now();
                             if let Some(bitrate) = adaptation.observe(queue_ms, dropped_groups) {
                                 match pipeline.set_video_bitrate(bitrate) {
-                                    Ok(()) => { actual_bitrate = bitrate; tracing::info!(bitrate, queue_ms, dropped_groups, "adapted video bitrate"); },
+                                    Ok(()) => { tracing::info!(bitrate, queue_ms, dropped_groups, "adapted video bitrate"); },
                                     Err(error) => { adaptive = false; tracing::warn!(%error, "encoder does not support live bitrate changes; retaining fixed bitrate"); }
                                 }
                             }
@@ -464,16 +521,27 @@ async fn connection(
 }
 
 fn desktop(options: &Options, capture: &Capture, video_start_group: u64) -> Result<Desktop> {
+    desktop_for_monitor(options, capture, capture.active_monitor, video_start_group)
+}
+
+fn desktop_for_monitor(
+    options: &Options,
+    capture: &Capture,
+    index: usize,
+    video_start_group: u64,
+) -> Result<Desktop> {
+    let monitor = capture.monitors.get(index).context("monitor unavailable")?;
     let width = if options.width == 0 {
-        capture.width
+        monitor.width
     } else {
         options.width
     } / 2
         * 2;
     let height =
-        ((width as u64 * capture.height as u64 / capture.width as u64) as u32 / 2 * 2).max(2);
+        ((width as u64 * monitor.height as u64 / monitor.width as u64) as u32 / 2 * 2).max(2);
     protocol::validate_video_size(width, height)?;
     Ok(Desktop {
+        multimonitor: true,
         ssh_agent: options.allow_ssh_agent,
         dynamic_range: options.dynamic_range,
         codec: options.codec,
@@ -484,15 +552,49 @@ fn desktop(options: &Options, capture: &Capture, video_start_group: u64) -> Resu
         fps: options.fps,
         source: capture.name.into(),
         monitors: capture.monitors.clone(),
-        active_monitor: capture.active_monitor,
+        active_monitor: index,
         audio: options.audio_source.is_some(),
         clipboard: options.clipboard,
         telemetry: true,
         configurable_video: true,
-        native_width: capture.width,
-        native_height: capture.height,
+        native_width: monitor.width,
+        native_height: monitor.height,
         bitrate: options.bitrate,
         video_start_group,
+    })
+}
+
+struct MonitorEncoder {
+    // Declaration order deliberately stops the pipeline before closing its fd.
+    pipeline: media::Pipeline,
+    _source: crate::capture::MonitorSource,
+    desktop: Desktop,
+}
+
+async fn monitor_encoder(
+    options: &Options,
+    capture: &Capture,
+    index: usize,
+    track: &moq_net::track::Producer,
+) -> Result<MonitorEncoder> {
+    let info = desktop_for_monitor(options, capture, index, video_barrier(track)?)?;
+    let source = capture.monitor_source(index, options.dynamic_range).await?;
+    let pipeline = media::encoder(
+        &source.pipeline,
+        (info.width, info.height),
+        options.fps,
+        options.bitrate,
+        track.clone(),
+        options.encoder,
+        media::VideoFormat {
+            codec: options.codec,
+            dynamic_range: options.dynamic_range,
+        },
+    )?;
+    Ok(MonitorEncoder {
+        pipeline,
+        _source: source,
+        desktop: info,
     })
 }
 

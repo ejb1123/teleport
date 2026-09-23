@@ -1201,7 +1201,7 @@ pub fn run() -> Result<()> {
                                 "4K width",
                             ][resolution],
                             ["30 fps", "60 fps", "120 fps"][frame_rate],
-                            ["8 Mbps", "20 Mbps", "40 Mbps"][quality],
+                            ["8 Mbps cap", "20 Mbps cap", "40 Mbps cap"][quality],
                             ["H.264", "H.265"][codec],
                             if hdr { "HDR preview" } else { "SDR" },
                             if clipboard {

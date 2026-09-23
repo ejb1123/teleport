@@ -17,6 +17,9 @@ use std::{
 };
 use tokio::{runtime::Runtime, sync::mpsc};
 
+#[path = "multi_display.rs"]
+mod multi_display;
+
 #[derive(Args, Clone)]
 pub struct Options {
     /// Experimental: allow this host to request SSH authentication signatures from SSH_AUTH_SOCK.
@@ -80,6 +83,7 @@ pub struct Options {
 }
 
 struct Link {
+    remote: moq_net::broadcast::Consumer,
     ssh_agent: Option<crate::ssh_agent::Task>,
     session: moq_net::Session,
     _origin: moq_net::origin::Producer,
@@ -215,6 +219,7 @@ async fn connect(options: &Options) -> Result<Link> {
         None
     };
     Ok(Link {
+        remote,
         ssh_agent,
         session,
         _origin: outgoing,
@@ -707,6 +712,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let audio_source = audio.as_ref().map(|(_, source)| source.clone());
     let audio_notices = updates_sender.clone();
     let network_stats = stream_stats.clone();
+    let remote = link.remote.clone();
     let mut network = Network(runtime.spawn(async move {
         let mut ssh_agent = link.ssh_agent;
         let _origin = link._origin;
@@ -980,8 +986,20 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut host_encode_us = 0;
     let mut host_bitrate = desktop.bitrate;
     let mut host_encoder = "Waiting / unavailable".to_owned();
+    let mut displays = multi_display::Displays::new(remote, options, events.clone());
+    let mut chrome = crate::fullscreen::Chrome::new();
+    let mut placement: Option<crate::fullscreen::Placement> = None;
     'running: loop {
         let mut redraw = first_draw;
+        let mouse = event_pump.mouse_state();
+        // SDL mouse coordinates are relative to its mouse-focus window, not
+        // necessarily this primary display in a multi-window session.
+        let pointer_here = unsafe { sdl2::sys::SDL_GetMouseFocus() } == canvas.window().raw();
+        redraw |= chrome.update(
+            pointer_here.then_some((mouse.x(), mouse.y())),
+            pointer_here && (mouse.left() || mouse.middle() || mouse.right()),
+        );
+        displays.draw(runtime, &font)?;
         first_draw = false;
         pipeline.error()?;
         if let Some((pipeline, _)) = &audio
@@ -1011,6 +1029,17 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         while let Ok(update) = updates.try_recv() {
             redraw = true;
             match update {
+                Update::MonitorStream { index, desktop } => displays.update(index, desktop)?,
+                // A queued close acknowledgement may arrive after a new mapping
+                // has started. Local close already removed the old consumer.
+                Update::MonitorStreamStopped {
+                    index,
+                    reason,
+                    requested: false,
+                } => displays.stopped(index, reason),
+                Update::MonitorStreamStopped {
+                    requested: true, ..
+                } => (),
                 Update::Telemetry {
                     encode_us,
                     bitrate,
@@ -1039,6 +1068,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         "host changed codec during an active session; reconnect to change codec"
                     );
                     desktop = next;
+                    host_bitrate = desktop.bitrate;
+                    tracing::info!(
+                        requested_kbps = options.bitrate,
+                        accepted_cap_kbps = desktop.bitrate,
+                        width = desktop.width,
+                        height = desktop.height,
+                        fps = desktop.fps,
+                        "host acknowledged video configuration"
+                    );
                     wheel = WheelAccumulator::default();
                     *image.lock().unwrap() = None;
                     hdr_frame = None;
@@ -1090,6 +1128,24 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             {
                 break 'running;
             }
+            if displays.event(&event, &desktop, runtime)? {
+                motion = None;
+                continue;
+            }
+            if let Some(id) = event.get_window_id()
+                && id != canvas.window().id()
+            {
+                continue;
+            }
+            if let SdlEvent::MouseMotion {
+                x, y, mousestate, ..
+            } = event
+            {
+                redraw |= chrome.update(
+                    Some((x, y)),
+                    mousestate.left() || mousestate.right() || mousestate.middle(),
+                );
+            }
             // Toolbar is local UI. Never forward its clicks or held modifier keys.
             if let SdlEvent::MouseButtonDown {
                 mouse_btn: MouseButton::Left,
@@ -1097,10 +1153,44 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 y,
                 ..
             } = event
-                && y < TOOLBAR_HEIGHT as i32
+                && chrome.visible()
+                && chrome.blocks_pointer(y)
             {
                 motion = None;
+                wheel = WheelAccumulator::default();
                 send(&events, Event::ReleaseAll)?;
+                if display_mode_rect().contains_point((x, y)) {
+                    if chrome.fullscreen() && displays.active() {
+                        displays.stop();
+                        notice = "Using this local display only".into();
+                    } else if desktop.multimonitor
+                        && desktop.monitors.len() > 1
+                        && video.num_video_displays().map_err(anyhow::Error::msg)? > 1
+                    {
+                        let local = canvas
+                            .window()
+                            .display_index()
+                            .map_err(anyhow::Error::msg)?;
+                        if !chrome.fullscreen() {
+                            placement =
+                                Some(crate::fullscreen::Placement::capture(canvas.window()));
+                            crate::fullscreen::enter(canvas.window_mut(), &video, local)?;
+                            chrome.set_fullscreen(true);
+                        }
+                        if let Err(error) = displays.start(&video, local, &desktop, runtime) {
+                            displays.stop();
+                            notice = format!("Additional displays unavailable: {error}");
+                        }
+                    } else {
+                        notice = if !desktop.multimonitor {
+                            "Update the host to enable independent monitor streams"
+                        } else {
+                            "Connect another local display and share another remote monitor"
+                        }
+                        .into();
+                    }
+                    continue;
+                }
                 match toolbar_hit(x, y, canvas.window().size().0) {
                     Some(0) if !switching && desktop.monitors.len() > 1 => {
                         let index = (desktop.active_monitor + 1) % desktop.monitors.len();
@@ -1147,17 +1237,28 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         notice = "Clipboard requires --clipboard on both host and client".into()
                     }
                     Some(4) => {
-                        let state = if canvas.window().fullscreen_state()
-                            == sdl2::video::FullscreenType::Off
-                        {
-                            sdl2::video::FullscreenType::Desktop
+                        if chrome.fullscreen() {
+                            displays.stop();
+                            if let Some(saved) = placement.take() {
+                                saved.restore(canvas.window_mut())?;
+                            }
+                            chrome.set_fullscreen(false);
                         } else {
-                            sdl2::video::FullscreenType::Off
-                        };
-                        canvas
-                            .window_mut()
-                            .set_fullscreen(state)
-                            .map_err(anyhow::Error::msg)?;
+                            placement =
+                                Some(crate::fullscreen::Placement::capture(canvas.window()));
+                            let local = canvas
+                                .window()
+                                .display_index()
+                                .map_err(anyhow::Error::msg)?;
+                            crate::fullscreen::enter(canvas.window_mut(), &video, local)?;
+                            chrome.set_fullscreen(true);
+                            if desktop.multimonitor
+                                && let Err(error) = displays.start(&video, local, &desktop, runtime)
+                            {
+                                displays.stop();
+                                notice = format!("Additional displays unavailable: {error}");
+                            }
+                        }
                     }
                     Some(5) => {
                         reconnect = true;
@@ -1203,7 +1304,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     ..
                 } => protocol::evdev(code).map(|code| Event::Key { code, down: false }),
                 SdlEvent::MouseMotion { x, y, .. } => {
-                    motion = desktop_pointer(x, y, canvas.window().size(), size)
+                    motion = chrome
+                        .pointer(x, y, canvas.window().size(), size)
                         .map(|(x, y)| Event::Motion { x, y });
                     None
                 }
@@ -1211,7 +1313,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     mouse_btn, x, y, ..
                 } => {
                     motion = None;
-                    if let Some((x, y)) = desktop_pointer(x, y, canvas.window().size(), size) {
+                    if let Some((x, y)) = chrome.pointer(x, y, canvas.window().size(), size) {
                         send(&events, Event::Motion { x, y })?;
                         button(mouse_btn).map(|button| Event::Button { button, down: true })
                     } else {
@@ -1222,7 +1324,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     mouse_btn, x, y, ..
                 } => {
                     motion = None;
-                    if let Some((x, y)) = desktop_pointer(x, y, canvas.window().size(), size) {
+                    if let Some((x, y)) = chrome.pointer(x, y, canvas.window().size(), size) {
                         send(&events, Event::Motion { x, y })?;
                     }
                     button(mouse_btn).map(|button| Event::Button {
@@ -1248,20 +1350,30 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         (x, y),
                         (precise_x, precise_y),
                         direction == sdl2::mouse::MouseWheelDirection::Flipped,
-                        desktop_pointer(mouse_x, mouse_y, canvas.window().size(), size),
+                        chrome.pointer(mouse_x, mouse_y, canvas.window().size(), size),
                     )? {
                         send(&events, event)?;
                     }
                     None
                 }
                 SdlEvent::Window {
-                    win_event: WindowEvent::FocusLost,
+                    win_event: WindowEvent::FocusLost | WindowEvent::FocusGained,
                     ..
                 } => {
                     motion = None;
                     wheel = WheelAccumulator::default();
                     Some(Event::ReleaseAll)
                 }
+                SdlEvent::RenderTargetsReset { .. } | SdlEvent::RenderDeviceReset { .. } => {
+                    texture = None;
+                    size = (0, 0);
+                    text_cache.clear();
+                    None
+                }
+                SdlEvent::Window {
+                    win_event: WindowEvent::Close,
+                    ..
+                } => break 'running,
                 _ => None,
             };
             if let Some(event) = event {
@@ -1346,7 +1458,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         canvas.clear();
         if let Some(texture) = &texture {
             canvas
-                .copy(texture, None, desktop_rect(window_size, size))
+                .copy(texture, None, chrome.rect(window_size, size))
                 .map_err(anyhow::Error::msg)?;
         }
         if stats.elapsed() >= Duration::from_secs(1) || stats_lines.is_empty() {
@@ -1404,7 +1516,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     desktop.codec.label()
                 ),
                 format!("Presented             {fps:.1} fps"),
-                format!("Video payload         {mbps:.2} Mbps (not wire bitrate)"),
+                format!("Video payload (main)  {mbps:.2} Mbps (not wire bitrate)"),
+                format!(
+                    "Request / accepted cap {} / {:.2} Mbps",
+                    options.bitrate.map_or_else(
+                        || "host default".into(),
+                        |rate| format!("{:.2}", rate as f64 / 1000.0)
+                    ),
+                    desktop.bitrate as f64 / 1000.0
+                ),
                 format!("Control round trip    {latency}"),
                 format!("Host encoder          {host_encoder}"),
                 format!(
@@ -1470,128 +1590,155 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             frames = 0;
         }
         use sdl2::pixels::Color;
-        canvas.set_draw_color(Color::RGB(21, 27, 38));
-        canvas
-            .fill_rect(Rect::new(0, 0, window_size.0, TOOLBAR_HEIGHT))
-            .map_err(anyhow::Error::msg)?;
-        canvas.set_draw_color(Color::RGB(46, 57, 74));
-        canvas
-            .fill_rect(Rect::new(0, TOOLBAR_HEIGHT as i32 - 1, window_size.0, 1))
-            .map_err(anyhow::Error::msg)?;
-        let mouse = event_pump.mouse_state();
-        let hover = toolbar_hit(mouse.x(), mouse.y(), window_size.0);
-        let fullscreen = canvas.window().fullscreen_state() != sdl2::video::FullscreenType::Off;
-        let labels = [
-            format!("Display {}", desktop.active_monitor + 1),
-            if audio.is_none() {
-                "Audio"
-            } else if muted {
-                "Muted"
-            } else {
-                "Audio"
-            }
-            .into(),
-            "Send".into(),
-            "Get".into(),
-            if fullscreen { "Window" } else { "Full" }.into(),
-            "Retry".into(),
-            "Disconnect".into(),
-            "Stats".into(),
-        ];
-        for (index, label) in labels.iter().enumerate() {
-            let rect = toolbar_rect(index, window_size.0);
-            let enabled = match index {
-                0 => desktop.monitors.len() > 1 && !switching,
-                1 => audio.is_some(),
-                2 | 3 => options.clipboard && desktop.clipboard,
-                _ => true,
-            };
-            let active = (index == 1 && audio.is_some() && !muted)
-                || (index == 4 && fullscreen)
-                || (index == 7 && show_stats);
-            canvas.set_draw_color(if hover == Some(index) && enabled {
-                if index == 6 {
-                    Color::RGB(114, 47, 59)
+        if chrome.visible() {
+            canvas.set_draw_color(Color::RGB(21, 27, 38));
+            canvas
+                .fill_rect(Rect::new(0, 0, window_size.0, TOOLBAR_HEIGHT))
+                .map_err(anyhow::Error::msg)?;
+            canvas.set_draw_color(Color::RGB(46, 57, 74));
+            canvas
+                .fill_rect(Rect::new(0, TOOLBAR_HEIGHT as i32 - 1, window_size.0, 1))
+                .map_err(anyhow::Error::msg)?;
+            let mouse = event_pump.mouse_state();
+            let hover = toolbar_hit(mouse.x(), mouse.y(), window_size.0);
+            let fullscreen = canvas.window().fullscreen_state() != sdl2::video::FullscreenType::Off;
+            let labels = [
+                format!("Display {}", desktop.active_monitor + 1),
+                if audio.is_none() {
+                    "Audio"
+                } else if muted {
+                    "Muted"
                 } else {
-                    Color::RGB(51, 69, 91)
+                    "Audio"
                 }
-            } else if active {
-                Color::RGB(27, 68, 75)
+                .into(),
+                "Send".into(),
+                "Get".into(),
+                if fullscreen { "Window" } else { "Full" }.into(),
+                "Retry".into(),
+                "Disconnect".into(),
+                "Stats".into(),
+            ];
+            for (index, label) in labels.iter().enumerate() {
+                let rect = toolbar_rect(index, window_size.0);
+                let enabled = match index {
+                    0 => desktop.monitors.len() > 1 && !switching,
+                    1 => audio.is_some(),
+                    2 | 3 => options.clipboard && desktop.clipboard,
+                    _ => true,
+                };
+                let active = (index == 1 && audio.is_some() && !muted)
+                    || (index == 4 && fullscreen)
+                    || (index == 7 && show_stats);
+                canvas.set_draw_color(if hover == Some(index) && enabled {
+                    if index == 6 {
+                        Color::RGB(114, 47, 59)
+                    } else {
+                        Color::RGB(51, 69, 91)
+                    }
+                } else if active {
+                    Color::RGB(27, 68, 75)
+                } else {
+                    Color::RGB(30, 38, 51)
+                });
+                canvas.fill_rect(rect).map_err(anyhow::Error::msg)?;
+                canvas.set_draw_color(if active {
+                    Color::RGB(71, 196, 172)
+                } else {
+                    Color::RGB(48, 61, 79)
+                });
+                canvas.draw_rect(rect).map_err(anyhow::Error::msg)?;
+                session_text(
+                    &mut canvas,
+                    &creator,
+                    &font,
+                    &mut text_cache,
+                    label,
+                    Rect::new(rect.x() + 9, rect.y() + 9, rect.width() - 18, 20),
+                    if !enabled {
+                        Color::RGB(126, 137, 153)
+                    } else if index == 6 {
+                        Color::RGB(255, 161, 166)
+                    } else {
+                        Color::RGB(223, 233, 243)
+                    },
+                )?;
+            }
+            let hint = match hover {
+                Some(0) => "Display · switch to the next remote monitor",
+                Some(1) => "Audio · toggle playback (requires host audio)",
+                Some(2) => "Send text · copy your clipboard to the remote desktop",
+                Some(3) => "Get text · copy remote text to your clipboard",
+                Some(4) => "Fullscreen · fill local displays; move to top to reveal controls",
+                Some(5) => "Reconnect · release held keys and start a fresh connection",
+                Some(6) => "Disconnect · end this session safely (Ctrl+Alt+Q)",
+                Some(7) => "Stats for nerds · measured streaming performance (F8)",
+                _ => "",
+            };
+            if previous_notice != notice {
+                previous_notice.clone_from(&notice);
+                notice_at = Instant::now();
+            }
+            let status = if !hint.is_empty() {
+                hint.into()
+            } else if !notice.is_empty() && notice_at.elapsed() < Duration::from_secs(5) {
+                notice.clone()
             } else {
-                Color::RGB(30, 38, 51)
-            });
-            canvas.fill_rect(rect).map_err(anyhow::Error::msg)?;
-            canvas.set_draw_color(if active {
-                Color::RGB(71, 196, 172)
+                format!(
+                    "CONNECTED   ·   Display {} of {}   ·   {} × {}   ·   {}   ·   {fps:.0} fps   ·   {mbps:.1} Mbps",
+                    desktop.active_monitor + 1,
+                    desktop.monitors.len(),
+                    size.0,
+                    size.1,
+                    desktop.dynamic_range.label()
+                )
+            };
+            let status = if options.forward_ssh_agent {
+                format!("SSH AGENT SHARED | {status}")
             } else {
-                Color::RGB(48, 61, 79)
-            });
-            canvas.draw_rect(rect).map_err(anyhow::Error::msg)?;
+                status
+            };
             session_text(
                 &mut canvas,
                 &creator,
                 &font,
                 &mut text_cache,
-                label,
-                Rect::new(rect.x() + 9, rect.y() + 9, rect.width() - 18, 20),
-                if !enabled {
-                    Color::RGB(126, 137, 153)
-                } else if index == 6 {
-                    Color::RGB(255, 161, 166)
-                } else {
-                    Color::RGB(223, 233, 243)
-                },
+                &status,
+                Rect::new(194, 55, window_size.0.saturating_sub(208), 20),
+                Color::RGB(146, 167, 188),
             )?;
-        }
-        let hint = match hover {
-            Some(0) => "Display · switch to the next remote monitor",
-            Some(1) => "Audio · toggle playback (requires host audio)",
-            Some(2) => "Send text · copy your clipboard to the remote desktop",
-            Some(3) => "Get text · copy remote text to your clipboard",
-            Some(4) => "Full screen · toggle the native window",
-            Some(5) => "Reconnect · release held keys and start a fresh connection",
-            Some(6) => "Disconnect · end this session safely (Ctrl+Alt+Q)",
-            Some(7) => "Stats for nerds · measured streaming performance (F8)",
-            _ => "",
-        };
-        if previous_notice != notice {
-            previous_notice.clone_from(&notice);
-            notice_at = Instant::now();
-        }
-        let status = if !hint.is_empty() {
-            hint.into()
-        } else if !notice.is_empty() && notice_at.elapsed() < Duration::from_secs(5) {
-            notice.clone()
+            let mode = display_mode_rect();
+            canvas.set_draw_color(Color::RGB(30, 48, 62));
+            canvas.fill_rect(mode).map_err(anyhow::Error::msg)?;
+            session_text(
+                &mut canvas,
+                &creator,
+                &font,
+                &mut text_cache,
+                if displays.active() {
+                    "Use one display"
+                } else {
+                    "Use all displays"
+                },
+                Rect::new(mode.x() + 8, mode.y() + 4, mode.width() - 16, 20),
+                Color::RGB(160, 223, 212),
+            )?;
         } else {
-            format!(
-                "CONNECTED   ·   Display {} of {}   ·   {} × {}   ·   {}   ·   {fps:.0} fps   ·   {mbps:.1} Mbps",
-                desktop.active_monitor + 1,
-                desktop.monitors.len(),
-                size.0,
-                size.1,
-                desktop.dynamic_range.label()
-            )
-        };
-        let status = if options.forward_ssh_agent {
-            format!("SSH AGENT SHARED | {status}")
-        } else {
-            status
-        };
-        session_text(
-            &mut canvas,
-            &creator,
-            &font,
-            &mut text_cache,
-            &status,
-            Rect::new(14, 55, window_size.0.saturating_sub(28), 20),
-            Color::RGB(146, 167, 188),
-        )?;
+            canvas.set_draw_color(Color::RGB(99, 218, 193));
+            canvas
+                .fill_rect(reveal_rect(window_size.0))
+                .map_err(anyhow::Error::msg)?;
+        }
         let mut stats_panel = None;
         if show_stats {
             let panel_width = 520.min(window_size.0.saturating_sub(24));
             let panel = Rect::new(
                 window_size.0 as i32 - panel_width as i32 - 12,
-                TOOLBAR_HEIGHT as i32 + 12,
+                if chrome.visible() {
+                    TOOLBAR_HEIGHT as i32 + 12
+                } else {
+                    12
+                },
                 panel_width,
                 stats_lines.len() as u32 * 24 + 28,
             );
@@ -1624,7 +1771,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         if let (Some(presenter), Some(frame)) = (&mut hdr_presenter, &hdr_frame) {
             let mut ui = vec![read_hdr_overlay(
                 &mut canvas,
-                Rect::new(0, 0, window_size.0, TOOLBAR_HEIGHT),
+                if chrome.visible() {
+                    Rect::new(0, 0, window_size.0, TOOLBAR_HEIGHT)
+                } else {
+                    reveal_rect(window_size.0)
+                },
                 window_size,
             )?];
             if let Some(panel) = stats_panel {
@@ -1644,7 +1795,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             let outcome = if let Some(surface) = &frame.surface {
                 presenter.present_surface(
                     surface,
-                    desktop_rect(window_size, size),
+                    chrome.rect(window_size, size),
                     &overlays,
                     window_size,
                 )?
@@ -1662,7 +1813,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         y_stride: hdr.y_stride,
                         uv_stride: hdr.uv_stride,
                     },
-                    desktop_rect(window_size, size),
+                    chrome.rect(window_size, size),
                     &overlays,
                     window_size,
                 )?
@@ -1704,7 +1855,20 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     Ok(reconnect)
 }
 
-const TOOLBAR_HEIGHT: u32 = 82;
+const TOOLBAR_HEIGHT: u32 = crate::fullscreen::HEIGHT;
+
+fn display_mode_rect() -> Rect {
+    Rect::new(12, 51, 172, 27)
+}
+
+fn reveal_rect(width: u32) -> Rect {
+    Rect::new(
+        width.saturating_sub(120) as i32 / 2,
+        0,
+        width.clamp(1, 120),
+        crate::fullscreen::REVEAL_HEIGHT,
+    )
+}
 
 #[derive(Default)]
 struct WheelAccumulator {
@@ -1876,27 +2040,6 @@ fn session_text<'a>(
         .map_err(anyhow::Error::msg)
 }
 
-fn desktop_rect(window: (u32, u32), image: (u32, u32)) -> Rect {
-    let mut rect = fit(
-        (window.0, window.1.saturating_sub(TOOLBAR_HEIGHT).max(1)),
-        image,
-    );
-    rect.set_y(rect.y() + TOOLBAR_HEIGHT as i32);
-    rect
-}
-
-fn desktop_pointer(x: i32, y: i32, window: (u32, u32), image: (u32, u32)) -> Option<(f64, f64)> {
-    if y < TOOLBAR_HEIGHT as i32 {
-        return None;
-    }
-    pointer(
-        x,
-        y - TOOLBAR_HEIGHT as i32,
-        (window.0, window.1.saturating_sub(TOOLBAR_HEIGHT).max(1)),
-        image,
-    )
-}
-
 fn check_network(network: &mut Network, runtime: &Runtime) -> Result<()> {
     if network.0.is_finished() {
         runtime.block_on(&mut network.0)??;
@@ -1918,32 +2061,6 @@ fn button(button: MouseButton) -> Option<u8> {
         MouseButton::Right => Some(3),
         _ => None,
     }
-}
-
-fn fit(window: (u32, u32), image: (u32, u32)) -> Rect {
-    let scale =
-        (window.0 as f64 / image.0.max(1) as f64).min(window.1 as f64 / image.1.max(1) as f64);
-    let w = (image.0 as f64 * scale) as u32;
-    let h = (image.1 as f64 * scale) as u32;
-    Rect::new(
-        ((window.0 - w) / 2) as i32,
-        ((window.1 - h) / 2) as i32,
-        w,
-        h,
-    )
-}
-fn pointer(x: i32, y: i32, window: (u32, u32), image: (u32, u32)) -> Option<(f64, f64)> {
-    if image.0 == 0 || image.1 == 0 {
-        return None;
-    }
-    let rect = fit(window, image);
-    if !rect.contains_point((x, y)) {
-        return None;
-    }
-    Some((
-        (x - rect.x()) as f64 / rect.width() as f64,
-        (y - rect.y()) as f64 / rect.height() as f64,
-    ))
 }
 
 #[cfg(test)]
@@ -2059,8 +2176,12 @@ mod tests {
     }
     #[test]
     fn letterbox_coordinates() {
-        assert!(pointer(0, 0, (1000, 1000), (1920, 1080)).is_none());
-        let (x, y) = pointer(500, 500, (1000, 1000), (1920, 1080)).unwrap();
+        let mut chrome = crate::fullscreen::Chrome::new();
+        chrome.set_fullscreen(true);
+        assert!(chrome.pointer(0, 0, (1000, 1000), (1920, 1080)).is_none());
+        let (x, y) = chrome
+            .pointer(500, 500, (1000, 1000), (1920, 1080))
+            .unwrap();
         assert!((x - 0.5).abs() < 0.01 && (y - 0.5).abs() < 0.01);
     }
 
@@ -2084,17 +2205,19 @@ mod tests {
 
     #[test]
     fn session_chrome_never_maps_to_remote_desktop() {
+        let chrome = crate::fullscreen::Chrome::new();
         for y in 0..TOOLBAR_HEIGHT as i32 {
-            assert!(desktop_pointer(350, y, (700, 600), (1920, 1080)).is_none());
+            assert!(chrome.pointer(350, y, (700, 600), (1920, 1080)).is_none());
         }
-        let rect = desktop_rect((700, 600), (1920, 1080));
-        let (x, y) = desktop_pointer(
-            rect.center().x(),
-            rect.center().y(),
-            (700, 600),
-            (1920, 1080),
-        )
-        .unwrap();
+        let rect = chrome.rect((700, 600), (1920, 1080));
+        let (x, y) = chrome
+            .pointer(
+                rect.center().x(),
+                rect.center().y(),
+                (700, 600),
+                (1920, 1080),
+            )
+            .unwrap();
         assert!((x - 0.5).abs() < 0.01 && (y - 0.5).abs() < 0.01);
     }
 

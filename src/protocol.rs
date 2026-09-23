@@ -74,6 +74,9 @@ impl Pairing {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Desktop {
+    /// Independent monitor tracks within this authenticated session.
+    #[serde(default)]
+    pub multimonitor: bool,
     /// SSH forwarding is separately negotiated; older hosts default to unsupported.
     #[serde(default)]
     pub ssh_agent: bool,
@@ -118,6 +121,17 @@ pub struct Monitor {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Update {
+    MonitorStreamStopped {
+        index: usize,
+        reason: String,
+        /// An acknowledgement of an explicit disable, not an encoder failure.
+        #[serde(default)]
+        requested: bool,
+    },
+    MonitorStream {
+        index: usize,
+        desktop: Desktop,
+    },
     Telemetry {
         encode_us: u64,
         bitrate: u32,
@@ -146,23 +160,79 @@ pub struct Input {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    Motion { x: f64, y: f64 },
-    Button { button: u8, down: bool },
-    Key { code: u16, down: bool },
-    Scroll { x: i32, y: i32 },
+    MonitorStream {
+        index: usize,
+        enabled: bool,
+    },
+    MonitorMotion {
+        index: usize,
+        x: f64,
+        y: f64,
+    },
+    MonitorFeedback {
+        index: usize,
+        queue_ms: u32,
+        dropped_groups: u32,
+    },
+    Motion {
+        x: f64,
+        y: f64,
+    },
+    Button {
+        button: u8,
+        down: bool,
+    },
+    Key {
+        code: u16,
+        down: bool,
+    },
+    Scroll {
+        x: i32,
+        y: i32,
+    },
     ReleaseAll,
     Ping,
-    Probe { id: u64 },
-    ConfigureVideo { width: u32, fps: u32, bitrate: u32 },
-    SelectMonitor { index: usize },
-    Feedback { queue_ms: u32, dropped_groups: u32 },
-    Clipboard { text: String },
+    Probe {
+        id: u64,
+    },
+    ConfigureVideo {
+        width: u32,
+        fps: u32,
+        bitrate: u32,
+    },
+    SelectMonitor {
+        index: usize,
+    },
+    Feedback {
+        queue_ms: u32,
+        dropped_groups: u32,
+    },
+    Clipboard {
+        text: String,
+    },
     ClipboardRequest,
 }
 
 impl Event {
     pub fn validate(&self) -> Result<()> {
         match self {
+            Self::MonitorStream { index, .. } => ensure!(*index < 64, "invalid monitor index"),
+            Self::MonitorMotion { index, x, y } => {
+                ensure!(*index < 64, "invalid monitor index");
+                Self::Motion { x: *x, y: *y }.validate()?;
+            }
+            Self::MonitorFeedback {
+                index,
+                queue_ms,
+                dropped_groups,
+            } => {
+                ensure!(*index < 64, "invalid monitor index");
+                Self::Feedback {
+                    queue_ms: *queue_ms,
+                    dropped_groups: *dropped_groups,
+                }
+                .validate()?;
+            }
             Self::ConfigureVideo {
                 width,
                 fps,
@@ -318,6 +388,73 @@ pub fn evdev(scancode: sdl2::keyboard::Scancode) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitor_controls_validate_indexes_and_payloads() {
+        let legacy: Desktop = serde_json::from_value(serde_json::json!({
+            "version": VERSION, "width": 1280, "height": 720, "fps": 60,
+            "source": "test", "monitors": [], "active_monitor": 0,
+            "audio": false, "clipboard": false
+        }))
+        .unwrap();
+        assert!(
+            !legacy.multimonitor,
+            "older hosts must not advertise independent streams"
+        );
+        assert!(
+            Event::MonitorStream {
+                index: 63,
+                enabled: true
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            Event::MonitorStream {
+                index: 64,
+                enabled: true
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Event::MonitorMotion {
+                index: 1,
+                x: 0.0,
+                y: 1.0
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            Event::MonitorMotion {
+                index: 1,
+                x: f64::INFINITY,
+                y: 1.0
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Event::MonitorFeedback {
+                index: 1,
+                queue_ms: 60_001,
+                dropped_groups: 0
+            }
+            .validate()
+            .is_err()
+        );
+        let event = Event::MonitorMotion {
+            index: 1,
+            x: 0.25,
+            y: 0.75,
+        };
+        let wire = serde_json::to_vec(&event).unwrap();
+        assert!(matches!(
+            serde_json::from_slice::<Event>(&wire).unwrap(),
+            Event::MonitorMotion { index: 1, .. }
+        ));
+    }
     #[test]
     fn old_metadata_defaults_to_h264_without_new_capabilities() {
         let old = serde_json::json!({ "version": 2, "width": 1280, "height": 720, "fps": 60,

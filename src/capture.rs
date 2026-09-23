@@ -43,7 +43,102 @@ enum Backend {
     Test,
 }
 
+/// A portal remote socket must outlive the GStreamer source using it. Each
+/// simultaneous source needs its own core connection, never a replayed fd.
+pub struct MonitorSource {
+    pub pipeline: String,
+    _fd: Option<OwnedFd>,
+}
+
 impl Capture {
+    pub async fn monitor_source(
+        &self,
+        index: usize,
+        range: crate::protocol::DynamicRange,
+    ) -> Result<MonitorSource> {
+        let monitor = self
+            .monitors
+            .get(index)
+            .context("monitor index is out of range")?;
+        let mut fd = None;
+        let mut pipeline = match &self.backend {
+            Backend::Test => format!(
+                "videotestsrc is-live=true pattern={}",
+                if index == 0 { "ball" } else { "smpte" }
+            ),
+            Backend::Portal { session, nodes, .. } => {
+                let remote = Screencast::new()
+                    .await?
+                    .open_pipe_wire_remote(session)
+                    .await?;
+                let source = format!(
+                    "pipewiresrc fd={} path={} do-timestamp=true ! video/x-raw",
+                    remote.as_raw_fd(),
+                    nodes[index]
+                );
+                fd = Some(remote);
+                source
+            }
+            Backend::X11 { origins, .. } => {
+                ensure!(
+                    range == crate::protocol::DynamicRange::Sdr,
+                    "X11 capture is SDR"
+                );
+                let (x, y) = origins[index];
+                format!(
+                    "ximagesrc use-damage=false show-pointer=true startx={x} starty={y} endx={} endy={}",
+                    u32::from(x as u16) + monitor.width - 1,
+                    u32::from(y as u16) + monitor.height - 1
+                )
+            }
+        };
+        if range == crate::protocol::DynamicRange::Hdr10 {
+            pipeline.push_str(" ! capsfilter name=hdr_source caps=video/x-raw,format=RGB10A2_LE,colorimetry=1:1:14:7");
+        }
+        Ok(MonitorSource { pipeline, _fd: fd })
+    }
+
+    pub async fn monitor_motion(&self, index: usize, x: f64, y: f64) -> Result<()> {
+        Event::MonitorMotion { index, x, y }.validate()?;
+        let monitor = self
+            .monitors
+            .get(index)
+            .context("monitor index is out of range")?;
+        let x = x * (monitor.width - 1) as f64;
+        let y = y * (monitor.height - 1) as f64;
+        match &self.backend {
+            Backend::Portal {
+                proxy,
+                session,
+                nodes,
+                ..
+            } => {
+                proxy
+                    .notify_pointer_motion_absolute(session, nodes[index], x, y)
+                    .await?
+            }
+            Backend::X11 {
+                connection,
+                root,
+                origins,
+            } => {
+                let (ox, oy) = origins[index];
+                connection
+                    .xtest_fake_input(
+                        xproto::MOTION_NOTIFY_EVENT,
+                        0,
+                        0,
+                        *root,
+                        (x as i32 + i32::from(ox)) as i16,
+                        (y as i32 + i32::from(oy)) as i16,
+                        0,
+                    )?
+                    .check()?;
+            }
+            Backend::Test => (),
+        }
+        Ok(())
+    }
     #[cfg(test)]
     pub async fn open(source: &str) -> Result<Self> {
         Self::open_with_options(source, None, 0).await
@@ -452,6 +547,9 @@ impl Capture {
             Event::Ping => (),
             // Host-level controls are handled before injection.
             Event::SelectMonitor { .. }
+            | Event::MonitorStream { .. }
+            | Event::MonitorMotion { .. }
+            | Event::MonitorFeedback { .. }
             | Event::Probe { .. }
             | Event::ConfigureVideo { .. }
             | Event::Feedback { .. }
@@ -605,6 +703,39 @@ fn write_restore_token(path: &Path, token: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn independent_monitor_source_and_motion_preserve_primary_and_held_keys() {
+        let mut capture = Capture::open("test").await.unwrap();
+        capture
+            .input(Event::Key {
+                code: 42,
+                down: true,
+            })
+            .await
+            .unwrap();
+        let source = capture
+            .monitor_source(1, crate::protocol::DynamicRange::Sdr)
+            .await
+            .unwrap();
+        assert!(source.pipeline.contains("smpte"));
+        capture.monitor_motion(1, 1.0, 0.5).await.unwrap();
+        assert_eq!(
+            (capture.active_monitor, capture.width, capture.height),
+            (0, 1280, 720)
+        );
+        assert!(capture.keys.contains(&42));
+        assert!(
+            capture
+                .monitor_source(2, crate::protocol::DynamicRange::Sdr)
+                .await
+                .is_err()
+        );
+        assert!(capture.monitor_motion(2, 0.5, 0.5).await.is_err());
+        assert!(capture.monitor_motion(1, f64::NAN, 0.5).await.is_err());
+        capture.release_all().await;
+        assert!(capture.keys.is_empty());
+    }
 
     #[tokio::test]
     async fn monitor_selection_validates_and_updates_dimensions() {

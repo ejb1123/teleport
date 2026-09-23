@@ -102,6 +102,20 @@ impl Pipeline {
         Ok(())
     }
     #[cfg(target_os = "linux")]
+    pub fn video_bitrate(&self) -> Result<u32> {
+        let encoder = self
+            .0
+            .by_name("video_encoder")
+            .context("not a video encoder")?;
+        encoder
+            .find_property("bitrate")
+            .context("encoder has no bitrate control")?;
+        // Every supported encoder's bitrate property is in decimal kbit/s.
+        // This is the encoder target, not measured encoded/network throughput.
+        Ok(encoder.property::<u32>("bitrate"))
+    }
+
+    #[cfg(target_os = "linux")]
     pub fn set_video_bitrate(&self, kbps: u32) -> Result<()> {
         ensure!(kbps > 0 && kbps <= 100_000, "invalid video bitrate");
         let encoder = self
@@ -116,6 +130,10 @@ impl Pipeline {
             "encoder cannot change bitrate while playing"
         );
         encoder.set_property("bitrate", kbps);
+        ensure!(
+            self.video_bitrate()? == kbps,
+            "encoder did not retain requested bitrate target"
+        );
         Ok(())
     }
 
@@ -2567,5 +2585,69 @@ mod tests {
         let mut rate = BitrateController::new(200);
         assert_eq!(rate.observe(1000, 10), None);
         assert_eq!(rate.current, 200);
+    }
+
+    #[test]
+    fn bitrate_controller_has_no_implicit_eight_megabit_cap() {
+        for ceiling in [20_000, 40_000, 100_000] {
+            let mut rate = BitrateController::new(ceiling);
+            assert_eq!(rate.current, ceiling);
+            assert_eq!(rate.observe(100, 0), Some(ceiling * 3 / 4));
+            for _ in 0..100 {
+                rate.observe(0, 0);
+            }
+            assert_eq!(rate.current, ceiling);
+        }
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            for kind in TEST_ENCODERS {
+                assert!(encoder_fragment(kind, 60, 40_000, codec).contains("bitrate=40000"));
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires GStreamer x264/x265 encoder plugins"]
+    fn software_encoder_retains_targets_above_eight_megabits() -> Result<()> {
+        gst::init()?;
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            for target in [20_000, 40_000] {
+                let pipeline = Pipeline(gst::parse::launch(&format!(
+                    "videotestsrc is-live=true ! video/x-raw,format=I420,width=640,height=360,framerate=30/1 ! {} ! appsink name=encoded sync=false max-buffers=1 drop=true",
+                    encoder_fragment(EncoderKind::Software, 30, target, codec)
+                ))?.downcast::<gst::Pipeline>().unwrap());
+                assert_eq!(pipeline.video_bitrate()?, target);
+                let sink = pipeline
+                    .0
+                    .by_name("encoded")
+                    .unwrap()
+                    .downcast::<AppSink>()
+                    .unwrap();
+                pipeline.0.set_state(gst::State::Playing)?;
+                assert!(
+                    sink.try_pull_sample(gst::ClockTime::from_seconds(3))
+                        .is_some()
+                );
+                assert_eq!(pipeline.video_bitrate()?, target);
+                let mutable = pipeline
+                    .0
+                    .by_name("video_encoder")
+                    .unwrap()
+                    .find_property("bitrate")
+                    .unwrap()
+                    .flags()
+                    .contains(gst::PARAM_FLAG_MUTABLE_PLAYING);
+                if mutable {
+                    let replacement = if target == 20_000 { 40_000 } else { 20_000 };
+                    pipeline.set_video_bitrate(replacement)?;
+                    assert_eq!(pipeline.video_bitrate()?, replacement);
+                    assert!(
+                        sink.try_pull_sample(gst::ClockTime::from_seconds(3))
+                            .is_some()
+                    );
+                }
+                pipeline.error()?;
+            }
+        }
+        Ok(())
     }
 }
