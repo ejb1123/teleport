@@ -1,0 +1,28 @@
+--- a/sys/applemedia/vtdec.c
++++ b/sys/applemedia/vtdec.c
+@@ -1032,6 +1032,25 @@
+   gst_vtutil_dict_set_i32 (output_image_buffer_attrs, kCVPixelBufferHeightKey,
+       vtdec->video_info.height);
+ 
++#ifndef HAVE_IOS
++  /* Teleport's experimental Metal sink imports the retained CVPixelBuffer
++   * from GstCoreVideoMeta, without mapping its GstMemory. Ask VideoToolbox
++   * for IOSurface-backed, Metal-compatible output only for that opt-in path;
++   * leave allocation unchanged for existing CPU/OpenGL consumers. */
++  if (g_strcmp0 (g_getenv ("TELEPORT_MAC_GPU_VIDEO"), "1") == 0) {
++    CFDictionaryRef surface_properties = CFDictionaryCreate (NULL, NULL, NULL,
++        0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++
++    if (surface_properties) {
++      CFDictionarySetValue (output_image_buffer_attrs,
++          kCVPixelBufferIOSurfacePropertiesKey, surface_properties);
++      CFRelease (surface_properties);
++    }
++    gst_vtutil_dict_set_boolean (output_image_buffer_attrs,
++        kCVPixelBufferMetalCompatibilityKey, TRUE);
++  }
++#endif
++
+   callback.decompressionOutputCallback = gst_vtdec_session_output_callback;
+   callback.decompressionOutputRefCon = vtdec;
+ 

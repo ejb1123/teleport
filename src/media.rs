@@ -531,6 +531,8 @@ pub struct Image {
     pub stride: usize,
     pub hdr: Option<HdrImage>,
     pub nv12: Option<Nv12Image>,
+    /// Native decoder surface retained without mapping its video planes.
+    pub surface: Option<gst::Sample>,
 }
 
 /// CPU-mappable NV12 planes for an accelerated SDL YUV texture. This avoids
@@ -634,16 +636,37 @@ pub fn decoder_with_stats_output(
     format: impl Into<VideoFormat>,
     prefer_nv12: bool,
 ) -> Result<(Pipeline, AppSrc, LatestImage)> {
-    let format = format.into();
+    decoder_with_stats_presentation(force_software, stats, format.into(), prefer_nv12, false)
+}
+
+pub fn decoder_with_stats_presentation(
+    force_software: bool,
+    stats: Arc<crate::stats::StreamStats>,
+    format: VideoFormat,
+    prefer_nv12: bool,
+    native_surface: bool,
+) -> Result<(Pipeline, AppSrc, LatestImage)> {
     format.validate()?;
+    ensure!(
+        !native_surface || (cfg!(target_os = "macos") && !force_software && !format.hdr()),
+        "native surfaces currently require macOS hardware decoding and SDR"
+    );
     let codec = format.codec;
     let decoder = decoder::select(force_software, format)?;
+    ensure!(
+        !native_surface || decoder == "vtdec_hw",
+        "native Metal video requires VideoToolbox hardware decoding; unset TELEPORT_MAC_GPU_VIDEO to use the compatible renderer"
+    );
     *stats.decoder.lock().unwrap() = decoder.to_owned();
     tracing::info!(decoder, ?codec, "video decoder");
     let caps = compressed_caps(codec);
     let fragment = decoder::fragment(decoder, codec);
     let nv12_output = cfg!(target_os = "linux") && prefer_nv12 && !format.hdr();
-    let conversion = decoder::output_fragment_for(format, nv12_output);
+    let conversion = if native_surface {
+        "video/x-raw,format=NV12,colorimetry=bt709,width=[2,7680],height=[2,8192]"
+    } else {
+        decoder::output_fragment_for(format, nv12_output)
+    };
     let pipeline = Pipeline(gst::parse::launch(&format!(
         "appsrc name=in is-live=true format=time do-timestamp=true max-bytes=8388608 block=false \
         caps={caps},stream-format=byte-stream,alignment=au \
@@ -706,6 +729,31 @@ pub fn decoder_with_stats_output(
                     .map_err(|_| gst::FlowError::Error)?;
                 if format.hdr() {
                     validate_hdr_raw(&info, false).map_err(|_| gst::FlowError::Error)?;
+                }
+                if native_surface {
+                    // Keep the decoder buffer (and its CVPixelBuffer owner) alive.
+                    // Never VideoFrame-map, lock, convert or copy these pixels.
+                    let video_group = stats.decoded(key);
+                    let mut latest = latest.lock().unwrap();
+                    if latest.is_some() {
+                        stats.overwritten_frames.fetch_add(1, Ordering::Relaxed);
+                    }
+                    *latest = Some(Image {
+                        decoded_at: Instant::now(),
+                        decoder_recovery: stats.decoder_recoveries.load(Ordering::Relaxed),
+                        video_group,
+                        data: Vec::new(),
+                        width: info.width(),
+                        height: info.height(),
+                        stride: 0,
+                        hdr: None,
+                        nv12: None,
+                        surface: Some(sample),
+                    });
+                    if video_group.is_some() {
+                        stats.ready_frames.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return Ok(gst::FlowSuccess::Ok);
                 }
                 let frame = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(
                     sample.buffer().ok_or(gst::FlowError::Error)?,
@@ -780,6 +828,7 @@ pub fn decoder_with_stats_output(
                     stats.overwritten_frames.fetch_add(1, Ordering::Relaxed);
                 }
                 *latest = Some(Image {
+                    surface: None,
                     hdr,
                     nv12,
                     decoded_at: Instant::now(),
@@ -799,6 +848,41 @@ pub fn decoder_with_stats_output(
     );
     pipeline.0.set_state(gst::State::Playing)?;
     Ok((pipeline, source, image))
+}
+
+#[cfg(test)]
+mod native_surface_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_native_modes_fail_before_starting_a_pipeline() {
+        // This needs neither GStreamer initialization nor a graphics context.
+        for (software, range) in [(true, DynamicRange::Sdr), (false, DynamicRange::Hdr10)] {
+            let result = decoder_with_stats_presentation(
+                software,
+                Arc::default(),
+                VideoFormat {
+                    codec: VideoCodec::H265,
+                    dynamic_range: range,
+                },
+                false,
+                true,
+            );
+            assert!(result.is_err());
+        }
+        if !cfg!(target_os = "macos") {
+            assert!(
+                decoder_with_stats_presentation(
+                    false,
+                    Arc::default(),
+                    VideoCodec::H264.into(),
+                    false,
+                    true,
+                )
+                .is_err()
+            );
+        }
+    }
 }
 
 pub async fn receive_video_with_stats(

@@ -105,6 +105,23 @@ pub struct HdrPresenter;
 
 #[cfg(not(target_os = "macos"))]
 impl HdrPresenter {
+    pub fn device_name(&self) -> String {
+        "unavailable".to_owned()
+    }
+    pub fn new_sdr(_window: &sdl2::video::Window) -> Result<Self> {
+        anyhow::bail!("GPU surface presentation is only available on macOS")
+    }
+
+    pub fn present_surface(
+        &mut self,
+        _sample: &gstreamer::Sample,
+        _desktop: Rect,
+        _overlays: &[Overlay<'_>],
+        _window_size: (u32, u32),
+    ) -> Result<PresentOutcome> {
+        anyhow::bail!("GPU surface presentation is only available on macOS")
+    }
+
     pub fn new(_window: &sdl2::video::Window) -> Result<Self> {
         anyhow::bail!(
             "native HDR presentation is currently implemented only for macOS; request an SDR stream on this platform"
@@ -170,6 +187,51 @@ mod macos {
         planes: Planes,
     }
 
+    // Core Video wrappers MUST survive GPU completion, not just MTLTexture.
+    struct CfOwned(NonNull<c_void>);
+    impl Drop for CfOwned {
+        fn drop(&mut self) {
+            unsafe { CFRelease(self.0.as_ptr()) }
+        }
+    }
+    struct SurfaceFlight {
+        command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+        _sample: gstreamer::Sample,
+        _y: CfOwned,
+        _uv: CfOwned,
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(value: *const c_void);
+    }
+    #[link(name = "CoreVideo", kind = "framework")]
+    unsafe extern "C" {
+        fn CVMetalTextureCacheCreate(
+            allocator: *const c_void,
+            attributes: *const c_void,
+            device: *const c_void,
+            texture_attributes: *const c_void,
+            output: *mut *mut c_void,
+        ) -> i32;
+        fn CVMetalTextureCacheCreateTextureFromImage(
+            allocator: *const c_void,
+            cache: *mut c_void,
+            image: *mut c_void,
+            attributes: *const c_void,
+            format: usize,
+            width: usize,
+            height: usize,
+            plane: usize,
+            output: *mut *mut c_void,
+        ) -> i32;
+        fn CVMetalTextureGetTexture(texture: *mut c_void) -> *mut ProtocolObject<dyn MTLTexture>;
+        fn CVPixelBufferGetPixelFormatType(buffer: *mut c_void) -> u32;
+        fn CVPixelBufferGetPlaneCount(buffer: *mut c_void) -> usize;
+        fn CVPixelBufferGetIOSurface(buffer: *mut c_void) -> *mut c_void;
+        fn CVPixelBufferGetWidthOfPlane(buffer: *mut c_void, plane: usize) -> usize;
+        fn CVPixelBufferGetHeightOfPlane(buffer: *mut c_void, plane: usize) -> usize;
+    }
+
     pub struct HdrPresenter {
         // The main-thread marker prevents moving Cocoa state to another thread.
         _main_thread: MainThreadMarker,
@@ -180,6 +242,9 @@ mod macos {
         video_pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
         ui_pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
         in_flight: VecDeque<InFlight>,
+        surface_flights: VecDeque<SurfaceFlight>,
+        surface_cache: Option<CfOwned>,
+        sdr: bool,
         edr_started: Option<Instant>,
         has_presented_hdr: bool,
         // A cloned SDL handle ensures the window outlives the attached view.
@@ -187,7 +252,18 @@ mod macos {
     }
 
     impl HdrPresenter {
+        pub fn device_name(&self) -> String {
+            self.device.name().to_string()
+        }
         pub fn new(window: &sdl2::video::Window) -> Result<Self> {
+            Self::new_mode(window, false)
+        }
+
+        pub fn new_sdr(window: &sdl2::video::Window) -> Result<Self> {
+            Self::new_mode(window, true)
+        }
+
+        fn new_mode(window: &sdl2::video::Window, sdr: bool) -> Result<Self> {
             let main_thread = MainThreadMarker::new()
                 .context("HDR presentation must run on the macOS main thread")?;
             autoreleasepool(|_| {
@@ -207,21 +283,32 @@ mod macos {
                 layer.setDevice(Some(&device));
                 layer.setPixelFormat(MTLPixelFormat::RGBA16Float);
                 layer.setFramebufferOnly(true);
-                layer.setWantsExtendedDynamicRangeContent(true);
+                layer.setWantsExtendedDynamicRangeContent(!sdr);
                 let colorspace =
                     CGColorSpace::with_name(Some(unsafe { kCGColorSpaceExtendedLinearITUR_2020 }))
                         .context("extended linear BT.2020 color space unavailable")?;
                 layer.setColorspace(Some(&colorspace));
-                let headroom = screen_headroom(view.0)?;
-                tracing::info!(
-                    headroom,
-                    sdr_white_nits = SDR_WHITE_NITS,
-                    "requested floating-point BT.2020 EDR layer; waiting for display headroom"
-                );
+                if sdr {
+                    tracing::info!(
+                        "created SDR Metal layer for GPU-resident VideoToolbox surfaces"
+                    );
+                } else {
+                    let headroom = screen_headroom(view.0)?;
+                    tracing::info!(
+                        headroom,
+                        sdr_white_nits = SDR_WHITE_NITS,
+                        "requested floating-point BT.2020 EDR layer; waiting for display headroom"
+                    );
+                }
                 let library = device
                     .newLibraryWithSource_options_error(&NSString::from_str(SHADER), None)
                     .map_err(|error| anyhow::anyhow!("compiling HDR Metal shaders: {error}"))?;
-                let video_pipeline = make_pipeline(&device, &library, "pq_video", false)?;
+                let video_pipeline = make_pipeline(
+                    &device,
+                    &library,
+                    if sdr { "nv12_video" } else { "pq_video" },
+                    false,
+                )?;
                 let ui_pipeline = make_pipeline(&device, &library, "sdr_ui", true)?;
                 let queue = device
                     .newCommandQueue()
@@ -235,6 +322,9 @@ mod macos {
                     video_pipeline,
                     ui_pipeline,
                     in_flight: VecDeque::new(),
+                    surface_flights: VecDeque::new(),
+                    surface_cache: None,
+                    sdr,
                     edr_started: None,
                     has_presented_hdr: false,
                     _window: window.clone(),
@@ -249,6 +339,7 @@ mod macos {
             overlays: &[Overlay<'_>],
             window_size: (u32, u32),
         ) -> Result<PresentOutcome> {
+            ensure!(!self.sdr, "P010 CPU presentation requires an HDR presenter");
             frame.validate()?;
             ensure!(window_size.0 > 0 && window_size.1 > 0, "empty HDR window");
             ensure!(overlays.len() <= 16, "too many HDR UI overlays");
@@ -373,6 +464,200 @@ mod macos {
             Ok(PresentOutcome::Presented { headroom })
         }
 
+        pub fn present_surface(
+            &mut self,
+            sample: &gstreamer::Sample,
+            desktop: Rect,
+            overlays: &[Overlay<'_>],
+            window_size: (u32, u32),
+        ) -> Result<PresentOutcome> {
+            ensure!(
+                self.sdr,
+                "NV12 surface presentation requires an SDR presenter"
+            );
+            ensure!(window_size.0 > 0 && window_size.1 > 0, "empty window");
+            ensure!(overlays.len() <= 16, "too many UI overlays");
+            for overlay in overlays {
+                overlay.validate()?;
+            }
+            autoreleasepool(|_| self.present_surface_inner(sample, desktop, overlays, window_size))
+        }
+
+        fn present_surface_inner(
+            &mut self,
+            sample: &gstreamer::Sample,
+            desktop: Rect,
+            overlays: &[Overlay<'_>],
+            window_size: (u32, u32),
+        ) -> Result<PresentOutcome> {
+            use gstreamer_video::{
+                VideoChromaSite, VideoColorMatrix, VideoColorPrimaries, VideoColorRange,
+                VideoFormat, VideoInfo, VideoTransferFunction,
+            };
+            let caps = sample.caps().context("native surface has no caps")?;
+            let info = VideoInfo::from_caps(caps)?;
+            crate::protocol::validate_video_size(info.width(), info.height())?;
+            let color = info.colorimetry();
+            ensure!(
+                info.format() == VideoFormat::Nv12
+                    && info.width().is_multiple_of(2)
+                    && info.height().is_multiple_of(2),
+                "native SDR surfaces must be even-sized NV12"
+            );
+            ensure!(
+                color.matrix() == VideoColorMatrix::Bt709
+                    && color.range() == VideoColorRange::Range16_235
+                    && color.transfer() == VideoTransferFunction::Bt709
+                    && color.primaries() == VideoColorPrimaries::Bt709,
+                "native SDR surface requires limited-range BT.709 metadata"
+            );
+            let site = info.chroma_site();
+            ensure!(
+                site == VideoChromaSite::MPEG2 || site == VideoChromaSite::JPEG,
+                "unsupported native NV12 chroma siting: {site:?}"
+            );
+            let pixel = pixel_buffer(sample)?;
+            let pixel = pixel.as_ptr();
+            unsafe {
+                ensure!(
+                    !CVPixelBufferGetIOSurface(pixel).is_null(),
+                    "VideoToolbox pixel buffer has no IOSurface backing"
+                );
+                ensure!(
+                    CVPixelBufferGetPixelFormatType(pixel) == u32::from_be_bytes(*b"420v"),
+                    "Core Video surface is not limited-range NV12"
+                );
+                ensure!(
+                    CVPixelBufferGetPlaneCount(pixel) == 2,
+                    "Core Video surface must have two planes"
+                );
+                for plane in 0..2 {
+                    let divisor = if plane == 0 { 1 } else { 2 };
+                    ensure!(
+                        CVPixelBufferGetWidthOfPlane(pixel, plane)
+                            == info.width() as usize / divisor
+                            && CVPixelBufferGetHeightOfPlane(pixel, plane)
+                                == info.height() as usize / divisor,
+                        "Core Video dimensions disagree with negotiated caps"
+                    );
+                }
+            }
+            if self.surface_cache.is_none() {
+                let mut cache = std::ptr::null_mut();
+                let status = unsafe {
+                    CVMetalTextureCacheCreate(
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        Retained::as_ptr(&self.device).cast(),
+                        std::ptr::null(),
+                        &mut cache,
+                    )
+                };
+                ensure!(
+                    status == 0,
+                    "creating Core Video Metal cache failed: {status}"
+                );
+                self.surface_cache = Some(CfOwned(
+                    NonNull::new(cache).context("Core Video returned no texture cache")?,
+                ));
+            }
+            let view: &AnyObject = unsafe { &*self.view.0.cast() };
+            let _: () = unsafe { msg_send![view, updateDrawableSize] };
+            let Some(drawable) = self.layer.nextDrawable() else {
+                return Ok(PresentOutcome::DrawableUnavailable);
+            };
+            if self.surface_flights.len() >= 3 {
+                let previous = self.surface_flights.pop_front().unwrap();
+                previous.command.waitUntilCompleted();
+                ensure!(
+                    previous.command.status() != MTLCommandBufferStatus::Error,
+                    "native surface GPU command failed: {:?}",
+                    previous.command.error()
+                );
+            }
+            let cache = self.surface_cache.as_ref().unwrap().0.as_ptr();
+            let (y_owner, y) = import_plane(
+                cache,
+                pixel,
+                MTLPixelFormat::R8Unorm,
+                info.width() as usize,
+                info.height() as usize,
+                0,
+            )?;
+            let (uv_owner, uv) = import_plane(
+                cache,
+                pixel,
+                MTLPixelFormat::RG8Unorm,
+                info.width() as usize / 2,
+                info.height() as usize / 2,
+                1,
+            )?;
+            let pass = MTLRenderPassDescriptor::new();
+            let attachment = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+            attachment.setTexture(Some(&drawable.texture()));
+            attachment.setLoadAction(MTLLoadAction::Clear);
+            attachment.setStoreAction(MTLStoreAction::Store);
+            attachment.setClearColor(MTLClearColor {
+                red: 0.0,
+                green: 0.0,
+                blue: 0.0,
+                alpha: 1.0,
+            });
+            let command = self
+                .queue
+                .commandBuffer()
+                .context("allocating surface command buffer")?;
+            let encoder = command
+                .renderCommandEncoderWithDescriptor(&pass)
+                .context("creating surface render encoder")?;
+            encoder.setRenderPipelineState(&self.video_pipeline);
+            // MPEG-2 chroma is horizontally co-sited with the left luma sample.
+            let offset = [
+                if site == VideoChromaSite::MPEG2 {
+                    0.5 / info.width() as f32
+                } else {
+                    0.0
+                },
+                0.0f32,
+            ];
+            unsafe {
+                encoder.setFragmentTexture_atIndex(Some(&y), 0);
+                encoder.setFragmentTexture_atIndex(Some(&uv), 1);
+                encoder.setFragmentBytes_length_atIndex(
+                    NonNull::from(&offset).cast(),
+                    size_of_val(&offset),
+                    0,
+                );
+            }
+            draw_quad(&encoder, desktop, window_size);
+            encoder.setRenderPipelineState(&self.ui_pipeline);
+            for overlay in overlays {
+                let texture =
+                    self.texture(MTLPixelFormat::RGBA8Unorm, overlay.width, overlay.height)?;
+                upload(
+                    &texture,
+                    overlay.rgba,
+                    overlay.stride,
+                    overlay.width,
+                    overlay.height,
+                );
+                unsafe {
+                    encoder.setFragmentTexture_atIndex(Some(&texture), 0);
+                }
+                draw_quad(&encoder, overlay.rect, window_size);
+            }
+            encoder.endEncoding();
+            command.presentDrawable(ProtocolObject::from_ref(&*drawable));
+            command.commit();
+            self.surface_flights.push_back(SurfaceFlight {
+                command,
+                _sample: sample.clone(),
+                _y: y_owner,
+                _uv: uv_owner,
+            });
+            Ok(PresentOutcome::Presented { headroom: 1.0 })
+        }
+
         fn texture(
             &self,
             format: MTLPixelFormat,
@@ -403,10 +688,78 @@ mod macos {
 
     impl Drop for HdrPresenter {
         fn drop(&mut self) {
+            for frame in &self.surface_flights {
+                frame.command.waitUntilCompleted();
+            }
             for frame in &self.in_flight {
                 frame.command.waitUntilCompleted();
             }
         }
+    }
+
+    fn pixel_buffer(sample: &gstreamer::Sample) -> Result<NonNull<c_void>> {
+        #[repr(C)]
+        struct CoreVideoMeta {
+            meta: gstreamer::ffi::GstMeta,
+            cvbuf: *mut c_void,
+            pixbuf: *mut c_void,
+        }
+        let buffer = sample.buffer().context("native sample has no buffer")?;
+        // GStreamer applemedia's GstCoreVideoMeta owns its CVPixelBuffer. The
+        // caller retains this Sample until GPU completion, keeping it alive.
+        unsafe {
+            let api =
+                gstreamer::glib::gobject_ffi::g_type_from_name(c"GstCoreVideoMetaAPI".as_ptr());
+            ensure!(
+                api != 0,
+                "VideoToolbox native surface metadata is unavailable"
+            );
+            let meta = gstreamer::ffi::gst_buffer_get_meta(buffer.as_ptr() as *mut _, api);
+            ensure!(
+                !meta.is_null()
+                    && !(*meta).info.is_null()
+                    && (*(*meta).info).size == size_of::<CoreVideoMeta>(),
+                "VideoToolbox buffer is missing compatible native surface metadata"
+            );
+            ensure!(
+                (*(meta.cast::<CoreVideoMeta>())).cvbuf == (*(meta.cast::<CoreVideoMeta>())).pixbuf,
+                "unexpected Core Video metadata ownership layout"
+            );
+            NonNull::new((*(meta.cast::<CoreVideoMeta>())).pixbuf)
+                .context("VideoToolbox metadata has no pixel buffer")
+        }
+    }
+
+    fn import_plane(
+        cache: *mut c_void,
+        pixel: *mut c_void,
+        format: MTLPixelFormat,
+        width: usize,
+        height: usize,
+        plane: usize,
+    ) -> Result<(CfOwned, Retained<ProtocolObject<dyn MTLTexture>>)> {
+        let mut output = std::ptr::null_mut();
+        let status = unsafe {
+            CVMetalTextureCacheCreateTextureFromImage(
+                std::ptr::null(),
+                cache,
+                pixel,
+                std::ptr::null(),
+                format.0,
+                width,
+                height,
+                plane,
+                &mut output,
+            )
+        };
+        ensure!(
+            status == 0,
+            "importing Core Video plane {plane} into Metal failed: {status}"
+        );
+        let owner = CfOwned(NonNull::new(output).context("Core Video returned no texture")?);
+        let texture = unsafe { Retained::retain(CVMetalTextureGetTexture(owner.0.as_ptr())) }
+            .context("Core Video texture has no Metal backing")?;
+        Ok((owner, texture))
     }
 
     fn screen_headroom(view: sdl2::sys::SDL_MetalView) -> Result<f64> {
@@ -523,6 +876,15 @@ mod macos {
             float2 uv = (chroma.sample(sample_filter, v.uv).rg * (65535.0 / 64.0) - 512.0) / 896.0;
             float3 rgb = float3(y + 1.4746 * uv.y, y - 0.1645531268 * uv.x - 0.5713531268 * uv.y, y + 1.8814 * uv.x);
             return float4(pq_to_edr(rgb), 1.0);
+        }
+        fragment float4 nv12_video(Vertex v [[stage_in]], texture2d<float> luma [[texture(0)]], texture2d<float> chroma [[texture(1)]], constant float2 &offset [[buffer(0)]]) {
+            constexpr sampler sample_filter(coord::normalized, address::clamp_to_edge, filter::linear);
+            float y = (luma.sample(sample_filter, v.uv).r * 255.0 - 16.0) / 219.0;
+            float2 uv = (chroma.sample(sample_filter, v.uv + offset).rg * 255.0 - 128.0) / 224.0;
+            float3 rgb = clamp(float3(y + 1.5748 * uv.y, y - 0.187324 * uv.x - 0.468124 * uv.y, y + 1.8556 * uv.x), 0.0, 1.0);
+            float3 linear = select(pow((rgb + 0.099) / 1.099, float3(1.0 / 0.45)), rgb / 4.5, rgb < 0.081);
+            float3 bt2020 = float3(dot(linear, float3(0.627404, 0.329283, 0.043313)), dot(linear, float3(0.069097, 0.919540, 0.011362)), dot(linear, float3(0.016391, 0.088013, 0.895595)));
+            return float4(bt2020, 1.0);
         }
         fragment float4 sdr_ui(Vertex v [[stage_in]], texture2d<float> image [[texture(0)]]) {
             constexpr sampler sample_filter(coord::normalized, address::clamp_to_edge, filter::linear);

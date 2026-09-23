@@ -1,5 +1,50 @@
 # Native HDR presentation (macOS implementation, hardware verification pending)
 
+## Experimental GPU-resident SDR video
+
+On macOS, build this revision with `nix build`, then launch:
+
+```sh
+TELEPORT_MAC_GPU_VIDEO=1 ./result/bin/teleport
+```
+
+Choose SDR and hardware decoding (H.264 or H.265). This opt-in path passes the
+VideoToolbox `CVPixelBuffer` retained by GStreamer's `GstCoreVideoMeta` directly
+to a CoreVideo Metal texture cache. The application does not map, CPU-convert,
+copy, or upload the decoded video planes. The application-local applemedia patch
+requests IOSurface-backed, Metal-compatible output when this variable is `1`.
+The private metadata layout is checked against the pinned GStreamer version;
+unknown layouts, missing surfaces, unsupported color metadata, and failed Metal
+imports are errors, not a silent CPU fallback labeled as GPU video.
+
+The Metal shader handles limited-range BT.709 NV12 and supported chroma siting.
+At most three submitted frames retain their decoder sample and imported CoreVideo
+textures until their GPU commands complete. The normal one-frame latest-image
+slot, generation barriers, input mapping, and native toolbar remain in use.
+
+This is **GPU-resident video**, not an entirely CPU-free application: networking,
+input, and UI work still use the CPU, and the toolbar/stats panels are read back
+and uploaded separately. HDR still uses the high-precision CPU-upload path below.
+Software decoding/rendering and headless operation also keep their existing paths.
+Linux is unchanged. Unset `TELEPORT_MAC_GPU_VIDEO` to return to normal rendering.
+
+Mac hardware acceptance is required before making this default: test both codecs,
+60 fps at 720p/1080p/native resolution, Retina resizing/fullscreen, monitor changes,
+minimize/restore, sleep/wake, toolbar/stats, repeated reconnects and stream switches.
+Compare F8 receive-to-ready/presented FPS and Activity Monitor CPU against the
+normal renderer at identical settings. Check grayscale, saturated colors and
+fine colored text. A successful Linux test or Darwin type-check does not verify
+Apple framework linkage, Metal shader compilation, visual correctness, or latency.
+
+The Mac-only surface lifetime test can be run separately:
+
+```sh
+nix develop --command env TELEPORT_MAC_GPU_VIDEO=1 cargo test --test mac_surface -- --ignored
+```
+
+It checks both codecs, IOSurface backing, and retained pixel-buffer ownership
+after decoder destruction. It does not create a Metal drawable or validate colors.
+
 `src/hdr_present.rs` is a native SDL2/Metal presenter. It does not make the existing
 SDL RGB24 renderer HDR, and must only be selected for a genuinely HDR frame whose
 color metadata has been checked upstream. H.265 or a ten-bit format alone is not

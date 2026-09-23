@@ -5,7 +5,10 @@ pkgs.stdenv.mkDerivation {
   pname = "teleport-applemedia-lowlatency-check";
   version = "1";
   src = pkgs.gst_all_1.gst-plugins-bad.src;
-  patches = [ ./gst-applemedia-lowlatency.patch ];
+  patches = [
+    ./gst-applemedia-lowlatency.patch
+    ./gst-applemedia-metal.patch
+  ];
   nativeBuildInputs = [ pkgs.pkg-config ];
   buildInputs = with pkgs.gst_all_1; [
     gst-plugins-base

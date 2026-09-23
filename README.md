@@ -206,8 +206,8 @@ and VideoToolbox on macOS. Failed probes fall back to the codec's software decod
 The stats overlay shows the selected decoder by name. `--software-decoder` forces
 CPU decoding. The probe checks a small synthetic stream; a device can still fail
 at larger resolutions or after a driver/device change. If that happens, reconnect
-with software decoding. Hardware decode currently downloads RGB for SDL upload;
-this is accelerated decoding, not a zero-copy render path. Physical Mac HEVC
+with software decoding. The default Mac path still downloads RGB for SDL upload;
+hardware decoding alone is not a zero-copy render path. Physical Mac HEVC
 acceptance remains required. Intel VA-API has been hardware-tested for H.264,
 HEVC SDR, and HEVC HDR10 decoding; AMD and QSV still require physical-hardware
 acceptance on supported GPUs.
@@ -219,6 +219,15 @@ A one-frame leaky queue **after decoding** prevents a slow downloader/converter
 from building an unlimited raw-frame backlog. Compressed dependent frames are
 never dropped individually. RGB remains the fallback for unsupported/software
 renderers; Mac and HDR pixel paths are unchanged.
+
+An experimental macOS SDR path is available with
+`TELEPORT_MAC_GPU_VIDEO=1 ./result/bin/teleport` after `nix build`.
+It imports VideoToolbox's IOSurface-backed NV12 planes directly into Metal for
+H.264/H.265, avoiding application CPU video mapping, conversion and upload.
+F8 reports the Metal device and pixel path. This is opt-in pending Mac hardware
+acceptance; unset the variable to use normal rendering. HDR retains its existing
+P010 upload path, and UI panels still use CPU readback/upload. See
+[GPU video testing and limitations](docs/hdr-presentation.md#experimental-gpu-resident-sdr-video).
 
 This is **not zero-copy**: decoded NV12 planes still pass through CPU memory and
 are uploaded to SDL. Non-BT.709 sources may also require YUV color conversion.

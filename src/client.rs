@@ -662,7 +662,16 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         codec: link.desktop.codec,
         dynamic_range: link.desktop.dynamic_range,
     };
-    let (pipeline, source, image) = if prefer_nv12 {
+    let native_surface = cfg!(target_os = "macos")
+        && std::env::var("TELEPORT_MAC_GPU_VIDEO").as_deref() == Ok("1")
+        && window_state.is_some()
+        && !options.software_decoder
+        && !options.software_renderer
+        && format.dynamic_range == protocol::DynamicRange::Sdr;
+    let (pipeline, source, image) = if native_surface {
+        tracing::info!("experimental GPU-resident VideoToolbox / Metal video enabled");
+        media::decoder_with_stats_presentation(false, stream_stats.clone(), format, false, true)?
+    } else if prefer_nv12 {
         media::decoder_with_stats_output(
             options.software_decoder,
             stream_stats.clone(),
@@ -907,7 +916,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         return Ok(false);
     }
     let (sdl, video, mut canvas) = window_state.take().context("session window missing")?;
-    let graphics_name =
+    let mut graphics_name =
         graphics_renderer(&video).unwrap_or_else(|| "Not exposed by this backend".into());
     tracing::info!(graphics = %graphics_name, "local graphics device");
     if ["llvmpipe", "softpipe", "software rasterizer"]
@@ -921,11 +930,17 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         .load_font(crate::launcher::font_path()?, 28)
         .map_err(anyhow::Error::msg)?;
     let creator = canvas.texture_creator();
-    let mut hdr_presenter = if desktop.dynamic_range == protocol::DynamicRange::Hdr10 {
+    let mut hdr_presenter = if native_surface {
+        Some(crate::hdr_present::HdrPresenter::new_sdr(canvas.window())?)
+    } else if desktop.dynamic_range == protocol::DynamicRange::Hdr10 {
         Some(crate::hdr_present::HdrPresenter::new(canvas.window())?)
     } else {
         None
     };
+    if let Some(presenter) = &hdr_presenter {
+        graphics_name = presenter.device_name();
+        tracing::info!(graphics = %graphics_name, "native Metal presentation device");
+    }
     let mut hdr_frame: Option<media::Image> = None;
     let mut hdr_frame_pending = false;
     let mut hdr_headroom: Option<f64> = None;
@@ -1267,7 +1282,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             redraw = true;
             decoded_age = frame.decoded_at.elapsed();
             protocol::validate_video_size(frame.width, frame.height)?;
-            if size != (frame.width, frame.height) && frame.hdr.is_none() {
+            let native_frame = frame.hdr.is_some() || frame.surface.is_some();
+            if size != (frame.width, frame.height) && !native_frame {
                 size = (frame.width, frame.height);
                 if frame.nv12.is_some() {
                     set_nv12_conversion();
@@ -1289,7 +1305,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     frame.width,
                     frame.height,
                 )?;
-            } else if frame.hdr.is_none() {
+            } else if !native_frame {
                 texture.as_mut().context("missing SDR texture")?.update(
                     None,
                     &frame.data,
@@ -1298,12 +1314,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             } else {
                 ensure!(
                     hdr_presenter.is_some(),
-                    "received HDR without an HDR presenter"
+                    "received native video without a Metal presenter"
                 );
                 size = (frame.width, frame.height);
             }
             last_frame = Instant::now();
-            if frame.hdr.is_some() {
+            if native_frame {
                 hdr_frame = Some(frame);
                 hdr_frame_pending = true;
             } else {
@@ -1395,11 +1411,22 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     "Client decoder        {}",
                     stream_stats.decoder.lock().unwrap()
                 ),
-                format!("Renderer              {}", canvas.info().name),
+                format!(
+                    "Renderer              {}",
+                    if hdr_presenter.is_some() {
+                        "Metal"
+                    } else {
+                        canvas.info().name
+                    }
+                ),
                 format!("Graphics device       {graphics_name}"),
                 format!(
                     "Pixel path            {}",
-                    if prefer_nv12 {
+                    if native_surface {
+                        "VideoToolbox surface / Metal (no video CPU copy)"
+                    } else if desktop.dynamic_range == protocol::DynamicRange::Hdr10 {
+                        "P010 CPU copy / Metal upload"
+                    } else if prefer_nv12 {
                         "NV12 upload / renderer color conversion"
                     } else {
                         "RGB CPU conversion / upload"
@@ -1595,10 +1622,6 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             }
         }
         if let (Some(presenter), Some(frame)) = (&mut hdr_presenter, &hdr_frame) {
-            let hdr = frame
-                .hdr
-                .as_ref()
-                .context("missing high-precision planes")?;
             let mut ui = vec![read_hdr_overlay(
                 &mut canvas,
                 Rect::new(0, 0, window_size.0, TOOLBAR_HEIGHT),
@@ -1618,21 +1641,37 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 })
                 .collect();
             canvas.present();
-            match presenter.present(
-                &crate::hdr_present::P010Frame {
-                    width: frame.width,
-                    height: frame.height,
-                    y: &hdr.y,
-                    uv: &hdr.uv,
-                    y_stride: hdr.y_stride,
-                    uv_stride: hdr.uv_stride,
-                },
-                desktop_rect(window_size, size),
-                &overlays,
-                window_size,
-            )? {
+            let outcome = if let Some(surface) = &frame.surface {
+                presenter.present_surface(
+                    surface,
+                    desktop_rect(window_size, size),
+                    &overlays,
+                    window_size,
+                )?
+            } else {
+                let hdr = frame
+                    .hdr
+                    .as_ref()
+                    .context("missing high-precision planes")?;
+                presenter.present(
+                    &crate::hdr_present::P010Frame {
+                        width: frame.width,
+                        height: frame.height,
+                        y: &hdr.y,
+                        uv: &hdr.uv,
+                        y_stride: hdr.y_stride,
+                        uv_stride: hdr.uv_stride,
+                    },
+                    desktop_rect(window_size, size),
+                    &overlays,
+                    window_size,
+                )?
+            };
+            match outcome {
                 crate::hdr_present::PresentOutcome::Presented { headroom } => {
-                    hdr_headroom = Some(headroom);
+                    if desktop.dynamic_range == protocol::DynamicRange::Hdr10 {
+                        hdr_headroom = Some(headroom);
+                    }
                     if hdr_frame_pending {
                         frames += 1;
                         total_frames += 1;
