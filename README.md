@@ -192,6 +192,12 @@ Opus and the client's audio output; use **Audio** or `--mute` to mute playback.
 This is output audio only, with no microphone forwarding and no tight A/V sync
 guarantee. `--audio-source test` generates a diagnostic tone.
 
+Keyboard shortcuts: **Bind keys** or **Ctrl+Alt+K** requests keyboard capture
+for Alt+Tab/Super and other shortcuts supported by the local OS. The same chord
+releases it; **Ctrl+Alt+Q** always disconnects locally. While bound, F8 goes
+remote; use the Stats button instead. See [keyboard capture and platform limits](docs/keyboard-capture.md)
+and the [remote-desktop feature audit](docs/remote-desktop-audit.md).
+
 The host defaults to `--encoder auto`: it probes NVIDIA, Intel Quick Sync (QSV),
 then AMD/Intel VA-API encoding before falling back to CPU x264 (H.264)
 or x265 (H.265). Force `--encoder qsv` (alias `quick-sync`), `--encoder vaapi`,

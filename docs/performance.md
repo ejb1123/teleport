@@ -1,7 +1,8 @@
 # Performance diagnostics
 
 Open **Stats** in the session toolbar, press **F8**, or pass `client --stats`.
-The overlay and its shortcut are local; F8 is not injected into the remote desktop.
+The overlay is local. F8 toggles it while keys are unbound; with keyboard capture
+enabled F8 goes remote, and the Stats button still controls the overlay.
 Measurements reset on reconnect. Rates warm up for one second before reporting.
 The overlay also reports codec, actual encoder/decoder names, configured bitrate,
 and stream dimensions. H.265 is available independently of the experimental HDR

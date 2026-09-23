@@ -804,6 +804,62 @@ fn native_toolbar_monitor_reconnect_disconnect_and_launcher() {
         None,
     );
     // Stats is rendered locally; opening it must not disrupt the session.
+    connection
+        .set_input_focus(xproto::InputFocus::PARENT, first, x11rb::CURRENT_TIME)
+        .unwrap()
+        .check()
+        .unwrap();
+    click(&connection, root, first, 250, 64);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !rendered_pixel(&connection, first, 196, 53, 0x1b444b) {
+        assert!(
+            Instant::now() < deadline,
+            "keyboard binding did not activate"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let grab = connection
+        .grab_keyboard(
+            false,
+            first,
+            x11rb::CURRENT_TIME,
+            xproto::GrabMode::ASYNC,
+            xproto::GrabMode::ASYNC,
+        )
+        .unwrap()
+        .reply()
+        .unwrap();
+    assert_eq!(
+        grab.status,
+        xproto::GrabStatus::ALREADY_GRABBED,
+        "client must own an actual X11 keyboard grab"
+    );
+    click(&connection, root, first, 250, 64);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !rendered_pixel(&connection, first, 196, 53, 0x1e303e) {
+        assert!(
+            Instant::now() < deadline,
+            "keyboard binding did not release"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let grab = connection
+        .grab_keyboard(
+            false,
+            first,
+            x11rb::CURRENT_TIME,
+            xproto::GrabMode::ASYNC,
+            xproto::GrabMode::ASYNC,
+        )
+        .unwrap()
+        .reply()
+        .unwrap();
+    assert_eq!(grab.status, xproto::GrabStatus::SUCCESS);
+    connection
+        .ungrab_keyboard(x11rb::CURRENT_TIME)
+        .unwrap()
+        .check()
+        .unwrap();
     click(&connection, root, first, 955, 28);
     let stats_deadline = Instant::now() + Duration::from_secs(10);
     while !rendered_pixel(&connection, first, 760, 100, 0x101721) {

@@ -373,6 +373,19 @@ pub fn evdev(scancode: sdl2::keyboard::Scancode) -> Option<u16> {
         80 => Some(105),
         81 => Some(108),
         82 => Some(103),
+        83 => Some(69), // Num Lock
+        84 => Some(98), // keypad /
+        85 => Some(55), // keypad *
+        86 => Some(74), // keypad -
+        87 => Some(78), // keypad +
+        88 => Some(96), // keypad Enter
+        89..=97 => Some([79, 80, 81, 75, 76, 77, 71, 72, 73][code - 89]),
+        98 => Some(82),                        // keypad 0
+        99 => Some(83),                        // keypad decimal
+        100 => Some(86),                       // ISO non-US backslash
+        101 => Some(127),                      // application/menu
+        103 => Some(117),                      // keypad equals
+        104..=115 => Some((code + 79) as u16), // F13..F24
         224 => Some(29),
         225 => Some(42),
         226 => Some(56),
@@ -524,5 +537,14 @@ mod tests {
         assert_eq!(evdev(Return), Some(28));
         assert_eq!(evdev(RGui), Some(126));
         assert_eq!(evdev(F12), Some(88));
+        assert_eq!(evdev(KpEnter), Some(96));
+        assert_eq!(evdev(Kp1), Some(79));
+        assert_eq!(evdev(Kp9), Some(73));
+        assert_eq!(evdev(Kp0), Some(82));
+        assert_eq!(evdev(NumLockClear), Some(69));
+        assert_eq!(evdev(NonUsBackslash), Some(86));
+        assert_eq!(evdev(Application), Some(127));
+        assert_eq!(evdev(F13), Some(183));
+        assert_eq!(evdev(F24), Some(194));
     }
 }

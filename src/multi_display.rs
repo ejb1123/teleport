@@ -57,12 +57,14 @@ impl Displays {
         !self.screens.is_empty()
     }
     pub fn owns_keyboard_focus(&self, primary: &sdl2::video::Window) -> bool {
+        self.focused_window(primary).is_some()
+    }
+    pub fn focused_window(&self, primary: &sdl2::video::Window) -> Option<sdl2::video::Window> {
         let focus = unsafe { sdl2::sys::SDL_GetKeyboardFocus() };
-        focus == primary.raw()
-            || self
-                .screens
-                .iter()
-                .any(|s| s.canvas.window().raw() == focus)
+        std::iter::once(primary)
+            .chain(self.screens.iter().map(|s| s.canvas.window()))
+            .find(|window| window.raw() == focus)
+            .cloned()
     }
 
     /// SDL keeps drag events attached to the window where the press began.
@@ -402,7 +404,7 @@ impl Displays {
         }
         Ok(true)
     }
-    pub fn draw(&mut self, runtime: &Runtime, font: &sdl2::ttf::Font<'_, '_>) -> Result<()> {
+    pub fn draw(&mut self, runtime: &Runtime, font: &mut SessionFonts<'_>) -> Result<()> {
         if self
             .screens
             .iter()
@@ -518,7 +520,7 @@ impl Screen {
         self.dirty = true;
         Ok(())
     }
-    fn draw(&mut self, runtime: &Runtime, font: &sdl2::ttf::Font<'_, '_>) -> Result<()> {
+    fn draw(&mut self, runtime: &Runtime, font: &mut SessionFonts<'_>) -> Result<()> {
         if let Some(worker) = &mut self.worker {
             check_network(worker, runtime)?;
         }
@@ -683,6 +685,16 @@ impl Screen {
                     error,
                     Rect::new(12, 48, window.0.saturating_sub(24), 26),
                     sdl2::pixels::Color::RGB(255, 160, 160),
+                )?;
+            } else {
+                session_text(
+                    &mut self.canvas,
+                    &creator,
+                    font,
+                    &mut cache,
+                    "Ctrl+Alt+K: bind/release keyboard | Ctrl+Alt+Q: disconnect",
+                    Rect::new(12, 48, window.0.saturating_sub(24), 26),
+                    sdl2::pixels::Color::RGB(160, 223, 212),
                 )?;
             }
         } else {

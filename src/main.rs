@@ -16,6 +16,7 @@ mod host_admin;
 mod host_ui;
 #[cfg(target_os = "linux")]
 mod identity;
+mod keyboard_capture;
 mod launcher;
 mod media;
 mod pairing;

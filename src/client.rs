@@ -932,9 +932,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         tracing::warn!("OpenGL is running on the CPU; check local graphics driver integration");
     }
     let ttf = sdl2::ttf::init().map_err(anyhow::Error::msg)?;
-    let font = ttf
-        .load_font(crate::launcher::font_path()?, 28)
-        .map_err(anyhow::Error::msg)?;
+    let mut session_fonts = SessionFonts {
+        ttf: &ttf,
+        fonts: std::collections::HashMap::new(),
+    };
     let creator = canvas.texture_creator();
     let mut hdr_presenter = if native_surface {
         Some(crate::hdr_present::HdrPresenter::new_sdr(canvas.window())?)
@@ -987,10 +988,19 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut host_bitrate = desktop.bitrate;
     let mut host_encoder = "Waiting / unavailable".to_owned();
     let mut displays = multi_display::Displays::new(remote, options, events.clone());
+    let mut keyboard_capture = crate::keyboard_capture::Capture::default();
+    let mut shortcuts = crate::keyboard_capture::Shortcuts::default();
     let mut chrome = crate::fullscreen::Chrome::new();
     let mut placement: Option<crate::fullscreen::Placement> = None;
     'running: loop {
         let mut redraw = first_draw;
+        let was_bound = keyboard_capture.active();
+        keyboard_capture.follow(displays.focused_window(canvas.window()));
+        if was_bound && !keyboard_capture.active() {
+            send(&events, Event::ReleaseAll)?;
+            notice = "Keyboard released after leaving session focus".into();
+            redraw = true;
+        }
         let mouse = event_pump.mouse_state();
         // SDL mouse coordinates are relative to its mouse-focus window, not
         // necessarily this primary display in a multi-window session.
@@ -999,7 +1009,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             pointer_here.then_some((mouse.x(), mouse.y())),
             pointer_here && (mouse.left() || mouse.middle() || mouse.right()),
         );
-        displays.draw(runtime, &font)?;
+        displays.draw(runtime, &mut session_fonts)?;
         first_draw = false;
         pipeline.error()?;
         if let Some((pipeline, _)) = &audio
@@ -1108,6 +1118,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let mut motion = None;
         for mut event in event_pump.poll_iter() {
             redraw = true;
+            keyboard_capture.follow(displays.focused_window(canvas.window()));
             displays.route_pointer(&mut event, canvas.window());
             // Moving focus between session windows must not release a remote
             // drag or held modifier. Leaving the entire session still must.
@@ -1120,27 +1131,25 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             ) && !displays.owns_keyboard_focus(canvas.window())
             {
                 motion = None;
+                shortcuts = crate::keyboard_capture::Shortcuts::default();
                 send(&events, Event::ReleaseAll)?;
             }
-            // Both edges stay local, so the remote never receives a stray F8 release.
-            if matches!(
-                event,
-                SdlEvent::KeyDown {
-                    keycode: Some(Keycode::F8),
-                    ..
-                } | SdlEvent::KeyUp {
-                    keycode: Some(Keycode::F8),
-                    ..
-                }
-            ) {
-                if matches!(event, SdlEvent::KeyDown { repeat: false, .. }) {
-                    show_stats = !show_stats;
+            if let Some(action) = shortcuts.event(&event, keyboard_capture.active()) {
+                use crate::keyboard_capture::Action;
+                match action {
+                    Action::Toggle => {
+                        motion = None;
+                        send(&events, Event::ReleaseAll)?;
+                        notice = toggle_keyboard_capture(
+                            &mut keyboard_capture,
+                            displays.focused_window(canvas.window()),
+                        );
+                    }
+                    Action::Disconnect => break 'running,
+                    Action::Stats => show_stats = !show_stats,
+                    Action::Swallow => (),
                 }
                 continue;
-            }
-            if matches!(event, SdlEvent::KeyDown { keycode: Some(Keycode::Q), keymod, .. } if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD) && keymod.intersects(Mod::LALTMOD | Mod::RALTMOD))
-            {
-                break 'running;
             }
             // Flush primary motion before an auxiliary event, preserving the
             // cross-monitor drag order instead of dropping its last position.
@@ -1181,6 +1190,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 motion = None;
                 wheel = WheelAccumulator::default();
                 send(&events, Event::ReleaseAll)?;
+                if keyboard_capture_rect().contains_point((x, y)) {
+                    notice = toggle_keyboard_capture(
+                        &mut keyboard_capture,
+                        Some(canvas.window().clone()),
+                    );
+                    continue;
+                }
                 if display_mode_rect().contains_point((x, y)) {
                     if chrome.fullscreen() && displays.active() {
                         displays.stop();
@@ -1529,7 +1545,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 format!("{:.2} ms (latest frame)", host_encode_us as f64 / 1000.0)
             };
             stats_lines = vec![
-                "STATS FOR NERDS                                     F8 to hide".into(),
+                if keyboard_capture.active() {
+                    "STATS FOR NERDS                 Stats button to hide (F8 goes remote)"
+                } else {
+                    "STATS FOR NERDS                                     F8 to hide"
+                }
+                .into(),
                 format!(
                     "Video                 {} x {}   |   {} / {}",
                     size.0,
@@ -1673,7 +1694,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 session_text(
                     &mut canvas,
                     &creator,
-                    &font,
+                    &mut session_fonts,
                     &mut text_cache,
                     label,
                     Rect::new(rect.x() + 9, rect.y() + 9, rect.width() - 18, 20),
@@ -1720,22 +1741,47 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             } else {
                 status
             };
+            let status = if keyboard_capture.active() {
+                format!("Ctrl+Alt+K releases keys | {status}")
+            } else {
+                status
+            };
             session_text(
                 &mut canvas,
                 &creator,
-                &font,
+                &mut session_fonts,
                 &mut text_cache,
                 &status,
-                Rect::new(194, 55, window_size.0.saturating_sub(208), 20),
+                Rect::new(326, 55, window_size.0.saturating_sub(340), 20),
                 Color::RGB(146, 167, 188),
             )?;
             let mode = display_mode_rect();
+            let bind = keyboard_capture_rect();
+            canvas.set_draw_color(if keyboard_capture.active() {
+                Color::RGB(27, 68, 75)
+            } else {
+                Color::RGB(30, 48, 62)
+            });
+            canvas.fill_rect(bind).map_err(anyhow::Error::msg)?;
+            session_text(
+                &mut canvas,
+                &creator,
+                &mut session_fonts,
+                &mut text_cache,
+                if keyboard_capture.active() {
+                    "Keys bound"
+                } else {
+                    "Bind keys"
+                },
+                Rect::new(bind.x() + 8, bind.y() + 4, bind.width() - 16, 20),
+                Color::RGB(160, 223, 212),
+            )?;
             canvas.set_draw_color(Color::RGB(30, 48, 62));
             canvas.fill_rect(mode).map_err(anyhow::Error::msg)?;
             session_text(
                 &mut canvas,
                 &creator,
-                &font,
+                &mut session_fonts,
                 &mut text_cache,
                 if displays.active() {
                     "Use one display"
@@ -1773,7 +1819,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 session_text(
                     &mut canvas,
                     &creator,
-                    &font,
+                    &mut session_fonts,
                     &mut text_cache,
                     line,
                     Rect::new(
@@ -2010,6 +2056,24 @@ fn video_generation_matches(start_group: u64, frame_group: Option<u64>) -> bool 
     start_group == 0 || frame_group.is_some_and(|group| group >= start_group)
 }
 
+fn keyboard_capture_rect() -> Rect {
+    Rect::new(194, 51, 120, 27)
+}
+
+fn toggle_keyboard_capture(
+    capture: &mut crate::keyboard_capture::Capture,
+    window: Option<sdl2::video::Window>,
+) -> String {
+    if capture.active() {
+        capture.release();
+        "Keyboard released locally".into()
+    } else if window.is_some_and(|window| capture.bind(window)) {
+        "Keyboard capture requested; Ctrl+Alt+K releases, Ctrl+Alt+Q disconnects".into()
+    } else {
+        "Keyboard capture unavailable on this window/backend".into()
+    }
+}
+
 fn toolbar_rect(index: usize, width: u32) -> Rect {
     // Fixed, legible controls with a flexible gap between session and window actions.
     // Visual order differs from action IDs to preserve existing button semantics.
@@ -2028,10 +2092,32 @@ fn toolbar_hit(x: i32, y: i32, width: u32) -> Option<usize> {
     (0..8).find(|&index| toolbar_rect(index, width).contains_point((x, y)))
 }
 
+struct SessionFonts<'ttf> {
+    ttf: &'ttf sdl2::ttf::Sdl2TtfContext,
+    fonts: std::collections::HashMap<u16, sdl2::ttf::Font<'ttf, 'static>>,
+}
+
+impl SessionFonts<'_> {
+    fn get(&mut self, points: u16) -> Result<&sdl2::ttf::Font<'_, 'static>> {
+        if !self.fonts.contains_key(&points) {
+            if self.fonts.len() >= 16 {
+                self.fonts.clear();
+            }
+            self.fonts.insert(
+                points,
+                self.ttf
+                    .load_font(crate::launcher::font_path()?, points)
+                    .map_err(anyhow::Error::msg)?,
+            );
+        }
+        Ok(self.fonts.get(&points).unwrap())
+    }
+}
+
 fn session_text<'a>(
     canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
     creator: &'a sdl2::render::TextureCreator<sdl2::video::WindowContext>,
-    font: &sdl2::ttf::Font<'_, '_>,
+    fonts: &mut SessionFonts<'_>,
     cache: &mut std::collections::HashMap<String, sdl2::render::Texture<'a>>,
     text: &str,
     rect: Rect,
@@ -2040,26 +2126,58 @@ fn session_text<'a>(
     if text.is_empty() {
         return Ok(());
     }
-    if !cache.contains_key(text) {
+    let logical = canvas.logical_size();
+    let logical = if logical.0 == 0 {
+        canvas.window().size()
+    } else {
+        logical
+    };
+    let output = canvas.output_size().map_err(anyhow::Error::msg)?;
+    let scale =
+        (output.0 as f64 / logical.0.max(1) as f64).min(output.1 as f64 / logical.1.max(1) as f64);
+    let points = (14.0 * scale).round().clamp(1.0, 256.0) as u16;
+    let key = format!("{points}:{text}");
+    if !cache.contains_key(&key) {
         if cache.len() >= 128 {
             cache.clear();
         }
+        let font = fonts.get(points)?;
         let surface = font.render(text).blended(sdl2::pixels::Color::WHITE)?;
-        cache.insert(text.into(), creator.create_texture_from_surface(&surface)?);
+        cache.insert(key.clone(), creator.create_texture_from_surface(&surface)?);
     }
-    let texture = cache.get_mut(text).unwrap();
+    let texture = cache.get_mut(&key).unwrap();
     texture.set_color_mod(color.r, color.g, color.b);
     let query = texture.query();
-    let width = (query.width / 2).min(rect.width());
-    let height = query.height / 2;
-    // Render at twice logical resolution for crisp Retina/HiDPI text. Clip, never stretch.
-    canvas
-        .copy(
-            texture,
-            Rect::new(0, 0, width * 2, query.height),
-            Rect::new(rect.x(), rect.y(), width, height),
-        )
-        .map_err(anyhow::Error::msg)
+    let destination = text_pixel_rect(rect, logical, output);
+    let width = query.width.min(destination.width());
+    let height = query.height.min(destination.height());
+    if width == 0 || height == 0 {
+        return Ok(());
+    }
+    // Rasterize at the actual drawable DPI and copy 1:1 onto pixel-aligned
+    // coordinates. Do not downsample a fixed 2x font or stretch at fractional DPI.
+    let saved_logical = canvas.logical_size();
+    canvas.set_logical_size(0, 0)?;
+    let result = canvas.copy(
+        texture,
+        Rect::new(0, 0, width, height),
+        Rect::new(destination.x(), destination.y(), width, height),
+    );
+    canvas.set_logical_size(saved_logical.0, saved_logical.1)?;
+    result.map_err(anyhow::Error::msg)
+}
+
+fn text_pixel_rect(rect: Rect, logical: (u32, u32), output: (u32, u32)) -> Rect {
+    let scale =
+        (output.0 as f64 / logical.0.max(1) as f64).min(output.1 as f64 / logical.1.max(1) as f64);
+    let offset_x = (output.0 as f64 - logical.0 as f64 * scale) / 2.0;
+    let offset_y = (output.1 as f64 - logical.1 as f64 * scale) / 2.0;
+    Rect::new(
+        (offset_x + rect.x() as f64 * scale).round() as i32,
+        (offset_y + rect.y() as f64 * scale).round() as i32,
+        (rect.width() as f64 * scale).floor() as u32,
+        (rect.height() as f64 * scale).floor() as u32,
+    )
 }
 
 fn check_network(network: &mut Network, runtime: &Runtime) -> Result<()> {
@@ -2088,6 +2206,25 @@ fn button(button: MouseButton) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_text_maps_to_native_pixels_at_integer_and_fractional_dpi() {
+        let rect = Rect::new(10, 20, 100, 20);
+        assert_eq!(text_pixel_rect(rect, (800, 600), (800, 600)), rect);
+        assert_eq!(
+            text_pixel_rect(rect, (800, 600), (1600, 1200)),
+            Rect::new(20, 40, 200, 40)
+        );
+        assert_eq!(
+            text_pixel_rect(rect, (800, 600), (1000, 750)),
+            Rect::new(13, 25, 125, 25)
+        );
+        assert_eq!(
+            text_pixel_rect(rect, (800, 600), (1000, 600)),
+            Rect::new(110, 20, 100, 20)
+        );
+        assert!(!keyboard_capture_rect().has_intersection(display_mode_rect()));
+    }
 
     #[test]
     fn wheel_notches_preserve_direction_amount_and_motion_order() -> Result<()> {
