@@ -189,6 +189,9 @@ pub enum EncoderKind {
 }
 
 #[cfg(target_os = "linux")]
+const AUTO_ENCODERS: &[EncoderKind] = &[EncoderKind::Nvidia, EncoderKind::Qsv, EncoderKind::Vaapi];
+
+#[cfg(target_os = "linux")]
 fn encoder_fragment(
     kind: EncoderKind,
     fps: u32,
@@ -346,9 +349,9 @@ fn select_encoder(
         return Ok(kind);
     }
     let choices: &[EncoderKind] = if matches!(kind, EncoderKind::Auto) {
-        // Prefer Intel's low-latency path when available, then generic VA-API
-        // (AMD/Intel), then NVIDIA. Every choice must produce an actual frame.
-        &[EncoderKind::Qsv, EncoderKind::Vaapi, EncoderKind::Nvidia]
+        // Prefer NVIDIA, then Intel QSV and generic AMD/Intel VA-API.
+        // Every choice must produce an actual frame before being selected.
+        AUTO_ENCODERS
     } else {
         std::slice::from_ref(&kind)
     };
@@ -1406,6 +1409,19 @@ pub fn doctor() -> Result<()> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn auto_encoding_prefers_nvidia_before_intel_and_vaapi() {
+        assert!(matches!(
+            super::AUTO_ENCODERS,
+            [
+                super::EncoderKind::Nvidia,
+                super::EncoderKind::Qsv,
+                super::EncoderKind::Vaapi
+            ]
+        ));
+    }
+
     #[test]
     fn nv12_output_opt_in_preserves_hdr_and_default_rgb_contracts() {
         let hdr = super::VideoFormat {

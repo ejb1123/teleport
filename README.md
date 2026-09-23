@@ -192,8 +192,8 @@ Opus and the client's audio output; use **Audio** or `--mute` to mute playback.
 This is output audio only, with no microphone forwarding and no tight A/V sync
 guarantee. `--audio-source test` generates a diagnostic tone.
 
-The host defaults to `--encoder auto`: it probes Intel Quick Sync (QSV),
-AMD/Intel VA-API, then NVIDIA encoding before falling back to CPU x264 (H.264)
+The host defaults to `--encoder auto`: it probes NVIDIA, Intel Quick Sync (QSV),
+then AMD/Intel VA-API encoding before falling back to CPU x264 (H.264)
 or x265 (H.265). Force `--encoder qsv` (alias `quick-sync`), `--encoder vaapi`,
 `--encoder nvidia`, or `--encoder software` for diagnosis. Both VA-API and QSV
 support H.264, HEVC SDR, and HEVC Main10 HDR when the GPU supports them. This is hardware
