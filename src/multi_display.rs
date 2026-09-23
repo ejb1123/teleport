@@ -56,6 +56,48 @@ impl Displays {
     pub fn active(&self) -> bool {
         !self.screens.is_empty()
     }
+    pub fn owns_keyboard_focus(&self, primary: &sdl2::video::Window) -> bool {
+        let focus = unsafe { sdl2::sys::SDL_GetKeyboardFocus() };
+        focus == primary.raw()
+            || self
+                .screens
+                .iter()
+                .any(|s| s.canvas.window().raw() == focus)
+    }
+
+    /// SDL keeps drag events attached to the window where the press began.
+    /// Route their out-of-window coordinates to the sibling under the pointer,
+    /// retaining capture so the eventual button release cannot be lost.
+    pub fn route_pointer(&self, event: &mut SdlEvent, primary: &sdl2::video::Window) {
+        if !self.active() {
+            return;
+        }
+        let (window_id, x, y) = match event {
+            SdlEvent::MouseMotion {
+                window_id, x, y, ..
+            }
+            | SdlEvent::MouseButtonDown {
+                window_id, x, y, ..
+            }
+            | SdlEvent::MouseButtonUp {
+                window_id, x, y, ..
+            } => (window_id, x, y),
+            _ => return,
+        };
+        let windows: Vec<_> = std::iter::once(primary)
+            .chain(self.screens.iter().map(|s| s.canvas.window()))
+            .map(|w| {
+                let (x, y) = w.position();
+                let (width, height) = w.size();
+                (w.id(), Rect::new(x, y, width, height))
+            })
+            .collect();
+        if let Some((id, point)) = crate::fullscreen::route_pointer(&windows, *window_id, (*x, *y))
+        {
+            *window_id = id;
+            (*x, *y) = point;
+        }
+    }
     pub fn stopped(&mut self, index: usize, reason: String) {
         for screen in &mut self.screens {
             if screen.remote == index {
@@ -210,7 +252,6 @@ impl Displays {
                 screen.pointer = None;
                 screen.buttons = 0;
                 screen.wheel = WheelAccumulator::default();
-                send(&self.events, Event::ReleaseAll)?;
             }
             SdlEvent::Window {
                 win_event: WindowEvent::Leave,

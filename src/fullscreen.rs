@@ -11,6 +11,26 @@ pub const HEIGHT: u32 = 82;
 pub const REVEAL_HEIGHT: u32 = 4;
 const HIDE_AFTER: Duration = Duration::from_millis(1200);
 
+/// Convert captured logical window coordinates across local monitor windows.
+pub fn route_pointer(
+    windows: &[(u32, Rect)],
+    source: u32,
+    point: (i32, i32),
+) -> Option<(u32, (i32, i32))> {
+    let (_, origin) = windows.iter().find(|(id, _)| *id == source)?;
+    let global = (
+        origin.x().checked_add(point.0)?,
+        origin.y().checked_add(point.1)?,
+    );
+    if origin.contains_point(global) {
+        return Some((source, point));
+    }
+    windows.iter().find_map(|(id, rect)| {
+        rect.contains_point(global)
+            .then(|| (*id, (global.0 - rect.x(), global.1 - rect.y())))
+    })
+}
+
 pub struct Chrome {
     fullscreen: bool,
     visible: bool,
@@ -171,6 +191,29 @@ pub fn enter(window: &mut Window, video: &VideoSubsystem, display: i32) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_drag_routes_both_directions_and_negative_monitor_origins() {
+        let windows = [
+            (1, Rect::new(0, 0, 1920, 1080)),
+            (2, Rect::new(-1440, 0, 1440, 900)),
+        ];
+        assert_eq!(
+            route_pointer(&windows, 1, (-20, 300)),
+            Some((2, (1420, 300)))
+        );
+        assert_eq!(
+            route_pointer(&windows, 2, (1450, 300)),
+            Some((1, (10, 300)))
+        );
+        assert_eq!(
+            route_pointer(&windows, 1, (100, 300)),
+            Some((1, (100, 300)))
+        );
+        assert_eq!(route_pointer(&windows, 1, (-20, 1000)), None);
+        assert_eq!(route_pointer(&windows, 2, (1440, 300)), Some((1, (0, 300))));
+        assert_eq!(route_pointer(&windows, 3, (10, 10)), None);
+    }
 
     #[test]
     fn toolbar_hides_reveals_and_stays_local() {

@@ -35,7 +35,11 @@ placement; test the actual Linux display backend in use.
 All windows use one authenticated QUIC session. The main stream and each active
 additional remote monitor have independent bounded decoder queues and generation
 barriers. Pointer events name the remote monitor; keyboard and button state is
-shared and released on focus changes, remapping, and disconnect. Auxiliary errors
+shared across sibling windows and released when focus leaves the session,
+on remapping, and on disconnect. Focus clicks are forwarded on their first press.
+Captured drag coordinates are routed across sibling window bounds without
+releasing the remote button; this relies on accurate local window positions
+from the display backend. Auxiliary errors
 do not terminate the main stream. Local display-change events close additional
 windows; use **Use all displays** after the new layout settles. Remote monitor
 hotplug/re-enumeration is not implemented.
@@ -59,6 +63,12 @@ different DPI and refresh rates, independent remote selection, duplicate mapping
 click/drag/scroll at all corners, focus changes while holding keys, toolbar clicks,
 window restore, rapid one/all toggles, unplug/replug, and disconnect. Verify input
 never goes to the wrong remote monitor and no keys remain held.
+
+The F8 received/decoded FPS counters cover the main stream only, not the sum of
+all monitors. Decoded FPS is counted after frame download/copy (or native surface
+handoff), so it is not a pure hardware-decoder throughput measurement. Compare
+one versus multiple monitors at the same resolution/FPS when diagnosing a gap;
+check queue age, parse/decode/download, copy time, and skipped groups as well.
 
 ## Understanding the bitrate readout
 

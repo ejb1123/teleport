@@ -3,6 +3,12 @@ use anyhow::{Context, Result};
 use sdl2::{Sdl, VideoSubsystem, render::Canvas, video::Window};
 
 pub fn init() -> Result<(Sdl, VideoSubsystem)> {
+    // A click on a sibling monitor should both focus it and reach the desktop.
+    sdl2::hint::set_with_priority(
+        "SDL_MOUSE_FOCUS_CLICKTHROUGH",
+        "1",
+        &sdl2::hint::Hint::Override,
+    );
     // Separate native fullscreen Spaces can hide sibling monitor windows.
     // Borderless desktop fullscreen keeps all mapped displays in one session.
     // SDL requires this hint before creating any windows (including launcher).

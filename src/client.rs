@@ -1106,8 +1106,22 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             }
         }
         let mut motion = None;
-        for event in event_pump.poll_iter() {
+        for mut event in event_pump.poll_iter() {
             redraw = true;
+            displays.route_pointer(&mut event, canvas.window());
+            // Moving focus between session windows must not release a remote
+            // drag or held modifier. Leaving the entire session still must.
+            if matches!(
+                event,
+                SdlEvent::Window {
+                    win_event: WindowEvent::FocusLost,
+                    ..
+                }
+            ) && !displays.owns_keyboard_focus(canvas.window())
+            {
+                motion = None;
+                send(&events, Event::ReleaseAll)?;
+            }
             // Both edges stay local, so the remote never receives a stray F8 release.
             if matches!(
                 event,
@@ -1128,8 +1142,16 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             {
                 break 'running;
             }
+            // Flush primary motion before an auxiliary event, preserving the
+            // cross-monitor drag order instead of dropping its last position.
+            if event
+                .get_window_id()
+                .is_some_and(|id| id != canvas.window().id())
+                && let Some(pending) = motion.take()
+            {
+                send(&events, pending)?;
+            }
             if displays.event(&event, &desktop, runtime)? {
-                motion = None;
                 continue;
             }
             if let Some(id) = event.get_window_id()
@@ -1362,7 +1384,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 } => {
                     motion = None;
                     wheel = WheelAccumulator::default();
-                    Some(Event::ReleaseAll)
+                    None
                 }
                 SdlEvent::RenderTargetsReset { .. } | SdlEvent::RenderDeviceReset { .. } => {
                     texture = None;
