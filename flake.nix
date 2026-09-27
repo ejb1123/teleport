@@ -45,6 +45,9 @@
             )
             gst_all_1.gst-plugins-ugly
             gst_all_1.gst-libav
+            (ffmpeg-headless.override {
+              withVpl = stdenv.hostPlatform.isLinux && stdenv.hostPlatform.isx86_64;
+            })
             SDL2
             SDL2_ttf
             libfido2
@@ -108,6 +111,7 @@
               fileset = pkgs.lib.fileset.unions [
                 ./Cargo.toml
                 ./Cargo.lock
+                ./build.rs
                 ./src
                 ./tests
                 ./packaging

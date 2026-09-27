@@ -5,6 +5,7 @@ mod capture;
 mod client;
 #[cfg(target_os = "linux")]
 mod clipboard;
+mod ffmpeg;
 mod fullscreen;
 mod hdr;
 mod hdr_present;

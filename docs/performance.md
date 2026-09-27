@@ -1,5 +1,11 @@
 # Performance diagnostics
 
+The default [direct FFmpeg backend](ffmpeg.md) reports `ffmpeg:` codec names.
+Its parse/decode/download interval includes the direct codec call, hardware
+download, pixel normalization and packed output copy. The later convert/copy
+interval covers Rust-side frame publication; these are not pure GPU timings.
+The raw-output-pad descriptions below apply to the legacy GStreamer backend.
+
 Open **Stats** in the session toolbar, press **F8**, or pass `client --stats`.
 The overlay is local. F8 toggles it while keys are unbound; with keyboard capture
 enabled F8 goes remote, and the Stats button still controls the overlay.

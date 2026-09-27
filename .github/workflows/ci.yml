@@ -28,10 +28,10 @@ jobs:
         run: nix develop --command bash -c 'cargo clippy --locked --all-targets -- -D warnings && cargo test --locked'
       - name: Real QUIC video, authentication, X11 input and native window tests
         if: runner.os == 'Linux'
-        run: nix develop --command cargo test --locked --test smoke -- --ignored --nocapture
-      - name: Media pipeline integration tests
+        run: nix develop --command cargo test --locked --test smoke --test multi_monitor --test ffmpeg_interop -- --ignored --nocapture
+      - name: Legacy GStreamer and direct FFmpeg library integration tests
         if: runner.os == 'Linux'
-        run: nix develop --command cargo test --locked --bin teleport -- --ignored --nocapture
+        run: nix develop --command env TELEPORT_VIDEO_BACKEND=gstreamer cargo test --locked --bin teleport -- --ignored --nocapture
       - name: Native toolbar and launcher interaction tests
         if: runner.os == 'Linux'
         run: nix develop --command cargo test --locked --test ui -- --ignored --nocapture

@@ -1,13 +1,18 @@
 # Teleport
 
 An experimental **native** remote desktop: Linux host, macOS/Linux client,
-Rust + SDL + GStreamer, with Media over QUIC for video and input. No browser,
+Rust + SDL + direct FFmpeg video codecs, with Media over QUIC for video and input. No browser,
 Electron, WebRTC, external relay, or account is required.
 
 This is an experimental implementation, not a production Parsec replacement yet.
 It shares an existing graphical session, one client at a time. Start on a LAN
 or a VPN with direct UDP connectivity.
 See [implementation status](docs/status.md) for verified features and unfinished work.
+
+Video encoding and decoding now default to directly linked FFmpeg libraries
+(no FFmpeg subprocess). GStreamer remains for capture, audio and scheduling.
+See [codec backend and testing](docs/ffmpeg.md), including hardware selection,
+the legacy-backend comparison switch, and current GPU-copy limitations.
 
 The current development build adds native Linux **Host settings**, persistent
 Teleport username/passphrase login and individually revocable device credentials.

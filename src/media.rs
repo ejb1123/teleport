@@ -6,6 +6,8 @@ use gstreamer as gst;
 use gstreamer_app::{AppSink, AppSrc};
 #[path = "decoder.rs"]
 mod decoder;
+#[path = "ffmpeg_media.rs"]
+mod ffmpeg_media;
 use std::{
     sync::{
         Arc, Mutex,
@@ -51,6 +53,9 @@ impl Drop for Pipeline {
 impl Pipeline {
     #[cfg(target_os = "linux")]
     pub fn encoder_metrics(&self) -> Result<Arc<EncoderMetrics>> {
+        if let Some(state) = ffmpeg_media::state(&self.0) {
+            return state.metrics.clone().context("not a direct encoder");
+        }
         let encoder = self
             .0
             .by_name("video_encoder")
@@ -103,6 +108,9 @@ impl Pipeline {
     }
     #[cfg(target_os = "linux")]
     pub fn video_bitrate(&self) -> Result<u32> {
+        if let Some(state) = ffmpeg_media::state(&self.0) {
+            return Ok(state.bitrate());
+        }
         let encoder = self
             .0
             .by_name("video_encoder")
@@ -117,6 +125,9 @@ impl Pipeline {
 
     #[cfg(target_os = "linux")]
     pub fn set_video_bitrate(&self, kbps: u32) -> Result<()> {
+        if let Some(state) = ffmpeg_media::state(&self.0) {
+            return state.set_bitrate(kbps);
+        }
         ensure!(kbps > 0 && kbps <= 100_000, "invalid video bitrate");
         let encoder = self
             .0
@@ -435,6 +446,9 @@ pub fn encoder(
 ) -> Result<Pipeline> {
     let video_format = video_format.into();
     video_format.validate()?;
+    if crate::ffmpeg::enabled()? {
+        return ffmpeg_media::encoder(source, size, fps, bitrate, track, kind, video_format);
+    }
     let codec = video_format.codec;
     let (width, height) = size;
     let kind = select_encoder(kind, width, height, fps, bitrate, video_format)?;
@@ -640,6 +654,9 @@ fn video_reference(buffer: &gst::BufferRef) -> Option<u64> {
 
 /// Call before opening QUIC: bounded hardware probes must not delay heartbeats.
 pub fn prepare_decoder(force_software: bool, format: impl Into<VideoFormat>) -> Result<()> {
+    if crate::ffmpeg::enabled()? {
+        return ffmpeg_media::select_decoder(force_software, format.into()).map(|_| ());
+    }
     decoder::select(force_software, format.into()).map(|_| ())
 }
 
@@ -668,6 +685,9 @@ pub fn decoder_with_stats_presentation(
     native_surface: bool,
 ) -> Result<(Pipeline, AppSrc, LatestImage)> {
     format.validate()?;
+    if crate::ffmpeg::enabled()? {
+        return ffmpeg_media::decoder(force_software, stats, format, prefer_nv12, native_surface);
+    }
     ensure!(
         !native_surface || (cfg!(target_os = "macos") && !force_software && !format.hdr()),
         "native surfaces currently require macOS hardware decoding and SDR"
@@ -984,6 +1004,8 @@ fn linux_software_fallback(decoder: &str) -> Option<&'static str> {
     match decoder {
         "vah264dec" | "qsvh264dec" => Some("avdec_h264"),
         "vah265dec" | "qsvh265dec" => Some("avdec_h265"),
+        "ffmpeg:h264:vaapi" | "ffmpeg:h264:qsv" => Some("ffmpeg:h264:software"),
+        "ffmpeg:h265:vaapi" | "ffmpeg:h265:qsv" => Some("ffmpeg:h265:software"),
         _ => None,
     }
 }
@@ -996,6 +1018,11 @@ fn replace_decoder(
     replacement: &str,
     stats: Arc<crate::stats::StreamStats>,
 ) -> Result<()> {
+    if let Some(state) = ffmpeg_media::state(pipeline) {
+        state.software_decoder()?;
+        *stats.decoder.lock().unwrap() = replacement.to_owned();
+        return Ok(());
+    }
     let old = pipeline
         .by_name("video_decoder")
         .context("missing decoder")?;
@@ -1123,6 +1150,9 @@ async fn reset_decoder_with_fallback(
             return Ok(());
         }
         pipeline.set_state(gst::State::Ready)?;
+        if let Some(state) = ffmpeg_media::state(&pipeline) {
+            state.flush();
+        }
         if let Some(replacement) = replacement {
             replace_decoder(&pipeline, replacement, stats.clone())?;
         }
@@ -1341,6 +1371,23 @@ pub fn video_subscription() -> moq_net::track::Subscription {
 }
 
 pub fn doctor() -> Result<()> {
+    let direct = crate::ffmpeg::enabled()?;
+    println!(
+        "Video codec backend: {}",
+        if direct {
+            "direct FFmpeg"
+        } else {
+            "GStreamer (legacy)"
+        }
+    );
+    if direct {
+        for codec in [VideoCodec::H264, VideoCodec::H265] {
+            let decoder = ffmpeg_media::select_decoder(true, codec.into())?;
+            println!(
+                "FFmpeg {codec:?}: software encode/decode verified ({decoder}); hardware is probed on connection"
+            );
+        }
+    }
     let mut missing = false;
     for name in [
         "queue",
@@ -1352,6 +1399,9 @@ pub fn doctor() -> Result<()> {
         "videoconvert",
         "videoscale",
     ] {
+        if direct && matches!(name, "h264parse" | "avdec_h264") {
+            continue;
+        }
         let found = gst::ElementFactory::find(name).is_some();
         println!("{name}: {}", if found { "ok" } else { "MISSING" });
         missing |= !found;
@@ -1364,6 +1414,9 @@ pub fn doctor() -> Result<()> {
         "videorate",
         "x264enc",
     ] {
+        if direct && name == "x264enc" {
+            continue;
+        }
         let found = gst::ElementFactory::find(name).is_some();
         println!("{name}: {}", if found { "ok" } else { "MISSING" });
         missing |= !found;

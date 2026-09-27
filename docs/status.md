@@ -1,5 +1,12 @@
 # Implementation status
 
+## Direct FFmpeg video codecs (development)
+
+Direct library encoding/decoding is now the default for H.264/H.265, with a
+legacy GStreamer switch for comparisons. Capture/audio remain GStreamer-backed;
+GPU surface import into the renderer is not included. See [backend details,
+verified tests and limitations](ffmpeg.md). Building does not deploy the host.
+
 ## Version 0.5.0: Existing Linux account authentication
 
 Opt-in host-native PAM authentication now accepts the desktop owner's existing
