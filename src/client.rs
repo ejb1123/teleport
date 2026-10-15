@@ -117,6 +117,9 @@ async fn connect(options: &Options) -> Result<Link> {
     }
     let mut config = moq_native::ClientConfig::default();
     config.version = vec![protocol::WIRE_VERSION.parse().map_err(anyhow::Error::msg)?];
+    config.quic.idle_timeout = Some(protocol::QUIC_IDLE_TIMEOUT);
+    config.quic.keep_alive = Some(protocol::QUIC_KEEP_ALIVE);
+    config.quic.mtu_discovery = Some(protocol::QUIC_MTU_DISCOVERY);
     config.tls.fingerprint = vec![pairing.fingerprint];
     let outgoing = moq_net::Origin::random().produce();
     let incoming = moq_net::Origin::random().produce();
@@ -205,14 +208,15 @@ async fn connect(options: &Options) -> Result<Link> {
         .subscribe(
             moq_net::track::Subscription::default()
                 .with_ordered(true)
-                .with_group_start(0),
+                .with_group_start(0)
+                .with_priority(media::UPDATES_PRIORITY),
         )
         .await?;
     let audio = if desktop.audio {
         Some(
             remote
                 .track("opus")?
-                .subscribe(media::video_subscription())
+                .subscribe(media::audio_subscription())
                 .await?,
         )
     } else {
@@ -338,6 +342,7 @@ fn connect_window(
         .unwrap_or("Connecting securely to your host…")
         .to_owned();
     let mut retry_at = Instant::now();
+    let mut failures = 0_u32;
     let mut task: Option<tokio::task::JoinHandle<Result<Link>>> = None;
     loop {
         for event in pump.poll_iter() {
@@ -391,7 +396,13 @@ fn connect_window(
                     status = format!("{error:#}");
                     tracing::warn!(%error, "connection failed");
                     if options.reconnect {
-                        retry_at = Instant::now() + Duration::from_secs(3);
+                        // A brief network blip should cost well under a second;
+                        // a host that is down is polled every 3 s at most.
+                        let delay = Duration::from_millis(250)
+                            .saturating_mul(1 << failures.min(4))
+                            .min(Duration::from_secs(3));
+                        failures += 1;
+                        retry_at = Instant::now() + delay;
                     } else {
                         retry_at = Instant::now() + Duration::from_secs(86400);
                     }
@@ -712,6 +723,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let audio_source = audio.as_ref().map(|(_, source)| source.clone());
     let audio_notices = updates_sender.clone();
     let network_stats = stream_stats.clone();
+    let keyframe_requests = desktop.keyframe_requests;
     let remote = link.remote.clone();
     let mut network = Network(runtime.spawn(async move {
         let mut ssh_agent = link.ssh_agent;
@@ -719,7 +731,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let _broadcast = link._broadcast;
         tokio::select! {
             result = crate::ssh_agent::closed(&mut ssh_agent) => result,
-            result = media::receive_video_with_stats(link.video, source, feedback, network_stats) => result,
+            result = media::receive_video_with_stats(link.video, source, feedback, network_stats, keyframe_requests) => result,
             result = send_input(link.input, receiver) => result,
             result = receive_updates(link.updates, updates_sender) => result,
             result = async {
@@ -911,6 +923,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             conversion_copy_us = snapshot.conversion_us,
             decoder_recoveries = snapshot.decoder_recoveries,
             stale_frames = snapshot.stale_frames,
+            decode_errors = snapshot.decode_errors,
             skipped_groups = snapshot.skipped_groups,
             overwritten_frames = snapshot.overwritten_frames,
             unmatched_frames = snapshot.unmatched_frames,
@@ -992,8 +1005,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut shortcuts = crate::keyboard_capture::Shortcuts::default();
     let mut chrome = crate::fullscreen::Chrome::new();
     let mut placement: Option<crate::fullscreen::Placement> = None;
+    // Input-only redraws (pointer motion, hover) are capped so a 1000 Hz mouse
+    // cannot drive a full present per event; new video frames never wait.
+    let mut deferred_redraw = false;
+    let mut last_present: Option<Instant> = None;
     'running: loop {
-        let mut redraw = first_draw;
+        let mut redraw = first_draw || deferred_redraw;
+        let mut new_frame = false;
         let was_bound = keyboard_capture.active();
         keyboard_capture.follow(displays.focused_window(canvas.window()));
         if was_bound && !keyboard_capture.active() {
@@ -1430,6 +1448,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 && video_generation_matches(desktop.video_start_group, frame.video_group)
         }) {
             redraw = true;
+            new_frame = true;
             decoded_age = frame.decoded_at.elapsed();
             protocol::validate_video_size(frame.width, frame.height)?;
             let native_frame = frame.hdr.is_some() || frame.surface.is_some();
@@ -1486,10 +1505,20 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             total_frames > 0 || last_frame.elapsed() < Duration::from_secs(15),
             "no initial decoded video for 15 seconds"
         );
-        if !redraw && stats.elapsed() < Duration::from_secs(1) {
-            std::thread::sleep(Duration::from_millis(2));
+        let throttled = redraw
+            && !new_frame
+            && last_present.is_some_and(|at| at.elapsed() < Duration::from_millis(4));
+        if (!redraw || throttled) && stats.elapsed() < Duration::from_secs(1) {
+            deferred_redraw = throttled;
+            // Wake at once for input (a plain sleep delayed motion and keys by
+            // up to 2 ms); otherwise look for a decoded frame within 1 ms.
+            // A null event only peeks, so poll_iter still sees every event.
+            unsafe {
+                sdl2::sys::SDL_WaitEventTimeout(std::ptr::null_mut(), 1);
+            }
             continue;
         }
+        deferred_redraw = false;
         let window_size = canvas.window().size();
         canvas.set_logical_size(window_size.0.max(1), window_size.1.max(TOOLBAR_HEIGHT + 1))?;
         canvas.set_draw_color(sdl2::pixels::Color::RGB(12, 15, 20));
@@ -1619,8 +1648,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 ),
                 format!("Unmatched timestamps  {}", snapshot.unmatched_frames),
                 format!(
-                    "Decoder recoveries    {}   |   Stale frames {}",
-                    snapshot.decoder_recoveries, snapshot.stale_frames
+                    "Decoder recoveries    {}   |   Stale frames {}   |   Decode errors {}",
+                    snapshot.decoder_recoveries, snapshot.stale_frames, snapshot.decode_errors
                 ),
                 "Decode includes scheduling/download, not pure GPU time.".into(),
                 "RTT includes control scheduling, not just network transit.".into(),
@@ -1916,7 +1945,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         {
             break;
         }
-        std::thread::sleep(Duration::from_millis(2));
+        last_present = Some(Instant::now());
     }
     let _ = events.try_send(Event::ReleaseAll);
     // Disconnect also triggers host-side release of every held key/button.
@@ -2190,9 +2219,18 @@ fn check_network(network: &mut Network, runtime: &Runtime) -> Result<()> {
 
 fn send(events: &mpsc::Sender<Event>, event: Event) -> Result<()> {
     event.validate()?;
-    events
-        .try_send(event)
-        .context("input queue full or disconnected; ending session rather than losing key events")
+    match events.try_send(event) {
+        Ok(()) => Ok(()),
+        // A network stall must not end the session over pointer motion or a
+        // wheel burst; those are superseded or harmless to lose.
+        Err(mpsc::error::TrySendError::Full(event)) if event.is_lossy() => {
+            tracing::debug!(?event, "input queue full; dropping superseded event");
+            Ok(())
+        }
+        Err(error) => Err(anyhow::anyhow!(
+            "input queue full or disconnected; ending session rather than losing key events: {error}"
+        )),
+    }
 }
 fn button(button: MouseButton) -> Option<u8> {
     match button {

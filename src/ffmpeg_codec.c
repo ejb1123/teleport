@@ -19,6 +19,7 @@ typedef struct {
     struct SwsContext *sws;
     enum AVPixelFormat hw_format, input_format;
     int encoder, hdr, output_format, width, height, fps, kbps;
+    int live_bitrate; /* encoder applies bitrate changes in place */
 } TpCodec;
 
 typedef struct {
@@ -82,6 +83,7 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
     if (!codec->ctx || !codec->packet || !codec->frame || !codec->download || !codec->converted) goto fail;
     codec->encoder = encoder; codec->hdr = hdr; codec->output_format = output;
     codec->width = width; codec->height = height; codec->fps = fps; codec->kbps = kbps;
+    codec->live_bitrate = encoder && (strstr(name, "nvenc") || !strcmp(name, "libx264"));
     codec->hw_format = AV_PIX_FMT_NONE;
     codec->ctx->opaque = codec;
     codec->ctx->thread_count = 2;
@@ -114,6 +116,7 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
             av_dict_set(&opts, hevc ? "x265-params" : "x264-params",
                 hevc ? "repeat-headers=1:annexb=1:open-gop=0:bframes=0:rc-lookahead=0:pools=1:frame-threads=1:log-level=error"
                      : "repeat-headers=1:annexb=1:bframes=0:rc-lookahead=0:scenecut=0", 0);
+            av_dict_set(&opts, "forced-idr", "1", 0); /* requested keyframes are IDR */
         } else if (strstr(name, "nvenc")) {
             av_dict_set(&opts, "preset", "p1", 0);
             av_dict_set(&opts, "tune", "ull", 0);
@@ -142,6 +145,7 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
             if (type == AV_HWDEVICE_TYPE_QSV) {
                 av_dict_set(&opts, "look_ahead", "0", 0);
                 av_dict_set(&opts, "preset", "veryfast", 0);
+                av_dict_set(&opts, "forced_idr", "1", 0);
             }
         }
     } else if (strcmp(name, "software")) {
@@ -181,7 +185,7 @@ int tp_send_packet(TpCodec *codec, const uint8_t *data, int size, int64_t pts) {
     return avcodec_send_packet(codec->ctx, codec->packet);
 }
 
-int tp_send_frame(TpCodec *codec, const uint8_t *data, int size, int64_t pts) {
+int tp_send_frame(TpCodec *codec, const uint8_t *data, int size, int64_t pts, int force_key) {
     if (!codec || !codec->encoder) return AVERROR(EINVAL);
     int required = av_image_get_buffer_size(codec->input_format, codec->width, codec->height, 1);
     if (required < 0 || required != size) return AVERROR(EINVAL);
@@ -200,6 +204,9 @@ int tp_send_frame(TpCodec *codec, const uint8_t *data, int size, int64_t pts) {
     result = sws_scale(codec->sws, (const uint8_t *const *)planes, strides, 0, codec->height, frame->data, frame->linesize);
     if (result != codec->height) return AVERROR(EINVAL);
     frame->pts = pts;
+    /* Copied to the hardware frame by av_frame_copy_props below. With forced
+     * IDR configured, an I picture starts a new closed GOP on every encoder. */
+    frame->pict_type = force_key ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
     color_frame(frame, codec->hdr);
     if (codec->hw_format != AV_PIX_FMT_NONE) {
         av_frame_unref(codec->download);
@@ -275,4 +282,18 @@ int tp_receive_frame(TpCodec *codec, TpOutput *output) {
 }
 
 void tp_codec_flush(TpCodec *codec) { avcodec_flush_buffers(codec->ctx); }
+
+/* NVENC (nvEncReconfigureEncoder) and libx264 (x264_encoder_reconfig) pick up
+ * bit_rate / rc_max_rate / rc_buffer_size changes at the next frame, without a
+ * new hardware session or forced IDR. Other encoders report ENOSYS so the
+ * caller reopens them instead. */
+int tp_codec_set_bitrate(TpCodec *codec, int kbps) {
+    if (!codec || !codec->encoder || kbps <= 0) return AVERROR(EINVAL);
+    if (!codec->live_bitrate) return AVERROR(ENOSYS);
+    codec->ctx->bit_rate = (int64_t)kbps * 1000;
+    codec->ctx->rc_max_rate = codec->ctx->bit_rate;
+    codec->ctx->rc_buffer_size = kbps * 1000 / codec->fps * 2;
+    codec->kbps = kbps;
+    return 0;
+}
 void tp_codec_error(int error, char *buffer, int length) { av_strerror(error, buffer, length); }

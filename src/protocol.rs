@@ -4,6 +4,14 @@ use std::{path::Path, time::Duration};
 
 pub const VERSION: u32 = 2;
 pub const WIRE_VERSION: &str = "moq-lite-05";
+/// moq-native defaults (30 s idle, 5 s keep-alive) leave a dead peer undetected
+/// for half a minute. A 1 s keep-alive holds a healthy idle session open while
+/// an unreachable peer is dropped after 8 s, so reconnect can start.
+pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
+pub const QUIC_KEEP_ALIVE: Duration = Duration::from_secs(1);
+/// Path MTU discovery (off by default) lifts packets above the 1200-byte QUIC
+/// floor; quinn falls back on black-hole detection if a path cannot carry them.
+pub const QUIC_MTU_DISCOVERY: bool = true;
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum VideoCodec {
@@ -108,6 +116,9 @@ pub struct Desktop {
     /// First video group belonging to these settings; zero for older hosts.
     #[serde(default)]
     pub video_start_group: u64,
+    /// Host accepts `Event::RequestKeyframe`; older hosts reject unknown events.
+    #[serde(default)]
+    pub keyframe_requests: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -211,9 +222,34 @@ pub enum Event {
         text: String,
     },
     ClipboardRequest,
+    /// The client lost decoder state; ask for an IDR now instead of waiting for
+    /// the next scheduled GOP. Only sent when `Desktop::keyframe_requests`.
+    RequestKeyframe {
+        /// Auxiliary monitor stream index; `None` is the primary stream.
+        #[serde(default)]
+        monitor: Option<usize>,
+    },
 }
 
 impl Event {
+    /// Events that may be dropped under backpressure: a later event supersedes
+    /// them (absolute motion, periodic feedback/probes, keyframe requests) or
+    /// losing one is harmless (a wheel step). Keys and buttons are never lossy:
+    /// a lost release would leave input held on the host.
+    pub fn is_lossy(&self) -> bool {
+        matches!(
+            self,
+            Self::Motion { .. }
+                | Self::MonitorMotion { .. }
+                | Self::Scroll { .. }
+                | Self::Feedback { .. }
+                | Self::MonitorFeedback { .. }
+                | Self::Probe { .. }
+                | Self::Ping
+                | Self::RequestKeyframe { .. }
+        )
+    }
+
     pub fn validate(&self) -> Result<()> {
         match self {
             Self::MonitorStream { index, .. } => ensure!(*index < 64, "invalid monitor index"),
@@ -256,7 +292,10 @@ impl Event {
                 x.abs_diff(0) <= 20 && y.abs_diff(0) <= 20,
                 "scroll out of range"
             ),
-            Self::SelectMonitor { index } => ensure!(*index < 64, "invalid monitor index"),
+            Self::SelectMonitor { index }
+            | Self::RequestKeyframe {
+                monitor: Some(index),
+            } => ensure!(*index < 64, "invalid monitor index"),
             Self::Clipboard { text } => ensure!(
                 text.len() <= MAX_TEXT && !text.contains('\0'),
                 "clipboard text exceeds limit or contains NUL"
@@ -469,12 +508,50 @@ mod tests {
         ));
     }
     #[test]
+    fn only_superseded_or_harmless_events_are_lossy() {
+        assert!(Event::Motion { x: 0.5, y: 0.5 }.is_lossy());
+        assert!(Event::Scroll { x: 0, y: 1 }.is_lossy());
+        assert!(Event::RequestKeyframe { monitor: None }.is_lossy());
+        for strict in [
+            Event::Key {
+                code: 30,
+                down: false,
+            },
+            Event::Button {
+                button: 1,
+                down: false,
+            },
+            Event::ReleaseAll,
+            Event::ClipboardRequest,
+            Event::SelectMonitor { index: 0 },
+        ] {
+            assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
+        }
+    }
+    #[test]
+    fn keyframe_requests_roundtrip_and_bound_monitor_index() {
+        for monitor in [None, Some(3)] {
+            let wire = serde_json::to_vec(&Event::RequestKeyframe { monitor }).unwrap();
+            let event = serde_json::from_slice::<Event>(&wire).unwrap();
+            assert!(matches!(event, Event::RequestKeyframe { monitor: m } if m == monitor));
+            assert!(event.validate().is_ok());
+        }
+        let primary: Event = serde_json::from_str(r#"{"type":"request_keyframe"}"#).unwrap();
+        assert!(matches!(primary, Event::RequestKeyframe { monitor: None }));
+        assert!(
+            Event::RequestKeyframe { monitor: Some(64) }
+                .validate()
+                .is_err()
+        );
+    }
+    #[test]
     fn old_metadata_defaults_to_h264_without_new_capabilities() {
         let old = serde_json::json!({ "version": 2, "width": 1280, "height": 720, "fps": 60,
             "source": "test", "monitors": [], "active_monitor": 0, "audio": false, "clipboard": false });
         let desktop: Desktop = serde_json::from_value(old.clone()).unwrap();
         assert_eq!(desktop.codec, VideoCodec::H264);
         assert!(!desktop.configurable_video && !desktop.telemetry);
+        assert!(!desktop.keyframe_requests);
         assert_eq!(desktop.video_start_group, 0);
         let mut invalid = old;
         invalid["codec"] = serde_json::json!("surprise");

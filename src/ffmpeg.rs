@@ -30,10 +30,17 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn tp_codec_free(codec: *mut c_void);
     fn tp_send_packet(codec: *mut c_void, data: *const u8, size: c_int, pts: i64) -> c_int;
-    fn tp_send_frame(codec: *mut c_void, data: *const u8, size: c_int, pts: i64) -> c_int;
+    fn tp_send_frame(
+        codec: *mut c_void,
+        data: *const u8,
+        size: c_int,
+        pts: i64,
+        force_key: c_int,
+    ) -> c_int;
     fn tp_receive_packet(codec: *mut c_void, output: *mut Output) -> c_int;
     fn tp_receive_frame(codec: *mut c_void, output: *mut Output) -> c_int;
     fn tp_codec_flush(codec: *mut c_void);
+    fn tp_codec_set_bitrate(codec: *mut c_void, kbps: c_int) -> c_int;
     fn tp_codec_error(error: c_int, buffer: *mut c_char, length: c_int);
 }
 
@@ -111,10 +118,20 @@ impl Codec {
         })
     }
     pub fn submit(&mut self, bytes: &[u8], pts: u64) -> Result<()> {
+        self.submit_frame(bytes, pts, false)
+    }
+    /// Encoders: `force_key` makes this frame an IDR starting a new closed GOP.
+    pub fn submit_frame(&mut self, bytes: &[u8], pts: u64, force_key: bool) -> Result<()> {
         let size = bytes.len().try_into()?;
         let result = unsafe {
             if self.config.encoder {
-                tp_send_frame(self.pointer.as_ptr(), bytes.as_ptr(), size, pts.try_into()?)
+                tp_send_frame(
+                    self.pointer.as_ptr(),
+                    bytes.as_ptr(),
+                    size,
+                    pts.try_into()?,
+                    force_key.into(),
+                )
             } else {
                 tp_send_packet(self.pointer.as_ptr(), bytes.as_ptr(), size, pts.try_into()?)
             }
@@ -153,6 +170,17 @@ impl Codec {
             key: output.key != 0,
             pts: output.pts.try_into().ok(),
         }))
+    }
+    /// Change an open encoder's bitrate without reopening it. `Ok(false)` means
+    /// this encoder cannot, and the caller must reopen to apply the change.
+    pub fn set_bitrate_in_place(&mut self, kbps: u32) -> Result<bool> {
+        let result = unsafe { tp_codec_set_bitrate(self.pointer.as_ptr(), kbps.try_into()?) };
+        if result == -libc::ENOSYS {
+            return Ok(false);
+        }
+        check(result)?;
+        self.config.kbps = kbps;
+        Ok(true)
     }
     pub fn flush(&mut self) {
         unsafe {
@@ -217,6 +245,78 @@ mod tests {
             }
             ensure!(decoded >= 20, "insufficient decoded frames: {decoded}");
         }
+        Ok(())
+    }
+    #[test]
+    fn forced_keyframe_starts_new_gop_mid_interval() -> Result<()> {
+        for hevc in [false, true] {
+            // 30 fps gives a 7-frame GOP; frame 3 is mid-interval.
+            let mut encoder = Codec::new(software_config(hevc))?;
+            let mut raw = vec![90; 64 * 48];
+            raw.extend(vec![128; 64 * 48 / 2]);
+            let mut keys = Vec::new();
+            for sequence in 0..6 {
+                raw[sequence as usize] = 200; // vary content so frames are not skipped
+                encoder.submit_frame(&raw, sequence, sequence == 3)?;
+                while let Some(packet) = encoder.receive()? {
+                    if packet.key {
+                        keys.push(packet.pts);
+                    }
+                }
+            }
+            ensure!(
+                keys == [Some(0), Some(3)],
+                "hevc={hevc}: expected keyframes at 0 and 3, got {keys:?}"
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn x264_bitrate_changes_in_place_and_x265_requires_reopen() -> Result<()> {
+        let config = Config {
+            width: 320,
+            height: 240,
+            kbps: 4000,
+            ..software_config(false)
+        };
+        let mut encoder = Codec::new(config)?;
+        // Pseudo-random content so the rate controller, not the content, limits size.
+        let mut seed = 0x2545_f491_u32;
+        let mut encode = |encoder: &mut Codec, from: u64| -> Result<usize> {
+            let mut bytes = 0;
+            for pts in from..from + 30 {
+                let raw: Vec<u8> = (0..320 * 240 * 3 / 2)
+                    .map(|_| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 17;
+                        seed ^= seed << 5;
+                        seed as u8
+                    })
+                    .collect();
+                encoder.submit(&raw, pts)?;
+                while let Some(packet) = encoder.receive()? {
+                    bytes += packet.bytes.len();
+                }
+            }
+            Ok(bytes)
+        };
+        let high = encode(&mut encoder, 0)?;
+        ensure!(
+            encoder.set_bitrate_in_place(300)?,
+            "libx264 must reconfigure in place"
+        );
+        ensure!(encoder.config.kbps == 300);
+        let low = encode(&mut encoder, 30)?;
+        ensure!(
+            low * 3 < high,
+            "in-place bitrate change had no effect: {high} -> {low} bytes"
+        );
+        let mut hevc = Codec::new(software_config(true))?;
+        ensure!(
+            !hevc.set_bitrate_in_place(300)?,
+            "libx265 must report that it needs a reopen"
+        );
+        ensure!(hevc.config.kbps == 1000);
         Ok(())
     }
     #[test]

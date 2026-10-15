@@ -39,6 +39,7 @@ pub struct StreamStats {
     pub decoder_queue_bytes: AtomicU64,
     pub decoder_recoveries: AtomicU64,
     pub stale_frames: AtomicU64,
+    pub decode_errors: AtomicU64,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -56,6 +57,7 @@ pub struct Snapshot {
     pub conversion_us: u64,
     pub decoder_recoveries: u64,
     pub stale_frames: u64,
+    pub decode_errors: u64,
 }
 
 impl Default for StreamStats {
@@ -76,6 +78,7 @@ impl Default for StreamStats {
             decoder_queue_bytes: AtomicU64::new(0),
             decoder_recoveries: AtomicU64::new(0),
             stale_frames: AtomicU64::new(0),
+            decode_errors: AtomicU64::new(0),
         }
     }
 }
@@ -226,6 +229,7 @@ impl StreamStats {
             conversion_us: timings.conversion_us,
             decoder_recoveries: self.decoder_recoveries.load(Ordering::Relaxed),
             stale_frames: self.stale_frames.load(Ordering::Relaxed),
+            decode_errors: self.decode_errors.load(Ordering::Relaxed),
         }
     }
 }

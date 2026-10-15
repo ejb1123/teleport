@@ -30,7 +30,8 @@ heartbeats, and cache their selection for that client process.
 | Skipped groups | MoQ GOPs superseded, missing, or incomplete; not a packet-loss percentage |
 | Superseded frames | Decoded frames replaced in the latest-frame slot before the renderer consumed them |
 | Unmatched timestamps | Frames whose exact local receive identity could not be recovered; their receive/decode timing and video generation are unavailable |
-| Decoder recoveries | Pipeline resets after compressed backlog exceeds the age/count/size budget; the entire remaining GOP is skipped and reception resumes at a new keyframe group |
+| Decoder recoveries | Pipeline resets after compressed backlog exceeds the age/count/size budget, or after a decode error; the entire remaining GOP is skipped and reception resumes at a new keyframe group |
+| Decode errors | Access units the direct FFmpeg decoder rejected; each triggers one recovery rather than ending the session |
 | Stale frames | Output discarded because it was already more than 250 ms old before publication |
 
 No cross-machine wall-clock subtraction is used. Capture latency, one-way network
@@ -70,8 +71,14 @@ output filtering still applies. If two resets fail to stabilize the decoder,
 the third recovery replaces VA/QSV with the matching software decoder in the
 same session, preserving parser, HDR caps, authentication and input connection.
 It resumes at a new keyframe, never at dependent frames from the abandoned GOP.
-The software path retains the bounded recovery policy: persistent CPU overload
-can still end the session with an error rather than accumulating unlimited delay.
+Every recovery discards the backlog, so delay never accumulates. Since the
+2026-10 review, frequent recoveries that still produce fresh frames (a burst
+after a network stall, or a marginally overloaded decoder) stutter and lower
+the host bitrate instead of ending the session. Five consecutive recoveries
+with no fresh decoded frame still end it with an error. A direct FFmpeg decode
+error (corrupt or truncated access unit) is counted as **Decode errors** in F8
+and handled as one recovery, and the client asks a supporting host for an
+immediate keyframe instead of waiting for the next scheduled group.
 F8 and the warning log identify the replacement. For a controlled comparison,
 choose **Decoder: software** before connecting. This bypasses hardware selection;
 the default remains hardware. Mac/NVIDIA selection is unaffected.

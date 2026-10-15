@@ -904,6 +904,10 @@ pub fn run() -> Result<()> {
                         }
                         if agent_consent.enabled_for(&profile.address) {
                             command.arg("--forward-ssh-agent");
+                        } else {
+                            // Survive Wi-Fi drops and host restarts. Agent
+                            // forwarding is never resumed automatically.
+                            command.arg("--reconnect");
                         }
                         command.stdin(Stdio::null()).stdout(Stdio::piped());
                         Ok(command.spawn()?)

@@ -17,6 +17,11 @@ use x11rb::{
     protocol::{randr::ConnectionExt as _, xproto, xtest::ConnectionExt},
 };
 
+/// PipeWire capture is damage-driven. Re-send the last frame on a static
+/// desktop so a requested keyframe or recovery always has a frame to encode,
+/// and a change dropped by the FPS cap is repeated rather than lost.
+const KEEPALIVE_MS: u32 = 250;
+
 pub struct Capture {
     pub width: u32,
     pub height: u32,
@@ -72,7 +77,7 @@ impl Capture {
                     .open_pipe_wire_remote(session)
                     .await?;
                 let source = format!(
-                    "pipewiresrc fd={} path={} do-timestamp=true ! video/x-raw",
+                    "pipewiresrc fd={} path={} do-timestamp=true keepalive-time={KEEPALIVE_MS} ! video/x-raw",
                     remote.as_raw_fd(),
                     nodes[index]
                 );
@@ -331,7 +336,7 @@ impl Capture {
                 }
             ),
             Backend::Portal { fd, nodes, .. } => format!(
-                "pipewiresrc fd={} path={} do-timestamp=true ! video/x-raw",
+                "pipewiresrc fd={} path={} do-timestamp=true keepalive-time={KEEPALIVE_MS} ! video/x-raw",
                 fd.as_raw_fd(),
                 nodes[self.active_monitor]
             ),
@@ -554,7 +559,8 @@ impl Capture {
             | Event::ConfigureVideo { .. }
             | Event::Feedback { .. }
             | Event::Clipboard { .. }
-            | Event::ClipboardRequest => (),
+            | Event::ClipboardRequest
+            | Event::RequestKeyframe { .. } => (),
         }
         Ok(())
     }

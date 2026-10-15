@@ -12,6 +12,13 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 
+/// Consecutive injection failures tolerated before the input path is treated
+/// as gone (for example a revoked portal session) rather than a transient error.
+const MAX_CONSECUTIVE_INPUT_FAILURES: u32 = 50;
+
+/// Minimum spacing between client-requested IDRs per stream.
+const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
+
 #[derive(Args, Clone)]
 pub struct Options {
     /// Experimental: permit clients that explicitly opt in to forward an SSH agent.
@@ -97,6 +104,9 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
     let mut config = moq_native::ServerConfig::default();
     config.bind = Some(options.listen.clone());
     config.version = vec![protocol::WIRE_VERSION.parse().map_err(anyhow::Error::msg)?];
+    config.quic.idle_timeout = Some(protocol::QUIC_IDLE_TIMEOUT);
+    config.quic.keep_alive = Some(protocol::QUIC_KEEP_ALIVE);
+    config.quic.mtu_discovery = Some(protocol::QUIC_MTU_DISCOVERY);
     let identity = options
         .identity_dir
         .as_deref()
@@ -370,6 +380,8 @@ async fn connection(
     let mut encoder_metrics = pipeline.encoder_metrics()?;
     let mut telemetry_enabled = false;
     let mut last_telemetry = Instant::now();
+    let mut input_failures = 0_u32;
+    let mut last_keyframe: BTreeMap<Option<usize>, Instant> = BTreeMap::new();
     loop {
         tokio::select! {
             result = crate::ssh_agent::closed(&mut ssh_agent) => return result,
@@ -429,6 +441,22 @@ async fn connection(
                     // Auxiliary streams currently use fixed bitrate. Their
                     // congestion must never adapt the independent primary.
                     Event::MonitorFeedback { .. } => {}
+                    Event::RequestKeyframe { monitor } => {
+                        // Bound IDR bursts: a lossy link must not turn every
+                        // request into a full keyframe and deepen congestion.
+                        let now = Instant::now();
+                        if last_keyframe.get(&monitor).is_none_or(|at| now.duration_since(*at) >= KEYFRAME_REQUEST_INTERVAL) {
+                            last_keyframe.insert(monitor, now);
+                            let target = match monitor {
+                                None => Some(&pipeline),
+                                Some(index) => monitor_streams.get(&index).map(|stream| &stream.pipeline),
+                            };
+                            if let Some(target) = target
+                                && let Err(error) = target.request_keyframe() {
+                                tracing::warn!(%error, ?monitor, "keyframe request failed");
+                            }
+                        }
+                    }
                     Event::ConfigureVideo { width, fps, bitrate } => {
                         if last_configure.elapsed() < Duration::from_millis(500) {
                             publish_update(&mut updates, Update::Notice { text: "Video settings changed too quickly; try again".into() })?;
@@ -513,7 +541,26 @@ async fn connection(
                         telemetry_enabled = true;
                         publish_update(&mut updates, Update::Pong { id })?;
                     },
-                    event => capture.input(event).await?,
+                    event => {
+                        // Invalid events still fail closed. An injection error
+                        // (portal/D-Bus hiccup) drops that one event; only a
+                        // persistently broken input path ends the session.
+                        event.validate()?;
+                        match capture.input(event).await {
+                            Ok(()) => input_failures = 0,
+                            Err(error) => {
+                                input_failures += 1;
+                                ensure!(
+                                    input_failures < MAX_CONSECUTIVE_INPUT_FAILURES,
+                                    "host input injection failed {input_failures} consecutive times: {error:#}"
+                                );
+                                tracing::warn!(%error, input_failures, "dropping input event that could not be injected");
+                                if input_failures == 1 {
+                                    publish_update(&mut updates, Update::Notice { text: format!("Host could not inject input: {error}") })?;
+                                }
+                            }
+                        }
+                    }
                 }
             },
         }
@@ -561,6 +608,7 @@ fn desktop_for_monitor(
         native_height: monitor.height,
         bitrate: options.bitrate,
         video_start_group,
+        keyframe_requests: true,
     })
 }
 

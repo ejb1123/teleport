@@ -4,8 +4,14 @@ use super::*;
 use crate::ffmpeg::{Codec, Config};
 use std::{collections::BTreeMap, sync::OnceLock};
 
+/// Reopen-and-continue budget for encoder errors; reset by any encoded frame.
+#[cfg(target_os = "linux")]
+const MAX_CONSECUTIVE_ENCODE_FAILURES: u32 = 3;
+
 pub(super) struct State {
     codec: Mutex<Codec>,
+    /// Set by a client keyframe request; consumed by the next encoded frame.
+    keyframe: std::sync::atomic::AtomicBool,
     #[cfg(target_os = "linux")]
     pub metrics: Option<Arc<EncoderMetrics>>,
 }
@@ -38,6 +44,10 @@ impl State {
         Ok(())
     }
     #[cfg(target_os = "linux")]
+    pub fn request_keyframe(&self) {
+        self.keyframe.store(true, Ordering::Relaxed);
+    }
+    #[cfg(target_os = "linux")]
     pub fn bitrate(&self) -> u32 {
         self.codec.lock().unwrap().config.kbps
     }
@@ -46,6 +56,12 @@ impl State {
         ensure!((1..=100_000).contains(&kbps), "invalid video bitrate");
         let mut codec = self.codec.lock().unwrap();
         ensure!(codec.config.encoder, "not an encoder");
+        // NVENC and libx264 reconfigure in place at the next frame: no new
+        // hardware session, no forced IDR during the congestion that caused
+        // this change. (Verified by the in-place bitrate codec test.)
+        if codec.set_bitrate_in_place(kbps)? {
+            return Ok(());
+        }
         // FFmpeg does not provide a universal mutable bitrate contract. Reopen
         // transactionally and start a new IDR/GOP instead of claiming a change
         // merely because AVCodecContext.bit_rate accepted an assignment.
@@ -270,6 +286,7 @@ pub(super) fn decoder(
     };
     let state = Arc::new(State {
         codec: Mutex::new(Codec::new(config(&name, format, output))?),
+        keyframe: Default::default(),
         #[cfg(target_os = "linux")]
         metrics: None,
     });
@@ -296,8 +313,8 @@ pub(super) fn decoder(
     sink.set_callbacks(
         gstreamer_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Flushing)?;
                 let process = || -> Result<()> {
-                    let sample = sink.pull_sample()?;
                     let buffer = sample
                         .buffer()
                         .context("compressed sample missing buffer")?;
@@ -376,10 +393,15 @@ pub(super) fn decoder(
                     }
                     Ok(())
                 };
-                process().map(|()| gst::FlowSuccess::Ok).map_err(|error| {
-                    tracing::error!(%error, "direct FFmpeg decode failed");
-                    gst::FlowError::Error
-                })
+                // One corrupt or truncated access unit must not end the session.
+                // The receiver sees the counter, abandons this GOP and resets
+                // the decoder at the next keyframe; its recovery budget still
+                // ends sessions whose decoder never makes progress.
+                if let Err(error) = process() {
+                    tracing::warn!(%error, "direct FFmpeg decode failed; recovering at next keyframe");
+                    stats.decode_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(gst::FlowSuccess::Ok)
             })
             .build(),
     );
@@ -404,6 +426,24 @@ pub(super) fn encoder(
     } else {
         "h264"
     };
+    // Probing opens and exercises up to four encoders. Quality and monitor
+    // changes re-create the encoder inside the session loop, so remember which
+    // one worked for this request and only probe again if it later fails.
+    type Cache = BTreeMap<(String, bool, bool, u32, u32), String>;
+    static ENCODERS: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let cache_key = (
+        format!("{kind:?}"),
+        format.codec == VideoCodec::H265,
+        format.hdr(),
+        size.0,
+        size.1,
+    );
+    let cached = ENCODERS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap()
+        .get(&cache_key)
+        .cloned();
     let choices = if matches!(kind, EncoderKind::Auto) {
         vec![
             EncoderKind::Nvidia,
@@ -437,6 +477,13 @@ pub(super) fn encoder(
             kbps: bitrate,
             ..config("", format, 1)
         };
+        if let Some(cached) = &cached {
+            if &config.name != cached {
+                continue;
+            }
+            selected = Some(config);
+            break;
+        }
         let probe = || -> Result<()> {
             let mut codec = Codec::new(config.clone())?;
             let raw = neutral_frame(size.0, size.1, format.hdr());
@@ -471,8 +518,19 @@ pub(super) fn encoder(
         pending: Mutex::default(),
         encode_us: std::sync::atomic::AtomicU64::new(0),
     });
+    let name = config.name.clone();
+    let codec = Codec::new(config);
+    {
+        let mut cache = ENCODERS.get_or_init(Mutex::default).lock().unwrap();
+        if codec.is_ok() {
+            cache.insert(cache_key, name);
+        } else {
+            cache.remove(&cache_key);
+        }
+    }
     let state = Arc::new(State {
-        codec: Mutex::new(Codec::new(config)?),
+        codec: Mutex::new(codec?),
+        keyframe: Default::default(),
         metrics: Some(metrics.clone()),
     });
     let pixel = if format.hdr() {
@@ -481,7 +539,10 @@ pub(super) fn encoder(
         "NV12,colorimetry=bt709"
     };
     let pipeline = Pipeline(gst::parse::launch(&format!(
-        "{source} ! queue max-size-buffers=2 max-size-bytes=0 max-size-time=0 leaky=downstream ! videoconvert ! videoscale ! videorate drop-only=true ! video/x-raw,format={pixel},width={},height={},framerate={fps}/1 ! appsink name=captured sync=false max-buffers=1 drop=false",size.0,size.1
+        // One-frame leaky queue: a slow encoder always picks up the newest
+        // capture. Rate-limit before converting so dropped frames cost nothing,
+        // then convert and scale in one multithreaded pass.
+        "{source} ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! videorate drop-only=true ! video/x-raw,framerate={fps}/1 ! videoconvertscale n-threads=0 ! video/x-raw,format={pixel},width={},height={},framerate={fps}/1 ! appsink name=captured sync=false max-buffers=1 drop=false",size.0,size.1
     ))?.downcast::<gst::Pipeline>().map_err(|_| anyhow::anyhow!("not a capture pipeline"))?);
     attach(&pipeline.0, state.clone());
     let sink = pipeline
@@ -507,6 +568,7 @@ pub(super) fn encoder(
     let mut ready_tx = Some(ready_tx);
     let mut group: Option<moq_net::group::Producer> = None;
     let mut frame_id = 0_u64;
+    let mut encode_failures = 0_u32;
     sink.set_callbacks(
         gstreamer_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -554,8 +616,33 @@ pub(super) fn encoder(
                             pending.pop_first();
                         }
                     }
-                    codec.submit(&raw, frame_id)?;
-                    while let Some(packet) = codec.receive()? {
+                    let mut packets = Vec::new();
+                    let force_key = state.keyframe.swap(false, Ordering::Relaxed);
+                    let encoded = codec.submit_frame(&raw, frame_id, force_key).and_then(|()| {
+                        while let Some(packet) = codec.receive()? {
+                            packets.push(packet);
+                        }
+                        Ok(())
+                    });
+                    if let Err(error) = encoded {
+                        // A transient driver error must not end the session.
+                        // Reopen the encoder so its next output is an IDR that
+                        // starts a fresh group; persistent failure stays fatal.
+                        encode_failures += 1;
+                        ensure!(
+                            encode_failures <= MAX_CONSECUTIVE_ENCODE_FAILURES,
+                            "encoder failed {encode_failures} consecutive frames: {error:#}"
+                        );
+                        tracing::warn!(%error, encode_failures, "direct FFmpeg encode failed; reopening encoder");
+                        *codec = Codec::new(codec.config.clone())?;
+                        metrics.pending.lock().unwrap().clear();
+                        if let Some(mut old) = group.take() {
+                            let _ = old.finish();
+                        }
+                        return Ok(());
+                    }
+                    encode_failures = 0;
+                    for packet in packets {
                         let elapsed = packet
                             .pts
                             .and_then(|pts| metrics.pending.lock().unwrap().remove(&pts))

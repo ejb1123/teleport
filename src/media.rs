@@ -123,6 +123,30 @@ impl Pipeline {
         Ok(encoder.property::<u32>("bitrate"))
     }
 
+    /// Make the next captured frame an IDR that starts a new MoQ group.
+    #[cfg(target_os = "linux")]
+    pub fn request_keyframe(&self) -> Result<()> {
+        if let Some(state) = ffmpeg_media::state(&self.0) {
+            state.request_keyframe();
+            return Ok(());
+        }
+        let encoder = self
+            .0
+            .by_name("video_encoder")
+            .context("not a video encoder")?;
+        let event = gstreamer_video::UpstreamForceKeyUnitEvent::builder()
+            .all_headers(true)
+            .build();
+        ensure!(
+            encoder
+                .static_pad("src")
+                .context("encoder has no src pad")?
+                .send_event(event),
+            "encoder rejected keyframe request"
+        );
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     pub fn set_video_bitrate(&self, kbps: u32) -> Result<()> {
         if let Some(state) = ffmpeg_media::state(&self.0) {
@@ -931,8 +955,10 @@ pub async fn receive_video_with_stats(
     source: AppSrc,
     events: tokio::sync::mpsc::Sender<crate::protocol::Event>,
     stats: Arc<crate::stats::StreamStats>,
+    keyframe_requests: bool,
 ) -> Result<()> {
     let dropped = Arc::new(AtomicU32::new(0));
+    let keyframes = keyframe_requests.then(|| events.clone());
     let monitor = async {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -962,7 +988,7 @@ pub async fn receive_video_with_stats(
     // Keep the read future alive across feedback ticks. Cancelling read_frame in
     // the middle of a GOP would lose a partially-read H.264 access unit.
     tokio::select! {
-        result = receive_video_inner(track, source.clone(), dropped.clone(), stats.clone()) => result,
+        result = receive_video_inner(track, source.clone(), dropped.clone(), stats.clone(), keyframes) => result,
         () = monitor => unreachable!(),
     }
 }
@@ -1072,10 +1098,21 @@ impl RecoveryBudget {
             self.without_progress = 0;
             self.fresh_frames = fresh_frames;
         }
+        // Rapid recoveries with decoded progress between them are what a burst
+        // after a network stall looks like. Each recovery already discards the
+        // backlog, so delay cannot accumulate; they feed the software fallback
+        // and the host's bitrate controller instead of ending the session.
+        // Only a decoder that never produces fresh frames is fatal.
         ensure!(
-            self.recent.len() < 5 && self.without_progress < 5,
+            self.without_progress < 5,
             "decoder repeatedly exceeded latency budget; reduce resolution/FPS, try H.265, or use --software-decoder"
         );
+        if self.recent.len() >= 5 {
+            tracing::warn!(
+                recent = self.recent.len(),
+                "frequent decoder recoveries; video will stutter until bitrate or load drops"
+            );
+        }
         self.recent.push_back(now);
         self.without_progress += 1;
         Ok(())
@@ -1170,10 +1207,23 @@ async fn receive_video_inner(
     source: AppSrc,
     dropped: Arc<AtomicU32>,
     stats: Arc<crate::stats::StreamStats>,
+    keyframes: Option<tokio::sync::mpsc::Sender<crate::protocol::Event>>,
 ) -> Result<()> {
+    // Lost decoder state otherwise waits for the host's next scheduled GOP.
+    // The host rate-limits too; this only keeps the shared input queue clear.
+    let mut last_keyframe_request: Option<Instant> = None;
+    let mut request_keyframe = || {
+        if let Some(events) = &keyframes
+            && last_keyframe_request.is_none_or(|at| at.elapsed() >= Duration::from_millis(50))
+        {
+            last_keyframe_request = Some(Instant::now());
+            let _ = events.try_send(crate::protocol::Event::RequestKeyframe { monitor: None });
+        }
+    };
     let mut current: Option<moq_net::group::Consumer> = None;
     let mut sequence = None;
     let mut stale_checkpoint = stats.stale_frames.load(Ordering::Relaxed);
+    let mut error_checkpoint = stats.decode_errors.load(Ordering::Relaxed);
     let mut recoveries = RecoveryBudget::default();
     let mut decoder_started = None;
     let mut ready_checkpoint = stats.ready_frames.load(Ordering::Relaxed);
@@ -1235,7 +1285,13 @@ async fn receive_video_inner(
                         source.current_level_buffers(),
                         source.current_level_bytes(),
                     );
-                    if !starting && decoder_needs_recovery(&source, &stats, stale_checkpoint) {
+                    // A decode error leaves references inconsistent for the rest
+                    // of this GOP, so it recovers even during startup grace.
+                    let decode_failed =
+                        stats.decode_errors.load(Ordering::Relaxed) != error_checkpoint;
+                    if decode_failed
+                        || (!starting && decoder_needs_recovery(&source, &stats, stale_checkpoint))
+                    {
                         let recent = recoveries
                             .recent
                             .iter()
@@ -1253,13 +1309,15 @@ async fn receive_video_inner(
                             queued_frames = source.current_level_buffers(),
                             queue_age_ms = stats.oldest_queued_age().map(|age| age.as_millis() as u64),
                             decoder = %stats.decoder.lock().unwrap(),
-                            "decoder backlog exceeded latency budget; resetting at next keyframe group"
+                            decode_failed,
+                            "decoder failed or exceeded latency budget; resetting at next keyframe group"
                         );
                         // Abandon the complete remainder of this GOP, including
                         // this frame. next_media_event accepts only a newer group;
                         // the host starts every group with an independent keyframe.
                         current = None;
                         record_drop(1);
+                        request_keyframe();
                         if let Some(replacement) = replacement {
                             tracing::warn!(
                                 replacement,
@@ -1272,6 +1330,7 @@ async fn receive_video_inner(
                             reset_decoder(&source, stats.clone()).await?;
                         }
                         stale_checkpoint = stats.stale_frames.load(Ordering::Relaxed);
+                        error_checkpoint = stats.decode_errors.load(Ordering::Relaxed);
                         decoder_started = None;
                         continue;
                     }
@@ -1285,6 +1344,7 @@ async fn receive_video_inner(
                 Err(error) => {
                     tracing::debug!(%error, "skipping incomplete video group");
                     record_drop(1);
+                    request_keyframe();
                     current = None;
                 }
             },
@@ -1366,8 +1426,22 @@ impl BitrateController {
     }
 }
 
+/// Subscriber priorities for host→client tracks; higher preempts lower when
+/// bandwidth is constrained. Input (client→host) uses 255. Control updates
+/// (barriers, notices, pongs) are tiny; audio gaps are more noticeable than a
+/// late video frame, which a newer frame supersedes anyway.
+pub const UPDATES_PRIORITY: u8 = 200;
+pub const AUDIO_PRIORITY: u8 = 150;
+pub const VIDEO_PRIORITY: u8 = 0;
+
 pub fn video_subscription() -> moq_net::track::Subscription {
-    moq_net::track::Subscription::default().with_latency_max(Duration::from_millis(100))
+    moq_net::track::Subscription::default()
+        .with_latency_max(Duration::from_millis(100))
+        .with_priority(VIDEO_PRIORITY)
+}
+
+pub fn audio_subscription() -> moq_net::track::Subscription {
+    video_subscription().with_priority(AUDIO_PRIORITY)
 }
 
 pub fn doctor() -> Result<()> {
@@ -1398,6 +1472,7 @@ pub fn doctor() -> Result<()> {
         "avdec_h264",
         "videoconvert",
         "videoscale",
+        "videoconvertscale",
     ] {
         if direct && matches!(name, "h264parse" | "avdec_h264") {
             continue;
@@ -1907,7 +1982,14 @@ mod tests {
         let subscriber = track.subscribe(None);
         let reader_stats = stats.clone();
         let task = tokio::spawn(async move {
-            receive_video_inner(subscriber, input, Arc::new(AtomicU32::new(0)), reader_stats).await
+            receive_video_inner(
+                subscriber,
+                input,
+                Arc::new(AtomicU32::new(0)),
+                reader_stats,
+                None,
+            )
+            .await
         });
         let result = async {
             let deadline = Instant::now() + Duration::from_secs(12);
@@ -1958,11 +2040,17 @@ mod tests {
         assert!(budget.attempt(1, now + Duration::from_secs(20)).is_err());
         // Stale outputs do not count as fresh progress; a real ready frame does.
         assert!(budget.attempt(2, now + Duration::from_secs(24)).is_ok());
+        // A burst after a network stall: rapid, but each recovery made progress.
         let mut rapid = RecoveryBudget::default();
-        for index in 0..5 {
+        for index in 0..20 {
             rapid.attempt(index, now).unwrap();
         }
-        assert!(rapid.attempt(6, now).is_err());
+        // Rapid recoveries without progress remain fatal.
+        let mut stuck = RecoveryBudget::default();
+        for _ in 0..5 {
+            stuck.attempt(1, now).unwrap();
+        }
+        assert!(stuck.attempt(1, now).is_err());
     }
 
     const TEST_ENCODERS: [EncoderKind; 4] = [
@@ -2479,8 +2567,14 @@ mod tests {
             let subscriber = track.subscribe(None);
             let reader_stats = stats.clone();
             let task = tokio::spawn(async move {
-                receive_video_inner(subscriber, input, Arc::new(AtomicU32::new(0)), reader_stats)
-                    .await
+                receive_video_inner(
+                    subscriber,
+                    input,
+                    Arc::new(AtomicU32::new(0)),
+                    reader_stats,
+                    None,
+                )
+                .await
             });
             let mut old = track.create_group(moq_net::group::Info { sequence: 1 })?;
             old.write_frame(moq_net::Timestamp::now(), frames[0].clone())?;
@@ -2532,6 +2626,103 @@ mod tests {
             task.abort();
             let _ = task.await;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires FFmpeg software codecs"]
+    async fn direct_decode_error_recovers_at_next_group_without_ending_session() -> Result<()> {
+        gst::init()?;
+        let codec = VideoCodec::H264;
+        let encoder = Pipeline(gst::parse::launch(&format!(
+            "videotestsrc num-buffers=4 ! video/x-raw,format=I420,width=320,height=180,framerate=30/1 ! {} ! {} config-interval=-1 ! {},stream-format=byte-stream,alignment=au ! appsink name=out sync=false",
+            encoder_fragment(EncoderKind::Software, 30, 1000, codec), parser(codec), compressed_caps(codec)
+        ))?.downcast::<gst::Pipeline>().unwrap());
+        let output = encoder
+            .0
+            .by_name("out")
+            .unwrap()
+            .downcast::<AppSink>()
+            .unwrap();
+        encoder.0.set_state(gst::State::Playing)?;
+        let keyframe = output
+            .try_pull_sample(gst::ClockTime::from_seconds(3))
+            .context("encoder stalled")?;
+        let keyframe =
+            bytes::Bytes::copy_from_slice(keyframe.buffer().unwrap().map_readable()?.as_slice());
+        let stats = Arc::new(crate::stats::StreamStats::default());
+        let (pipeline, input, image) =
+            ffmpeg_media::decoder(true, stats.clone(), codec.into(), false, false)?;
+
+        // A buffer the callback cannot process must be counted, not fatal.
+        input.push_buffer(gst::Buffer::from_slice(keyframe.clone()))?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while stats.decode_errors.load(Ordering::Relaxed) == 0 {
+            pipeline.error()?;
+            ensure!(Instant::now() < deadline, "decode error was not counted");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        pipeline.error()?;
+
+        let origin = moq_net::Origin::random().produce();
+        let mut broadcast = origin.create_broadcast("errors", moq_net::broadcast::Route::new())?;
+        let mut track = broadcast.create_track("video", moq_net::track::Info::default())?;
+        let subscriber = track.subscribe(None);
+        let reader_stats = stats.clone();
+        let task = tokio::spawn(async move {
+            receive_video_inner(
+                subscriber,
+                input,
+                Arc::new(AtomicU32::new(0)),
+                reader_stats,
+                None,
+            )
+            .await
+        });
+        let mut damaged = track.create_group(moq_net::group::Info { sequence: 1 })?;
+        damaged.write_frame(moq_net::Timestamp::now(), keyframe.clone())?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while image
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|frame| frame.video_group != Some(1))
+        {
+            ensure!(Instant::now() < deadline, "first group did not decode");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Mid-GOP failure: the next frame of the same group must trigger a reset.
+        stats.decode_errors.fetch_add(1, Ordering::Relaxed);
+        damaged.write_frame(moq_net::Timestamp::now(), keyframe.clone())?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while stats.decoder_recoveries.load(Ordering::Relaxed) == 0 {
+            ensure!(!task.is_finished(), "receiver ended after a decode error");
+            ensure!(
+                Instant::now() < deadline,
+                "decode error did not trigger recovery"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(stats.skipped_groups.load(Ordering::Relaxed) >= 1);
+        let mut fresh = track.create_group(moq_net::group::Info { sequence: 2 })?;
+        fresh.write_frame(moq_net::Timestamp::now(), keyframe)?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while image
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|frame| frame.video_group != Some(2))
+        {
+            pipeline.error()?;
+            ensure!(!task.is_finished(), "receiver ended during recovery");
+            ensure!(
+                Instant::now() < deadline,
+                "no frame after decode error recovery"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        task.abort();
+        let _ = task.await;
         Ok(())
     }
 
