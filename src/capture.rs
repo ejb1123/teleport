@@ -22,6 +22,18 @@ use x11rb::{
 /// and a change dropped by the FPS cap is repeated rather than lost.
 const KEEPALIVE_MS: u32 = 250;
 
+/// `--source test` pattern. `TELEPORT_TEST_PATTERN` (e.g. `snow`) lets network
+/// tests use content that fills the configured bitrate; the default ball
+/// compresses to almost nothing and would never stress a link.
+fn test_pattern(monitor: usize) -> String {
+    std::env::var("TELEPORT_TEST_PATTERN")
+        .ok()
+        .filter(|name| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+        .unwrap_or_else(|| if monitor == 0 { "ball" } else { "smpte" }.into())
+}
+
 pub struct Capture {
     pub width: u32,
     pub height: u32,
@@ -67,10 +79,7 @@ impl Capture {
             .context("monitor index is out of range")?;
         let mut fd = None;
         let mut pipeline = match &self.backend {
-            Backend::Test => format!(
-                "videotestsrc is-live=true pattern={}",
-                if index == 0 { "ball" } else { "smpte" }
-            ),
+            Backend::Test => format!("videotestsrc is-live=true pattern={}", test_pattern(index)),
             Backend::Portal { session, nodes, .. } => {
                 let remote = Screencast::new()
                     .await?
@@ -329,11 +338,7 @@ impl Capture {
         match &self.backend {
             Backend::Test => format!(
                 "videotestsrc is-live=true pattern={}",
-                if self.active_monitor == 0 {
-                    "ball"
-                } else {
-                    "smpte"
-                }
+                test_pattern(self.active_monitor)
             ),
             Backend::Portal { fd, nodes, .. } => format!(
                 "pipewiresrc fd={} path={} do-timestamp=true keepalive-time={KEEPALIVE_MS} ! video/x-raw",

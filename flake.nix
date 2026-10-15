@@ -197,7 +197,12 @@
               ]
               ++ deps.tools
               ++ deps.media
-              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.xorg-server ];
+              ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                pkgs.xorg-server
+                # tests/network.rs: netem link shaping in a user namespace
+                pkgs.iproute2
+                pkgs.util-linux
+              ];
 
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
             TELEPORT_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";

@@ -783,6 +783,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         ensure!(frames > 0, "headless frame count must be positive");
         let deadline = Instant::now() + Duration::from_secs(20);
         let mut count = 0;
+        // Delivery timing for network-condition tests: span and longest stall.
+        let mut first_frame_at: Option<Instant> = None;
+        let mut last_frame_at: Option<Instant> = None;
+        let mut max_frame_gap = Duration::ZERO;
         let mut switched = false;
         let mut clipboard_ok = false;
         let mut initial_updates = expected_initial_updates;
@@ -851,6 +855,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 );
                 protocol::validate_video_size(frame.width, frame.height)?;
                 count += 1;
+                let now = Instant::now();
+                if let Some(last) = last_frame_at {
+                    max_frame_gap = max_frame_gap.max(now - last);
+                }
+                first_frame_at.get_or_insert(now);
+                last_frame_at = Some(now);
                 if options.smoke_clipboard && count == 5 {
                     ensure!(
                         options.clipboard && desktop.clipboard,
@@ -910,8 +920,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             "clipboard did not roundtrip"
         );
         let snapshot = stream_stats.snapshot();
+        let span_ms = first_frame_at
+            .zip(last_frame_at)
+            .map_or(0, |(first, last)| (last - first).as_millis() as u64);
         tracing::info!(
             frames = count,
+            span_ms,
+            max_frame_gap_ms = max_frame_gap.as_millis() as u64,
             width = desktop.width,
             height = desktop.height,
             received_bytes = snapshot.received_bytes,

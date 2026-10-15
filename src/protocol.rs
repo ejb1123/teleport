@@ -10,7 +10,10 @@ pub const WIRE_VERSION: &str = "moq-lite-05";
 pub const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(8);
 pub const QUIC_KEEP_ALIVE: Duration = Duration::from_secs(1);
 /// Path MTU discovery (off by default) lifts packets above the 1200-byte QUIC
-/// floor; quinn falls back on black-hole detection if a path cannot carry them.
+/// floor, only after a probe of that size is acknowledged, and never past
+/// quinn's 1452-byte upper bound. Overlays with smaller MTUs (Tailscale 1280,
+/// WireGuard ~1420, VXLAN ~1450) just stay at what they can carry; black-hole
+/// detection drops back to 1200 if a path shrinks mid-session (e.g. a VPN).
 pub const QUIC_MTU_DISCOVERY: bool = true;
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
