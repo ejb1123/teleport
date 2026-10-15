@@ -29,6 +29,8 @@ pub struct StreamStats {
     pending: Mutex<BTreeMap<u64, PendingFrame>>,
     last_key: AtomicU64,
     timings: Mutex<Timings>,
+    /// Sums over every matched frame, for whole-run means (Timings is latest-only).
+    timing_sums: Mutex<(Timings, u64)>,
     pub received_bytes: AtomicU64,
     pub received_frames: AtomicU64,
     pub decoded_frames: AtomicU64,
@@ -68,6 +70,7 @@ impl Default for StreamStats {
             pending: Mutex::default(),
             last_key: AtomicU64::new(0),
             timings: Mutex::default(),
+            timing_sums: Mutex::default(),
             received_bytes: AtomicU64::new(0),
             received_frames: AtomicU64::new(0),
             decoded_frames: AtomicU64::new(0),
@@ -192,25 +195,46 @@ impl StreamStats {
         let micros = |duration: Duration| duration.as_micros().max(1).min(u64::MAX as u128) as u64;
         // All stages refer to the same exact completed frame. Missing timestamps
         // remain unavailable, never estimated from another frame or FIFO order.
-        *self.timings.lock().unwrap() =
-            matched
-                .as_ref()
-                .map_or_else(Timings::default, |frame| Timings {
-                    total_us: micros(now.saturating_duration_since(frame.received)),
-                    queue_us: frame.entered.map_or(0, |entered| {
-                        micros(entered.saturating_duration_since(frame.received))
+        let timings = matched
+            .as_ref()
+            .map_or_else(Timings::default, |frame| Timings {
+                total_us: micros(now.saturating_duration_since(frame.received)),
+                queue_us: frame.entered.map_or(0, |entered| {
+                    micros(entered.saturating_duration_since(frame.received))
+                }),
+                decoder_us: frame
+                    .entered
+                    .zip(frame.output)
+                    .map_or(0, |(entered, output)| {
+                        micros(output.saturating_duration_since(entered))
                     }),
-                    decoder_us: frame
-                        .entered
-                        .zip(frame.output)
-                        .map_or(0, |(entered, output)| {
-                            micros(output.saturating_duration_since(entered))
-                        }),
-                    conversion_us: frame
-                        .output
-                        .map_or(0, |output| micros(now.saturating_duration_since(output))),
-                });
+                conversion_us: frame
+                    .output
+                    .map_or(0, |output| micros(now.saturating_duration_since(output))),
+            });
+        if matched.is_some() {
+            let mut sums = self.timing_sums.lock().unwrap();
+            sums.0.total_us += timings.total_us;
+            sums.0.queue_us += timings.queue_us;
+            sums.0.decoder_us += timings.decoder_us;
+            sums.0.conversion_us += timings.conversion_us;
+            sums.1 += 1;
+        }
+        *self.timings.lock().unwrap() = timings;
         matched.map(|frame| frame.group)
+    }
+
+    /// Whole-run means in microseconds: (receive→ready, compressed queue,
+    /// parse/decode/download, convert/copy). Zero before any matched frame.
+    pub fn mean_timings_us(&self) -> (u64, u64, u64, u64) {
+        let (sum, count) = *self.timing_sums.lock().unwrap();
+        let mean = |total: u64| total.checked_div(count).unwrap_or(0);
+        (
+            mean(sum.total_us),
+            mean(sum.queue_us),
+            mean(sum.decoder_us),
+            mean(sum.conversion_us),
+        )
     }
 
     pub fn snapshot(&self) -> Snapshot {

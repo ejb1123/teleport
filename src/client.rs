@@ -1013,6 +1013,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             "clipboard did not roundtrip"
         );
         let snapshot = stream_stats.snapshot();
+        let (mean_ready_us, mean_queue_us, mean_decode_us, mean_convert_us) =
+            stream_stats.mean_timings_us();
         probe_rtts.sort();
         let probe_percentile = |p: usize| {
             probe_rtts
@@ -1032,6 +1034,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             probe_p50_us,
             probe_p95_us,
             probe_max_us,
+            mean_ready_us,
+            mean_queue_us,
+            mean_decode_us,
+            mean_convert_us,
             width = desktop.width,
             height = desktop.height,
             received_bytes = snapshot.received_bytes,

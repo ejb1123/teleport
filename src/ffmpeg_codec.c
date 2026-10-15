@@ -86,7 +86,7 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
     codec->live_bitrate = encoder && (strstr(name, "nvenc") || !strcmp(name, "libx264"));
     codec->hw_format = AV_PIX_FMT_NONE;
     codec->ctx->opaque = codec;
-    codec->ctx->thread_count = 2;
+    codec->ctx->thread_count = 4; /* slice threads: encoder emits 4 slices the decoder can parallelise */
     codec->ctx->max_pixels = 33554432;
     codec->ctx->log_level_offset = 8; /* keep warnings/errors, suppress codec info dumps */
     codec->ctx->thread_type = FF_THREAD_SLICE;

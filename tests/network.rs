@@ -22,6 +22,8 @@ struct Profile {
     pattern: &'static str,
     /// Stream ~500 Hz pointer motion and time input-path probe round trips.
     input_latency: bool,
+    /// Stream width; height follows the 16:9 test source.
+    width: u32,
 }
 
 #[derive(Debug)]
@@ -37,6 +39,10 @@ struct Outcome {
     probe_p50_us: u64,
     probe_p95_us: u64,
     probe_max_us: u64,
+    mean_ready_us: u64,
+    mean_queue_us: u64,
+    mean_decode_us: u64,
+    mean_convert_us: u64,
 }
 
 impl Outcome {
@@ -65,7 +71,7 @@ fn run(profile: &Profile) -> Outcome {
 ip link set lo up
 tc qdisc add dev lo root netem {netem}
 TELEPORT_TEST_PATTERN={pattern} "$TELEPORT" host --source test --encoder software --listen 127.0.0.1:4443 \
-    --width 640 --fps {FPS} --bitrate {bitrate} --pairing-file "$DIR/pairing.json" \
+    --width {width} --fps {FPS} --bitrate {bitrate} --pairing-file "$DIR/pairing.json" \
     >/dev/null 2>"$DIR/host.log" &
 host=$!
 trap 'kill $host 2>/dev/null || true' EXIT
@@ -81,6 +87,7 @@ sleep 0.3
 "#,
         netem = profile.netem,
         pattern = profile.pattern,
+        width = profile.width,
         input = if profile.input_latency {
             "--smoke-input-latency"
         } else {
@@ -128,6 +135,10 @@ sleep 0.3
         probe_p50_us: field("probe_p50_us"),
         probe_p95_us: field("probe_p95_us"),
         probe_max_us: field("probe_max_us"),
+        mean_ready_us: field("mean_ready_us"),
+        mean_queue_us: field("mean_queue_us"),
+        mean_decode_us: field("mean_decode_us"),
+        mean_convert_us: field("mean_convert_us"),
     };
     println!(
         "NETWORK {:<10} netem=[{}] fps={:.1} mbps={:.2} max_gap_ms={} recoveries={} skipped_groups={} decode_errors={}",
@@ -139,6 +150,14 @@ sleep 0.3
         outcome.decoder_recoveries,
         outcome.skipped_groups,
         outcome.decode_errors,
+    );
+    println!(
+        "DECODE  {:<10} ready_ms={:.2} queue_ms={:.2} decode_ms={:.2} convert_ms={:.2}",
+        profile.name,
+        outcome.mean_ready_us as f64 / 1000.0,
+        outcome.mean_queue_us as f64 / 1000.0,
+        outcome.mean_decode_us as f64 / 1000.0,
+        outcome.mean_convert_us as f64 / 1000.0,
     );
     if profile.input_latency {
         println!(
@@ -181,6 +200,7 @@ fn clean_link_streams_at_full_rate() {
         blackout: None,
         pattern: "ball",
         input_latency: false,
+        width: 640,
     });
     assert!(outcome.fps() >= 25.0, "{outcome:?}");
     assert!(outcome.max_frame_gap_ms < 250, "{outcome:?}");
@@ -196,6 +216,7 @@ fn high_latency_link_keeps_full_rate() {
         blackout: None,
         pattern: "ball",
         input_latency: false,
+        width: 640,
     });
     assert!(outcome.fps() >= 25.0, "{outcome:?}");
 }
@@ -210,6 +231,7 @@ fn one_percent_loss_survives_with_usable_rate() {
         blackout: None,
         pattern: "snow",
         input_latency: false,
+        width: 640,
     });
     assert!(outcome.fps() >= 20.0, "{outcome:?}");
 }
@@ -224,6 +246,7 @@ fn five_percent_loss_survives() {
         blackout: None,
         pattern: "snow",
         input_latency: false,
+        width: 640,
     });
 }
 
@@ -237,6 +260,7 @@ fn jitter_and_reordering_survive() {
         blackout: None,
         pattern: "snow",
         input_latency: false,
+        width: 640,
     });
     assert!(outcome.fps() >= 20.0, "{outcome:?}");
 }
@@ -252,6 +276,7 @@ fn bitrate_above_link_capacity_survives() {
         blackout: None,
         pattern: "snow",
         input_latency: false,
+        width: 640,
     });
 }
 
@@ -265,6 +290,7 @@ fn two_second_blackout_recovers_without_reconnect() {
         blackout: Some(2),
         pattern: "ball",
         input_latency: false,
+        width: 640,
     });
     // The stall must cover the outage, and video must resume promptly after.
     assert!(outcome.max_frame_gap_ms >= 1500, "{outcome:?}");
@@ -282,6 +308,7 @@ fn input_profile(name: &'static str, netem: &'static str) -> Outcome {
         blackout: None,
         pattern: "ball",
         input_latency: true,
+        width: 640,
     });
     assert!(outcome.probes >= 50, "too few probe replies: {outcome:?}");
     outcome
@@ -299,4 +326,20 @@ fn input_round_trip_with_streaming_pointer_on_clean_link() {
 #[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
 fn input_round_trip_with_streaming_pointer_under_loss() {
     input_profile("input_loss", "delay 20ms loss 5%");
+}
+
+#[test]
+#[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
+fn full_hd_clean_link_decode_path() {
+    // Client-side receive→ready cost at 1080p (software decode, NV12 output).
+    let outcome = run(&Profile {
+        name: "hd",
+        netem: "delay 1ms",
+        bitrate: 8000,
+        blackout: None,
+        pattern: "snow",
+        input_latency: false,
+        width: 1920,
+    });
+    assert!(outcome.fps() >= 25.0, "{outcome:?}");
 }
