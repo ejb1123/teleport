@@ -373,6 +373,7 @@ async fn connection(
     let incoming = receive_input(input, sender);
     tokio::pin!(incoming);
     let mut adaptation = media::BitrateController::new(options.bitrate);
+    let mut network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
     let mut adaptive = !options.fixed_bitrate;
     let mut last_feedback = Instant::now();
     let mut last_switch = Instant::now() - Duration::from_secs(1);
@@ -396,6 +397,19 @@ async fn connection(
                     publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor stream stopped: {error}"), requested: false })?;
                 }
                 if let Some(audio) = &audio { audio.error()?; }
+                if adaptive {
+                    let stats = session.stats();
+                    if let (Some(rtt), Some(sent), Some(lost)) = (stats.rtt, stats.packets_sent, stats.packets_lost)
+                        && network_rate.observe(Instant::now(), rtt, sent, lost).is_some() {
+                        let bitrate = adaptation.current().min(network_rate.current());
+                        if bitrate != pipeline.video_bitrate()? {
+                            match pipeline.set_video_bitrate(bitrate) {
+                                Ok(()) => tracing::info!(bitrate, rtt_ms = rtt.as_millis() as u64, "adapted video bitrate to network"),
+                                Err(error) => { adaptive = false; tracing::warn!(%error, "encoder does not support live bitrate changes; retaining fixed bitrate"); }
+                            }
+                        }
+                    }
+                }
                 if telemetry_enabled && last_telemetry.elapsed() >= Duration::from_secs(1) {
                     last_telemetry = Instant::now();
                     publish_update(&mut updates, Update::Telemetry {
@@ -494,6 +508,7 @@ async fn connection(
                         }
                         encoder_metrics = pipeline.encoder_metrics()?;
                         adaptation = media::BitrateController::new(bitrate);
+                        network_rate = media::NetworkRateController::new(bitrate, Instant::now());
                         adaptive = !options.fixed_bitrate;
                         last_feedback = Instant::now();
                         publish_update(&mut updates, Update::Desktop { desktop: info })?;
@@ -512,6 +527,7 @@ async fn connection(
                         let info = desktop(options, capture, video_start_group)?;
                         pipeline = media::encoder(&capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, options.bitrate, video.clone(), options.encoder, media::VideoFormat { codec: options.codec, dynamic_range: options.dynamic_range })?;
                         adaptation = media::BitrateController::new(options.bitrate);
+                        network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
                         encoder_metrics = pipeline.encoder_metrics()?;
                         adaptive = !options.fixed_bitrate;
                         last_feedback = Instant::now();
@@ -520,7 +536,9 @@ async fn connection(
                     Event::Feedback { queue_ms, dropped_groups } => {
                         if adaptive && last_feedback.elapsed() >= Duration::from_millis(900) {
                             last_feedback = Instant::now();
-                            if let Some(bitrate) = adaptation.observe(queue_ms, dropped_groups) {
+                            if adaptation.observe(queue_ms, dropped_groups).is_some()
+                                && adaptation.current().min(network_rate.current()) != pipeline.video_bitrate()? {
+                                let bitrate = adaptation.current().min(network_rate.current());
                                 match pipeline.set_video_bitrate(bitrate) {
                                     Ok(()) => { tracing::info!(bitrate, queue_ms, dropped_groups, "adapted video bitrate"); },
                                     Err(error) => { adaptive = false; tracing::warn!(%error, "encoder does not support live bitrate changes; retaining fixed bitrate"); }

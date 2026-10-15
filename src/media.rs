@@ -1405,6 +1405,10 @@ impl BitrateController {
         }
     }
 
+    pub fn current(&self) -> u32 {
+        self.current
+    }
+
     pub fn observe(&mut self, queue_ms: u32, dropped_groups: u32) -> Option<u32> {
         let previous = self.current;
         if queue_ms > 80 || dropped_groups >= 2 {
@@ -1421,6 +1425,90 @@ impl BitrateController {
             }
         } else {
             self.clean_samples = 0;
+        }
+        (previous != self.current).then_some(self.current)
+    }
+}
+
+/// Delay-based rate control from the host's own QUIC statistics, sampled every
+/// ~200 ms. A queue building at the bottleneck shows up as smoothed RTT rising
+/// above its recent minimum long before frames are dropped, so this reacts in
+/// a few hundred milliseconds instead of waiting for decoder backlog.
+/// Random loss alone is not treated as congestion (QUIC retransmits it), only
+/// heavy loss is. Combined with [`BitrateController`] by taking the minimum.
+#[cfg(target_os = "linux")]
+pub struct NetworkRateController {
+    current: u32,
+    ceiling: u32,
+    /// Minimum RTT over the current and previous 10 s windows.
+    min_rtt: [Option<Duration>; 2],
+    window_start: Instant,
+    clean_since: Instant,
+    last_decrease: Option<Instant>,
+    last_increase: Instant,
+    packets: Option<(u64, u64)>,
+}
+
+#[cfg(target_os = "linux")]
+impl NetworkRateController {
+    const WINDOW: Duration = Duration::from_secs(10);
+
+    pub fn new(ceiling: u32, now: Instant) -> Self {
+        Self {
+            current: ceiling,
+            ceiling,
+            min_rtt: [None, None],
+            window_start: now,
+            clean_since: now,
+            last_decrease: None,
+            last_increase: now,
+            packets: None,
+        }
+    }
+
+    pub fn current(&self) -> u32 {
+        self.current
+    }
+
+    fn base_rtt(&self) -> Option<Duration> {
+        self.min_rtt.iter().flatten().min().copied()
+    }
+
+    /// `sent`/`lost` are cumulative QUIC packet counters.
+    pub fn observe(&mut self, now: Instant, rtt: Duration, sent: u64, lost: u64) -> Option<u32> {
+        if now.duration_since(self.window_start) >= Self::WINDOW {
+            self.min_rtt = [None, self.min_rtt[0]];
+            self.window_start = now;
+        }
+        self.min_rtt[0] = Some(self.min_rtt[0].map_or(rtt, |min| min.min(rtt)));
+        let base = self.base_rtt().unwrap_or(rtt);
+        let (sent_delta, lost_delta) = self.packets.map_or((0, 0), |(s, l)| {
+            (sent.saturating_sub(s), lost.saturating_sub(l))
+        });
+        self.packets = Some((sent, lost));
+        let queueing = rtt.saturating_sub(base);
+        // Random radio loss of a few percent is not congestion, and short
+        // samples are noisy: only a fifth of packets lost counts as overload.
+        let heavy_loss = sent_delta >= 50 && lost_delta * 5 > sent_delta;
+        let overuse = queueing > Duration::from_millis(25).max(base / 2) || heavy_loss;
+        let previous = self.current;
+        if overuse {
+            self.clean_since = now;
+            // Let one decrease take effect (srtt lags by a few RTTs) before
+            // cutting again, so a single queue does not collapse the rate.
+            if self
+                .last_decrease
+                .is_none_or(|at| now.duration_since(at) >= Duration::from_millis(400))
+            {
+                self.current = (self.current.saturating_mul(3) / 4).max(self.ceiling.min(500));
+                self.last_decrease = Some(now);
+            }
+        } else if now.duration_since(self.clean_since) >= Duration::from_secs(1)
+            && now.duration_since(self.last_increase) >= Duration::from_secs(1)
+        {
+            // Multiplicative probing: about 5 s from half rate back to full.
+            self.current = (self.current + self.current / 8 + 50).min(self.ceiling);
+            self.last_increase = now;
         }
         (previous != self.current).then_some(self.current)
     }
@@ -2838,6 +2926,67 @@ mod tests {
             rate.observe(0, 0);
         }
         assert_eq!(rate.current, 8_000);
+    }
+
+    #[test]
+    fn network_rate_cuts_on_queueing_delay_and_recovers_after_it_clears() {
+        let start = Instant::now();
+        let mut rate = NetworkRateController::new(4000, start);
+        let ms = Duration::from_millis;
+        let mut sent = 0;
+        let mut at = |t: u64, rtt: u64, rate: &mut NetworkRateController| {
+            sent += 100;
+            rate.observe(start + ms(t), ms(rtt), sent, 0)
+        };
+        // Steady 20 ms path: no change.
+        for t in (0..2000).step_by(200) {
+            assert_eq!(at(t, 20, &mut rate), None);
+        }
+        // Queue builds: RTT +60 ms. Cut at once, but at most every 400 ms.
+        assert_eq!(at(2000, 80, &mut rate), Some(3000));
+        assert_eq!(at(2200, 90, &mut rate), None);
+        assert_eq!(at(2400, 90, &mut rate), Some(2250));
+        // Queue drains: wait a clean second, then probe upward each second.
+        assert_eq!(at(2600, 21, &mut rate), None);
+        assert_eq!(at(3200, 21, &mut rate), None);
+        let raised = at(3400, 21, &mut rate).expect("probe after a clean second");
+        assert!(raised > 2250 && raised < 3000);
+        assert_eq!(
+            at(3600, 21, &mut rate),
+            None,
+            "probes at most once a second"
+        );
+        let mut t = 3600;
+        while rate.current() < 4000 {
+            t += 200;
+            at(t, 20, &mut rate);
+            assert!(t < 12_000, "did not return to the ceiling");
+        }
+        assert_eq!(rate.current(), 4000);
+    }
+
+    #[test]
+    fn network_rate_ignores_light_random_loss_but_cuts_on_heavy_loss() {
+        let start = Instant::now();
+        let mut rate = NetworkRateController::new(4000, start);
+        let ms = Duration::from_millis;
+        rate.observe(start, ms(20), 0, 0);
+        // 3% loss with a flat RTT is radio noise, not congestion.
+        assert_eq!(rate.observe(start + ms(200), ms(20), 100, 3), None);
+        // 25% loss is treated as overload even without RTT growth.
+        assert_eq!(rate.observe(start + ms(400), ms(20), 200, 28), Some(3000));
+    }
+
+    #[test]
+    fn network_rate_respects_low_ceiling_and_floor() {
+        let start = Instant::now();
+        let mut rate = NetworkRateController::new(400, start);
+        let ms = Duration::from_millis;
+        rate.observe(start, ms(10), 0, 0);
+        for step in 1..20 {
+            rate.observe(start + ms(step * 500), ms(200), step * 100, 0);
+            assert!(rate.current() <= 400 && rate.current() >= 300);
+        }
     }
 
     #[test]
