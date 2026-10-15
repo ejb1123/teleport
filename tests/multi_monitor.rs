@@ -41,6 +41,7 @@ fn send(
         serde_json::to_vec(&protocol::Input {
             sequence: *sequence,
             event,
+            motion: None,
         })?,
     )?;
     group.finish()?;

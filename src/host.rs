@@ -8,6 +8,10 @@ use clap::Args;
 use std::{
     collections::BTreeMap,
     path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
@@ -375,7 +379,13 @@ async fn connection(
     );
     let mut check = tokio::time::interval(Duration::from_millis(200));
     let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
-    let incoming = receive_input(input, sender);
+    // Highest pointer motion ID applied from either the ordered input track or
+    // pointer datagrams; older or duplicate positions are dropped.
+    let last_motion = Arc::new(AtomicU64::new(0));
+    let controls = incoming.clone();
+    let pointer_sender = sender.clone();
+    let mut pointer_task: Option<AbortOnDrop> = None;
+    let incoming = receive_input(input, sender, last_motion.clone());
     tokio::pin!(incoming);
     let mut adaptation = media::BitrateController::new(options.bitrate);
     let mut network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
@@ -464,7 +474,10 @@ async fn connection(
                     // Auxiliary streams currently use fixed bitrate. Their
                     // congestion must never adapt the independent primary.
                     Event::MonitorFeedback { .. } => {}
-                    Event::ClientFeatures { keyframe_requests } => {
+                    Event::ClientFeatures { keyframe_requests , pointer_datagrams } => {
+                        if pointer_datagrams && pointer_task.is_none() {
+                            pointer_task = Some(AbortOnDrop(tokio::spawn(receive_pointer(controls.clone(), pointer_sender.clone(), last_motion.clone()))));
+                        }
                         if keyframe_requests && !long_gop {
                             long_gop = true;
                             let frames = options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS);
@@ -647,6 +660,7 @@ fn desktop_for_monitor(
         bitrate: options.bitrate,
         video_start_group,
         keyframe_requests: true,
+        pointer_datagrams: true,
     })
 }
 
@@ -756,9 +770,64 @@ fn publish_update(track: &mut moq_net::track::Producer, update: Update) -> Resul
     Ok(())
 }
 
+/// Aborts a session-scoped helper task when the session ends.
+struct AbortOnDrop(tokio::task::JoinHandle<Result<()>>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Apply a motion only if it is newer than any already applied, whichever
+/// path (ordered track or datagram) delivered it.
+fn newer_motion(last_motion: &AtomicU64, motion: u64) -> bool {
+    last_motion.fetch_max(motion, Ordering::Relaxed) < motion
+}
+
+/// Pointer motion datagrams: unreliable and unordered, so stale or duplicate
+/// positions are dropped by ID and anything but motion is ignored. A full
+/// session queue drops the sample; the next one supersedes it.
+async fn receive_pointer(
+    controls: moq_net::origin::Producer,
+    sender: tokio::sync::mpsc::Sender<Event>,
+    last_motion: Arc<AtomicU64>,
+) -> Result<()> {
+    let remote = tokio::time::timeout(
+        Duration::from_secs(10),
+        controls.consume().announced_broadcast("controls"),
+    )
+    .await
+    .context("pointer broadcast missing")?
+    .context("controls missing")?;
+    let mut track = remote
+        .track(protocol::POINTER_TRACK)?
+        .subscribe(moq_net::track::Subscription::default().with_priority(255))
+        .await?;
+    while let Some(datagram) = track.recv_datagram().await? {
+        let Ok(pointer) = serde_json::from_slice::<protocol::PointerInput>(&datagram.payload)
+        else {
+            tracing::debug!("ignoring malformed pointer datagram");
+            continue;
+        };
+        if !matches!(
+            pointer.event,
+            Event::Motion { .. } | Event::MonitorMotion { .. }
+        ) || pointer.event.validate().is_err()
+        {
+            tracing::debug!("ignoring non-motion pointer datagram");
+            continue;
+        }
+        if newer_motion(&last_motion, pointer.motion) {
+            let _ = sender.try_send(pointer.event);
+        }
+    }
+    Ok(())
+}
+
 async fn receive_input(
     mut track: moq_net::track::Subscriber,
     sender: tokio::sync::mpsc::Sender<Event>,
+    last_motion: Arc<AtomicU64>,
 ) -> Result<()> {
     let mut sequence = 0;
     let mut group_sequence = 0;
@@ -786,6 +855,11 @@ async fn receive_input(
             );
             sequence += 1;
             input.event.validate()?;
+            if let Some(motion) = input.motion
+                && !newer_motion(&last_motion, motion)
+            {
+                continue; // a datagram already delivered this or a later position
+            }
             sender
                 .send(input.event)
                 .await
@@ -807,6 +881,15 @@ async fn ordered_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pointer_motion_applies_only_newer_positions_from_either_path() {
+        let last = AtomicU64::new(0);
+        assert!(newer_motion(&last, 3)); // datagram 3
+        assert!(!newer_motion(&last, 3)); // ordered repeat of 3 before a click
+        assert!(!newer_motion(&last, 2)); // late, reordered datagram
+        assert!(newer_motion(&last, 4));
+        assert_eq!(last.load(Ordering::Relaxed), 4);
+    }
     #[test]
     fn codec_request_is_explicit_and_bounded() {
         use protocol::VideoCodec::*;

@@ -50,6 +50,14 @@ pub struct Options {
     pub smoke_audio: bool,
     #[arg(long, hide = true, requires = "headless_frames")]
     pub smoke_clipboard: bool,
+    /// Stream pointer motion at a gaming poll rate while timing probe round
+    /// trips on the input path (network-condition tests).
+    #[arg(long, hide = true, requires = "headless_frames")]
+    pub smoke_input_latency: bool,
+    /// Send pointer motion on the ordered input track even when the host
+    /// accepts datagrams (comparison and troubleshooting).
+    #[arg(long, hide = true)]
+    pub reliable_pointer: bool,
     /// Retry dropped sessions until the connection window is closed.
     #[arg(long)]
     pub reconnect: bool,
@@ -89,6 +97,7 @@ struct Link {
     _origin: moq_net::origin::Producer,
     _broadcast: moq_net::broadcast::Producer,
     input: moq_net::track::Producer,
+    pointer: moq_net::track::Producer,
     video: moq_net::track::Subscriber,
     desktop: Desktop,
     updates: moq_net::track::Subscriber,
@@ -133,6 +142,11 @@ async fn connect(options: &Options) -> Result<Link> {
             .with_ordered(true)
             .with_priority(255)
             .with_latency_max(protocol::INPUT_TIMEOUT),
+    )?;
+    // Always published; a host only subscribes after ClientFeatures declares it.
+    let pointer = broadcast.create_track(
+        protocol::POINTER_TRACK,
+        moq_net::track::Info::default().with_priority(255),
     )?;
     let agent_responses = if options.forward_ssh_agent {
         Some(crate::ssh_agent::create_track(
@@ -229,6 +243,7 @@ async fn connect(options: &Options) -> Result<Link> {
         _origin: outgoing,
         _broadcast: broadcast,
         input,
+        pointer,
         video,
         desktop,
         updates,
@@ -238,25 +253,69 @@ async fn connect(options: &Options) -> Result<Link> {
 
 async fn send_input(
     mut track: moq_net::track::Producer,
+    mut pointer: moq_net::track::Producer,
+    pointer_datagrams: bool,
     mut events: mpsc::Receiver<Event>,
 ) -> Result<()> {
     let mut sequence = 0u64;
     let mut group = track.append_group()?;
     let mut heartbeat = tokio::time::interval(Duration::from_millis(500));
+    let mut motion_id = 0u64;
+    // Latest datagram motion not yet repeated on the ordered track.
+    let mut unconfirmed: Option<(u64, Event)> = None;
+    let mut write = |group: &mut moq_net::group::Producer,
+                     sequence: &mut u64,
+                     event: Event,
+                     motion: Option<u64>|
+     -> Result<()> {
+        if *sequence > 0 && sequence.is_multiple_of(256) {
+            group.finish()?;
+            *group = track.append_group()?;
+        }
+        group.write_frame(
+            moq_net::Timestamp::now(),
+            serde_json::to_vec(&Input {
+                sequence: *sequence,
+                event,
+                motion,
+            })?,
+        )?;
+        *sequence += 1;
+        Ok(())
+    };
     loop {
         let event = tokio::select! {
             event = events.recv() => match event { Some(event) => event, None => break },
             _ = heartbeat.tick() => Event::Ping,
         };
-        if sequence > 0 && sequence.is_multiple_of(256) {
-            group.finish()?;
-            group = track.append_group()?;
+        if !pointer_datagrams {
+            write(&mut group, &mut sequence, event, None)?;
+            continue;
         }
-        group.write_frame(
-            moq_net::Timestamp::now(),
-            serde_json::to_vec(&Input { sequence, event })?,
-        )?;
-        sequence += 1;
+        match event {
+            Event::Motion { .. } | Event::MonitorMotion { .. } => {
+                // Latest-wins and never retransmitted: a lost motion packet
+                // cannot hold up keys queued behind it on the ordered track.
+                motion_id += 1;
+                pointer.append_datagram(
+                    moq_net::Timestamp::now(),
+                    serde_json::to_vec(&protocol::PointerInput {
+                        motion: motion_id,
+                        event: event.clone(),
+                    })?,
+                )?;
+                unconfirmed = Some((motion_id, event));
+            }
+            Event::Button { .. } | Event::Scroll { .. } => {
+                // Clicks and wheel steps land where the pointer was: repeat the
+                // latest position reliably, in order, right before them.
+                if let Some((id, motion)) = unconfirmed.take() {
+                    write(&mut group, &mut sequence, motion, Some(id))?;
+                }
+                write(&mut group, &mut sequence, event, None)?;
+            }
+            event => write(&mut group, &mut sequence, event, None)?,
+        }
     }
     group.finish()?;
     Ok(())
@@ -724,6 +783,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let audio_notices = updates_sender.clone();
     let network_stats = stream_stats.clone();
     let keyframe_requests = desktop.keyframe_requests;
+    let pointer_datagrams = desktop.pointer_datagrams && !options.reliable_pointer;
     let remote = link.remote.clone();
     let mut network = Network(runtime.spawn(async move {
         let mut ssh_agent = link.ssh_agent;
@@ -732,7 +792,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         tokio::select! {
             result = crate::ssh_agent::closed(&mut ssh_agent) => result,
             result = media::receive_video_with_stats(link.video, source, feedback, network_stats, keyframe_requests) => result,
-            result = send_input(link.input, receiver) => result,
+            result = send_input(link.input, link.pointer, pointer_datagrams, receiver) => result,
             result = receive_updates(link.updates, updates_sender) => result,
             result = async {
                 if let (Some(track), Some(source)) = (link.audio, audio_source)
@@ -750,6 +810,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             &events,
             Event::ClientFeatures {
                 keyframe_requests: true,
+                pointer_datagrams: desktop.pointer_datagrams && !options.reliable_pointer,
             },
         )?;
     }
@@ -797,6 +858,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let mut max_frame_gap = Duration::ZERO;
         let mut switched = false;
         let mut clipboard_ok = false;
+        // --smoke-input-latency: probe send times by id, and completed round trips.
+        let mut probes_in_flight = std::collections::BTreeMap::<u64, Instant>::new();
+        let mut probe_rtts = Vec::<Duration>::new();
+        let mut next_probe = Instant::now();
+        let mut probe_id = 0_u64;
+        let mut motion_step = 0_u32;
         let mut initial_updates = expected_initial_updates;
         let mut initial_ready = expected_initial_updates == 0;
         const CLIPBOARD_SMOKE: &str = "Teleport clipboard smoke ✓\nline 2";
@@ -836,6 +903,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         }
                     }
                     Update::Clipboard { text } => clipboard_ok = text == CLIPBOARD_SMOKE,
+                    Update::Pong { id } => {
+                        if let Some(sent) = probes_in_flight.remove(&id) {
+                            probe_rtts.push(sent.elapsed());
+                        }
+                    }
                     Update::Notice { text } => tracing::info!(%text, "host notice"),
                     _ => (),
                 }
@@ -911,6 +983,19 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     }
                 }
             }
+            if options.smoke_input_latency && count > 0 {
+                // ~500 Hz motion like a gaming mouse, plus a timed probe every
+                // 50 ms riding the same input path as key events.
+                motion_step = motion_step.wrapping_add(1);
+                let x = f64::from(motion_step % 1000) / 1000.0;
+                send(&events, Event::Motion { x, y: 1.0 - x })?;
+                if Instant::now() >= next_probe {
+                    next_probe = Instant::now() + Duration::from_millis(50);
+                    probe_id += 1;
+                    probes_in_flight.insert(probe_id, Instant::now());
+                    send(&events, Event::Probe { id: probe_id })?;
+                }
+            }
             std::thread::sleep(Duration::from_millis(2));
         }
         ensure!(
@@ -928,6 +1013,14 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             "clipboard did not roundtrip"
         );
         let snapshot = stream_stats.snapshot();
+        probe_rtts.sort();
+        let probe_percentile = |p: usize| {
+            probe_rtts
+                .get((probe_rtts.len() * p / 100).min(probe_rtts.len().saturating_sub(1)))
+                .map_or(0, |rtt| rtt.as_micros() as u64)
+        };
+        let (probe_p50_us, probe_p95_us) = (probe_percentile(50), probe_percentile(95));
+        let probe_max_us = probe_rtts.last().map_or(0, |rtt| rtt.as_micros() as u64);
         let span_ms = first_frame_at
             .zip(last_frame_at)
             .map_or(0, |(first, last)| (last - first).as_millis() as u64);
@@ -935,6 +1028,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             frames = count,
             span_ms,
             max_frame_gap_ms = max_frame_gap.as_millis() as u64,
+            probes = probe_rtts.len(),
+            probe_p50_us,
+            probe_p95_us,
+            probe_max_us,
             width = desktop.width,
             height = desktop.height,
             received_bytes = snapshot.received_bytes,

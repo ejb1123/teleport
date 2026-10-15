@@ -20,6 +20,8 @@ struct Profile {
     blackout: Option<u32>,
     /// `snow` fills the configured bitrate; `ball` compresses to almost nothing.
     pattern: &'static str,
+    /// Stream ~500 Hz pointer motion and time input-path probe round trips.
+    input_latency: bool,
 }
 
 #[derive(Debug)]
@@ -31,6 +33,10 @@ struct Outcome {
     skipped_groups: u64,
     decode_errors: u64,
     received_bytes: u64,
+    probes: u64,
+    probe_p50_us: u64,
+    probe_p95_us: u64,
+    probe_max_us: u64,
 }
 
 impl Outcome {
@@ -71,10 +77,15 @@ done
 sleep 0.3
 {blackout}
 "$TELEPORT" client 127.0.0.1:4443 --pairing-file "$DIR/pairing.json" \
-    --headless-frames {FRAMES} --software-decoder --bitrate {bitrate}
+    --headless-frames {FRAMES} --software-decoder --bitrate {bitrate} {input}
 "#,
         netem = profile.netem,
         pattern = profile.pattern,
+        input = if profile.input_latency {
+            "--smoke-input-latency"
+        } else {
+            ""
+        },
         bitrate = profile.bitrate,
     );
     let output = Command::new("unshare")
@@ -113,6 +124,10 @@ sleep 0.3
         skipped_groups: field("skipped_groups"),
         decode_errors: field("decode_errors"),
         received_bytes: field("received_bytes"),
+        probes: field("probes"),
+        probe_p50_us: field("probe_p50_us"),
+        probe_p95_us: field("probe_p95_us"),
+        probe_max_us: field("probe_max_us"),
     };
     println!(
         "NETWORK {:<10} netem=[{}] fps={:.1} mbps={:.2} max_gap_ms={} recoveries={} skipped_groups={} decode_errors={}",
@@ -125,6 +140,17 @@ sleep 0.3
         outcome.skipped_groups,
         outcome.decode_errors,
     );
+    if profile.input_latency {
+        println!(
+            "INPUT   {:<10} netem=[{}] probes={} p50_ms={:.1} p95_ms={:.1} max_ms={:.1}",
+            profile.name,
+            profile.netem,
+            outcome.probes,
+            outcome.probe_p50_us as f64 / 1000.0,
+            outcome.probe_p95_us as f64 / 1000.0,
+            outcome.probe_max_us as f64 / 1000.0,
+        );
+    }
     outcome
 }
 
@@ -154,6 +180,7 @@ fn clean_link_streams_at_full_rate() {
         bitrate: 2000,
         blackout: None,
         pattern: "ball",
+        input_latency: false,
     });
     assert!(outcome.fps() >= 25.0, "{outcome:?}");
     assert!(outcome.max_frame_gap_ms < 250, "{outcome:?}");
@@ -168,6 +195,7 @@ fn high_latency_link_keeps_full_rate() {
         bitrate: 2000,
         blackout: None,
         pattern: "ball",
+        input_latency: false,
     });
     assert!(outcome.fps() >= 25.0, "{outcome:?}");
 }
@@ -181,6 +209,7 @@ fn one_percent_loss_survives_with_usable_rate() {
         bitrate: 4000,
         blackout: None,
         pattern: "snow",
+        input_latency: false,
     });
     assert!(outcome.fps() >= 20.0, "{outcome:?}");
 }
@@ -194,6 +223,7 @@ fn five_percent_loss_survives() {
         bitrate: 4000,
         blackout: None,
         pattern: "snow",
+        input_latency: false,
     });
 }
 
@@ -206,6 +236,7 @@ fn jitter_and_reordering_survive() {
         bitrate: 4000,
         blackout: None,
         pattern: "snow",
+        input_latency: false,
     });
     assert!(outcome.fps() >= 20.0, "{outcome:?}");
 }
@@ -220,6 +251,7 @@ fn bitrate_above_link_capacity_survives() {
         bitrate: 6000,
         blackout: None,
         pattern: "snow",
+        input_latency: false,
     });
 }
 
@@ -232,8 +264,39 @@ fn two_second_blackout_recovers_without_reconnect() {
         bitrate: 2000,
         blackout: Some(2),
         pattern: "ball",
+        input_latency: false,
     });
     // The stall must cover the outage, and video must resume promptly after.
     assert!(outcome.max_frame_gap_ms >= 1500, "{outcome:?}");
     assert!(outcome.max_frame_gap_ms < 4000, "{outcome:?}");
+}
+
+/// Key-path latency while the pointer streams at a gaming poll rate. Probes
+/// share the ordered input path with key events, so their round trip is what
+/// a key press waits for (plus the return trip) when the mouse is moving.
+fn input_profile(name: &'static str, netem: &'static str) -> Outcome {
+    let outcome = run(&Profile {
+        name,
+        netem,
+        bitrate: 2000,
+        blackout: None,
+        pattern: "ball",
+        input_latency: true,
+    });
+    assert!(outcome.probes >= 50, "too few probe replies: {outcome:?}");
+    outcome
+}
+
+#[test]
+#[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
+fn input_round_trip_with_streaming_pointer_on_clean_link() {
+    let outcome = input_profile("input", "delay 20ms");
+    // 40 ms RTT link: probes should not queue behind pointer motion.
+    assert!(outcome.probe_p95_us < 80_000, "{outcome:?}");
+}
+
+#[test]
+#[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
+fn input_round_trip_with_streaming_pointer_under_loss() {
+    input_profile("input_loss", "delay 20ms loss 5%");
 }

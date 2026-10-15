@@ -122,6 +122,9 @@ pub struct Desktop {
     /// Host accepts `Event::RequestKeyframe`; older hosts reject unknown events.
     #[serde(default)]
     pub keyframe_requests: bool,
+    /// Host reads pointer datagrams once the client declares them.
+    #[serde(default)]
+    pub pointer_datagrams: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -168,6 +171,21 @@ pub enum Update {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Input {
     pub sequence: u64,
+    pub event: Event,
+    /// Pointer motion ID when the client also sends motion as datagrams; the
+    /// host applies a motion only if its ID is newer than the last applied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub motion: Option<u64>,
+}
+
+/// Track carrying pointer motion as unreliable, latest-wins QUIC datagrams so a
+/// lost packet never stalls key events queued behind it on the input track.
+pub const POINTER_TRACK: &str = "pointer";
+
+/// One pointer datagram. Only `Motion` and `MonitorMotion` are accepted.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PointerInput {
+    pub motion: u64,
     pub event: Event,
 }
 
@@ -239,6 +257,9 @@ pub enum Event {
         /// periodic IDRs far apart instead of every quarter second.
         #[serde(default)]
         keyframe_requests: bool,
+        /// The client publishes pointer motion on [`POINTER_TRACK`] datagrams.
+        #[serde(default)]
+        pointer_datagrams: bool,
     },
 }
 
@@ -537,6 +558,7 @@ mod tests {
             Event::SelectMonitor { index: 0 },
             Event::ClientFeatures {
                 keyframe_requests: true,
+                pointer_datagrams: true,
             },
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
@@ -555,7 +577,8 @@ mod tests {
         assert!(matches!(
             features,
             Event::ClientFeatures {
-                keyframe_requests: true
+                keyframe_requests: true,
+                pointer_datagrams: false,
             }
         ));
         let primary: Event = serde_json::from_str(r#"{"type":"request_keyframe"}"#).unwrap();
