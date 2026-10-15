@@ -239,7 +239,7 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         {
             match crate::relay::connect(endpoint, &relay_namespace).await {
                 Ok(link) => {
-                    tracing::info!(relay = %endpoint.url, "connected to relay; accepting end-to-end encrypted sessions");
+                    tracing::info!(relay = %endpoint.url, namespace = %relay_namespace, "connected to relay; accepting end-to-end encrypted sessions");
                     let (sender, receiver) = tokio::sync::mpsc::channel(4);
                     let intake = tokio::spawn(crate::relay::intake(
                         link.session.clone(),

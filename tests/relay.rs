@@ -39,11 +39,17 @@ struct Setup {
 }
 
 fn setup() -> Setup {
+    setup_with_versions(&[])
+}
+
+/// `versions` restricts the relay (e.g. IETF-only, as provider relays are).
+fn setup_with_versions(versions: &[&str]) -> Setup {
     let temp = tempfile::tempdir().unwrap();
     let relay_address = free_udp();
     let mut relay = Process(
         teleport()
             .args(["relay", "--listen", &relay_address, "--key", RELAY_KEY])
+            .args(versions.iter().flat_map(|version| ["--version", version]))
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -208,6 +214,31 @@ fn relay_refuses_clients_without_its_key() {
         assert!(
             stderr.contains("check --relay-key"),
             "failed for another reason: {stderr}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires local UDP sockets and GStreamer plugins"]
+fn relayed_session_works_over_ietf_moq_transport_like_provider_relays() {
+    // Cloudflare's relay speaks IETF drafts 14/16 only. No datagrams there:
+    // pointer motion must fall back to the ordered input track.
+    for version in ["moq-transport-16", "moq-transport-14"] {
+        let setup = setup_with_versions(&[version]);
+        let output = client(
+            &setup,
+            &setup.temp.path().join("identity/pairing.json"),
+            &setup.relay_fingerprint,
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("SMOKE PASS"),
+            "{version}: {stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !stdout.contains("probes=0 "),
+            "{version}: no input: {stdout}"
         );
     }
 }

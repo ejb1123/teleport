@@ -48,6 +48,10 @@ pub struct Options {
     /// so clients can keep pinning the same relay fingerprint.
     #[arg(long)]
     pub identity_dir: Option<std::path::PathBuf>,
+    /// MoQ versions to accept (repeatable). Defaults to moq-lite-05 and IETF
+    /// MoQ Transport drafts 16 and 14.
+    #[arg(long = "version", hide = true)]
+    pub versions: Vec<String>,
     /// Shared secret every host and client must present (`--relay-key`).
     /// Without it anyone who can reach the relay may join a namespace and
     /// observe its traffic sizes and timing (never its content).
@@ -60,7 +64,7 @@ pub struct Options {
 pub async fn serve(options: Options) -> Result<()> {
     let mut config = moq_native::ServerConfig::default();
     config.bind = Some(options.listen.clone());
-    config.version = vec![protocol::WIRE_VERSION.parse().map_err(anyhow::Error::msg)?];
+    config.version = versions(&options.versions)?;
     config.quic.idle_timeout = Some(protocol::QUIC_IDLE_TIMEOUT);
     config.quic.keep_alive = Some(protocol::QUIC_KEEP_ALIVE);
     config.quic.mtu_discovery = Some(protocol::QUIC_MTU_DISCOVERY);
@@ -129,6 +133,22 @@ pub async fn serve(options: Options) -> Result<()> {
     Ok(())
 }
 
+fn versions(requested: &[String]) -> Result<Vec<moq_net::Version>> {
+    let defaults: Vec<String> = protocol::RELAY_VERSIONS
+        .iter()
+        .map(|v| v.to_string())
+        .collect();
+    let requested = if requested.is_empty() {
+        &defaults[..]
+    } else {
+        requested
+    };
+    requested
+        .iter()
+        .map(|version| version.parse().map_err(anyhow::Error::msg))
+        .collect()
+}
+
 fn valid_namespace(namespace: &str) -> bool {
     namespace.len() == 32 && namespace.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -176,7 +196,7 @@ pub async fn connect(endpoint: &Endpoint, namespace: &str) -> Result<Link> {
         url.query_pairs_mut().append_pair("key", key);
     }
     let mut config = moq_native::ClientConfig::default();
-    config.version = vec![protocol::WIRE_VERSION.parse().map_err(anyhow::Error::msg)?];
+    config.version = versions(&[])?;
     config.quic.idle_timeout = Some(protocol::QUIC_IDLE_TIMEOUT);
     config.quic.keep_alive = Some(protocol::QUIC_KEEP_ALIVE);
     config.quic.mtu_discovery = Some(protocol::QUIC_MTU_DISCOVERY);

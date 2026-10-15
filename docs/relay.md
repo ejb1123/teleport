@@ -6,7 +6,8 @@ cannot read or forge: every session is authenticated and encrypted end to end
 between the client and the host.
 
 Status (development, 2026-10): works with the self-hosted `teleport relay`.
-Provider relays such as Cloudflare's are not yet supported (see below).
+Provider relays such as Cloudflare's: the IETF MoQ Transport path is implemented and
+tested locally, but not yet verified against a provider (see below).
 
 ## Quick start (self-hosted relay)
 
@@ -92,16 +93,19 @@ ends or degrades the session but cannot inject content.
 
 ## Provider relays (Cloudflare)
 
-Not working yet. Cloudflare's relay speaks IETF MoQ Transport drafts 14 and 16
-with JWT authentication; Teleport currently negotiates only `moq-lite-05`.
-`moq-net` includes an IETF adapter, so the remaining work is:
+Teleport offers `moq-lite-05` and IETF MoQ Transport drafts 16 and 14 to a
+relay. Provider relays such as Cloudflare's speak the IETF drafts only; that
+path is tested locally against `teleport relay --version moq-transport-16`
+(and `-14`), including the fallback of pointer motion to the ordered input
+track, because IETF sessions carry no datagrams.
 
-- offer the IETF drafts when connecting to a provider relay and pass its token
-  (`?jwt=` in the relay URL);
-- disable pointer datagrams on IETF sessions (`moq-net` does not deliver
-  datagrams over IETF MoQ Transport) so pointer motion uses the ordered input
-  track;
-- verify announcement and namespace behaviour against the provider.
+To use a provider relay, pass its WebTransport URL and token, e.g.
+`--relay "https://<relay host>/?jwt=<token>"` on both ends (no
+`--relay-fingerprint`: its public certificate is verified against system
+roots). Teleport replaces the URL path with the host's namespace, which the
+host logs when it connects (`namespace=`); mint the provider token for that
+path. Not yet verified against Cloudflare itself (no account was available
+for testing); report what you find.
 
 ## Tests
 

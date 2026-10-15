@@ -828,7 +828,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let audio_notices = updates_sender.clone();
     let network_stats = stream_stats.clone();
     let keyframe_requests = desktop.keyframe_requests;
-    let pointer_datagrams = desktop.pointer_datagrams && !options.reliable_pointer;
+    // IETF MoQ Transport sessions (provider relays) deliver no datagrams.
+    let pointer_datagrams =
+        desktop.pointer_datagrams && !options.reliable_pointer && link.session.version().is_lite();
     let remote = link.remote.clone();
     let mut network = Network(runtime.spawn(async move {
         let mut ssh_agent = link.ssh_agent;
@@ -855,7 +857,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             &events,
             Event::ClientFeatures {
                 keyframe_requests: true,
-                pointer_datagrams: desktop.pointer_datagrams && !options.reliable_pointer,
+                pointer_datagrams,
             },
         )?;
     }

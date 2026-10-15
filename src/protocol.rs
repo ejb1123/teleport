@@ -4,6 +4,10 @@ use std::{path::Path, time::Duration};
 
 pub const VERSION: u32 = 2;
 pub const WIRE_VERSION: &str = "moq-lite-05";
+/// Versions offered to and accepted by relays. Provider relays (Cloudflare)
+/// speak only IETF MoQ Transport; moq-net adapts. IETF sessions carry no
+/// datagrams, so pointer motion then uses the ordered input track.
+pub const RELAY_VERSIONS: [&str; 3] = [WIRE_VERSION, "moq-transport-16", "moq-transport-14"];
 /// moq-native defaults (30 s idle, 5 s keep-alive) leave a dead peer undetected
 /// for half a minute. A 1 s keep-alive holds a healthy idle session open while
 /// an unreachable peer is dropped after 8 s, so reconnect can start.
