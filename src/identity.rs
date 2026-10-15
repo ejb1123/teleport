@@ -20,6 +20,30 @@ fn pem(label: &str, der: &[u8]) -> String {
     result
 }
 
+/// Decode the single `label` block of a PEM file written by [`pem`].
+pub fn read_pem(path: &Path, label: &str) -> Result<Vec<u8>> {
+    let text = std::fs::read_to_string(path)?;
+    let begin = format!("-----BEGIN {label}-----");
+    let end = format!("-----END {label}-----");
+    let body = text
+        .split_once(&begin)
+        .and_then(|(_, rest)| rest.split_once(&end))
+        .map(|(body, _)| body)
+        .with_context(|| format!("{} has no {label} block", path.display()))?;
+    let encoded: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    Ok(base64::engine::general_purpose::STANDARD.decode(encoded)?)
+}
+
+impl Identity {
+    /// The host identity used to authenticate relayed sessions end to end.
+    pub fn e2e(&self) -> Result<crate::e2e::HostIdentity> {
+        crate::e2e::HostIdentity::new(
+            read_pem(&self.certificate, "CERTIFICATE")?,
+            &read_pem(&self.key, "PRIVATE KEY")?,
+        )
+    }
+}
+
 pub struct Identity {
     pub certificate: PathBuf,
     pub key: PathBuf,

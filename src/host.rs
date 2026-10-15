@@ -30,6 +30,21 @@ const LONG_KEY_INTERVAL_SECONDS: u32 = 4;
 
 #[derive(Args, Clone)]
 pub struct Options {
+    /// Also accept end-to-end encrypted sessions through this MoQ relay, e.g.
+    /// moqt://relay.example:4444 (`teleport relay`). Requires --identity-dir.
+    #[arg(long)]
+    pub relay: Option<url::Url>,
+    /// Pin a self-hosted relay's certificate (printed by `teleport relay`).
+    #[arg(long, requires = "relay")]
+    pub relay_fingerprint: Option<String>,
+    /// Access key for a relay started with `teleport relay --key`.
+    #[arg(
+        long,
+        requires = "relay",
+        env = "TELEPORT_RELAY_KEY",
+        hide_env_values = true
+    )]
+    pub relay_key: Option<String>,
     /// Experimental: permit clients that explicitly opt in to forward an SSH agent.
     #[arg(long)]
     pub allow_ssh_agent: bool,
@@ -196,9 +211,83 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
     }
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+    let relay_endpoint = options.relay.clone().map(|url| crate::relay::Endpoint {
+        url,
+        fingerprint: options.relay_fingerprint.clone(),
+        key: options.relay_key.clone(),
+    });
+    let relay_identity = match (&relay_endpoint, &identity, &access) {
+        (Some(_), Some(identity), Some(_)) => Some(Arc::new(identity.e2e()?)),
+        (Some(_), _, _) => {
+            anyhow::bail!("--relay requires --identity-dir (a persistent host identity)")
+        }
+        (None, _, _) => None,
+    };
+    let relay_namespace = crate::relay::namespace(&pairing.fingerprint)?;
+    // Connected relay, confirmed sessions from its intake task, and the task.
+    let mut relay: Option<(
+        crate::relay::Link,
+        tokio::sync::mpsc::Receiver<crate::relay::Accepted>,
+        crate::relay::AbortOnDrop,
+    )> = None;
+    let mut relay_retry = Instant::now();
     loop {
+        if let (Some(endpoint), Some(e2e), Some(access)) =
+            (&relay_endpoint, &relay_identity, &access)
+            && relay.is_none()
+            && Instant::now() >= relay_retry
+        {
+            match crate::relay::connect(endpoint, &relay_namespace).await {
+                Ok(link) => {
+                    tracing::info!(relay = %endpoint.url, "connected to relay; accepting end-to-end encrypted sessions");
+                    let (sender, receiver) = tokio::sync::mpsc::channel(4);
+                    let intake = tokio::spawn(crate::relay::intake(
+                        link.session.clone(),
+                        link.incoming.clone(),
+                        link.outgoing.clone(),
+                        access.clone(),
+                        e2e.clone(),
+                        sender,
+                    ));
+                    relay = Some((link, receiver, crate::relay::AbortOnDrop(intake)));
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "relay unavailable; retrying in 5 s");
+                    relay_retry = Instant::now() + Duration::from_secs(5);
+                }
+            }
+        }
         let request = tokio::select! {
             request = server.accept() => match request { Some(request) => request, None => break },
+            accepted = async {
+                match relay.as_mut() {
+                    Some((_, receiver, _)) => receiver.recv().await,
+                    None => {
+                        tokio::time::sleep_until(relay_retry.max(Instant::now() + Duration::from_millis(100)).into()).await;
+                        None
+                    }
+                }
+            }, if relay_endpoint.is_some() => {
+                match (accepted, &access, &relay) {
+                    (Some(accepted), Some(access), Some((link, _, _))) => {
+                        let result = tokio::select! {
+                            result = relayed(link, accepted, access, options, capture) => result,
+                            _ = &mut shutdown => { capture.release_all().await; break; }
+                        };
+                        capture.release_all().await;
+                        if let Err(error) = result {
+                            tracing::warn!(%error, "relayed client disconnected");
+                        }
+                    }
+                    (None, _, Some(_)) => {
+                        tracing::warn!("relay connection lost; reconnecting");
+                        relay = None;
+                        relay_retry = Instant::now() + Duration::from_secs(1);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             _ = &mut shutdown => break,
         };
         let supplied = request
@@ -240,6 +329,35 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
     Ok(())
 }
 
+/// Run a relayed client that has already proven the session keys (see
+/// `relay::intake`). Only now is the credential leased (claiming a single-use
+/// ticket) and the desktop captured.
+async fn relayed(
+    link: &crate::relay::Link,
+    accepted: crate::relay::Accepted,
+    access: &Arc<crate::access::ServerState>,
+    options: &Options,
+    capture: &mut Capture,
+) -> Result<()> {
+    let hash = accepted.credential;
+    let _lease = access
+        .begin_session_hash(hash.to_vec())
+        .context("relayed credential not usable")?;
+    let bridged = crate::relay::host(link, &accepted)?;
+    let session = link.session.clone();
+    tokio::select! {
+        result = run_session(
+            Some(accepted.request.as_str()),
+            bridged.outgoing.clone(),
+            bridged.incoming.clone(),
+            async { Ok(session) },
+            options,
+            capture,
+        ) => result,
+        _ = async { loop { tokio::time::sleep(Duration::from_secs(1)).await; if !access.authorized_hash(&hash) { break; } } } => Err(anyhow::anyhow!("device access revoked")),
+    }
+}
+
 async fn shutdown_signal() -> Result<()> {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     tokio::select! {
@@ -254,10 +372,41 @@ async fn connection(
     options: &Options,
     capture: &mut Capture,
 ) -> Result<()> {
+    let query = request.query().map(str::to_owned);
+    let outgoing = moq_net::Origin::random().produce();
+    let incoming = moq_net::Origin::random().produce();
+    let session = request
+        .with_publisher(&outgoing)
+        .with_subscriber(incoming.clone())
+        .ok();
+    run_session(
+        query.as_deref(),
+        outgoing,
+        incoming,
+        async { Ok(session.await?) },
+        options,
+        capture,
+    )
+    .await
+}
+
+/// One authenticated client session. `outgoing`/`incoming` are the origins the
+/// session publishes `desktop` to and receives `controls` from: the QUIC
+/// session's own origins on a direct connection, or plaintext origins bridged
+/// to a relay (see `crate::relay`). `session` resolves to the transport whose
+/// closure and statistics apply.
+async fn run_session(
+    query: Option<&str>,
+    outgoing: moq_net::origin::Producer,
+    incoming: moq_net::origin::Producer,
+    session: impl std::future::Future<Output = Result<moq_net::Session>>,
+    options: &Options,
+    capture: &mut Capture,
+) -> Result<()> {
     // Stream preferences belong to this connection, not the next paired client.
     let mut negotiated = options.clone();
-    let requested = requested_format(request.query(), options.codec)?;
-    let ssh_requested = url::form_urlencoded::parse(request.query().unwrap_or_default().as_bytes())
+    let requested = requested_format(query, options.codec)?;
+    let ssh_requested = url::form_urlencoded::parse(query.unwrap_or_default().as_bytes())
         .any(|(key, value)| key == "ssh-agent" && value == "1");
     ensure!(
         !ssh_requested || options.allow_ssh_agent,
@@ -268,8 +417,6 @@ async fn connection(
     negotiated.dynamic_range = requested.dynamic_range;
     let options = &mut negotiated;
     capture.select_monitor(capture.active_monitor).await?;
-    let outgoing = moq_net::Origin::random().produce();
-    let incoming = moq_net::Origin::random().produce();
     let mut broadcast = outgoing.create_broadcast(
         "desktop",
         moq_net::broadcast::Route::new().with_announce(true),
@@ -304,11 +451,7 @@ async fn connection(
     } else {
         None
     };
-    let session = request
-        .with_publisher(&outgoing)
-        .with_subscriber(incoming.clone())
-        .ok()
-        .await?;
+    let session = session.await?;
     let input = tokio::time::timeout(Duration::from_secs(10), async {
         let remote = incoming
             .consume()

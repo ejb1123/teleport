@@ -1,0 +1,557 @@
+//! Relay mode: reach a host through a MoQ relay instead of a direct UDP path.
+//!
+//! Both the host and the client connect *out* to the relay, so the host needs
+//! no reachable port. Nothing the relay forwards is readable or forgeable by
+//! it: every session is authenticated and sealed end to end by `crate::e2e`
+//! and `crate::bridge`.
+//!
+//! Layout inside the relay namespace (derived from the host's pinned
+//! fingerprint, so a client needs only the relay URL):
+//!
+//! * `<session>/hello`   client → host: `e2e::ClientHello`
+//! * `<session>/reply`   host → client: `e2e::HostReply`
+//! * `<session>/controls` client → host: sealed input/pointer/agent tracks
+//! * `<session>/desktop`  host → client: sealed metadata/video/audio/updates
+//!
+//! `<session>` is 128 random bits chosen by the client per connection.
+//!
+//! `teleport relay` runs a minimal self-hosted relay for testing or for users
+//! who prefer their own server to a third-party relay such as Cloudflare's.
+
+use crate::{
+    e2e::{self, ClientHandshake, Direction, SessionKeys},
+    protocol,
+};
+use anyhow::{Context, Result, ensure};
+use clap::Args;
+use std::{sync::Arc, time::Duration};
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Track key label for the client's key-confirmation object.
+const CONFIRM_TRACK: &str = "confirm";
+/// Host-side bounds on unauthenticated handshake work.
+#[cfg(target_os = "linux")]
+const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(target_os = "linux")]
+const MAX_PENDING_HELLOS: usize = 8;
+#[cfg(target_os = "linux")]
+const REPLAY_CACHE: usize = 4096;
+
+#[derive(Args, Clone)]
+pub struct Options {
+    /// UDP address to accept QUIC relay connections on.
+    #[arg(long, default_value = "0.0.0.0:4444")]
+    pub listen: String,
+    /// Directory holding a persistent relay TLS identity (created if absent),
+    /// so clients can keep pinning the same relay fingerprint.
+    #[arg(long)]
+    pub identity_dir: Option<std::path::PathBuf>,
+    /// Shared secret every host and client must present (`--relay-key`).
+    /// Without it anyone who can reach the relay may join a namespace and
+    /// observe its traffic sizes and timing (never its content).
+    #[arg(long, env = "TELEPORT_RELAY_KEY", hide_env_values = true)]
+    pub key: Option<String>,
+}
+
+/// Run a relay. Each connection is scoped to its URL path, so unrelated hosts
+/// sharing a relay never see each other's broadcasts.
+pub async fn serve(options: Options) -> Result<()> {
+    let mut config = moq_native::ServerConfig::default();
+    config.bind = Some(options.listen.clone());
+    config.version = vec![protocol::WIRE_VERSION.parse().map_err(anyhow::Error::msg)?];
+    config.quic.idle_timeout = Some(protocol::QUIC_IDLE_TIMEOUT);
+    config.quic.keep_alive = Some(protocol::QUIC_KEEP_ALIVE);
+    config.quic.mtu_discovery = Some(protocol::QUIC_MTU_DISCOVERY);
+    match options.identity_dir.as_deref() {
+        Some(directory) => {
+            let identity = crate::identity::open(directory)?;
+            config.tls.cert = vec![identity.certificate];
+            config.tls.key = vec![identity.key];
+        }
+        None => config.tls.generate = vec!["teleport-relay".into()],
+    }
+    let mut server = config.init()?;
+    let fingerprint = server
+        .certificates()
+        .fingerprints()
+        .first()
+        .context("no relay certificate")?
+        .clone();
+    tracing::info!(address = %server.local_addr()?, %fingerprint, "relay ready; clients and hosts pass --relay-fingerprint to pin it");
+    // Printed for scripts and tests that need the fingerprint before logs flush.
+    println!("RELAY FINGERPRINT {fingerprint}");
+    let origin = moq_net::Origin::random().produce();
+    while let Some(request) = server.accept().await {
+        let namespace = request.path().trim_matches('/').to_owned();
+        let presented = url::form_urlencoded::parse(request.query().unwrap_or_default().as_bytes())
+            .find(|(name, _)| name == "key")
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_default();
+        let admitted = options.key.as_ref().is_none_or(|key| {
+            use subtle::ConstantTimeEq;
+            bool::from(key.as_bytes().ct_eq(presented.as_bytes()))
+        });
+        if !admitted {
+            let path = request.path().to_owned();
+            let _ = request.close(403).await;
+            tracing::warn!(
+                path,
+                presented_len = presented.len(),
+                "rejected relay connection without the relay key"
+            );
+            continue;
+        }
+        if !valid_namespace(&namespace) {
+            let _ = request.close(404).await;
+            continue;
+        }
+        let Some(scoped) = origin.with_root(namespace.as_str()) else {
+            let _ = request.close(404).await;
+            continue;
+        };
+        tokio::spawn(async move {
+            match request
+                .with_publisher(&scoped)
+                .with_subscriber(scoped.clone())
+                .ok()
+                .await
+            {
+                Ok(session) => {
+                    let error = session.closed().await;
+                    tracing::debug!(%error, "relay session closed");
+                }
+                Err(error) => tracing::debug!(%error, "relay session rejected"),
+            }
+        });
+    }
+    Ok(())
+}
+
+fn valid_namespace(namespace: &str) -> bool {
+    namespace.len() == 32 && namespace.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Relay namespace for a host: derived from its pinned certificate
+/// fingerprint so clients need no extra configuration, but not equal to it.
+pub fn namespace(fingerprint: &str) -> Result<String> {
+    let fingerprint = moq_native::tls::parse_fingerprint(fingerprint)
+        .map_err(|error| anyhow::anyhow!("invalid host fingerprint: {error}"))?;
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(b"teleport-relay-namespace-v1");
+    context.update(&fingerprint);
+    Ok(hex(&context.finish().as_ref()[..16]))
+}
+
+/// How to reach a relay.
+#[derive(Clone, Debug)]
+pub struct Endpoint {
+    /// e.g. `moqt://relay.example:4444` (self-hosted) or a provider's
+    /// `https://` WebTransport URL; `?jwt=` carries a provider token.
+    pub url: url::Url,
+    /// Pin a self-hosted relay's certificate; `None` uses system roots.
+    pub fingerprint: Option<String>,
+    /// Access key for a relay started with `--key`.
+    pub key: Option<String>,
+}
+
+/// One connection to a relay, scoped to a host namespace.
+pub struct Link {
+    pub session: moq_net::Session,
+    /// Broadcasts we publish to the relay.
+    pub outgoing: moq_net::origin::Producer,
+    /// Broadcasts the relay announces to us.
+    pub incoming: moq_net::origin::Producer,
+}
+
+pub async fn connect(endpoint: &Endpoint, namespace: &str) -> Result<Link> {
+    let mut url = endpoint.url.clone();
+    url.set_path(&format!("/{namespace}"));
+    if let Some(key) = &endpoint.key {
+        url.query_pairs_mut().append_pair("key", key);
+    }
+    let mut config = moq_native::ClientConfig::default();
+    config.version = vec![protocol::WIRE_VERSION.parse().map_err(anyhow::Error::msg)?];
+    config.quic.idle_timeout = Some(protocol::QUIC_IDLE_TIMEOUT);
+    config.quic.keep_alive = Some(protocol::QUIC_KEEP_ALIVE);
+    config.quic.mtu_discovery = Some(protocol::QUIC_MTU_DISCOVERY);
+    if let Some(fingerprint) = &endpoint.fingerprint {
+        config.tls.fingerprint = vec![fingerprint.clone()];
+    }
+    let outgoing = moq_net::Origin::random().produce();
+    let incoming = moq_net::Origin::random().produce();
+    let session = config
+        .init()?
+        .with_publisher(&outgoing)
+        .with_subscriber(incoming.clone())
+        .connect(url)
+        .await
+        .context("relay connection failed")?;
+    Ok(Link {
+        session,
+        outgoing,
+        incoming,
+    })
+}
+
+/// Publish one message; the returned handles must outlive its reader.
+async fn publish_one(
+    origin: &moq_net::origin::Producer,
+    path: &str,
+    payload: Vec<u8>,
+) -> Result<(moq_net::broadcast::Producer, moq_net::track::Producer)> {
+    let mut broadcast =
+        origin.create_broadcast(path, moq_net::broadcast::Route::new().with_announce(true))?;
+    let mut track = broadcast.create_track(
+        "message",
+        moq_net::track::Info::default().with_ordered(true),
+    )?;
+    let mut group = track.append_group()?;
+    group.write_frame(moq_net::Timestamp::now(), bytes::Bytes::from(payload))?;
+    group.finish()?;
+    Ok((broadcast, track))
+}
+
+async fn read_one(broadcast: &moq_net::broadcast::Consumer) -> Result<bytes::Bytes> {
+    let mut track = broadcast
+        .track("message")?
+        .subscribe(moq_net::track::Subscription::default().with_group_start(0))
+        .await?;
+    let mut group = track
+        .recv_group()
+        .await?
+        .context("handshake message missing")?;
+    protocol::read_frame(&mut group, protocol::MAX_CONTROL)
+        .await?
+        .context("empty handshake message")
+}
+
+/// Client side: plaintext origins the unchanged session code uses, bridged to
+/// the relay after an authenticated handshake.
+pub struct ClientSession {
+    pub link: Link,
+    /// Publish `controls` here (plaintext; sealed by the bridge).
+    pub outgoing: moq_net::origin::Producer,
+    /// `desktop` is announced here (opened by the bridge).
+    pub incoming: moq_net::origin::Producer,
+    _bridges: Vec<AbortOnDrop>,
+    _handshake: (
+        (moq_net::broadcast::Producer, moq_net::track::Producer),
+        (moq_net::broadcast::Producer, moq_net::track::Producer),
+    ),
+}
+
+pub struct AbortOnDrop(pub tokio::task::JoinHandle<Result<()>>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+pub async fn client(
+    endpoint: &Endpoint,
+    pairing: &protocol::Pairing,
+    request: &str,
+) -> Result<ClientSession> {
+    let link = connect(endpoint, &namespace(&pairing.fingerprint)?).await?;
+    let session_id = hex(&e2e::random::<16>());
+    let handshake = ClientHandshake::new(&pairing.token, request)?;
+    let hello = publish_one(
+        &link.outgoing,
+        &format!("{session_id}/hello"),
+        serde_json::to_vec(handshake.hello())?,
+    )
+    .await?;
+    let replies = link.incoming.consume();
+    let reply_path = format!("{session_id}/reply");
+    let reply = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        tokio::select! {
+            broadcast = replies.announced_broadcast(reply_path.as_str()) => {
+                let broadcast = broadcast.context("relay closed before the host replied")?;
+                read_one(&broadcast).await
+            }
+            error = link.session.closed() => {
+                anyhow::bail!("relay closed the connection: {error} (check --relay-key)")
+            }
+        }
+    })
+    .await
+    .context("host did not answer through the relay; is it running with the same --relay and is this device still authorized?")??;
+    let reply: e2e::HostReply = serde_json::from_slice(&reply).context("malformed host reply")?;
+    let keys = Arc::new(handshake.finish(&reply, &pairing.fingerprint)?);
+    // Key confirmation: the host starts nothing (no lease, no capture) until
+    // this authenticates, so a replayed hello costs it no more than a reply.
+    let confirm = publish_one(
+        &link.outgoing,
+        &format!("{session_id}/confirm"),
+        keys.sealer(Direction::ClientToHost, CONFIRM_TRACK)?
+            .seal(0, &keys.session_id())?,
+    )
+    .await?;
+    tracing::info!(session = %hex(&keys.session_id()), "end-to-end encrypted relay session established");
+    let outgoing = moq_net::Origin::random().produce();
+    let incoming = moq_net::Origin::random().produce();
+    let export = {
+        let local = outgoing.consume();
+        let network = link.outgoing.create_broadcast(
+            format!("{session_id}/controls").as_str(),
+            moq_net::broadcast::Route::new().with_announce(true),
+        )?;
+        tokio::spawn(crate::bridge::export(
+            async move {
+                local
+                    .announced_broadcast("controls")
+                    .await
+                    .context("local controls missing")
+            },
+            network,
+            keys.clone(),
+            Direction::ClientToHost,
+        ))
+    };
+    let import = {
+        let network_origin = link.incoming.consume();
+        let local = incoming.create_broadcast(
+            "desktop",
+            moq_net::broadcast::Route::new().with_announce(true),
+        )?;
+        let path = format!("{session_id}/desktop");
+        tokio::spawn(crate::bridge::import(
+            async move {
+                network_origin
+                    .announced_broadcast(path.as_str())
+                    .await
+                    .context("host desktop missing on relay")
+            },
+            local,
+            keys.clone(),
+            Direction::HostToClient,
+        ))
+    };
+    Ok(ClientSession {
+        link,
+        outgoing,
+        incoming,
+        _bridges: vec![AbortOnDrop(export), AbortOnDrop(import)],
+        _handshake: (hello, confirm),
+    })
+}
+
+/// A relayed client that has proven it holds the session keys. Nothing is
+/// leased or captured for a client before it reaches this state.
+#[cfg(target_os = "linux")]
+pub struct Accepted {
+    pub session_id: String,
+    pub request: String,
+    /// The credential the hello named, as `SHA-256(token)`.
+    pub credential: [u8; 32],
+    pub keys: Arc<SessionKeys>,
+    _reply: (moq_net::broadcast::Producer, moq_net::track::Producer),
+}
+
+/// Host side: turn relay announcements into confirmed sessions.
+///
+/// Unauthenticated work is bounded: hellos are read concurrently (at most
+/// [`MAX_PENDING_HELLOS`] at once, each within [`HELLO_READ_TIMEOUT`]), a
+/// client ephemeral key is answered at most once, unknown credentials get no
+/// reply, and a client must prove the session keys within
+/// [`CONFIRM_TIMEOUT`] before it is handed to the session loop. Ends when the
+/// relay connection does.
+#[cfg(target_os = "linux")]
+pub async fn intake(
+    session: moq_net::Session,
+    incoming: moq_net::origin::Producer,
+    outgoing: moq_net::origin::Producer,
+    access: Arc<crate::access::ServerState>,
+    identity: Arc<e2e::HostIdentity>,
+    accepted: tokio::sync::mpsc::Sender<Accepted>,
+) -> Result<()> {
+    let mut announced = incoming.consume().announced();
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HELLOS));
+    // Client ephemerals already answered (bounded, oldest evicted first).
+    let seen = Arc::new(std::sync::Mutex::new((
+        std::collections::HashSet::<Vec<u8>>::new(),
+        std::collections::VecDeque::<Vec<u8>>::new(),
+    )));
+    let mut handlers = tokio::task::JoinSet::new();
+    loop {
+        while handlers.try_join_next().is_some() {}
+        // A relay that refuses us (wrong --relay-key) closes the MoQ session
+        // after the transport connected; notice it instead of waiting forever.
+        let announce = tokio::select! {
+            announce = announced.next() => announce.context("relay connection closed")?,
+            error = session.closed() => anyhow::bail!("relay closed the connection: {error} (check --relay-key)"),
+        };
+        let Some(broadcast) = announce.broadcast else {
+            continue;
+        };
+        let path = announce.path.to_string();
+        let Some(session_id) = path.strip_suffix("/hello") else {
+            continue;
+        };
+        if !valid_namespace(session_id) {
+            continue;
+        }
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            tracing::warn!("too many pending relay handshakes; ignoring hello");
+            continue;
+        };
+        let session_id = session_id.to_owned();
+        let (incoming, outgoing, access, identity, accepted, seen) = (
+            incoming.clone(),
+            outgoing.clone(),
+            access.clone(),
+            identity.clone(),
+            accepted.clone(),
+            seen.clone(),
+        );
+        handlers.spawn(async move {
+            let _permit = permit;
+            let hello: e2e::ClientHello =
+                match tokio::time::timeout(HELLO_READ_TIMEOUT, read_one(&broadcast)).await {
+                    Ok(Ok(bytes)) => match serde_json::from_slice(&bytes) {
+                        Ok(hello) => hello,
+                        Err(_) => return,
+                    },
+                    _ => return,
+                };
+            {
+                let (set, order) = &mut *seen.lock().unwrap();
+                if !set.insert(hello.ephemeral.clone()) {
+                    tracing::warn!("ignoring replayed relay hello");
+                    return;
+                }
+                order.push_back(hello.ephemeral.clone());
+                if order.len() > REPLAY_CACHE
+                    && let Some(old) = order.pop_front()
+                {
+                    set.remove(&old);
+                }
+            }
+            let candidates = access.credential_hashes();
+            let Some(index) = e2e::HostIdentity::identify(&hello, &candidates) else {
+                tracing::warn!("rejected unauthorized relayed client");
+                return;
+            };
+            let credential = candidates[index];
+            let Ok((reply, keys)) = identity.respond(&hello, &credential) else {
+                return;
+            };
+            let Ok(reply) = serde_json::to_vec(&reply) else {
+                return;
+            };
+            let Ok(reply) = publish_one(&outgoing, &format!("{session_id}/reply"), reply).await
+            else {
+                return;
+            };
+            let confirmed = tokio::time::timeout(CONFIRM_TIMEOUT, async {
+                let broadcast = incoming
+                    .consume()
+                    .announced_broadcast(format!("{session_id}/confirm").as_str())
+                    .await
+                    .context("no confirmation")?;
+                let sealed = read_one(&broadcast).await?;
+                let opened = keys
+                    .opener(Direction::ClientToHost, CONFIRM_TRACK, e2e::Order::Strict)?
+                    .open(0, &sealed)?;
+                ensure!(opened == keys.session_id(), "confirmation mismatch");
+                Ok::<_, anyhow::Error>(())
+            })
+            .await;
+            if !matches!(confirmed, Ok(Ok(()))) {
+                tracing::warn!("relayed client did not confirm the session keys");
+                return;
+            }
+            let _ = accepted
+                .send(Accepted {
+                    session_id,
+                    request: hello.request,
+                    credential,
+                    keys: Arc::new(keys),
+                    _reply: reply,
+                })
+                .await;
+        });
+    }
+}
+
+/// Host side of a confirmed relayed session: plaintext origins for the
+/// unchanged session code, bridged to the relay.
+#[cfg(target_os = "linux")]
+pub struct HostSession {
+    /// Publish `desktop` here (plaintext; sealed by the bridge).
+    pub outgoing: moq_net::origin::Producer,
+    /// `controls` is announced here (opened by the bridge).
+    pub incoming: moq_net::origin::Producer,
+    _bridges: Vec<AbortOnDrop>,
+}
+
+#[cfg(target_os = "linux")]
+pub fn host(link: &Link, accepted: &Accepted) -> Result<HostSession> {
+    let keys = accepted.keys.clone();
+    let session_id = &accepted.session_id;
+    let outgoing = moq_net::Origin::random().produce();
+    let incoming = moq_net::Origin::random().produce();
+    let export = {
+        let local = outgoing.consume();
+        let network = link.outgoing.create_broadcast(
+            format!("{session_id}/desktop").as_str(),
+            moq_net::broadcast::Route::new().with_announce(true),
+        )?;
+        tokio::spawn(crate::bridge::export(
+            async move {
+                local
+                    .announced_broadcast("desktop")
+                    .await
+                    .context("local desktop missing")
+            },
+            network,
+            keys.clone(),
+            Direction::HostToClient,
+        ))
+    };
+    let import = {
+        let network_origin = link.incoming.consume();
+        let local = incoming.create_broadcast(
+            "controls",
+            moq_net::broadcast::Route::new().with_announce(true),
+        )?;
+        let path = format!("{session_id}/controls");
+        tokio::spawn(crate::bridge::import(
+            async move {
+                network_origin
+                    .announced_broadcast(path.as_str())
+                    .await
+                    .context("client controls missing on relay")
+            },
+            local,
+            keys,
+            Direction::ClientToHost,
+        ))
+    };
+    Ok(HostSession {
+        outgoing,
+        incoming,
+        _bridges: vec![AbortOnDrop(export), AbortOnDrop(import)],
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn namespace_is_stable_hex_and_not_the_fingerprint() {
+        let fingerprint = "ab".repeat(32);
+        let namespace = namespace(&fingerprint).unwrap();
+        assert!(valid_namespace(&namespace));
+        assert_eq!(namespace, super::namespace(&fingerprint).unwrap());
+        assert!(!fingerprint.contains(&namespace));
+        assert!(super::namespace("not hex").is_err());
+    }
+}

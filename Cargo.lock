@@ -3500,6 +3500,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "x11rb",
+ "x509-parser",
  "zeroize",
 ]
 

@@ -1,10 +1,12 @@
 mod access;
 mod audio;
+mod bridge;
 #[cfg(target_os = "linux")]
 mod capture;
 mod client;
 #[cfg(target_os = "linux")]
 mod clipboard;
+mod e2e;
 mod ffmpeg;
 mod fullscreen;
 mod hdr;
@@ -23,6 +25,7 @@ mod media;
 mod pairing;
 mod profiles;
 mod protocol;
+mod relay;
 mod security_key;
 mod ssh_agent;
 mod stats;
@@ -83,6 +86,9 @@ enum Command {
     Host(host::Options),
     /// Open a native remote desktop window.
     Client(client::Options),
+    /// Run a minimal MoQ relay (self-hosted alternative to a provider relay).
+    /// It forwards only end-to-end encrypted objects it cannot read.
+    Relay(relay::Options),
     /// Check required media plugins without sharing the desktop.
     Doctor {
         /// Test synthetic HEVC Main 10 support; does not imply HDR desktop capture/display.
@@ -173,6 +179,7 @@ fn main() -> Result<()> {
             Ok(())
         }
         Some(Command::Client(options)) => client::run(options, &runtime),
+        Some(Command::Relay(options)) => runtime.block_on(relay::serve(options)),
         Some(Command::Doctor { hdr }) => {
             media::doctor()?;
             if hdr {

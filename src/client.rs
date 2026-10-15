@@ -58,6 +58,21 @@ pub struct Options {
     /// accepts datagrams (comparison and troubleshooting).
     #[arg(long, hide = true)]
     pub reliable_pointer: bool,
+    /// Reach the host through this MoQ relay with end-to-end encryption
+    /// (e.g. moqt://relay.example:4444). The host must run with the same --relay.
+    #[arg(long)]
+    pub relay: Option<url::Url>,
+    /// Pin a self-hosted relay's certificate (printed by `teleport relay`).
+    #[arg(long, requires = "relay")]
+    pub relay_fingerprint: Option<String>,
+    /// Access key for a relay started with `teleport relay --key`.
+    #[arg(
+        long,
+        requires = "relay",
+        env = "TELEPORT_RELAY_KEY",
+        hide_env_values = true
+    )]
+    pub relay_key: Option<String>,
     /// Retry dropped sessions until the connection window is closed.
     #[arg(long)]
     pub reconnect: bool,
@@ -91,6 +106,8 @@ pub struct Options {
 }
 
 struct Link {
+    /// Relay handshake and bridges; dropping it ends a relayed session.
+    _relay: Option<crate::relay::ClientSession>,
     remote: moq_net::broadcast::Consumer,
     ssh_agent: Option<crate::ssh_agent::Task>,
     session: moq_net::Session,
@@ -129,9 +146,31 @@ async fn connect(options: &Options) -> Result<Link> {
     config.quic.idle_timeout = Some(protocol::QUIC_IDLE_TIMEOUT);
     config.quic.keep_alive = Some(protocol::QUIC_KEEP_ALIVE);
     config.quic.mtu_discovery = Some(protocol::QUIC_MTU_DISCOVERY);
+    // Relay mode: authenticate the host end to end, then let the unchanged
+    // session code below use plaintext origins that the bridge seals.
+    let relay = match &options.relay {
+        Some(relay) => Some(
+            crate::relay::client(
+                &crate::relay::Endpoint {
+                    url: relay.clone(),
+                    fingerprint: options.relay_fingerprint.clone(),
+                    key: options.relay_key.clone(),
+                },
+                &pairing,
+                url.query().unwrap_or_default(),
+            )
+            .await?,
+        ),
+        None => None,
+    };
     config.tls.fingerprint = vec![pairing.fingerprint];
-    let outgoing = moq_net::Origin::random().produce();
-    let incoming = moq_net::Origin::random().produce();
+    let (outgoing, incoming) = match &relay {
+        Some(relay) => (relay.outgoing.clone(), relay.incoming.clone()),
+        None => (
+            moq_net::Origin::random().produce(),
+            moq_net::Origin::random().produce(),
+        ),
+    };
     let mut broadcast = outgoing.create_broadcast(
         "controls",
         moq_net::broadcast::Route::new().with_announce(true),
@@ -156,15 +195,20 @@ async fn connect(options: &Options) -> Result<Link> {
     } else {
         None
     };
-    let client = config
-        .init()?
-        .with_publisher(&outgoing)
-        .with_subscriber(incoming.clone());
-    tracing::info!(address = %options.address, "connecting with pinned TLS certificate");
-    let session = client
-        .connect(url)
-        .await
-        .context("QUIC connection failed; check address, pairing file and UDP firewall")?;
+    let session = match &relay {
+        Some(relay) => relay.link.session.clone(),
+        None => {
+            let client = config
+                .init()?
+                .with_publisher(&outgoing)
+                .with_subscriber(incoming.clone());
+            tracing::info!(address = %options.address, "connecting with pinned TLS certificate");
+            client
+                .connect(url)
+                .await
+                .context("QUIC connection failed; check address, pairing file and UDP firewall")?
+        }
+    };
     let incoming_broadcasts = incoming.consume();
     let remote = tokio::select! {
         result = incoming_broadcasts.announced_broadcast("desktop") => result.context("host did not announce desktop")?,
@@ -237,6 +281,7 @@ async fn connect(options: &Options) -> Result<Link> {
         None
     };
     Ok(Link {
+        _relay: relay,
         remote,
         ssh_agent,
         session,

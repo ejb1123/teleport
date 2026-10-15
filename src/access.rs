@@ -613,17 +613,47 @@ mod server {
             })
         }
         pub fn authorized(&self, token: &str) -> bool {
-            if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return false;
+            token.len() == 64
+                && token.bytes().all(|b| b.is_ascii_hexdigit())
+                && self.authorized_hash(&token_hash(token))
+        }
+
+        /// Every currently acceptable credential as `SHA-256(token)`: the
+        /// legacy host token, managed devices and live system-login tickets.
+        /// A relayed hello names one of these without revealing the token.
+        pub fn credential_hashes(&self) -> Vec<[u8; 32]> {
+            let mut hashes = Vec::new();
+            let mut push = |hash: &[u8]| {
+                if let Ok(hash) = hash.try_into() {
+                    hashes.push(hash);
+                }
+            };
+            push(&token_hash(&self.legacy.token));
+            if let Ok(record) = self.record.lock() {
+                for device in &record.devices {
+                    push(&device.token_hash);
+                }
             }
-            if bool::from(token.as_bytes().ct_eq(self.legacy.token.as_bytes())) {
+            if self.system_login_allowed()
+                && let Ok(sessions) = self.system_sessions.lock()
+            {
+                for hash in sessions.keys() {
+                    push(hash);
+                }
+            }
+            hashes
+        }
+
+        /// Authorization by `SHA-256(token)`, for relayed sessions where the
+        /// token itself is never transmitted (see `crate::e2e`).
+        pub fn authorized_hash(&self, hash: &[u8]) -> bool {
+            if bool::from(token_hash(&self.legacy.token).ct_eq(hash)) {
                 return true;
             }
-            let hash = token_hash(token);
             if self.system_login_allowed()
                 && let Ok(generation) = self.system_generation()
                 && let Ok(sessions) = self.system_sessions.lock()
-                && sessions.get(&hash).is_some_and(|s| {
+                && sessions.get(hash).is_some_and(|s| {
                     s.generation == generation
                         && (s.active || s.deadline > std::time::Instant::now())
                 })
@@ -634,7 +664,7 @@ mod server {
                 .lock()
                 .map(|r| {
                     r.devices.iter().fold(false, |accepted, d| {
-                        accepted | bool::from(d.token_hash.ct_eq(&hash))
+                        accepted | bool::from(d.token_hash.ct_eq(hash))
                     })
                 })
                 .unwrap_or(false)
@@ -698,14 +728,18 @@ mod server {
                 token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()),
                 "unauthorized session"
             );
-            let hash = token_hash(token);
+            self.begin_session_hash(token_hash(token))
+        }
+
+        /// [`Self::begin_session`] by `SHA-256(token)` (relayed sessions).
+        pub fn begin_session_hash(self: &Arc<Self>, hash: Vec<u8>) -> Result<SessionLease> {
             // Atomic authorization and claim; absence from the ticket map must
             // never turn a concurrently revoked ticket into reusable trust.
             let record = self
                 .record
                 .lock()
                 .map_err(|_| anyhow::anyhow!("access unavailable"))?;
-            let saved = bool::from(token.as_bytes().ct_eq(self.legacy.token.as_bytes()))
+            let saved = bool::from(token_hash(&self.legacy.token).ct_eq(&hash))
                 | record.devices.iter().fold(false, |accepted, d| {
                     accepted | bool::from(d.token_hash.ct_eq(&hash))
                 });
