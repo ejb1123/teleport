@@ -67,6 +67,7 @@ impl Pipeline {
                 .name()
                 .to_string(),
             pending: Mutex::default(),
+            totals: Mutex::default(),
             encode_us: std::sync::atomic::AtomicU64::new(0),
         });
         let input = metrics.clone();
@@ -217,6 +218,27 @@ pub struct EncoderMetrics {
     pub encoder: String,
     pending: Mutex<std::collections::BTreeMap<u64, Instant>>,
     pub encode_us: std::sync::atomic::AtomicU64,
+    /// Whole-run sums: (capture copy-in µs, submit-to-packet µs, frames).
+    pub totals: Mutex<(u64, u64, u64)>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for EncoderMetrics {
+    /// One line per encoder lifetime, for comparing host-side cost across runs.
+    fn drop(&mut self) {
+        let (prepare, encode, frames) = *self.totals.lock().unwrap();
+        if let (Some(mean_prepare_us), Some(mean_encode_us)) =
+            (prepare.checked_div(frames), encode.checked_div(frames))
+        {
+            tracing::info!(
+                encoder = %self.encoder,
+                frames,
+                mean_prepare_us,
+                mean_encode_us,
+                "encoder summary"
+            );
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]

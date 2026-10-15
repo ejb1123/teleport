@@ -580,6 +580,7 @@ pub(super) fn encoder(
         encoder: format!("ffmpeg:{}", config.name),
         pending: Mutex::default(),
         encode_us: std::sync::atomic::AtomicU64::new(0),
+        totals: Mutex::default(),
     });
     let name = config.name.clone();
     let codec = Codec::new(config);
@@ -640,6 +641,7 @@ pub(super) fn encoder(
             .new_sample(move |sink| {
                 let mut process = || -> Result<()> {
                     let sample = sink.pull_sample()?;
+                    let pulled = Instant::now();
                     if let Some(pad) = &hdr_source {
                         let caps = pad
                             .upgrade()
@@ -671,6 +673,7 @@ pub(super) fn encoder(
                         }
                     }
                     let start = Instant::now();
+                    let prepare_us = start.duration_since(pulled).as_micros() as u64;
                     let mut codec = state.codec.lock().unwrap();
                     frame_id = frame_id
                         .checked_add(1)
@@ -722,6 +725,12 @@ pub(super) fn encoder(
                             elapsed.map_or(0, |elapsed| elapsed.as_micros().max(1) as u64),
                             Ordering::Relaxed,
                         );
+                        if let Some(elapsed) = elapsed {
+                            let mut totals = metrics.totals.lock().unwrap();
+                            totals.0 += prepare_us;
+                            totals.1 += elapsed.as_micros() as u64;
+                            totals.2 += 1;
+                        }
                         if packet.key {
                             if let Some(mut old) = group.take() {
                                 let _ = old.finish();

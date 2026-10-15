@@ -39,6 +39,8 @@ struct Outcome {
     probe_p50_us: u64,
     probe_p95_us: u64,
     probe_max_us: u64,
+    host_prepare_us: u64,
+    host_encode_us: u64,
     mean_ready_us: u64,
     mean_queue_us: u64,
     mean_decode_us: u64,
@@ -72,7 +74,7 @@ ip link set lo up
 tc qdisc add dev lo root netem {netem}
 TELEPORT_TEST_PATTERN={pattern} "$TELEPORT" host --source test --encoder software --listen 127.0.0.1:4443 \
     --width {width} --fps {FPS} --bitrate {bitrate} --pairing-file "$DIR/pairing.json" \
-    >/dev/null 2>"$DIR/host.log" &
+    >"$DIR/host.log" 2>&1 &
 host=$!
 trap 'kill $host 2>/dev/null || true' EXIT
 tries=0
@@ -84,6 +86,8 @@ sleep 0.3
 {blackout}
 "$TELEPORT" client 127.0.0.1:4443 --pairing-file "$DIR/pairing.json" \
     --headless-frames {FRAMES} --software-decoder --bitrate {bitrate} {input}
+# Let the host notice the disconnect and log its encoder summary.
+sleep 0.5
 "#,
         netem = profile.netem,
         pattern = profile.pattern,
@@ -135,6 +139,8 @@ sleep 0.3
         probe_p50_us: field("probe_p50_us"),
         probe_p95_us: field("probe_p95_us"),
         probe_max_us: field("probe_max_us"),
+        host_prepare_us: host_field(&host_log, "mean_prepare_us"),
+        host_encode_us: host_field(&host_log, "mean_encode_us"),
         mean_ready_us: field("mean_ready_us"),
         mean_queue_us: field("mean_queue_us"),
         mean_decode_us: field("mean_decode_us"),
@@ -152,12 +158,14 @@ sleep 0.3
         outcome.decode_errors,
     );
     println!(
-        "DECODE  {:<10} ready_ms={:.2} queue_ms={:.2} decode_ms={:.2} convert_ms={:.2}",
+        "DECODE  {:<10} ready_ms={:.2} queue_ms={:.2} decode_ms={:.2} convert_ms={:.2} host_prepare_ms={:.2} host_encode_ms={:.2}",
         profile.name,
         outcome.mean_ready_us as f64 / 1000.0,
         outcome.mean_queue_us as f64 / 1000.0,
         outcome.mean_decode_us as f64 / 1000.0,
         outcome.mean_convert_us as f64 / 1000.0,
+        outcome.host_prepare_us as f64 / 1000.0,
+        outcome.host_encode_us as f64 / 1000.0,
     );
     if profile.input_latency {
         println!(
@@ -171,6 +179,20 @@ sleep 0.3
         );
     }
     outcome
+}
+
+/// Mean from the host's last "encoder summary" line (0 if absent).
+fn host_field(log: &str, name: &str) -> u64 {
+    log.lines()
+        .rev()
+        .find(|line| line.contains("encoder summary"))
+        .and_then(|line| {
+            line.split_whitespace()
+                .filter_map(|pair| pair.split_once('='))
+                .find(|(key, _)| *key == name)
+                .and_then(|(_, value)| value.parse().ok())
+        })
+        .unwrap_or(0)
 }
 
 /// Parses `key=value` pairs from the client's SMOKE PASS log line.
