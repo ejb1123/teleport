@@ -12,6 +12,10 @@ pub(super) struct State {
     codec: Mutex<Codec>,
     /// Set by a client keyframe request; consumed by the next encoded frame.
     keyframe: std::sync::atomic::AtomicBool,
+    /// Encoders: force an IDR after this many frames without one. Starts at the
+    /// historical fps/4 so every client recovers by itself; lengthened once
+    /// the client declares it requests keyframes on loss.
+    key_interval: std::sync::atomic::AtomicU32,
     #[cfg(target_os = "linux")]
     pub metrics: Option<Arc<EncoderMetrics>>,
 }
@@ -46,6 +50,10 @@ impl State {
     #[cfg(target_os = "linux")]
     pub fn request_keyframe(&self) {
         self.keyframe.store(true, Ordering::Relaxed);
+    }
+    #[cfg(target_os = "linux")]
+    pub fn set_key_interval(&self, frames: u32) {
+        self.key_interval.store(frames.max(1), Ordering::Relaxed);
     }
     #[cfg(target_os = "linux")]
     pub fn bitrate(&self) -> u32 {
@@ -88,6 +96,7 @@ fn config(name: &str, format: VideoFormat, output: i32) -> Config {
         fps: 30,
         kbps: 1000,
         output,
+        gop: 0,
     }
 }
 
@@ -124,6 +133,56 @@ fn synthetic(format: VideoFormat) -> Result<Vec<Vec<u8>>> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "requires GStreamer capture plugins; codecs are direct FFmpeg"]
+    async fn session_key_interval_defaults_short_and_lengthens_on_request() -> Result<()> {
+        gst::init()?;
+        let mut broadcast = moq_net::broadcast::Info::new().produce();
+        let track = broadcast.create_track(VideoCodec::H264.track(), None)?;
+        let mut subscriber = track.subscribe(None);
+        let encode = encoder(
+            "videotestsrc is-live=true pattern=ball",
+            (320, 180),
+            30,
+            2000,
+            track,
+            EncoderKind::Software,
+            VideoCodec::H264.into(),
+        )?;
+        // Count groups (each starts at an IDR) arriving within a window.
+        async fn groups_within(
+            subscriber: &mut moq_net::track::Subscriber,
+            window: Duration,
+        ) -> Result<u32> {
+            let deadline = tokio::time::Instant::now() + window;
+            let mut groups = 0;
+            while let Ok(group) = tokio::time::timeout_at(deadline, subscriber.recv_group()).await {
+                group?.context("track closed")?;
+                groups += 1;
+            }
+            Ok(groups)
+        }
+        // Clients that never declare keyframe requests keep fps/4 (4 IDR/s).
+        let legacy = groups_within(&mut subscriber, Duration::from_millis(1500)).await?;
+        ensure!(
+            legacy >= 4,
+            "legacy cadence produced only {legacy} groups in 1.5 s"
+        );
+        encode.set_key_interval(30 * 4);
+        let _ = groups_within(&mut subscriber, Duration::from_millis(300)).await?;
+        let long = groups_within(&mut subscriber, Duration::from_millis(1500)).await?;
+        ensure!(
+            long <= 1,
+            "long interval still produced {long} groups in 1.5 s"
+        );
+        encode.request_keyframe()?;
+        ensure!(
+            groups_within(&mut subscriber, Duration::from_millis(500)).await? >= 1,
+            "requested keyframe did not start a group"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     #[ignore = "requires GStreamer capture plugins; codecs are direct FFmpeg"]
     async fn direct_pipeline_bitrate_reopen_reset_and_generation() -> Result<()> {
@@ -287,6 +346,7 @@ pub(super) fn decoder(
     let state = Arc::new(State {
         codec: Mutex::new(Codec::new(config(&name, format, output))?),
         keyframe: Default::default(),
+        key_interval: Default::default(),
         #[cfg(target_os = "linux")]
         metrics: None,
     });
@@ -475,6 +535,9 @@ pub(super) fn encoder(
             height: size.1,
             fps,
             kbps: bitrate,
+            // The callback forces IDRs at the session interval (see State::
+            // key_interval); this is only a ceiling the encoder never reaches.
+            gop: fps.saturating_mul(10).max(1),
             ..config("", format, 1)
         };
         if let Some(cached) = &cached {
@@ -531,6 +594,7 @@ pub(super) fn encoder(
     let state = Arc::new(State {
         codec: Mutex::new(codec?),
         keyframe: Default::default(),
+        key_interval: std::sync::atomic::AtomicU32::new((fps / 4).max(1)),
         metrics: Some(metrics.clone()),
     });
     let pixel = if format.hdr() {
@@ -569,6 +633,8 @@ pub(super) fn encoder(
     let mut group: Option<moq_net::group::Producer> = None;
     let mut frame_id = 0_u64;
     let mut encode_failures = 0_u32;
+    // Frames submitted since (and including) the last keyframe.
+    let mut since_key = u32::MAX;
     sink.set_callbacks(
         gstreamer_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -617,7 +683,9 @@ pub(super) fn encoder(
                         }
                     }
                     let mut packets = Vec::new();
-                    let force_key = state.keyframe.swap(false, Ordering::Relaxed);
+                    let force_key = state.keyframe.swap(false, Ordering::Relaxed)
+                        || since_key >= state.key_interval.load(Ordering::Relaxed);
+                    since_key = since_key.saturating_add(1);
                     let encoded = codec.submit_frame(&raw, frame_id, force_key).and_then(|()| {
                         while let Some(packet) = codec.receive()? {
                             packets.push(packet);
@@ -643,6 +711,9 @@ pub(super) fn encoder(
                     }
                     encode_failures = 0;
                     for packet in packets {
+                        if packet.key {
+                            since_key = 1;
+                        }
                         let elapsed = packet
                             .pts
                             .and_then(|pts| metrics.pending.lock().unwrap().remove(&pts))

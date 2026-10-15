@@ -232,6 +232,14 @@ pub enum Event {
         #[serde(default)]
         monitor: Option<usize>,
     },
+    /// Client capabilities the host may rely on for this session. Only sent to
+    /// hosts advertising `Desktop::keyframe_requests`.
+    ClientFeatures {
+        /// The client sends `RequestKeyframe` on loss, so the host can space
+        /// periodic IDRs far apart instead of every quarter second.
+        #[serde(default)]
+        keyframe_requests: bool,
+    },
 }
 
 impl Event {
@@ -527,6 +535,9 @@ mod tests {
             Event::ReleaseAll,
             Event::ClipboardRequest,
             Event::SelectMonitor { index: 0 },
+            Event::ClientFeatures {
+                keyframe_requests: true,
+            },
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
         }
@@ -539,6 +550,14 @@ mod tests {
             assert!(matches!(event, Event::RequestKeyframe { monitor: m } if m == monitor));
             assert!(event.validate().is_ok());
         }
+        let features: Event =
+            serde_json::from_str(r#"{"type":"client_features","keyframe_requests":true}"#).unwrap();
+        assert!(matches!(
+            features,
+            Event::ClientFeatures {
+                keyframe_requests: true
+            }
+        ));
         let primary: Event = serde_json::from_str(r#"{"type":"request_keyframe"}"#).unwrap();
         assert!(matches!(primary, Event::RequestKeyframe { monitor: None }));
         assert!(

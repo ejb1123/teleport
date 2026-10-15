@@ -565,7 +565,8 @@ impl Capture {
             | Event::Feedback { .. }
             | Event::Clipboard { .. }
             | Event::ClipboardRequest
-            | Event::RequestKeyframe { .. } => (),
+            | Event::RequestKeyframe { .. }
+            | Event::ClientFeatures { .. } => (),
         }
         Ok(())
     }

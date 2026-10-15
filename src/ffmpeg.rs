@@ -26,6 +26,7 @@ unsafe extern "C" {
         fps: c_int,
         kbps: c_int,
         output: c_int,
+        gop: c_int,
         error: *mut c_int,
     ) -> *mut c_void;
     fn tp_codec_free(codec: *mut c_void);
@@ -56,6 +57,8 @@ pub struct Config {
     pub kbps: u32,
     /// 0 = RGB24, 1 = NV12, 2 = P010LE.
     pub output: i32,
+    /// Encoder keyframe interval in frames; 0 keeps the fps/4 default.
+    pub gop: u32,
 }
 pub struct Codec {
     pointer: NonNull<c_void>,
@@ -108,6 +111,7 @@ impl Codec {
                 config.fps.try_into()?,
                 config.kbps.try_into()?,
                 config.output,
+                config.gop.try_into()?,
                 &mut error,
             )
         };
@@ -212,6 +216,7 @@ mod tests {
             fps: 30,
             kbps: 1000,
             output: 1,
+            gop: 0,
         }
     }
     #[test]

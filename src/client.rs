@@ -745,6 +745,14 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             error = link.session.closed() => anyhow::bail!("connection closed: {error}"),
         }
     }));
+    if desktop.keyframe_requests {
+        send(
+            &events,
+            Event::ClientFeatures {
+                keyframe_requests: true,
+            },
+        )?;
+    }
     if let Some(index) = options.monitor {
         send(&events, Event::SelectMonitor { index })?;
     }

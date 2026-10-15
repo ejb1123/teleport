@@ -19,6 +19,11 @@ const MAX_CONSECUTIVE_INPUT_FAILURES: u32 = 50;
 /// Minimum spacing between client-requested IDRs per stream.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Safety-net IDR spacing for clients that request keyframes on loss. Rare
+/// IDRs avoid the quarter-second bitrate spikes of the legacy interval while
+/// still bounding recovery if a request itself is lost.
+const LONG_KEY_INTERVAL_SECONDS: u32 = 4;
+
 #[derive(Args, Clone)]
 pub struct Options {
     /// Experimental: permit clients that explicitly opt in to forward an SSH agent.
@@ -383,6 +388,9 @@ async fn connection(
     let mut last_telemetry = Instant::now();
     let mut input_failures = 0_u32;
     let mut last_keyframe: BTreeMap<Option<usize>, Instant> = BTreeMap::new();
+    // Set once the client declares it requests keyframes on loss; every encoder
+    // in this session then spaces periodic IDRs LONG_KEY_INTERVAL_SECONDS apart.
+    let mut long_gop = false;
     loop {
         tokio::select! {
             result = crate::ssh_agent::closed(&mut ssh_agent) => return result,
@@ -439,6 +447,7 @@ async fn connection(
                         match monitor_encoder(options, capture, index, &monitor_tracks[index]).await {
                             Ok(stream) => {
                                 publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
+                                if long_gop { stream.pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
                                 monitor_streams.insert(index, stream);
                             }
                             Err(error) => publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor unavailable: {error}"), requested: false })?,
@@ -455,6 +464,14 @@ async fn connection(
                     // Auxiliary streams currently use fixed bitrate. Their
                     // congestion must never adapt the independent primary.
                     Event::MonitorFeedback { .. } => {}
+                    Event::ClientFeatures { keyframe_requests } => {
+                        if keyframe_requests && !long_gop {
+                            long_gop = true;
+                            let frames = options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS);
+                            pipeline.set_key_interval(frames);
+                            for stream in monitor_streams.values() { stream.pipeline.set_key_interval(frames); }
+                        }
+                    }
                     Event::RequestKeyframe { monitor } => {
                         // Bound IDR bursts: a lossy link must not turn every
                         // request into a full keyframe and deepen congestion.
@@ -494,6 +511,7 @@ async fn connection(
                         info.video_start_group = video_start_group;
                         capture.select_monitor(capture.active_monitor).await?;
                         pipeline = media::encoder(&capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), fps, bitrate, video.clone(), options.encoder, media::VideoFormat { codec: options.codec, dynamic_range: options.dynamic_range })?;
+                        if long_gop { pipeline.set_key_interval(fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
                         *options = requested;
                         let active: Vec<_> = monitor_streams.keys().copied().collect();
                         monitor_streams.clear();
@@ -501,6 +519,7 @@ async fn connection(
                             match monitor_encoder(options, capture, index, &monitor_tracks[index]).await {
                                 Ok(stream) => {
                                     publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
+                                    if long_gop { stream.pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
                                     monitor_streams.insert(index, stream);
                                 }
                                 Err(error) => publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor reconfiguration failed: {error}"), requested: false })?,
@@ -526,6 +545,7 @@ async fn connection(
                         capture.select_monitor(index).await?;
                         let info = desktop(options, capture, video_start_group)?;
                         pipeline = media::encoder(&capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, options.bitrate, video.clone(), options.encoder, media::VideoFormat { codec: options.codec, dynamic_range: options.dynamic_range })?;
+                        if long_gop { pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
                         adaptation = media::BitrateController::new(options.bitrate);
                         network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
                         encoder_metrics = pipeline.encoder_metrics()?;

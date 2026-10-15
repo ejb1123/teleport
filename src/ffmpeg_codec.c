@@ -62,7 +62,7 @@ static int color_frame(AVFrame *frame, int hdr) {
 /* name: an encoder name, or decoder device type ("software", "cuda",
  * "vaapi", "qsv", "videotoolbox"). output: 0 RGB24, 1 NV12, 2 P010. */
 TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
-                       int width, int height, int fps, int kbps, int output, int *error) {
+                       int width, int height, int fps, int kbps, int output, int gop, int *error) {
     int result = AVERROR(ENOMEM);
     AVDictionary *opts = NULL;
     const AVCodec *implementation = encoder ? avcodec_find_encoder_by_name(name)
@@ -100,7 +100,9 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
         ctx->bit_rate = (int64_t)kbps * 1000;
         ctx->rc_max_rate = ctx->bit_rate;
         ctx->rc_buffer_size = kbps * 1000 / fps * 2;
-        ctx->gop_size = fps / 4 > 0 ? fps / 4 : 1;
+        /* gop 0 keeps the historical fps/4 interval; session encoders pass a long
+         * interval and force IDRs themselves (periodic or client-requested). */
+        ctx->gop_size = gop > 0 ? gop : (fps / 4 > 0 ? fps / 4 : 1);
         ctx->max_b_frames = 0;
         ctx->flags |= AV_CODEC_FLAG_CLOSED_GOP;
         ctx->color_range = AVCOL_RANGE_MPEG;
