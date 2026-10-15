@@ -775,7 +775,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         );
         enabled
     } else {
-        false
+        // Headless runs measure the path an accelerated Linux window uses.
+        cfg!(target_os = "linux") && link.desktop.dynamic_range == protocol::DynamicRange::Sdr
     };
     let stream_stats = std::sync::Arc::new(crate::stats::StreamStats::default());
     let format = media::VideoFormat {
@@ -974,6 +975,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             }) {
                 ensure!(
                     !frame.data.is_empty()
+                        || frame
+                            .nv12
+                            .as_ref()
+                            .is_some_and(|nv12| !nv12.y.is_empty() && !nv12.uv.is_empty())
                         || frame
                             .hdr
                             .as_ref()

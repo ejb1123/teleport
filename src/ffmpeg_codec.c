@@ -104,6 +104,9 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
          * interval and force IDRs themselves (periodic or client-requested). */
         ctx->gop_size = gop > 0 ? gop : (fps / 4 > 0 ? fps / 4 : 1);
         ctx->max_b_frames = 0;
+        /* Four slices let the client decode each frame in parallel. libx264
+         * slices via slice threads; NVENC, VAAPI and QSV read ctx->slices. */
+        ctx->slices = 4;
         ctx->flags |= AV_CODEC_FLAG_CLOSED_GOP;
         ctx->color_range = AVCOL_RANGE_MPEG;
         ctx->color_primaries = hdr ? AVCOL_PRI_BT2020 : AVCOL_PRI_BT709;
