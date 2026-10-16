@@ -116,6 +116,11 @@ pub struct Options {
     /// (20000 up to 60 fps, more above).
     #[arg(long, value_parser = stream_settings::parse_bitrate)]
     pub bitrate: Option<stream_settings::Setting>,
+    /// Wait for vertical sync before showing each frame (no tearing on
+    /// fixed-refresh displays, up to one refresh of extra latency). By default
+    /// frames are shown as they arrive, which variable-refresh displays follow.
+    #[arg(long)]
+    pub vsync: bool,
     /// Headless runs: pretend to show video on a WxH display at R mHz
     /// (`1280x720@60000`); a second one is switched to halfway through.
     #[arg(long, hide = true, requires = "headless_frames", value_parser = stream_settings::parse_display)]
@@ -792,6 +797,46 @@ fn session_window(options: &Options) -> Result<SessionWindow> {
     Ok((sdl, video, canvas))
 }
 
+/// Sync of the session window's presents. By default frames are shown as
+/// they arrive, so a variable-refresh display (FreeSync/G-Sync, enabled by
+/// the compositor for fullscreen windows that present promptly) refreshes in
+/// step with the stream and nothing queues behind a fixed vsync: adaptive
+/// vsync (swap interval -1: synced when on time, a late frame tears instead
+/// of waiting a refresh) where the GL driver offers it (GLX with
+/// EXT_swap_control_tear), otherwise no wait at all (EGL, as on Wayland,
+/// rejects -1). `--vsync` waits for every refresh instead (no tearing on
+/// fixed-refresh displays). Whether VRR is active is up to the display and
+/// compositor and is not visible here.
+fn configure_presentation(
+    video: &sdl2::VideoSubsystem,
+    canvas: &sdl2::render::Canvas<sdl2::video::Window>,
+    vsync: bool,
+) -> &'static str {
+    if vsync {
+        // Any renderer; SDL maps it to the swap interval or Metal/D3D present.
+        return if unsafe { sdl2::sys::SDL_RenderSetVSync(canvas.raw(), 1) } == 0 {
+            "vsync (--vsync)"
+        } else {
+            "vsync unavailable; immediate"
+        };
+    }
+    // SDL created the renderer without PRESENTVSYNC (interval 0). Swap
+    // intervals apply to the current context, which is the renderer's.
+    let gl = canvas.info().name.starts_with("opengl")
+        && !unsafe { sdl2::sys::SDL_GL_GetCurrentContext() }.is_null();
+    if gl
+        && video
+            .gl_set_swap_interval(sdl2::video::SwapInterval::LateSwapTearing)
+            .is_ok()
+    {
+        return "adaptive vsync (late frames tear)";
+    }
+    if gl {
+        let _ = video.gl_set_swap_interval(sdl2::video::SwapInterval::Immediate);
+    }
+    "immediate (no vsync wait)"
+}
+
 fn renderer_accelerated(canvas: &sdl2::render::Canvas<sdl2::video::Window>) -> bool {
     canvas.info().flags & sdl2::sys::SDL_RendererFlags::SDL_RENDERER_ACCELERATED as u32 != 0
 }
@@ -1423,6 +1468,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         return Ok(false);
     }
     let (sdl, video, mut canvas) = window_state.take().context("session window missing")?;
+    let presentation = configure_presentation(&video, &canvas, options.vsync);
+    tracing::info!(presentation, "session presentation sync");
     // Dropped with the session: the host removes its pads when it ends.
     let mut controllers = controllers::Controllers::new(&sdl);
     let mut graphics_name =
@@ -2232,7 +2279,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     }
                 ),
                 format!(
-                    "Local display         {} x {} px at {}",
+                    "Local display         {} x {} px at {}   |   {presentation}",
                     local_display.width,
                     local_display.height,
                     match local_display.refresh_mhz {
