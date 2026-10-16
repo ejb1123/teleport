@@ -83,6 +83,10 @@ fn setup_with(versions: &[&str], host_args: &[&str]) -> Setup {
         teleport()
             .args(["host", "--source", "test", "--encoder", "software"])
             .args(["--listen", &host_address, "--width", "640"])
+            // Peer-to-peer stays on loopback, where it has no usable
+            // candidate: signalling runs, then sessions use the relay.
+            // tests/p2p.rs covers hole punching between NATed networks.
+            .args(["--p2p-listen", "127.0.0.1:0"])
             .args(host_args)
             .arg("--identity-dir")
             .arg(temp.path().join("identity"))
@@ -557,6 +561,13 @@ fn auto_route_falls_back_to_the_relay_and_presence_follows_the_host() {
     );
     assert!(
         stdout.contains("direct path unavailable; trying the relay"),
+        "{stdout}"
+    );
+    // The host answered peer-to-peer signalling, with nothing usable.
+    assert!(
+        stdout.contains(
+            "peer-to-peer path unavailable error=\"peer-to-peer path unavailable: the host offered no usable peer-to-peer candidates\""
+        ),
         "{stdout}"
     );
     assert!(stdout.contains("connection path chosen: relay"), "{stdout}");

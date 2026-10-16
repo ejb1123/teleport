@@ -24,6 +24,8 @@ mod identity;
 mod keyboard_capture;
 mod launcher;
 mod media;
+mod natpmp;
+mod p2p;
 mod pairing;
 mod presence;
 mod profiles;
@@ -33,6 +35,7 @@ mod relay_enroll;
 mod security_key;
 mod ssh_agent;
 mod stats;
+mod stun;
 mod system_login;
 #[cfg(target_os = "linux")]
 mod system_pam;
