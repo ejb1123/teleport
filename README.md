@@ -187,6 +187,10 @@ nix run . -- client LINUX_IP:4443 --pairing-file pairing.json \
   --width 0 --fps 60 --bitrate 20000 --codec h265 --stats
 ```
 
+`--codec auto` (the default; launcher **Auto codec**) streams H.265 when the host
+encodes it in hardware and the client decodes it in hardware, and H.264 otherwise
+or with hosts from before automatic choice. An explicit `--codec h264|h265` always
+wins. Stats (F8) shows the codec and why it was chosen.
 `--width match --fps match --bitrate auto` negotiate as above. `--width 0` means native; a positive width requests scaling, with a supported
 ceiling of 7680 pixels wide, 8192 high and 33,554,432 total pixels. Actual encoder
 hardware may have lower limits. Host CLI defaults remain 1280 wide for older
@@ -357,7 +361,7 @@ to separate networking/decoding problems from portal/capture problems.
 - Initial local approval is required for Wayland. Saved permission is opt-in
   and compositor-dependent. No login-screen access or unattended-access guarantee.
 - HDR requires the experimental patched-KWin/Mac path; see [its limitations](docs/hdr.md).
-- Gamepads need a Linux host with `/dev/uinput` access and have no rumble;
+- Gamepads (with rumble) need a Linux host with `/dev/uinput` access;
   see [gamepads](docs/gamepad.md).
 - No file transfer, virtual display, IME, monitor hotplug or
   keychain-backed credentials yet. NAT traversal needs a relay for
@@ -379,7 +383,9 @@ wire protocol, not a claim of compliance with the latest IETF draft.
 
 The host publishes a `desktop` broadcast with metadata and a selected `h264` or
 `h265` track. Codec selection is an authenticated connection parameter, and the
-client requires matching metadata before subscribing. Each video group starts
+client requires matching metadata before subscribing. Hosts advertising
+`codec_selection` send the metadata (with their hardware codecs) before video and
+let the client's first input event, `select_codec`, override that parameter. Each video group starts
 with a keyframe and inline parameter sets (including VPS for HEVC). The receiver
 cancels an older group when a newer group arrives. Frames are Annex B access
 units; this application's media framing is not Hang/CMAF interoperable.

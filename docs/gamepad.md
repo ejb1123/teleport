@@ -16,6 +16,9 @@ session notice shows "Gamepad N connected: …" when a controller is attached.
   codes and ranges as the kernel `xpad` driver: sticks −32768..32767,
   triggers 0..255, d-pad as `ABS_HAT0X/Y`. SDL, Steam Input, Proton and evdev
   games treat it like a wired Xbox 360 pad.
+- Rumble: a game's vibration on the virtual pad plays on the client's
+  controller (`SDL_GameControllerRumble`), strong motor as SDL's low-frequency
+  one. Controllers without motors ignore it.
 - Controller input reaches the host only while a session window has focus.
   When the session loses focus, or Ctrl+Alt+K or a toolbar click releases
   input, every pad button is released and every axis centred. The pads stay
@@ -87,12 +90,27 @@ that desktop.
 - Older hosts reject unknown events, so the client sends none of these unless
   the host advertises `gamepads`. The `--source test` host advertises it and
   accepts the events as no-ops.
+- Rumble: the client declares `ClientFeatures { rumble: true }` (older hosts
+  ignore the field; older clients never declare it, and would reject the
+  update). Pads the host creates after that offer `EV_FF`/`FF_RUMBLE` with 16
+  effect slots, like `xpad`. A thread per pad polls the uinput fd, answers
+  `UI_FF_UPLOAD`/`UI_FF_ERASE` (`UI_BEGIN_*`/`UI_END_*`; a game blocks in
+  `EVIOCSFF` until then; non-rumble effects are refused) and tracks `EV_FF`
+  play/stop. Playing effects add up (saturating); the host sends
+  `Update::Rumble { pad, low, high, duration_ms }` on the updates track when
+  the motors change, when an effect is (re)played and when effects end.
+  `duration_ms` is the time left, at most 65535 ms (SDL's limit); effects
+  without an end are re-sent every 30 s. Zeros stop the motors, also when a
+  pad is removed. The `--source test` host answers each pad button press
+  with a 100 ms rumble so the update path can be tested.
 
 ## Limits
 
 - Linux hosts only. On macOS or Windows hosts the client never sends
   gamepad events, because only Linux hosts advertise `gamepads`.
-- No rumble/force feedback, LEDs, motion sensors, touchpad or paddles.
+- Rumble only (no trigger rumble, other force-feedback effects, LEDs,
+  motion sensors, touchpad or paddles). Effect delays (`replay.delay`) and
+  gain are ignored.
   Every controller appears as an Xbox 360 pad, so games show Xbox button
   prompts.
 - No per-controller mapping beyond SDL's own database. SDL's
@@ -112,7 +130,16 @@ that desktop.
   access. It creates a real pad, reads the events back from evdev, checks
   that release-all and destroy work, and checks through SDL that every
   forwarded button and axis comes back as the same SDL button and axis.
+- Rumble: `gamepad::tests::rumble_effects_add_up_end_and_stop` (effect
+  bookkeeping), `uinput_pad_rumble_reaches_the_client` (ignored, needs
+  `/dev/uinput`: a game's `EVIOCSFF` upload, `EV_FF` play and stop and
+  `EVIOCRMFF` on the evdev node reach the session as `Rumble`, and pads made
+  without rumble offer no force feedback) and
+  `sdl_rumble_on_the_virtual_pad_reaches_the_client` (ignored: SDL sees
+  rumble on the virtual pad and `SDL_GameControllerRumble` arrives with the
+  same strengths). `client::controllers::tests` covers finding the client
+  controller for a pad.
 - `tests/smoke.rs` (`--smoke-input`) sends the gamepad events end to end over
-  QUIC to a `--source test` host.
-- Not covered by tests: a physical controller on the client, or a game
-  reading the pad on a host.
+  QUIC to a `--source test` host and checks that its rumble comes back.
+- Not covered by tests: a physical controller on the client (its motors
+  actually turning), or a game reading the pad on a host.

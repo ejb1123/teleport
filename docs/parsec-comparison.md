@@ -412,9 +412,8 @@ What is on `main`/this branch, from README, docs and code:
   - The SDL canvas is created without `present_vsync`
     (`src/client.rs:765`, `src/multi_display.rs:156`); there is no VSync
     setting.
-- **Codecs:** H.264 or H.265, chosen explicitly (the launcher and client
-  default to H.264, `src/client.rs` `--codec`). There is no automatic HEVC
-  attempt or fallback. HDR10: HEVC Main10 on the experimental patched-KWin
+- **Codecs:** H.264 or H.265. (Since 2026-10-16, G5: `--codec auto`, the
+  default, picks H.265 when both ends have it in hardware.) HDR10: HEVC Main10 on the experimental patched-KWin
   path to a Mac Metal/EDR client (docs/hdr.md). No AV1, no 4:4:4.
 - **Rates:** host `--fps` 1..=120 (`src/host.rs:74`). The launcher offers
   30/60/120 FPS, 8/20/40 Mbps (CLI 0.5–100 Mbps), and native or scaled widths
@@ -440,10 +439,10 @@ What is on `main`/this branch, from README, docs and code:
   - Physical scancodes; Cmd→Super and Option→Alt (fixed). Keyboard capture
     with Ctrl+Alt+K. Mouse lock (relative) with Ctrl+Alt+M.
   - Disconnect with Ctrl+Alt+Q; hotkeys are fixed.
-  - **Mouse buttons left, middle, right only** (`src/client.rs:3191`):
-    back/forward are dropped. Precise wheel deltas are forwarded.
-  - Gamepads: SDL to uinput Xbox 360, up to 4. No rumble, motion, touchpad or
-    other pad types.
+  - Mouse buttons left, middle, right and (since 2026-10-16, G14)
+    back/forward. Precise wheel deltas are forwarded.
+  - Gamepads: SDL to uinput Xbox 360, up to 4, with rumble (since 2026-10-16,
+    G12). No motion, touchpad or other pad types.
   - Local cursor on X11 hosts only; on Wayland the cursor stays in the video.
 - **Audio:** desktop output only (an explicit `.monitor`). Opus stereo 128
   kbps with 10 ms frames, no in-band FEC (M8). The client queue is ≤100 ms,
@@ -478,7 +477,7 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | macOS client | Yes | Yes | Partial | Mac latency items M3/H10 unverified on hardware |
 | Linux client | Ubuntu 22.04, X11 | Any Nix Linux, X11 or Wayland | **Teleport ahead** | |
 | Android / iOS / web | Android experimental; no iOS; Chrome web | None | Missing | No iOS from Parsec is an opening |
-| H.264 / H.265 | Yes, HEVC tried by default with fallback | Yes, explicit choice, H.264 default | Partial | Needs auto-negotiation |
+| H.264 / H.265 | Yes, HEVC tried by default with fallback | Yes, auto: H.265 when both ends have hardware (2026-10-16) | Parity | G5 |
 | AV1 | No | No | Parity | Moonlight/Sunshine have it; an opening |
 | 4:4:4 | Warp, Windows host, NVIDIA/Intel | No | Missing | |
 | 10-bit SDR | Experimental | Main10 only for HDR | Partial | |
@@ -502,11 +501,11 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Keyboard capture | Immersive keyboard | Ctrl+Alt+K | Parity | |
 | Pointer confinement / relative | Immersive mouse, "Always Relative" | Ctrl+Alt+M relative lock | Parity | Auto-lock on hidden cursor missing |
 | Local cursor | Yes (inferred) | X11 only | Partial | Wayland hosts are the main target |
-| Extra mouse buttons | Yes (unverified) | No (L/M/R only) | Missing | S |
+| Extra mouse buttons | Yes (unverified) | Back/forward (2026-10-16) | Parity | G14 |
 | Configurable hotkeys / ignore hotkey | Yes | Fixed chords | Missing | S |
 | Cmd/Ctrl swap | Yes | Fixed Cmd→Super | Missing | S |
 | Gamepad (Xbox 360) | Yes (Windows host) | Yes (Linux host, 4 pads) | Parity | |
-| Rumble | Yes | No | **Missing** | |
+| Rumble | Yes | Yes (2026-10-16) | Parity | G12 |
 | DS4 / DualSense emulation, touchpad, motion, haptics | Yes (Windows host) | No | Missing | |
 | Pad remapping UI | Yes | SDL database only | Missing | Low |
 | Pen / tablet | Warp | No | Missing | Low for gamers |
@@ -672,6 +671,16 @@ VRR itself is WIP.**
 
 **G5. Automatic codec negotiation, HEVC by default. Effort S.**
 
+- **Status (2026-10-16): implemented** (review tracker R9). `--codec auto`
+  is the client and launcher default: H.265 when the host's encoder probe
+  (`Desktop.hardware_codecs`) and the client's decoder probe both find
+  hardware, otherwise H.264. The client sends `Event::SelectCodec` first to
+  hosts advertising `codec_selection`, which wait for it before starting
+  video, so there is no restart. Older hosts and clients keep H.264 unless
+  asked; HDR10 stays H.265; an explicit `--codec` wins. F8 and both logs
+  show the codec and why. Not done: a fallback when a probed hardware path
+  later fails mid-session (the existing decoder recovery applies), and AV1.
+
 - **Why:** Parsec tries H.265 by default and silently falls back (ADV, HW).
   Teleport defaults to H.264 and makes the user choose. HEVC is roughly half
   the bitrate at equal quality per Parsec's own claim (HW), which matters most
@@ -775,6 +784,12 @@ refresh. Effort M.**
 
 **G12. Rumble / force feedback. Effort S–M.**
 
+- **Status (2026-10-16): implemented** as below (docs/gamepad.md, review
+  tracker R4), gated on `ClientFeatures.rumble` instead of a `Desktop`
+  field: the client declares it, and only then do new pads offer
+  `FF_RUMBLE`. Verified with real uinput pads (`EVIOCSFF`/`EV_FF`, and SDL
+  rumbling the virtual pad); not with a physical controller.
+
 - **Why:** Parsec's Xbox 360 emulation includes vibration (GP). Teleport has
   none (docs/gamepad.md). Rumble is the most noticeable missing pad feature.
 - **Steps:**
@@ -803,9 +818,11 @@ Effort M–L.**
 
 **G14. Extra mouse buttons and minor input parity. Effort S.**
 
-- **Mouse buttons:** map SDL `X1`/`X2` to evdev `BTN_SIDE`/`BTN_EXTRA` (portal
-  `NotifyPointerButton`) and XTest buttons 8/9. `src/client.rs:3191` currently
-  returns `None` for them. Back/forward buttons are bound in many games.
+- **Mouse buttons (done 2026-10-16, review tracker R10):** SDL `X1`/`X2` go
+  on the wire as buttons 8/9 to hosts advertising
+  `Desktop.extra_mouse_buttons`, which inject evdev `BTN_SIDE`/`BTN_EXTRA`
+  (portal `NotifyPointerButton`) or XTest buttons 8/9. Verified end to end on
+  an Xvfb X11 host; the portal mapping is unit-tested only.
 - **Hotkeys:** configurable hotkeys and an "ignore hotkey" list (Discord
   push-to-talk). Parsec has both (HK). Teleport's chords are hard-coded in
   `src/keyboard_capture.rs` and the client.

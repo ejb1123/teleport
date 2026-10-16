@@ -170,6 +170,20 @@ pub struct Desktop {
     /// from it ([`negotiate`]); older hosts reject unknown events.
     #[serde(default)]
     pub display_negotiation: bool,
+    /// Host waits for `Event::SelectCodec` as the client's first input event
+    /// before it starts video, and encodes the codec chosen there. Older
+    /// hosts reject unknown events, so clients must check this first.
+    #[serde(default)]
+    pub codec_selection: bool,
+    /// Codecs the host encodes in hardware (its encoder probe), so a client
+    /// choosing automatically prefers H.265 only when it is cheap to encode.
+    /// Empty for older and software-only hosts.
+    #[serde(default)]
+    pub hardware_codecs: Vec<VideoCodec>,
+    /// Host injects the back and forward mouse buttons
+    /// ([`BUTTON_BACK`], [`BUTTON_FORWARD`]); older hosts reject them.
+    #[serde(default)]
+    pub extra_mouse_buttons: bool,
 }
 
 impl Desktop {
@@ -305,16 +319,37 @@ pub enum Update {
     Cursor {
         cursor: Option<CursorImage>,
     },
+    /// Force feedback a game started on virtual pad `pad`: play `low`
+    /// (strong, low-frequency motor) and `high` (weak, high-frequency) for
+    /// `duration_ms` unless a newer update replaces it; zeros stop it. Only
+    /// sent after the client declared `ClientFeatures::rumble` (older
+    /// clients reject unknown updates).
+    Rumble {
+        pad: u8,
+        low: u16,
+        high: u16,
+        duration_ms: u32,
+    },
 }
+
+/// Longest `Update::Rumble` (SDL's `SDL_GameControllerRumble` limit); hosts
+/// re-send effects that last longer.
+pub const MAX_RUMBLE_MS: u32 = 0xFFFF;
 
 impl Update {
     /// Rejects malformed host data before the client acts on it.
     pub fn validate(&self) -> Result<()> {
-        if let Self::Cursor {
-            cursor: Some(image),
-        } = self
-        {
-            image.validate()?;
+        match self {
+            Self::Cursor {
+                cursor: Some(image),
+            } => image.validate()?,
+            Self::Rumble {
+                pad, duration_ms, ..
+            } => ensure!(
+                *pad < MAX_GAMEPADS && *duration_ms <= MAX_RUMBLE_MS,
+                "invalid rumble"
+            ),
+            _ => (),
         }
         Ok(())
     }
@@ -336,6 +371,10 @@ pub const POINTER_TRACK: &str = "pointer";
 
 /// Largest per-event pointer delta; clients split larger movements.
 pub const MAX_RELATIVE_MOTION: u32 = 4096;
+
+/// Side mouse buttons in X11 numbering (SDL X1/X2, evdev BTN_SIDE/BTN_EXTRA).
+pub const BUTTON_BACK: u8 = 8;
+pub const BUTTON_FORWARD: u8 = 9;
 
 /// Most gamepads one session may attach (Xbox-style player slots).
 pub const MAX_GAMEPADS: u8 = 4;
@@ -376,6 +415,9 @@ pub enum Event {
         x: f64,
         y: f64,
     },
+    /// X11 numbering: 1 left, 2 middle, 3 right; [`BUTTON_BACK`] and
+    /// [`BUTTON_FORWARD`] only to hosts advertising
+    /// `Desktop::extra_mouse_buttons` (older hosts reject them).
     Button {
         button: u8,
         down: bool,
@@ -461,6 +503,17 @@ pub enum Event {
         /// `Desktop::local_cursor`.
         #[serde(default)]
         local_cursor: bool,
+        /// The client plays `Update::Rumble`, so the host gives the pads it
+        /// creates from now on force feedback (`FF_RUMBLE`). Older hosts
+        /// ignore the field.
+        #[serde(default)]
+        rumble: bool,
+    },
+    /// The session's video codec. Sent as the very first input event to hosts
+    /// advertising `Desktop::codec_selection`, which wait for it before
+    /// starting video; it overrides the connection's `codec` parameter.
+    SelectCodec {
+        codec: VideoCodec,
     },
     /// The client's display and stream choices; the host picks the stream
     /// size, rate and bitrate from them ([`negotiate`]) and answers with
@@ -572,7 +625,10 @@ impl Event {
                     && (0.0..=1.0).contains(y),
                 "invalid pointer coordinates"
             ),
-            Self::Button { button, .. } => ensure!((1..=3).contains(button), "unsupported button"),
+            Self::Button { button, .. } => ensure!(
+                matches!(*button, 1..=3 | BUTTON_BACK | BUTTON_FORWARD),
+                "unsupported button"
+            ),
             Self::Key { code, .. } => ensure!((1..=127).contains(code), "unsupported key"),
             Self::RelativeMotion { dx, dy } => ensure!(
                 dx.unsigned_abs() <= MAX_RELATIVE_MOTION
@@ -977,6 +1033,7 @@ mod tests {
                 keyframe_requests: true,
                 pointer_datagrams: true,
                 local_cursor: true,
+                rumble: true,
             },
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
@@ -1127,6 +1184,7 @@ mod tests {
                 keyframe_requests: true,
                 pointer_datagrams: false,
                 local_cursor: false,
+                rumble: false,
             }
         ));
         let primary: Event = serde_json::from_str(r#"{"type":"request_keyframe"}"#).unwrap();
@@ -1146,10 +1204,83 @@ mod tests {
         assert!(!desktop.configurable_video && !desktop.telemetry);
         assert!(!desktop.keyframe_requests);
         assert!(!desktop.local_cursor);
+        assert!(!desktop.codec_selection && desktop.hardware_codecs.is_empty());
         assert_eq!(desktop.video_start_group, 0);
         let mut invalid = old;
         invalid["codec"] = serde_json::json!("surprise");
         assert!(serde_json::from_value::<Desktop>(invalid).is_err());
+    }
+    #[test]
+    fn codec_selection_roundtrips_and_is_never_dropped() {
+        let event: Event =
+            serde_json::from_str(r#"{"type":"select_codec","codec":"h265"}"#).unwrap();
+        assert!(matches!(
+            event,
+            Event::SelectCodec {
+                codec: VideoCodec::H265
+            }
+        ));
+        assert!(event.validate().is_ok() && !event.is_lossy());
+        assert!(serde_json::from_str::<Event>(r#"{"type":"select_codec","codec":"av1"}"#).is_err());
+        let desktop: Desktop = serde_json::from_value(serde_json::json!({ "version": 2,
+            "width": 1, "height": 1, "fps": 1, "source": "test", "monitors": [],
+            "active_monitor": 0, "audio": false, "clipboard": false,
+            "codec_selection": true, "hardware_codecs": ["h264", "h265"] }))
+        .unwrap();
+        assert!(desktop.codec_selection);
+        assert_eq!(
+            desktop.hardware_codecs,
+            [VideoCodec::H264, VideoCodec::H265]
+        );
+    }
+    #[test]
+    fn rumble_updates_are_bounded_and_declared_by_the_client() {
+        let rumble = |pad, duration_ms| Update::Rumble {
+            pad,
+            low: u16::MAX,
+            high: 0,
+            duration_ms,
+        };
+        assert!(rumble(MAX_GAMEPADS - 1, MAX_RUMBLE_MS).validate().is_ok());
+        assert!(rumble(MAX_GAMEPADS, 100).validate().is_err());
+        assert!(rumble(0, MAX_RUMBLE_MS + 1).validate().is_err());
+        let json = serde_json::to_string(&rumble(1, 250)).unwrap();
+        assert!(json.contains(r#""type":"rumble""#), "{json}");
+        assert!(matches!(
+            serde_json::from_str::<Update>(&json).unwrap(),
+            Update::Rumble {
+                pad: 1,
+                duration_ms: 250,
+                ..
+            }
+        ));
+        // Clients from before rumble never declare it; hosts ignore the
+        // field if they predate it.
+        let features: Event =
+            serde_json::from_str(r#"{"type":"client_features","keyframe_requests":true}"#).unwrap();
+        assert!(matches!(
+            features,
+            Event::ClientFeatures { rumble: false, .. }
+        ));
+    }
+    #[test]
+    fn side_mouse_buttons_are_valid_and_negotiated() {
+        let button = |button| Event::Button { button, down: true }.validate();
+        for valid in [1, 2, 3, BUTTON_BACK, BUTTON_FORWARD] {
+            assert!(button(valid).is_ok(), "{valid}");
+        }
+        // 4-7 are wheel steps in X11 numbering; they travel as Scroll.
+        for invalid in [0, 4, 5, 6, 7, 10, 255] {
+            assert!(button(invalid).is_err(), "{invalid}");
+        }
+        let old: Desktop = serde_json::from_value(serde_json::json!({ "version": 2, "width": 1,
+            "height": 1, "fps": 1, "source": "test", "monitors": [], "active_monitor": 0,
+            "audio": false, "clipboard": false }))
+        .unwrap();
+        assert!(
+            !old.extra_mouse_buttons,
+            "older hosts reject buttons 8 and 9"
+        );
     }
     fn cursor(width: u16, height: u16) -> CursorImage {
         CursorImage {

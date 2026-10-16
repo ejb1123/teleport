@@ -129,15 +129,18 @@ pub struct Options {
     #[arg(long, hide = true, requires = "headless_frames", value_parser = stream_settings::parse_display)]
     pub smoke_display: Vec<stream_settings::LocalDisplay>,
     /// Headless runs: treat the host as one from before display negotiation
-    /// and 240 FPS (ConfigureVideo, at most 120 FPS).
+    /// and 240 FPS (ConfigureVideo, at most 120 FPS) and codec selection
+    /// (no SelectCodec: the host keeps the requested codec, as for old clients).
     #[arg(long, hide = true, requires = "headless_frames")]
     pub smoke_legacy_host: bool,
     /// Show the streaming performance overlay immediately (F8 toggles it).
     #[arg(long)]
     pub stats: bool,
-    /// Session video codec. H.265 requires support on both host and client.
-    #[arg(long, value_enum, default_value = "h264")]
-    pub codec: protocol::VideoCodec,
+    /// Session video codec. `auto` uses H.265 when the host encodes and this
+    /// client decodes it in hardware, otherwise H.264 (always H.264 with
+    /// hosts that cannot negotiate). An explicit codec is always used.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub codec: stream_settings::CodecChoice,
     /// Explicit experimental HDR10 requires patched capture and a macOS HDR display.
     #[arg(long, value_enum, default_value = "sdr")]
     pub dynamic_range: protocol::DynamicRange,
@@ -235,7 +238,12 @@ struct Link {
     input: moq_net::track::Producer,
     pointer: moq_net::track::Producer,
     video: moq_net::track::Subscriber,
+    /// `desktop.codec` is the session codec (after any `SelectCodec`).
     desktop: Desktop,
+    /// Why `desktop.codec` was chosen, for logs and Stats.
+    codec_reason: String,
+    /// The next input sequence number (`SelectCodec` may have used 0).
+    input_sequence: u64,
     updates: moq_net::track::Subscriber,
     audio: Option<moq_net::track::Subscriber>,
 }
@@ -325,8 +333,10 @@ async fn connect_via(
     );
     let mut url: url::Url =
         format!("moqt://{}/teleport/{}", options.address, pairing.token).parse()?;
-    url.query_pairs_mut()
-        .append_pair("codec", options.codec.track());
+    url.query_pairs_mut().append_pair(
+        "codec",
+        options.codec.requested(options.dynamic_range).track(),
+    );
     if options.dynamic_range == protocol::DynamicRange::Hdr10 {
         url.query_pairs_mut().append_pair("range", "hdr10");
     }
@@ -489,10 +499,46 @@ async fn connect_via(
         desktop.dynamic_range == options.dynamic_range,
         "host did not negotiate requested dynamic range; HDR is never inferred from an SDR stream"
     );
+    let mut desktop = desktop;
+    if options.smoke_legacy_host {
+        // Behave like a client from before codec selection.
+        desktop.codec_selection = false;
+    }
+    let decision = stream_settings::choose_codec(
+        options.codec,
+        options.dynamic_range,
+        &desktop,
+        client_hevc_decoder(options).as_deref(),
+    );
+    let mut input = input;
+    let mut input_sequence = 0;
+    if desktop.codec_selection {
+        // First on the input track: the host waits for it to start video.
+        let mut group = input.append_group()?;
+        group.write_frame(
+            moq_net::Timestamp::now(),
+            serde_json::to_vec(&Input {
+                sequence: 0,
+                event: Event::SelectCodec {
+                    codec: decision.codec,
+                },
+                motion: None,
+            })?,
+        )?;
+        group.finish()?;
+        input_sequence = 1;
+        desktop.codec = decision.codec;
+    }
     ensure!(
-        desktop.codec == options.codec,
+        desktop.codec == decision.codec,
         "host did not negotiate {}; update the host or select H.264",
-        options.codec.label()
+        decision.codec.label()
+    );
+    tracing::info!(
+        codec = decision.codec.label(),
+        reason = %decision.reason,
+        host_hardware = ?desktop.hardware_codecs,
+        "session video codec"
     );
     let video = remote
         .track(desktop.codec.track())?
@@ -530,6 +576,8 @@ async fn connect_via(
         pointer,
         video,
         desktop,
+        codec_reason: decision.reason,
+        input_sequence,
         updates,
         audio,
     })
@@ -540,8 +588,9 @@ async fn send_input(
     mut pointer: moq_net::track::Producer,
     pointer_datagrams: bool,
     mut events: mpsc::Receiver<Event>,
+    first_sequence: u64,
 ) -> Result<()> {
-    let mut sequence = 0u64;
+    let mut sequence = first_sequence;
     let mut group = track.append_group()?;
     let mut heartbeat = tokio::time::interval(Duration::from_millis(500));
     let mut motion_id = 0u64;
@@ -612,12 +661,27 @@ impl Drop for Network {
     }
 }
 
+/// This client's hardware H.265 decoder for `--codec auto` (SDR); probed
+/// once per process, so call it before connecting.
+fn client_hevc_decoder(options: &Options) -> Option<String> {
+    if options.codec != stream_settings::CodecChoice::Auto
+        || options.software_decoder
+        || options.dynamic_range != protocol::DynamicRange::Sdr
+    {
+        return None;
+    }
+    media::hardware_decoder(protocol::VideoCodec::H265).unwrap_or_else(|error| {
+        tracing::info!(%error, "no H.265 decoder for automatic codec choice");
+        None
+    })
+}
+
 pub fn run(options: Options, runtime: &Runtime) -> Result<()> {
     // Hardware probing can take several seconds. Do it before opening the remote
     // session, whose safety watchdog requires an input heartbeat every 3 seconds.
     ensure!(
         options.dynamic_range != protocol::DynamicRange::Hdr10
-            || options.codec == protocol::VideoCodec::H265,
+            || options.codec != stream_settings::CodecChoice::H264,
         "HDR10 requires --codec h265"
     );
     ensure!(
@@ -627,13 +691,16 @@ pub fn run(options: Options, runtime: &Runtime) -> Result<()> {
         "HDR presentation currently requires macOS; select an SDR stream on Linux"
     );
     options.effective_route()?;
+    // `auto` may fall back to the requested codec (H.264 for SDR), so that
+    // one must decode; the H.265 probe only informs the choice.
     media::prepare_decoder(
         options.software_decoder,
         media::VideoFormat {
-            codec: options.codec,
+            codec: options.codec.requested(options.dynamic_range),
             dynamic_range: options.dynamic_range,
         },
     )?;
+    client_hevc_decoder(&options);
     let mut last_error = None;
     loop {
         let link = if options.headless_frames.is_some() {
@@ -1075,6 +1142,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     stream_stats
         .stream_fps
         .store(link.desktop.fps.into(), Ordering::Relaxed);
+    let session_codec = link.desktop.codec;
+    let codec_reason = link.codec_reason.clone();
     let format = media::VideoFormat {
         codec: link.desktop.codec,
         dynamic_range: link.desktop.dynamic_range,
@@ -1175,7 +1244,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let result = tokio::select! {
             result = crate::ssh_agent::closed(&mut ssh_agent) => result,
             result = media::receive_video_with_stats(link.video, source, feedback, network_stats, keyframe_requests) => result,
-            result = send_input(link.input, link.pointer, pointer_datagrams, receiver) => result,
+            result = send_input(link.input, link.pointer, pointer_datagrams, receiver, link.input_sequence) => result,
             result = receive_updates(link.updates, updates_sender) => result,
             result = async {
                 if let (Some(track), Some(source)) = (link.audio, audio_source)
@@ -1204,6 +1273,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 keyframe_requests: true,
                 pointer_datagrams,
                 local_cursor,
+                // Played on the local controller (headless runs log it).
+                rumble: desktop.gamepads,
             },
         )?;
     }
@@ -1284,7 +1355,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         );
                         protocol::validate_video_size(next.width, next.height)?;
                         ensure!(
-                            next.codec == options.codec
+                            next.codec == session_codec
                                 && next.dynamic_range == options.dynamic_range,
                             "host changed codec during an active session; reconnect to change codec"
                         );
@@ -1317,6 +1388,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         tracing::info!("remote cursor {}x{}", image.width, image.height)
                     }
                     Update::Cursor { cursor: None } => tracing::info!("remote cursor hidden"),
+                    Update::Rumble {
+                        pad,
+                        low,
+                        high,
+                        duration_ms,
+                    } => tracing::info!(pad, low, high, duration_ms, "host rumble"),
                     _ => (),
                 }
             }
@@ -1426,24 +1503,36 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     } else {
                         Vec::new()
                     };
-                    for event in [
-                        Event::Motion { x: 0.5, y: 0.5 },
-                        Event::Key {
-                            code: 30,
-                            down: true,
-                        },
-                        Event::Key {
-                            code: 30,
-                            down: false,
-                        },
-                        Event::Key {
-                            code: 29,
-                            down: true,
-                        },
-                    ]
-                    .into_iter()
-                    .chain(relative)
-                    .chain(gamepad)
+                    // Back and forward, pressed and released at the centre.
+                    let side_buttons = if desktop.extra_mouse_buttons {
+                        [protocol::BUTTON_BACK, protocol::BUTTON_FORWARD]
+                            .into_iter()
+                            .flat_map(|button| {
+                                [true, false].map(|down| Event::Button { button, down })
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    for event in [Event::Motion { x: 0.5, y: 0.5 }]
+                        .into_iter()
+                        .chain(side_buttons)
+                        .chain([
+                            Event::Key {
+                                code: 30,
+                                down: true,
+                            },
+                            Event::Key {
+                                code: 30,
+                                down: false,
+                            },
+                            Event::Key {
+                                code: 29,
+                                down: true,
+                            },
+                        ])
+                        .chain(relative)
+                        .chain(gamepad)
                     {
                         runtime.block_on(events.send(event))?;
                     }
@@ -1541,6 +1630,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             overwritten_frames = snapshot.overwritten_frames,
             unmatched_frames = snapshot.unmatched_frames,
             codec = desktop.codec.label(),
+            codec_reason = %codec_reason,
             dynamic_range = desktop.dynamic_range.label(),
             decoder = %stream_stats.decoder.lock().unwrap(),
             "SMOKE PASS: authenticated MoQ video decoded"
@@ -1619,7 +1709,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut host_encode_us = 0;
     let mut host_bitrate = desktop.bitrate;
     let mut host_encoder = "Waiting / unavailable".to_owned();
-    let mut displays = multi_display::Displays::new(remote, options, events.clone());
+    let mut displays = multi_display::Displays::new(remote, options, &desktop, events.clone());
     let mut keyboard_capture = crate::keyboard_capture::Capture::default();
     // Pointer lock for games; the guard releases it on every exit path.
     let mut pointer_lock = PointerLock::default();
@@ -1752,7 +1842,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     );
                     protocol::validate_video_size(next.width, next.height)?;
                     ensure!(
-                        next.codec == options.codec && next.dynamic_range == options.dynamic_range,
+                        next.codec == session_codec && next.dynamic_range == options.dynamic_range,
                         "host changed codec during an active session; reconnect to change codec"
                     );
                     desktop = next;
@@ -1794,6 +1884,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     notice = text.chars().take(160).collect();
                 }
                 Update::Cursor { cursor } => remote_cursor.set_shape(cursor.as_ref()),
+                Update::Rumble {
+                    pad,
+                    low,
+                    high,
+                    duration_ms,
+                } => controllers.rumble(pad, low, high, duration_ms),
                 _ => (),
             }
         }
@@ -2058,11 +2154,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 }
                 SdlEvent::MouseButtonDown { mouse_btn, .. } if pointer_lock.active() => {
                     flush_relative(&events, &mut relative)?;
-                    button(mouse_btn).map(|button| Event::Button { button, down: true })
+                    button(mouse_btn, desktop.extra_mouse_buttons)
+                        .map(|button| Event::Button { button, down: true })
                 }
                 SdlEvent::MouseButtonUp { mouse_btn, .. } if pointer_lock.active() => {
                     flush_relative(&events, &mut relative)?;
-                    button(mouse_btn).map(|button| Event::Button {
+                    button(mouse_btn, desktop.extra_mouse_buttons).map(|button| Event::Button {
                         button,
                         down: false,
                     })
@@ -2079,7 +2176,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     motion = None;
                     if let Some((x, y)) = chrome.pointer(x, y, canvas.window().size(), size) {
                         send(&events, Event::Motion { x, y })?;
-                        button(mouse_btn).map(|button| Event::Button { button, down: true })
+                        button(mouse_btn, desktop.extra_mouse_buttons)
+                            .map(|button| Event::Button { button, down: true })
                     } else {
                         None
                     }
@@ -2091,7 +2189,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     if let Some((x, y)) = chrome.pointer(x, y, canvas.window().size(), size) {
                         send(&events, Event::Motion { x, y })?;
                     }
-                    button(mouse_btn).map(|button| Event::Button {
+                    button(mouse_btn, desktop.extra_mouse_buttons).map(|button| Event::Button {
                         button,
                         down: false,
                     })
@@ -2344,6 +2442,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     size.0,
                     size.1,
                     desktop.dynamic_range.label(),
+                    desktop.codec.label()
+                ),
+                format!(
+                    "Codec                 {}   |   {codec_reason}",
                     desktop.codec.label()
                 ),
                 format!("Presented             {fps:.1} fps"),
@@ -3419,11 +3521,15 @@ fn send(events: &mpsc::Sender<Event>, event: Event) -> Result<()> {
         )),
     }
 }
-fn button(button: MouseButton) -> Option<u8> {
+/// Wire number of a mouse button (X11 numbering). Back and forward only go
+/// to hosts advertising `Desktop::extra_mouse_buttons`.
+fn button(button: MouseButton, extra_buttons: bool) -> Option<u8> {
     match button {
         MouseButton::Left => Some(1),
         MouseButton::Middle => Some(2),
         MouseButton::Right => Some(3),
+        MouseButton::X1 if extra_buttons => Some(protocol::BUTTON_BACK),
+        MouseButton::X2 if extra_buttons => Some(protocol::BUTTON_FORWARD),
         _ => None,
     }
 }
@@ -3431,6 +3537,26 @@ fn button(button: MouseButton) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn side_mouse_buttons_only_go_to_hosts_that_take_them() {
+        assert_eq!(button(MouseButton::X1, true), Some(protocol::BUTTON_BACK));
+        assert_eq!(
+            button(MouseButton::X2, true),
+            Some(protocol::BUTTON_FORWARD)
+        );
+        assert_eq!(button(MouseButton::X1, false), None);
+        assert_eq!(button(MouseButton::X2, false), None);
+        assert_eq!(button(MouseButton::Right, false), Some(3));
+        assert_eq!(button(MouseButton::Unknown, true), None);
+        for extra in [false, true] {
+            for mouse in [MouseButton::Left, MouseButton::X1, MouseButton::X2] {
+                if let Some(button) = button(mouse, extra) {
+                    Event::Button { button, down: true }.validate().unwrap();
+                }
+            }
+        }
+    }
 
     #[test]
     fn large_pointer_lock_movement_is_split_without_loss() {
@@ -3656,7 +3782,7 @@ mod tests {
     }
 
     #[test]
-    fn codec_cli_defaults_to_h264_and_accepts_explicit_h265() {
+    fn codec_cli_defaults_to_auto_and_accepts_explicit_codecs() {
         use clap::Parser;
         #[derive(Parser)]
         struct Arguments {
@@ -3665,7 +3791,7 @@ mod tests {
         }
         let base = ["test", "localhost:4443", "--pairing-file", "unused.json"];
         let parsed = Arguments::try_parse_from(base).unwrap();
-        assert_eq!(parsed.options.codec, protocol::VideoCodec::H264);
+        assert_eq!(parsed.options.codec, stream_settings::CodecChoice::Auto);
         assert!(!parsed.options.forward_ssh_agent);
         assert!(
             Arguments::try_parse_from(
@@ -3676,7 +3802,7 @@ mod tests {
         );
         let parsed =
             Arguments::try_parse_from(base.into_iter().chain(["--codec", "h265"])).unwrap();
-        assert_eq!(parsed.options.codec, protocol::VideoCodec::H265);
+        assert_eq!(parsed.options.codec, stream_settings::CodecChoice::H265);
         assert!(Arguments::try_parse_from(base.into_iter().chain(["--codec", "av1"])).is_err());
     }
 

@@ -436,11 +436,7 @@ impl Capture {
     async fn button(&self, button: u8, down: bool) -> Result<()> {
         match &self.backend {
             Backend::Portal { proxy, session, .. } => {
-                let code = match button {
-                    1 => 272,
-                    2 => 274,
-                    _ => 273,
-                };
+                let code = evdev_button(button).context("unsupported button")?;
                 proxy
                     .notify_pointer_button(session, code, state(down))
                     .await?;
@@ -622,6 +618,7 @@ impl Capture {
             | Event::ClipboardRequest
             | Event::RequestKeyframe { .. }
             | Event::ClientFeatures { .. }
+            | Event::SelectCodec { .. }
             | Event::ClientDisplay(_) => (),
         }
         Ok(())
@@ -647,6 +644,12 @@ impl Capture {
     pub async fn end_session(&mut self) {
         self.release_all().await;
         self.gamepads.destroy_all();
+    }
+
+    /// The client plays rumble: pads created from now on in this session
+    /// offer force feedback, reported to `sender`.
+    pub fn enable_rumble(&mut self, sender: crate::gamepad::RumbleSender) {
+        self.gamepads.enable_rumble(sender);
     }
 
     /// Whether `Gamepad*` events can be backed by virtual pads.
@@ -717,6 +720,19 @@ fn state(down: bool) -> KeyState {
     } else {
         KeyState::Released
     }
+}
+
+/// Wire button (X11 numbering) → the evdev code the portal's
+/// `NotifyPointerButton` takes (`linux/input-event-codes.h`).
+fn evdev_button(button: u8) -> Option<i32> {
+    Some(match button {
+        1 => 0x110,                               // BTN_LEFT
+        2 => 0x112,                               // BTN_MIDDLE
+        3 => 0x111,                               // BTN_RIGHT
+        crate::protocol::BUTTON_BACK => 0x113,    // BTN_SIDE
+        crate::protocol::BUTTON_FORWARD => 0x114, // BTN_EXTRA
+        _ => return None,
+    })
 }
 
 /// Refresh rate of the first active output of a RandR monitor, in
@@ -916,6 +932,16 @@ pub fn portal_session_lost(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mouse_buttons_map_to_evdev_codes() {
+        // Unchanged for left, middle and right (272, 274, 273 before).
+        assert_eq!(evdev_button(1), Some(272));
+        assert_eq!(evdev_button(2), Some(274));
+        assert_eq!(evdev_button(3), Some(273));
+        assert_eq!(evdev_button(crate::protocol::BUTTON_BACK), Some(275));
+        assert_eq!(evdev_button(crate::protocol::BUTTON_FORWARD), Some(276));
+        assert_eq!(evdev_button(4), None);
+    }
     #[test]
     fn recognises_kde_lost_session_errors_only() {
         for text in [

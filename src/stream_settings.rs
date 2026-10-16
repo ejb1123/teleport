@@ -57,6 +57,73 @@ pub fn parse_bitrate(value: &str) -> Result<Setting, String> {
     )
 }
 
+/// The client's `--codec`: `auto` picks per host (see [`choose_codec`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum CodecChoice {
+    #[default]
+    Auto,
+    H264,
+    H265,
+}
+
+impl CodecChoice {
+    /// The codec named in the connection request. `auto` asks for H.264 so
+    /// hosts without `Desktop::codec_selection` keep streaming what they
+    /// always did; HDR10 is H.265 only.
+    pub fn requested(self, range: protocol::DynamicRange) -> protocol::VideoCodec {
+        match self {
+            Self::H265 => protocol::VideoCodec::H265,
+            Self::Auto if range == protocol::DynamicRange::Hdr10 => protocol::VideoCodec::H265,
+            Self::Auto | Self::H264 => protocol::VideoCodec::H264,
+        }
+    }
+}
+
+/// The session codec and why, for logs and Stats (F8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodecDecision {
+    pub codec: protocol::VideoCodec,
+    pub reason: String,
+}
+
+/// Picks the session codec once the host's `Desktop` is known.
+/// `client_hevc` names this client's hardware H.265 decoder, if any.
+/// `auto` prefers H.265 only when both ends do it in hardware: it needs
+/// roughly half H.264's bitrate for the same quality, but a software encode
+/// or decode costs more latency than the bitrate saves.
+pub fn choose_codec(
+    choice: CodecChoice,
+    range: protocol::DynamicRange,
+    desktop: &Desktop,
+    client_hevc: Option<&str>,
+) -> CodecDecision {
+    use protocol::VideoCodec::{H264, H265};
+    let decision = |codec, reason: &str| CodecDecision {
+        codec,
+        reason: reason.into(),
+    };
+    let requested = choice.requested(range);
+    if choice != CodecChoice::Auto {
+        return decision(requested, "chosen with --codec");
+    }
+    if range == protocol::DynamicRange::Hdr10 {
+        return decision(H265, "auto: HDR10 needs H.265");
+    }
+    if !desktop.codec_selection {
+        return decision(requested, "auto: older host keeps H.264");
+    }
+    if !desktop.hardware_codecs.contains(&H265) {
+        return decision(H264, "auto: no hardware H.265 encoder on host");
+    }
+    match client_hevc {
+        Some(decoder) => CodecDecision {
+            codec: H265,
+            reason: format!("auto: hardware on both ends ({decoder} decoder)"),
+        },
+        None => decision(H264, "auto: no hardware H.265 decoder here"),
+    }
+}
+
 /// What the client shows video on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct LocalDisplay {
@@ -429,5 +496,34 @@ mod tests {
         fixed.sent(window);
         assert_eq!(fixed.poll(&host, QHD_180, at(0)), None);
         assert_eq!(fixed.poll(&host, QHD_180, at(5000)), None);
+    }
+
+    #[test]
+    fn auto_codec_prefers_h265_only_with_hardware_on_both_ends() {
+        use protocol::{DynamicRange::*, VideoCodec::*};
+        let old = desktop(true);
+        let mut new = desktop(true);
+        new.codec_selection = true;
+        let mut hevc_host = new.clone();
+        hevc_host.hardware_codecs = vec![H264, H265];
+        let pick = |choice, range, desktop: &Desktop, decoder| {
+            choose_codec(choice, range, desktop, decoder).codec
+        };
+        // Older hosts keep H.264 unless asked; the request says H.264 too.
+        assert_eq!(CodecChoice::Auto.requested(Sdr), H264);
+        assert_eq!(pick(CodecChoice::Auto, Sdr, &old, Some("cuda")), H264);
+        // Both ends in hardware: H.265, and the reason names the decoder.
+        let both = choose_codec(CodecChoice::Auto, Sdr, &hevc_host, Some("vaapi"));
+        assert_eq!(both.codec, H265);
+        assert!(both.reason.contains("vaapi"), "{}", both.reason);
+        // Either end in software: H.264.
+        assert_eq!(pick(CodecChoice::Auto, Sdr, &new, Some("cuda")), H264);
+        assert_eq!(pick(CodecChoice::Auto, Sdr, &hevc_host, None), H264);
+        // An explicit choice always wins, in both directions.
+        assert_eq!(pick(CodecChoice::H264, Sdr, &hevc_host, Some("cuda")), H264);
+        assert_eq!(pick(CodecChoice::H265, Sdr, &old, None), H265);
+        // HDR10 is H.265 only, whatever the hardware.
+        assert_eq!(CodecChoice::Auto.requested(Hdr10), H265);
+        assert_eq!(pick(CodecChoice::Auto, Hdr10, &old, None), H265);
     }
 }

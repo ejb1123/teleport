@@ -262,6 +262,12 @@ fn test_host_advertises_and_accepts_gamepad_events() {
         "gamepad smoke client failed: {stdout} {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // The client declared rumble; the test host answers the press with one
+    // over the updates track (real pads: gamepad::tests::*rumble*).
+    assert!(
+        stdout.contains("host rumble pad=0"),
+        "no rumble update: {stdout}"
+    );
     assert!(host.0.try_wait().unwrap().is_none(), "host exited");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -283,6 +289,105 @@ fn test_host_advertises_and_accepts_gamepad_events() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// `--codec auto` (the default) against a host advertising hardware H.264
+/// and H.265: H.265 only with a hardware decoder here, H.264 otherwise, and
+/// clients that do not select a codec (as before this feature) still get the
+/// codec they asked for in the connection request.
+#[test]
+#[ignore = "requires local UDP sockets and GStreamer runtime plugins"]
+fn automatic_codec_choice_and_clients_without_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let pairing = temp.path().join("pairing.json");
+    let log = temp.path().join("host.log");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let mut host = Process(
+        teleport()
+            .args([
+                "host",
+                "--source",
+                "test",
+                "--encoder",
+                "software",
+                "--smoke-hardware-codecs",
+                "h264,h265",
+                "--listen",
+                &address,
+                "--width",
+                "640",
+                "--pairing-file",
+            ])
+            .arg(&pairing)
+            .stdout(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::read(&pairing)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_none()
+    {
+        assert!(host.0.try_wait().unwrap().is_none(), "test host exited");
+        assert!(Instant::now() < deadline, "test host did not become ready");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let client = |extra: &[&str]| {
+        let output = teleport()
+            .args(["client", &address, "--pairing-file"])
+            .arg(&pairing)
+            .args(["--headless-frames", "15"])
+            .args(extra)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success() && stdout.contains("SMOKE PASS"),
+            "{extra:?}: {stdout} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    };
+    // No hardware decoder (forced software): H.264, and the reason says why.
+    let software = client(&["--software-decoder"]);
+    assert!(
+        software.contains("codec=\"H.264\"") && software.contains("no hardware H.265 decoder here"),
+        "{software}"
+    );
+    // A client without codec selection: the host waits for its first event,
+    // sees something else and streams the requested H.264.
+    let legacy = client(&["--software-decoder", "--smoke-legacy-host"]);
+    assert!(
+        legacy.contains("codec=\"H.264\"") && legacy.contains("older host keeps H.264"),
+        "{legacy}"
+    );
+    // This machine's own decoders decide; both outcomes must say why.
+    let auto = client(&[]);
+    let hevc = auto.contains("codec=\"H.265\"");
+    assert!(
+        if hevc {
+            auto.contains("hardware on both ends")
+        } else {
+            auto.contains("codec=\"H.264\"") && auto.contains("no hardware H.265 decoder here")
+        },
+        "{auto}"
+    );
+    eprintln!("automatic choice here: H.265 = {hevc}");
+    // An explicit codec still wins over the host's hardware.
+    let explicit = client(&["--software-decoder", "--codec", "h265"]);
+    assert!(
+        explicit.contains("codec=\"H.265\"") && explicit.contains("chosen with --codec"),
+        "{explicit}"
+    );
+    drop(host);
+    let log = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        log.contains("chosen_by_client=false") && log.contains("chosen_by_client=true"),
+        "{log}"
+    );
 }
 
 #[test]
@@ -480,7 +585,11 @@ fn native_moq_video() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("SMOKE PASS"));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("SMOKE PASS"));
+    // The default is `--codec auto` against this machine's real encoder
+    // probe: whichever codec it picks, it says why.
+    assert!(stdout.contains("codec_reason=auto: "), "{stdout}");
     // Same authenticated host, explicitly selected HEVC and automatic hardware
     // decoding. Codec choice must not change or rotate trust.
     let output = teleport()
@@ -936,7 +1045,12 @@ fn x11_capture_input_and_native_window() {
             0,
             WindowClass::INPUT_OUTPUT,
             0,
-            &CreateWindowAux::new().event_mask(EventMask::KEY_PRESS | EventMask::KEY_RELEASE),
+            &CreateWindowAux::new().event_mask(
+                EventMask::KEY_PRESS
+                    | EventMask::KEY_RELEASE
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE,
+            ),
         )
         .unwrap()
         .check()
@@ -1011,12 +1125,15 @@ fn x11_capture_input_and_native_window() {
         "no local cursor shape received"
     );
     let mut transitions = Vec::new();
+    let mut buttons = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         while let Some(event) = connection.poll_for_event().unwrap() {
             match event {
                 x11rb::protocol::Event::KeyPress(e) => transitions.push((e.detail, true)),
                 x11rb::protocol::Event::KeyRelease(e) => transitions.push((e.detail, false)),
+                x11rb::protocol::Event::ButtonPress(e) => buttons.push((e.detail, true)),
+                x11rb::protocol::Event::ButtonRelease(e) => buttons.push((e.detail, false)),
                 _ => (),
             }
         }
@@ -1032,6 +1149,12 @@ fn x11_capture_input_and_native_window() {
     assert!(
         transitions.contains(&(38, true)) && transitions.contains(&(38, false)),
         "A press/release missing: {transitions:?}"
+    );
+    // Back and forward (SDL X1/X2) arrive as X11 buttons 8 and 9.
+    assert_eq!(
+        buttons,
+        [(8, true), (8, false), (9, true), (9, false)],
+        "side buttons"
     );
     assert!(
         connection
