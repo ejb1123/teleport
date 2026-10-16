@@ -17,6 +17,8 @@ use std::{
 };
 use tokio::{runtime::Runtime, sync::mpsc};
 
+#[path = "controllers.rs"]
+mod controllers;
 #[path = "multi_display.rs"]
 mod multi_display;
 
@@ -1064,6 +1066,36 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     let relative = desktop
                         .relative_pointer
                         .then_some(Event::RelativeMotion { dx: 25, dy: -15 });
+                    // The test host accepts pad events as no-ops; a host that
+                    // rejected them would end this session. Real hosts would
+                    // create a system-wide uinput pad (visible to the host
+                    // user's games), so smoke runs never press one there.
+                    let gamepad = if desktop.gamepads && desktop.source == "test" {
+                        vec![
+                            Event::GamepadConnected {
+                                pad: 0,
+                                name: "Smoke pad".into(),
+                            },
+                            Event::GamepadButton {
+                                pad: 0,
+                                button: 0,
+                                down: true,
+                            },
+                            Event::GamepadAxis {
+                                pad: 0,
+                                axis: 0,
+                                value: -12000,
+                            },
+                            Event::GamepadButton {
+                                pad: 0,
+                                button: 0,
+                                down: false,
+                            },
+                            Event::GamepadDisconnected { pad: 0 },
+                        ]
+                    } else {
+                        Vec::new()
+                    };
                     for event in [
                         Event::Motion { x: 0.5, y: 0.5 },
                         Event::Key {
@@ -1081,6 +1113,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     ]
                     .into_iter()
                     .chain(relative)
+                    .chain(gamepad)
                     {
                         runtime.block_on(events.send(event))?;
                     }
@@ -1164,6 +1197,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         return Ok(false);
     }
     let (sdl, video, mut canvas) = window_state.take().context("session window missing")?;
+    // Dropped with the session: the host removes its pads when it ends.
+    let mut controllers = controllers::Controllers::new(&sdl);
     let mut graphics_name =
         graphics_renderer(&video).unwrap_or_else(|| "Not exposed by this backend".into());
     tracing::info!(graphics = %graphics_name, "local graphics device");
@@ -1398,7 +1433,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     notice = "Mouse released after leaving the session window".into();
                 }
                 shortcuts = crate::keyboard_capture::Shortcuts::default();
+                // Also centres and releases every host gamepad.
                 send(&events, Event::ReleaseAll)?;
+            }
+            // SDL delivers controller input only while a session window has
+            // focus (SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS is off by default).
+            if controllers.event(&event, &events, desktop.gamepads)? {
+                continue;
             }
             if let Some(action) = shortcuts.event(&event, keyboard_capture.active()) {
                 use crate::keyboard_capture::Action;
@@ -1717,6 +1758,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         flush_relative(&events, &mut relative)?;
         if let Some(event) = motion {
             send(&events, event)?;
+        }
+        controllers.flush(&events, desktop.gamepads)?;
+        if let Some(text) = controllers.take_notice() {
+            notice = text;
+            redraw = true;
         }
         let next_frame = { image.lock().unwrap().take() };
         if let Some(mut frame) = next_frame.filter(|frame| {

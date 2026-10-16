@@ -40,6 +40,10 @@ in
       description = "Additional host arguments. Clipboard and audio are opt-in.";
     };
     systemLogin = lib.mkEnableOption "existing Linux password login for allowed users' running desktops";
+    gamepads = lib.mkEnableOption ''
+      virtual gamepads for clients' game controllers: enables
+      `hardware.uinput` and adds the allowed users to the `uinput` group
+      (takes effect at their next login)'';
     preauthorizeRemoteDesktop = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -76,6 +80,13 @@ in
       })
     ];
     security.pam.services.teleport = lib.mkIf cfg.systemLogin { };
+    # The host advertises gamepads only when it can write /dev/uinput.
+    hardware.uinput.enable = lib.mkIf cfg.gamepads true;
+    users.users = lib.mkIf cfg.gamepads (
+      lib.genAttrs cfg.users (_: {
+        extraGroups = [ "uinput" ];
+      })
+    );
     # The host registers the application ID `dev.teleport.Host` with the portal
     # itself (host portal Registry; the desktop entry above is required). KDE
     # can then pre-authorize it (see preauthorizeRemoteDesktop), so a lost or

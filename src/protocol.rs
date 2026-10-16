@@ -136,6 +136,10 @@ pub struct Desktop {
     /// `Update::Cursor` once the client declares `ClientFeatures::local_cursor`.
     #[serde(default)]
     pub local_cursor: bool,
+    /// Host accepts the `Gamepad*` events and backs them with virtual pads.
+    /// Older hosts reject unknown events, so clients must check this first.
+    #[serde(default)]
+    pub gamepads: bool,
 }
 
 /// Largest cursor side accepted on the wire (cursors are usually 16-64 px;
@@ -288,6 +292,17 @@ pub const POINTER_TRACK: &str = "pointer";
 /// Largest per-event pointer delta; clients split larger movements.
 pub const MAX_RELATIVE_MOTION: u32 = 4096;
 
+/// Most gamepads one session may attach (Xbox-style player slots).
+pub const MAX_GAMEPADS: u8 = 4;
+/// SDL2 `SDL_GameControllerButton` values (A = 0 … TOUCHPAD = 20).
+pub const GAMEPAD_BUTTONS: u8 = 21;
+/// SDL2 `SDL_GameControllerAxis` values (LEFTX = 0 … TRIGGERRIGHT = 5).
+pub const GAMEPAD_AXES: u8 = 6;
+/// First trigger axis; triggers range 0..=32767, sticks the full i16 range.
+pub const GAMEPAD_FIRST_TRIGGER: u8 = 4;
+/// Longest controller name forwarded for host logs.
+pub const MAX_GAMEPAD_NAME: usize = 128;
+
 /// One pointer datagram. Only `Motion` and `MonitorMotion` are accepted.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct PointerInput {
@@ -363,6 +378,29 @@ pub enum Event {
         dx: i32,
         dy: i32,
     },
+    /// A local game controller was attached as pad `pad`. The host creates a
+    /// virtual pad (or neutralises an existing one). Only sent to hosts
+    /// advertising `Desktop::gamepads`, like every `Gamepad*` event.
+    GamepadConnected {
+        pad: u8,
+        name: String,
+    },
+    /// The controller in slot `pad` went away; the host destroys its pad.
+    GamepadDisconnected {
+        pad: u8,
+    },
+    /// `button` is an SDL2 GameController button number.
+    GamepadButton {
+        pad: u8,
+        button: u8,
+        down: bool,
+    },
+    /// `axis` is an SDL2 GameController axis number; `value` uses SDL's range.
+    GamepadAxis {
+        pad: u8,
+        axis: u8,
+        value: i16,
+    },
     /// Client capabilities the host may rely on for this session. Only sent to
     /// hosts advertising `Desktop::keyframe_requests`.
     ClientFeatures {
@@ -384,8 +422,14 @@ pub enum Event {
 impl Event {
     /// Events that may be dropped under backpressure: a later event supersedes
     /// them (absolute motion, periodic feedback/probes, keyframe requests) or
-    /// losing one is harmless (a wheel step). Keys and buttons are never lossy:
-    /// a lost release would leave input held on the host.
+    /// losing one is harmless (a wheel step). Keys and buttons (mouse and
+    /// gamepad) are never lossy: a lost release would leave input held on the
+    /// host. A gamepad axis is an absolute position that the next value fully
+    /// supersedes. A dropped *final* value (a stick back at centre) would leave
+    /// the pad deflected, so the client keeps an axis whose latest value was
+    /// dropped dirty and re-sends it on the next loop iteration: under
+    /// backpressure an axis is delayed and coalesced, never lost, and a stall
+    /// cannot end the session the way a full queue of reliable events does.
     pub fn is_lossy(&self) -> bool {
         matches!(
             self,
@@ -397,6 +441,7 @@ impl Event {
                 | Self::Probe { .. }
                 | Self::Ping
                 | Self::RequestKeyframe { .. }
+                | Self::GamepadAxis { .. }
         )
     }
 
@@ -461,6 +506,25 @@ impl Event {
             } => ensure!(
                 *queue_ms <= 60_000 && *dropped_groups <= 100_000,
                 "invalid video feedback"
+            ),
+            Self::GamepadConnected { pad, name } => ensure!(
+                *pad < MAX_GAMEPADS
+                    && name.len() <= MAX_GAMEPAD_NAME
+                    && !name.chars().any(char::is_control),
+                "invalid gamepad slot or name"
+            ),
+            Self::GamepadDisconnected { pad } => {
+                ensure!(*pad < MAX_GAMEPADS, "invalid gamepad slot")
+            }
+            Self::GamepadButton { pad, button, .. } => ensure!(
+                *pad < MAX_GAMEPADS && *button < GAMEPAD_BUTTONS,
+                "invalid gamepad button"
+            ),
+            Self::GamepadAxis { pad, axis, value } => ensure!(
+                *pad < MAX_GAMEPADS
+                    && *axis < GAMEPAD_AXES
+                    && (*axis < GAMEPAD_FIRST_TRIGGER || *value >= 0),
+                "invalid gamepad axis"
             ),
             _ => (),
         }
@@ -714,6 +778,108 @@ mod tests {
         let old: Desktop = serde_json::from_value(serde_json::json!({ "version": 2, "width": 1, "height": 1, "fps": 1,
             "source": "test", "monitors": [], "active_monitor": 0, "audio": false, "clipboard": false })).unwrap();
         assert!(!old.relative_pointer);
+    }
+    #[test]
+    fn gamepad_events_are_bounded_negotiated_and_roundtrip() {
+        let old: Desktop = serde_json::from_value(serde_json::json!({ "version": 2, "width": 1, "height": 1, "fps": 1,
+            "source": "test", "monitors": [], "active_monitor": 0, "audio": false, "clipboard": false })).unwrap();
+        assert!(!old.gamepads, "older hosts must not receive gamepad events");
+        for event in [
+            Event::GamepadConnected {
+                pad: MAX_GAMEPADS - 1,
+                name: "Xbox Series X Controller".into(),
+            },
+            Event::GamepadDisconnected { pad: 0 },
+            Event::GamepadButton {
+                pad: 1,
+                button: GAMEPAD_BUTTONS - 1,
+                down: true,
+            },
+            Event::GamepadAxis {
+                pad: 2,
+                axis: 1,
+                value: i16::MIN,
+            },
+            Event::GamepadAxis {
+                pad: 2,
+                axis: GAMEPAD_AXES - 1,
+                value: i16::MAX,
+            },
+        ] {
+            assert!(event.validate().is_ok(), "{event:?}");
+            let wire = serde_json::to_vec(&event).unwrap();
+            let back = serde_json::from_slice::<Event>(&wire).unwrap();
+            assert_eq!(format!("{back:?}"), format!("{event:?}"));
+        }
+        for invalid in [
+            Event::GamepadConnected {
+                pad: MAX_GAMEPADS,
+                name: String::new(),
+            },
+            Event::GamepadConnected {
+                pad: 0,
+                name: "x".repeat(MAX_GAMEPAD_NAME + 1),
+            },
+            Event::GamepadConnected {
+                pad: 0,
+                name: "pad\n".into(),
+            },
+            Event::GamepadDisconnected { pad: MAX_GAMEPADS },
+            Event::GamepadButton {
+                pad: MAX_GAMEPADS,
+                button: 0,
+                down: true,
+            },
+            Event::GamepadButton {
+                pad: 0,
+                button: GAMEPAD_BUTTONS,
+                down: true,
+            },
+            Event::GamepadAxis {
+                pad: 0,
+                axis: GAMEPAD_AXES,
+                value: 0,
+            },
+            // SDL triggers never go negative.
+            Event::GamepadAxis {
+                pad: 0,
+                axis: GAMEPAD_FIRST_TRIGGER,
+                value: -1,
+            },
+        ] {
+            assert!(invalid.validate().is_err(), "{invalid:?}");
+        }
+        // Values outside i16 / u8, or missing fields, fail to decode at all.
+        for wire in [
+            r#"{"type":"gamepad_axis","pad":0,"axis":0,"value":32768}"#,
+            r#"{"type":"gamepad_button","pad":256,"button":0,"down":true}"#,
+            r#"{"type":"gamepad_button","pad":0,"button":0}"#,
+        ] {
+            assert!(serde_json::from_str::<Event>(wire).is_err(), "{wire}");
+        }
+        // Buttons and attach/detach are never shed; an axis is superseded.
+        for strict in [
+            Event::GamepadButton {
+                pad: 0,
+                button: 0,
+                down: false,
+            },
+            Event::GamepadDisconnected { pad: 0 },
+            Event::GamepadConnected {
+                pad: 0,
+                name: String::new(),
+            },
+        ] {
+            assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
+        }
+        assert!(
+            Event::GamepadAxis {
+                pad: 0,
+                axis: 0,
+                value: 0
+            }
+            .is_lossy()
+        );
     }
     #[test]
     fn keyframe_requests_roundtrip_and_bound_monitor_index() {

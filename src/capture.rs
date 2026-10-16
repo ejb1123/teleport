@@ -43,6 +43,8 @@ pub struct Capture {
     backend: Backend,
     keys: BTreeSet<u16>,
     buttons: BTreeSet<u8>,
+    /// Virtual gamepads for this session (no-ops on the test backend).
+    gamepads: crate::gamepad::Gamepads,
     /// How this capture was opened, so a lost portal session can be recreated.
     source: String,
     restore_token_path: Option<std::path::PathBuf>,
@@ -197,6 +199,7 @@ impl Capture {
             local_cursor: false,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
+            gamepads: crate::gamepad::Gamepads::new(false),
         };
         let source = match source {
             "auto"
@@ -320,6 +323,7 @@ impl Capture {
             }
             _ => anyhow::bail!("unknown capture source"),
         }
+        result.gamepads = crate::gamepad::Gamepads::new(!matches!(result.backend, Backend::Test));
         result.select_monitor(monitor).await?;
         Ok(result)
     }
@@ -592,6 +596,10 @@ impl Capture {
                 Backend::Test => (),
             },
             Event::ReleaseAll => self.release_all().await,
+            Event::GamepadConnected { .. }
+            | Event::GamepadDisconnected { .. }
+            | Event::GamepadButton { .. }
+            | Event::GamepadAxis { .. } => self.gamepads.input(&event)?,
             Event::Ping => (),
             // Host-level controls are handled before injection.
             Event::SelectMonitor { .. }
@@ -620,6 +628,20 @@ impl Capture {
                 tracing::warn!(%error, "button release failed");
             }
         }
+        // Pads stay attached (a game would see an unplug on every focus loss
+        // or toolbar click); every button is released and every axis centred.
+        self.gamepads.neutralise();
+    }
+
+    /// The client session ended: release everything and remove its pads.
+    pub async fn end_session(&mut self) {
+        self.release_all().await;
+        self.gamepads.destroy_all();
+    }
+
+    /// Whether `Gamepad*` events can be backed by virtual pads.
+    pub fn gamepads_available(&self) -> bool {
+        self.gamepads.available()
     }
 
     /// A previous recreation failed: the capture must be reopened before use.
@@ -644,7 +666,11 @@ impl Capture {
     /// active monitor when it still exists.
     pub async fn reopen(&mut self) -> Result<()> {
         let monitor = self.active_monitor;
+        // A portal recreation mid-session keeps the session's (neutralised)
+        // pads: uinput does not depend on the portal.
+        let gamepads = std::mem::replace(&mut self.gamepads, crate::gamepad::Gamepads::new(false));
         self.close().await;
+        self.gamepads = gamepads;
         self.lost = true;
         let mut fresh = match Self::open_with_options(
             &self.source,
@@ -663,11 +689,12 @@ impl Capture {
         };
         fresh.local_cursor = self.local_cursor;
         std::mem::swap(self, &mut fresh);
+        std::mem::swap(&mut self.gamepads, &mut fresh.gamepads);
         Ok(())
     }
 
     pub async fn close(&mut self) {
-        self.release_all().await;
+        self.end_session().await;
         if let Backend::Portal { session, .. } = &self.backend {
             let _ = session.close().await;
         }

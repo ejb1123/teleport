@@ -278,9 +278,9 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
                         restore_capture(capture).await;
                         let result = tokio::select! {
                             result = relayed(link, accepted, access, options, capture) => result,
-                            _ = &mut shutdown => { capture.release_all().await; break; }
+                            _ = &mut shutdown => { capture.end_session().await; break; }
                         };
-                        capture.release_all().await;
+                        capture.end_session().await;
                         if let Err(error) = result {
                             tracing::warn!(%error, "relayed client disconnected");
                         }
@@ -325,9 +325,9 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         let result = tokio::select! {
             result = connection(request, options, capture) => result,
             _ = async { loop { tokio::time::sleep(Duration::from_secs(1)).await; if access.as_ref().is_some_and(|access| !access.authorized(&supplied)) { break; } } } => Err(anyhow::anyhow!("device access revoked")),
-            _ = &mut shutdown => { capture.release_all().await; break; }
+            _ = &mut shutdown => { capture.end_session().await; break; }
         };
-        capture.release_all().await;
+        capture.end_session().await;
         if let Err(error) = result {
             tracing::warn!(%error, "client disconnected");
         }
@@ -995,6 +995,7 @@ fn desktop_for_monitor(
         pointer_datagrams: true,
         relative_pointer: true,
         local_cursor: capture.supports_local_cursor(),
+        gamepads: capture.gamepads_available(),
     })
 }
 

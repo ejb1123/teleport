@@ -32,6 +32,10 @@ portal's relative pointer motion on Wayland. Both ends need this version: an
 older host reports that it does not support mouse lock. Combine with
 **Ctrl+Alt+K** so game keys and Alt+Tab reach the remote side.
 
+Game controllers are forwarded automatically to Linux hosts that can create
+virtual pads. The host needs `/dev/uinput` access. See [gamepads](gamepad.md).
+Losing session focus also releases every pad button and centres its sticks.
+
 This is a best-effort OS keyboard grab, **not a guarantee of every system key**.
 SDL's grab-state getter is not proof that a compositor forwards every shortcut.
 OS-reserved secure shortcuts cannot always be intercepted. Wayland needs
