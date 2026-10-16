@@ -97,6 +97,7 @@ fn config(name: &str, format: VideoFormat, output: i32) -> Config {
         kbps: 1000,
         output,
         gop: 0,
+        gpu_input: false,
     }
 }
 
@@ -250,6 +251,443 @@ mod tests {
             encode.error()?;
             decode.error()?;
         }
+        Ok(())
+    }
+
+    /// Called with every new capture pipeline before it starts (tests feed
+    /// their `appsrc` from here).
+    pub(super) static PIPELINE_HOOK: Mutex<Option<PipelineHook>> = Mutex::new(None);
+    type PipelineHook = Box<dyn Fn(&gst::Pipeline) + Send>;
+
+    unsafe extern "C" {
+        fn gst_dmabuf_allocator_new() -> *mut gst::ffi::GstAllocator;
+        fn gst_dmabuf_allocator_alloc(
+            allocator: *mut gst::ffi::GstAllocator,
+            fd: std::ffi::c_int,
+            size: usize,
+        ) -> *mut gst::ffi::GstMemory;
+    }
+
+    const COLORS: [[u8; 3]; 4] = [[200, 40, 40], [40, 180, 60], [50, 60, 210], [230, 230, 230]];
+
+    /// A live test capture: DMA-BUFs exported by a GPU (like a compositor's
+    /// screencast buffers), or the same quadrants in CPU memory (like a
+    /// PipeWire SHM buffer). Content is static; each frame is a new buffer
+    /// referencing it, so the source itself costs (almost) nothing.
+    enum TestCapture {
+        Dmabuf(Arc<crate::ffmpeg::TestDmabuf>),
+        Cpu(bytes::Bytes),
+    }
+
+    impl TestCapture {
+        fn new(dmabuf: bool, node: Option<&str>, size: (u32, u32)) -> Result<Option<Self>> {
+            if dmabuf {
+                return Ok(
+                    crate::ffmpeg::TestDmabuf::new(node, size.0, size.1, COLORS)?
+                        .map(|source| Self::Dmabuf(Arc::new(source))),
+                );
+            }
+            let (width, height) = (size.0 as usize, size.1 as usize);
+            let mut rgba = vec![255_u8; width * height * 4];
+            for y in 0..height {
+                for x in 0..width {
+                    let color = COLORS[(y >= height / 2) as usize * 2 + (x >= width / 2) as usize];
+                    rgba[(y * width + x) * 4..][..3].copy_from_slice(&color);
+                }
+            }
+            Ok(Some(Self::Cpu(rgba.into())))
+        }
+
+        fn description(&self, size: (u32, u32), fps: u32) -> Result<String> {
+            let caps = match self {
+                Self::Dmabuf(source) => format!(
+                    "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={}",
+                    gstreamer_video::dma_drm_fourcc_to_string(
+                        source.frame.fourcc,
+                        source.frame.modifier
+                    )
+                ),
+                Self::Cpu(_) => "video/x-raw,format=RGBA".into(),
+            };
+            Ok(format!(
+                "appsrc name=test_capture is-live=true do-timestamp=true format=time max-buffers=2 block=false caps=\"{caps},width={},height={},framerate={fps}/1\"",
+                size.0, size.1
+            ))
+        }
+
+        /// Push a frame every 1/fps from a thread until the pipeline stops.
+        fn feed(&self, pipeline: &gst::Pipeline, fps: u32) {
+            let Some(source) = pipeline.by_name("test_capture") else {
+                return;
+            };
+            let source = source.downcast::<gstreamer_app::AppSrc>().unwrap();
+            let capture = match self {
+                Self::Dmabuf(source) => Self::Dmabuf(source.clone()),
+                Self::Cpu(bytes) => Self::Cpu(bytes.clone()),
+            };
+            std::thread::spawn(move || {
+                let allocator = unsafe { gst_dmabuf_allocator_new() };
+                loop {
+                    let buffer = match &capture {
+                        Self::Cpu(bytes) => gst::Buffer::from_slice(bytes.clone()),
+                        Self::Dmabuf(dmabuf) => {
+                            let frame = dmabuf.frame;
+                            let size = unsafe { libc::lseek(frame.fds[0], 0, libc::SEEK_END) };
+                            let memory = unsafe {
+                                gst_dmabuf_allocator_alloc(
+                                    allocator,
+                                    libc::dup(frame.fds[0]),
+                                    size as usize,
+                                )
+                            };
+                            let mut buffer = gst::Buffer::new();
+                            let writable = buffer.get_mut().unwrap();
+                            writable.append_memory(unsafe {
+                                gst::glib::translate::from_glib_full(memory)
+                            });
+                            gstreamer_video::VideoMeta::add_full(
+                                writable,
+                                gstreamer_video::VideoFrameFlags::empty(),
+                                gstreamer_video::VideoFormat::DmaDrm,
+                                frame.width as u32,
+                                frame.height as u32,
+                                &[frame.offsets[0] as usize],
+                                &[frame.pitches[0] as i32],
+                            )
+                            .unwrap();
+                            buffer
+                        }
+                    };
+                    if source.push_buffer(buffer).is_err() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_secs(1) / fps);
+                }
+                unsafe { gst::ffi::gst_object_unref(allocator.cast()) };
+            });
+        }
+    }
+
+    /// Show the encoder's own logs (path, fallback) with `RUST_LOG`.
+    fn test_tracing() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_test_writer()
+            .try_init();
+    }
+
+    fn process_cpu() -> Duration {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+        let time = |t: libc::timeval| {
+            Duration::from_secs(t.tv_sec as u64) + Duration::from_micros(t.tv_usec as u64)
+        };
+        time(usage.ru_utime) + time(usage.ru_stime)
+    }
+
+    /// Run `encoder()` on a test capture for `seconds` after a warm-up and
+    /// return (encoder label, frames, host CPU ms/frame, capture→packet ms,
+    /// submit→packet ms, last decoded frame).
+    fn run_capture(
+        kind: EncoderKind,
+        capture: TestCapture,
+        size: (u32, u32),
+        seconds: f64,
+    ) -> Result<(String, u64, f64, f64, f64, crate::ffmpeg::Frame)> {
+        let fps = 60;
+        let description = capture.description(size, fps)?;
+        let capture = Arc::new(capture);
+        let feeder = capture.clone();
+        *PIPELINE_HOOK.lock().unwrap() = Some(Box::new(move |pipeline: &gst::Pipeline| {
+            feeder.feed(pipeline, fps)
+        }));
+        let mut broadcast = moq_net::broadcast::Info::new().produce();
+        let track = broadcast.create_track(VideoCodec::H264.track(), None)?;
+        let mut subscriber = track.subscribe(None);
+        let encode = encoder(
+            &description,
+            size,
+            fps,
+            20_000,
+            track,
+            kind,
+            VideoCodec::H264.into(),
+        );
+        *PIPELINE_HOOK.lock().unwrap() = None;
+        let encode = encode?;
+        let metrics = encode.encoder_metrics()?;
+        std::thread::sleep(Duration::from_millis(500));
+        let (before, cpu_before) = (*metrics.totals.lock().unwrap(), process_cpu());
+        std::thread::sleep(Duration::from_secs_f64(seconds));
+        let (after, cpu_after) = (*metrics.totals.lock().unwrap(), process_cpu());
+        encode.error()?;
+        let label = metrics.encoder.clone();
+        let frames = after.2 - before.2;
+        ensure!(frames > 0, "{label}: no frames encoded");
+        let per_frame = |sum: u64| sum as f64 / frames as f64 / 1000.0;
+        // Decode what is being sent: the newest complete group.
+        let mut packets = Vec::new();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+        runtime.block_on(async {
+            while let Ok(Ok(Some(mut group))) =
+                tokio::time::timeout_at(deadline, subscriber.recv_group()).await
+            {
+                let mut frames = Vec::new();
+                while let Ok(Ok(Some(packet))) = tokio::time::timeout(
+                    Duration::from_millis(50),
+                    crate::protocol::read_frame(&mut group, crate::protocol::MAX_FRAME),
+                )
+                .await
+                {
+                    frames.push(packet.to_vec());
+                }
+                if !frames.is_empty() {
+                    packets = frames;
+                }
+            }
+        });
+        drop(encode);
+        let mut decoder = Codec::new(Config {
+            width: size.0,
+            height: size.1,
+            ..config("software", VideoCodec::H264.into(), 0)
+        })?;
+        let mut last = None;
+        for (index, packet) in packets.iter().enumerate() {
+            decoder.submit(packet, index as u64)?;
+            while let Some(frame) = decoder.receive()? {
+                last = Some(frame);
+            }
+        }
+        Ok((
+            label,
+            frames,
+            (cpu_after - cpu_before).as_secs_f64() * 1000.0 / frames as f64,
+            per_frame(after.3 - before.3),
+            per_frame(after.1 - before.1),
+            last.context("nothing decoded")?,
+        ))
+    }
+
+    fn check_colors(frame: &crate::ffmpeg::Frame, label: &str) -> Result<()> {
+        let (width, height) = (frame.width as usize, frame.height as usize);
+        for (quadrant, (x, y)) in [
+            (width / 4, height / 4),
+            (width * 3 / 4, height / 4),
+            (width / 4, height * 3 / 4),
+            (width * 3 / 4, height * 3 / 4),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let actual = &frame.bytes[(y * width + x) * 3..][..3];
+            for channel in 0..3 {
+                ensure!(
+                    (COLORS[quadrant][channel] as i32 - actual[channel] as i32).abs() <= 8,
+                    "{label}: pixel ({x},{y}) {actual:?}, source {:?}",
+                    COLORS[quadrant]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// GPUs with a zero-copy encoder here: NVENC fed by the NVIDIA EGL
+    /// device, VA-API fed by the first render node's EGL device.
+    fn zero_copy_targets() -> Vec<(EncoderKind, Option<&'static str>)> {
+        vec![
+            (EncoderKind::Nvidia, None),
+            (EncoderKind::Vaapi, Some("/dev/dri/renderD128")),
+        ]
+    }
+
+    /// DMA-BUF capture through the real encoder pipeline on each GPU: the
+    /// decoded stream shows the captured colours, the active path is
+    /// reported, and a source that cannot negotiate DMA-BUFs falls back to
+    /// CPU capture (logged, still streaming).
+    #[test]
+    #[ignore = "requires NVENC or VA-API and an EGL device exporting DMA-BUFs"]
+    fn zero_copy_capture_pipeline_and_fallback() -> Result<()> {
+        if std::env::var("TELEPORT_TEST_HARDWARE").as_deref() != Ok("1") {
+            eprintln!("SKIP: set TELEPORT_TEST_HARDWARE=1 on a machine with NVENC or VA-API");
+            return Ok(());
+        }
+        test_tracing();
+        gst::init()?;
+        ZERO_COPY_FAILED.store(false, Ordering::Relaxed);
+        let size = (1280, 720);
+        let mut passed = 0;
+        for (kind, node) in zero_copy_targets() {
+            let Some(capture) = TestCapture::new(true, node, size)? else {
+                eprintln!("SKIP {kind:?}: no EGL device exporting DMA-BUFs");
+                continue;
+            };
+            let (label, frames, ..) = match run_capture(kind, capture, size, 1.0) {
+                Ok(result) => result,
+                Err(error) if ZERO_COPY_FAILED.load(Ordering::Relaxed) => {
+                    return Err(error.context(format!("{kind:?} zero-copy capture failed")));
+                }
+                Err(error) => {
+                    eprintln!("SKIP {kind:?}: {error:#}");
+                    continue;
+                }
+            };
+            ensure!(
+                label.ends_with(" DMA-BUF zero-copy"),
+                "{kind:?} did not use zero-copy: {label}"
+            );
+            let (.., decoded) = run_capture(
+                kind,
+                TestCapture::new(true, node, size)?.context("source vanished")?,
+                size,
+                0.3,
+            )?;
+            check_colors(&decoded, &label)?;
+            ensure!(!ZERO_COPY_FAILED.load(Ordering::Relaxed));
+            eprintln!("PASS {label}: {frames} frames");
+            passed += 1;
+        }
+        ensure!(passed > 0, "no zero-copy encoder available");
+        // A "DMA-BUF" source that only produces CPU memory: negotiation
+        // fails, the encoder falls back to CPU capture and keeps streaming.
+        let kind = zero_copy_targets()
+            .into_iter()
+            .map(|(kind, _)| kind)
+            .find(|kind| {
+                let capture = TestCapture::new(false, None, size).unwrap().unwrap();
+                run_capture(*kind, capture, size, 0.2).is_ok()
+            })
+            .context("no encoder for the fallback check")?;
+        let pipeline = encoder(
+            "videotestsrc is-live=true ! identity name=memory:DMABuf",
+            size,
+            30,
+            4000,
+            moq_net::broadcast::Info::new()
+                .produce()
+                .create_track(VideoCodec::H264.track(), None)?,
+            kind,
+            VideoCodec::H264.into(),
+        )?;
+        let metrics = pipeline.encoder_metrics()?;
+        ensure!(
+            !metrics.encoder.contains("zero-copy"),
+            "{}",
+            metrics.encoder
+        );
+        ensure!(
+            ZERO_COPY_FAILED.load(Ordering::Relaxed),
+            "fallback not recorded"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        pipeline.error()?;
+        ensure!(
+            metrics.totals.lock().unwrap().2 > 0,
+            "fallback encoded nothing"
+        );
+        ZERO_COPY_FAILED.store(false, Ordering::Relaxed);
+        eprintln!("PASS fallback to CPU capture on {kind:?}");
+        Ok(())
+    }
+
+    /// The real desktop through the xdg-desktop-portal: whatever the
+    /// compositor negotiates (DMA-BUF unless `TELEPORT_CAPTURE_ZERO_COPY=0`).
+    /// Opens its own portal session (no restore token, no input).
+    #[tokio::test]
+    #[ignore = "opens a desktop portal session; set TELEPORT_TEST_PORTAL=1"]
+    async fn portal_capture_benchmark() -> Result<()> {
+        if std::env::var("TELEPORT_TEST_PORTAL").as_deref() != Ok("1") {
+            eprintln!("SKIP: set TELEPORT_TEST_PORTAL=1 inside a graphical session");
+            return Ok(());
+        }
+        test_tracing();
+        gst::init()?;
+        let kind = match std::env::var("TELEPORT_TEST_ENCODER").as_deref() {
+            Ok("vaapi") => EncoderKind::Vaapi,
+            _ => EncoderKind::Nvidia,
+        };
+        let mut capture = crate::capture::Capture::open_with_options("portal", None, 0).await?;
+        let size = (capture.width & !1, capture.height & !1);
+        let encode = encoder(
+            &capture.pipeline_source(),
+            size,
+            60,
+            20_000,
+            moq_net::broadcast::Info::new()
+                .produce()
+                .create_track(VideoCodec::H264.track(), None)?,
+            kind,
+            VideoCodec::H264.into(),
+        )?;
+        let metrics = encode.encoder_metrics()?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let (before, cpu_before) = (*metrics.totals.lock().unwrap(), process_cpu());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let (after, cpu_after) = (*metrics.totals.lock().unwrap(), process_cpu());
+        encode.error()?;
+        let frames = after.2 - before.2;
+        ensure!(frames > 0, "no frames captured");
+        let per_frame = |sum: u64| sum as f64 / frames as f64 / 1000.0;
+        eprintln!(
+            "BENCH portal {} {}x{}: {frames} frames, CPU {:.2} ms/frame, capture->packet {:.2} ms, submit->packet {:.2} ms",
+            metrics.encoder,
+            size.0,
+            size.1,
+            (cpu_after - cpu_before).as_secs_f64() * 1000.0 / frames as f64,
+            per_frame(after.3 - before.3),
+            per_frame(after.1 - before.1),
+        );
+        drop(encode);
+        capture.close().await;
+        Ok(())
+    }
+
+    /// Host cost per frame, CPU capture vs DMA-BUF zero-copy, at 1080p and
+    /// 4K on each GPU (60 FPS live test source; whole-process CPU time, so
+    /// it includes driver threads).
+    #[test]
+    #[ignore = "benchmark; requires NVENC or VA-API and an EGL device exporting DMA-BUFs"]
+    fn zero_copy_capture_benchmark() -> Result<()> {
+        if std::env::var("TELEPORT_TEST_HARDWARE").as_deref() != Ok("1") {
+            eprintln!("SKIP: set TELEPORT_TEST_HARDWARE=1 on a machine with NVENC or VA-API");
+            return Ok(());
+        }
+        test_tracing();
+        gst::init()?;
+        ZERO_COPY_FAILED.store(false, Ordering::Relaxed);
+        let seconds = std::env::var("TELEPORT_BENCH_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4.0);
+        for (kind, node) in zero_copy_targets() {
+            for size in [(1920, 1080), (3840, 2160)] {
+                for dmabuf in [false, true] {
+                    let Some(capture) = TestCapture::new(dmabuf, node, size)? else {
+                        eprintln!("SKIP {kind:?}: no EGL device exporting DMA-BUFs");
+                        continue;
+                    };
+                    match run_capture(kind, capture, size, seconds) {
+                        Ok((label, frames, cpu, capture, encode, decoded)) => {
+                            check_colors(&decoded, &label)?;
+                            eprintln!(
+                                "BENCH {label} {}x{}: {frames} frames, CPU {cpu:.2} ms/frame, capture->packet {capture:.2} ms, submit->packet {encode:.2} ms",
+                                size.0, size.1
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("SKIP {kind:?} {size:?} dmabuf={dmabuf}: {error:#}")
+                        }
+                    }
+                }
+            }
+        }
+        ensure!(
+            !ZERO_COPY_FAILED.load(Ordering::Relaxed),
+            "zero-copy fell back"
+        );
         Ok(())
     }
 }
@@ -521,13 +959,130 @@ pub(super) fn decoder(
     Ok((pipeline, source, image))
 }
 
+/// Set when DMA-BUF capture failed in this process (negotiation, import or
+/// conversion). Later encoders capture through the CPU path instead of
+/// retrying a broken driver path.
+#[cfg(target_os = "linux")]
+static ZERO_COPY_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long a new DMA-BUF capture may take to encode its first frame before
+/// it is trusted; a failure within this window falls back to CPU capture.
+#[cfg(target_os = "linux")]
+const DMABUF_VERIFY: Duration = Duration::from_secs(2);
+
+/// RGB DRM formats offered for DMA-BUF capture (KWin, Mutter and wlroots
+/// share 8-bit desktops as one of these).
+#[cfg(target_os = "linux")]
+const DMABUF_FORMATS: [&str; 4] = ["XR24", "AR24", "XB24", "AB24"];
+
+/// The DMA-BUF variant of a capture description, if the source can produce
+/// DMA-BUFs: a PipeWire source without its system-memory caps (pipewiresrc
+/// then offers our modifiers to the compositor), or a test source that
+/// already negotiates `memory:DMABuf`. `TELEPORT_CAPTURE_ZERO_COPY=0` opts
+/// out.
+#[cfg(target_os = "linux")]
+fn dmabuf_source(source: &str) -> Option<String> {
+    if std::env::var("TELEPORT_CAPTURE_ZERO_COPY").as_deref() == Ok("0") {
+        return None;
+    }
+    if source.contains("memory:DMABuf") {
+        return Some(source.into());
+    }
+    source
+        .strip_suffix(&format!(" ! {}", crate::capture::PIPEWIRE_SYSTEM_MEMORY))
+        .filter(|source| source.starts_with("pipewiresrc ") && !source.contains(" ! "))
+        .map(Into::into)
+}
+
+/// `memory:DMABuf` caps listing every format/modifier `codec` can import, or
+/// `None` when it can import none.
+#[cfg(target_os = "linux")]
+fn dmabuf_caps(codec: &mut Codec) -> Result<Option<gst::Caps>> {
+    let mut formats = Vec::new();
+    for name in DMABUF_FORMATS {
+        let (fourcc, _) = gstreamer_video::dma_drm_fourcc_from_str(name)?;
+        for modifier in codec.dmabuf_modifiers(fourcc)? {
+            formats.push(gstreamer_video::dma_drm_fourcc_to_string(fourcc, modifier).to_string());
+        }
+    }
+    if formats.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        gst::Caps::builder("video/x-raw")
+            .features(["memory:DMABuf"])
+            .field("format", "DMA_DRM")
+            .field("drm-format", gst::List::new(formats))
+            .build(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn gst_is_dmabuf_memory(memory: *mut gst::ffi::GstMemory) -> gst::glib::ffi::gboolean;
+    fn gst_dmabuf_memory_get_fd(memory: *mut gst::ffi::GstMemory) -> std::ffi::c_int;
+}
+
+/// Describe a captured DMA-BUF sample for the encoder. The descriptors
+/// belong to the sample, which must outlive their use.
+#[cfg(target_os = "linux")]
+fn dmabuf_frame(sample: &gst::Sample) -> Result<crate::ffmpeg::Dmabuf> {
+    let info = gstreamer_video::VideoInfoDmaDrm::from_caps(
+        sample.caps().context("missing capture caps")?,
+    )?;
+    let buffer = sample.buffer().context("missing capture buffer")?;
+    // pipewiresrc (and any DMA-BUF producer) describes plane layout here.
+    let meta = buffer
+        .meta::<gstreamer_video::VideoMeta>()
+        .context("DMA-BUF capture without plane layout")?;
+    let planes = meta.n_planes() as usize;
+    ensure!((1..=4).contains(&planes), "unsupported DMA-BUF plane count");
+    let mut frame = crate::ffmpeg::Dmabuf {
+        fds: [-1; 4],
+        planes: planes as i32,
+        fourcc: info.fourcc(),
+        modifier: info.modifier(),
+        width: info.width().try_into()?,
+        height: info.height().try_into()?,
+        crop_width: info.width().try_into()?,
+        crop_height: info.height().try_into()?,
+        ..Default::default()
+    };
+    for plane in 0..planes {
+        let offset = meta.offset()[plane];
+        let (memories, skip) = buffer
+            .find_memory(offset..offset + 1)
+            .context("DMA-BUF plane outside its buffer")?;
+        let memory = buffer.peek_memory(memories.start);
+        let pointer = memory.as_ptr() as *mut gst::ffi::GstMemory;
+        ensure!(
+            unsafe { gst_is_dmabuf_memory(pointer) } != 0,
+            "capture memory is not a DMA-BUF"
+        );
+        frame.fds[plane] = unsafe { gst_dmabuf_memory_get_fd(pointer) };
+        frame.offsets[plane] = (memory.offset() + skip).try_into()?;
+        frame.pitches[plane] = meta.stride()[plane].try_into()?;
+    }
+    // The compositor may share a larger buffer than the visible area.
+    if let Some(crop) = buffer.meta::<gstreamer_video::VideoCropMeta>() {
+        let (x, y, width, height) = crop.rect();
+        if width > 0 && height > 0 {
+            frame.crop_x = x.try_into()?;
+            frame.crop_y = y.try_into()?;
+            frame.crop_width = width.try_into()?;
+            frame.crop_height = height.try_into()?;
+        }
+    }
+    Ok(frame)
+}
+
 #[cfg(target_os = "linux")]
 pub(super) fn encoder(
     source: &str,
     size: (u32, u32),
     fps: u32,
     bitrate: u32,
-    mut track: moq_net::track::Producer,
+    track: moq_net::track::Producer,
     kind: EncoderKind,
     format: VideoFormat,
 ) -> Result<Pipeline> {
@@ -538,6 +1093,10 @@ pub(super) fn encoder(
     } else {
         "h264"
     };
+    // Zero-copy capture needs a DMA-BUF source, an 8-bit stream and an
+    // encoder whose GPU can import (NVENC through CUDA, or VA-API).
+    let zero_copy = dmabuf_source(source)
+        .filter(|_| !format.hdr() && !ZERO_COPY_FAILED.load(Ordering::Relaxed));
     // Probing opens and exercises up to four encoders. Quality and monitor
     // changes re-create the encoder inside the session loop, so remember which
     // one worked for this request and only probe again if it later fails.
@@ -582,6 +1141,8 @@ pub(super) fn encoder(
         };
         let config = Config {
             encoder: true,
+            gpu_input: zero_copy.is_some()
+                && (name.ends_with("_nvenc") || name.ends_with("_vaapi")),
             name,
             width: size.0,
             height: size.1,
@@ -627,15 +1188,8 @@ pub(super) fn encoder(
         Some(config) => config,
         None => return Err(last.context("no FFmpeg encoders")?),
     };
-    tracing::info!(encoder=%config.name,backend="ffmpeg",?format.codec,bitrate,"direct video encoder");
-    let metrics = Arc::new(EncoderMetrics {
-        encoder: format!("ffmpeg:{}", config.name),
-        pending: Mutex::default(),
-        encode_us: std::sync::atomic::AtomicU64::new(0),
-        totals: Mutex::default(),
-    });
     let name = config.name.clone();
-    let codec = Codec::new(config);
+    let codec = Codec::new(config.clone());
     {
         let mut cache = ENCODERS.get_or_init(Mutex::default).lock().unwrap();
         if codec.is_ok() {
@@ -644,8 +1198,74 @@ pub(super) fn encoder(
             cache.remove(&cache_key);
         }
     }
+    let mut codec = codec?;
+    if let Some(dmabuf) = zero_copy.filter(|_| config.gpu_input) {
+        let attempt = dmabuf_caps(&mut codec).and_then(|caps| {
+            let caps = caps.context("encoder GPU imports none of the offered DMA-BUF formats")?;
+            start(
+                &dmabuf,
+                Some(caps),
+                codec,
+                size,
+                fps,
+                bitrate,
+                track.clone(),
+                format,
+            )
+        });
+        match attempt {
+            Ok(pipeline) => return Ok(pipeline),
+            Err(error) => {
+                ZERO_COPY_FAILED.store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    encoder = %config.name,
+                    error = format!("{error:#}"),
+                    "DMA-BUF zero-copy capture unavailable; using CPU capture"
+                );
+                codec = Codec::new(config)?;
+            }
+        }
+    }
+    start(source, None, codec, size, fps, bitrate, track, format)
+}
+
+/// Build and start the capture → encode pipeline around an open encoder.
+/// With `dmabuf` caps the source must produce DMA-BUFs, which go to the
+/// encoder's GPU without a CPU copy; the first frame is verified before
+/// returning (an error means: fall back to CPU capture).
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn start(
+    source: &str,
+    dmabuf: Option<gst::Caps>,
+    codec: Codec,
+    size: (u32, u32),
+    fps: u32,
+    bitrate: u32,
+    mut track: moq_net::track::Producer,
+    format: VideoFormat,
+) -> Result<Pipeline> {
+    let zero_copy = dmabuf.is_some();
+    tracing::info!(
+        encoder = %codec.config.name,
+        backend = "ffmpeg",
+        ?format.codec,
+        bitrate,
+        capture = if zero_copy { "DMA-BUF zero-copy" } else { "CPU" },
+        "direct video encoder"
+    );
+    let metrics = Arc::new(EncoderMetrics {
+        encoder: format!(
+            "ffmpeg:{}{}",
+            codec.config.name,
+            if zero_copy { " DMA-BUF zero-copy" } else { "" }
+        ),
+        pending: Mutex::default(),
+        encode_us: std::sync::atomic::AtomicU64::new(0),
+        totals: Mutex::default(),
+    });
     let state = Arc::new(State {
-        codec: Mutex::new(codec?),
+        codec: Mutex::new(codec),
         keyframe: Default::default(),
         key_interval: std::sync::atomic::AtomicU32::new((fps / 4).max(1)),
         metrics: Some(metrics.clone()),
@@ -655,19 +1275,40 @@ pub(super) fn encoder(
     } else {
         "NV12,colorimetry=bt709"
     };
-    let pipeline = Pipeline(gst::parse::launch(&format!(
-        // One-frame leaky queue: a slow encoder always picks up the newest
-        // capture. Rate-limit before converting so dropped frames cost nothing,
-        // then convert and scale in one multithreaded pass.
-        "{source} ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! videorate drop-only=true ! video/x-raw,framerate={fps}/1 ! videoconvertscale n-threads=0 ! video/x-raw,format={pixel},width={},height={},framerate={fps}/1 ! appsink name=captured sync=false max-buffers=1 drop=false",size.0,size.1
-    ))?.downcast::<gst::Pipeline>().map_err(|_| anyhow::anyhow!("not a capture pipeline"))?);
+    // One-frame leaky queue: a slow encoder always picks up the newest
+    // capture. Rate-limit before converting so dropped frames cost nothing.
+    // CPU capture then converts and scales in one multithreaded pass; DMA-BUF
+    // capture leaves both to the encoder's GPU.
+    let queue = "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! videorate drop-only=true";
+    let description = if zero_copy {
+        format!(
+            "{source} ! {queue} ! video/x-raw(memory:DMABuf),framerate={fps}/1 ! appsink name=captured sync=false max-buffers=1 drop=false"
+        )
+    } else {
+        format!(
+            "{source} ! {queue} ! video/x-raw,framerate={fps}/1 ! videoconvertscale n-threads=0 ! video/x-raw,format={pixel},width={},height={},framerate={fps}/1 ! appsink name=captured sync=false max-buffers=1 drop=false",
+            size.0, size.1
+        )
+    };
+    let pipeline = Pipeline(
+        gst::parse::launch(&description)?
+            .downcast::<gst::Pipeline>()
+            .map_err(|_| anyhow::anyhow!("not a capture pipeline"))?,
+    );
     attach(&pipeline.0, state.clone());
+    #[cfg(test)]
+    if let Some(hook) = tests::PIPELINE_HOOK.lock().unwrap().as_ref() {
+        hook(&pipeline.0);
+    }
     let sink = pipeline
         .0
         .by_name("captured")
         .unwrap()
         .downcast::<AppSink>()
         .unwrap();
+    if let Some(caps) = &dmabuf {
+        sink.set_caps(Some(caps));
+    }
     let hdr_source = if format.hdr() {
         Some(
             pipeline
@@ -681,19 +1322,35 @@ pub(super) fn encoder(
     } else {
         None
     };
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    // First frame encoded (Ok) or failed (Err), for HDR and DMA-BUF checks.
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
     let mut ready_tx = Some(ready_tx);
     let mut group: Option<moq_net::group::Producer> = None;
     let mut frame_id = 0_u64;
     let mut encode_failures = 0_u32;
     // Frames submitted since (and including) the last keyframe.
     let mut since_key = u32::MAX;
+    // When each pending frame was captured (its running-time timestamp).
+    let mut captured: BTreeMap<u64, Instant> = BTreeMap::new();
     sink.set_callbacks(
         gstreamer_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
                 let mut process = || -> Result<()> {
                     let sample = sink.pull_sample()?;
                     let pulled = Instant::now();
+                    // Age of the frame since the source timestamped it (live
+                    // sources stamp capture time), so latency covers conversion.
+                    let age = sample
+                        .buffer()
+                        .and_then(|buffer| buffer.pts())
+                        .zip(sample.segment().and_then(|segment| {
+                            segment.downcast_ref::<gst::ClockTime>().cloned()
+                        }))
+                        .and_then(|(pts, segment)| segment.to_running_time(pts))
+                        .zip(sink.current_running_time())
+                        .and_then(|(at, now)| now.checked_sub(at))
+                        .map(|age| Duration::from_nanos(age.nseconds()))
+                        .unwrap_or_default();
                     if let Some(pad) = &hdr_source {
                         let caps = pad
                             .upgrade()
@@ -702,26 +1359,34 @@ pub(super) fn encoder(
                             .context("HDR source caps missing")?;
                         validate_hdr_raw(&gstreamer_video::VideoInfo::from_caps(&caps)?, true)?;
                     }
-                    let info = gstreamer_video::VideoInfo::from_caps(
-                        sample.caps().context("missing capture caps")?,
-                    )?;
-                    let frame = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(
-                        sample.buffer().context("missing capture buffer")?,
-                        &info,
-                    )?;
-                    use gstreamer_video::prelude::*;
-                    let stride = size.0 as usize * if format.hdr() { 2 } else { 1 };
-                    let mut raw = Vec::with_capacity(stride * size.1 as usize * 3 / 2);
-                    for (plane, rows) in [(0, size.1 as usize), (1, size.1 as usize / 2)] {
-                        let pitch = usize::try_from(frame.plane_stride()[plane])?;
-                        ensure!(pitch >= stride, "invalid capture stride");
-                        let bytes = frame.plane_data(plane as u32)?;
-                        for row in 0..rows {
-                            raw.extend_from_slice(
-                                bytes
-                                    .get(row * pitch..row * pitch + stride)
-                                    .context("short capture plane")?,
-                            );
+                    let dmabuf = if zero_copy {
+                        Some(dmabuf_frame(&sample)?)
+                    } else {
+                        None
+                    };
+                    let mut raw = Vec::new();
+                    if dmabuf.is_none() {
+                        let info = gstreamer_video::VideoInfo::from_caps(
+                            sample.caps().context("missing capture caps")?,
+                        )?;
+                        let frame = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(
+                            sample.buffer().context("missing capture buffer")?,
+                            &info,
+                        )?;
+                        use gstreamer_video::prelude::*;
+                        let stride = size.0 as usize * if format.hdr() { 2 } else { 1 };
+                        raw.reserve(stride * size.1 as usize * 3 / 2);
+                        for (plane, rows) in [(0, size.1 as usize), (1, size.1 as usize / 2)] {
+                            let pitch = usize::try_from(frame.plane_stride()[plane])?;
+                            ensure!(pitch >= stride, "invalid capture stride");
+                            let bytes = frame.plane_data(plane as u32)?;
+                            for row in 0..rows {
+                                raw.extend_from_slice(
+                                    bytes
+                                        .get(row * pitch..row * pitch + stride)
+                                        .context("short capture plane")?,
+                                );
+                            }
                         }
                     }
                     let start = Instant::now();
@@ -737,21 +1402,43 @@ pub(super) fn encoder(
                             pending.pop_first();
                         }
                     }
+                    captured.insert(frame_id, pulled.checked_sub(age).unwrap_or(pulled));
+                    while captured.len() > 256 {
+                        captured.pop_first();
+                    }
                     let mut packets = Vec::new();
                     let force_key = state.keyframe.swap(false, Ordering::Relaxed)
                         || since_key >= state.key_interval.load(Ordering::Relaxed);
                     since_key = since_key.saturating_add(1);
-                    let encoded = codec.submit_frame(&raw, frame_id, force_key).and_then(|()| {
+                    let submitted = match &dmabuf {
+                        // The sample (and the compositor's buffer) stays
+                        // alive until the GPU has finished reading it.
+                        Some(dmabuf) => codec.submit_dmabuf(dmabuf, frame_id, force_key),
+                        None => codec.submit_frame(&raw, frame_id, force_key),
+                    };
+                    drop(sample);
+                    let encoded = submitted.and_then(|()| {
                         while let Some(packet) = codec.receive()? {
                             packets.push(packet);
                         }
                         Ok(())
                     });
                     if let Err(error) = encoded {
+                        // An import or conversion failure before the first
+                        // frame means DMA-BUF capture does not work here: let
+                        // the caller fall back to CPU capture.
+                        if zero_copy && ready_tx.is_some() {
+                            return Err(error);
+                        }
                         // A transient driver error must not end the session.
                         // Reopen the encoder so its next output is an IDR that
                         // starts a fresh group; persistent failure stays fatal.
                         encode_failures += 1;
+                        if zero_copy && encode_failures > MAX_CONSECUTIVE_ENCODE_FAILURES {
+                            // Later encoders (the host recreates capture after
+                            // this pipeline error) use CPU capture.
+                            ZERO_COPY_FAILED.store(true, Ordering::Relaxed);
+                        }
                         ensure!(
                             encode_failures <= MAX_CONSECUTIVE_ENCODE_FAILURES,
                             "encoder failed {encode_failures} consecutive frames: {error:#}"
@@ -773,6 +1460,10 @@ pub(super) fn encoder(
                             .pts
                             .and_then(|pts| metrics.pending.lock().unwrap().remove(&pts))
                             .map(|at| at.elapsed());
+                        let capture = packet
+                            .pts
+                            .and_then(|pts| captured.remove(&pts))
+                            .map(|at| at.elapsed());
                         metrics.encode_us.store(
                             elapsed.map_or(0, |elapsed| elapsed.as_micros().max(1) as u64),
                             Ordering::Relaxed,
@@ -782,6 +1473,7 @@ pub(super) fn encoder(
                             totals.0 += prepare_us;
                             totals.1 += elapsed.as_micros() as u64;
                             totals.2 += 1;
+                            totals.3 += capture.unwrap_or(elapsed).as_micros() as u64;
                         }
                         if packet.key {
                             if let Some(mut old) = group.take() {
@@ -796,12 +1488,15 @@ pub(super) fn encoder(
                             )?;
                         }
                         if let Some(tx) = ready_tx.take() {
-                            let _ = tx.send(());
+                            let _ = tx.send(Ok(()));
                         }
                     }
                     Ok(())
                 };
                 process().map(|()| gst::FlowSuccess::Ok).map_err(|error| {
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(Err(format!("{error:#}")));
+                    }
                     tracing::error!(%error,"direct FFmpeg encode failed");
                     gst::FlowError::Error
                 })
@@ -812,7 +1507,31 @@ pub(super) fn encoder(
     if format.hdr() {
         ready_rx
             .recv_timeout(Duration::from_secs(3))
-            .context("HDR capture/encoder did not produce verified output")?;
+            .context("HDR capture/encoder did not produce verified output")?
+            .map_err(|error| anyhow::anyhow!(error))?;
+    } else if zero_copy {
+        // Negotiation errors (no common DMA-BUF format) arrive on the bus;
+        // import errors through the first frame. A source that is merely
+        // slow to start keeps zero-copy: runtime failures still end this
+        // pipeline and later ones use CPU capture.
+        let deadline = Instant::now() + DMABUF_VERIFY;
+        loop {
+            match ready_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(Ok(())) => break,
+                Ok(Err(error)) => anyhow::bail!(error),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("DMA-BUF capture stopped before its first frame")
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    pipeline.error()?;
+                    if Instant::now() >= deadline {
+                        tracing::warn!("DMA-BUF capture produced no frame yet; keeping it");
+                        break;
+                    }
+                }
+            }
+        }
+        tracing::info!("DMA-BUF zero-copy capture active");
     }
     Ok(pipeline)
 }
