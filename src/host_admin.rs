@@ -876,6 +876,7 @@ mod tests {
             identity_dir: Some(relay_identity),
             versions: Vec::new(),
             key: Some("relay key".into()),
+            stun_listen: Some("off".into()),
         }));
         let endpoint = crate::relay::Endpoint {
             url: format!("moqt://{relay_address}").parse()?,

@@ -60,6 +60,44 @@ pub struct Options {
     /// observe its traffic sizes and timing (never its content).
     #[arg(long, env = "TELEPORT_RELAY_KEY", hide_env_values = true)]
     pub key: Option<String>,
+    /// UDP address of the built-in STUN responder (Binding only) that hosts
+    /// and clients use to learn their public address for peer-to-peer
+    /// connections; `off` disables it. Default: the --listen address, port
+    /// 3478.
+    #[arg(long, value_name = "ADDRESS|off")]
+    pub stun_listen: Option<String>,
+}
+
+/// Start the relay's STUN responder (see `crate::stun`). A port already in
+/// use is logged, not fatal: peer-to-peer then falls back to the relay.
+async fn start_stun(options: &Options) -> Result<()> {
+    let address = match options.stun_listen.as_deref() {
+        Some("off") => return Ok(()),
+        Some(address) => address
+            .parse::<std::net::SocketAddr>()
+            .with_context(|| format!("invalid --stun-listen {address}"))?,
+        None => {
+            let listen = tokio::net::lookup_host(options.listen.as_str())
+                .await?
+                .next()
+                .context("--listen did not resolve")?;
+            std::net::SocketAddr::new(listen.ip(), crate::stun::DEFAULT_PORT)
+        }
+    };
+    match tokio::net::UdpSocket::bind(address).await {
+        Ok(socket) => {
+            tracing::info!(%address, "STUN responder ready (peer-to-peer address discovery)");
+            tokio::spawn(async move {
+                if let Err(error) = crate::stun::serve(socket).await {
+                    tracing::warn!(%error, "STUN responder stopped");
+                }
+            });
+        }
+        Err(error) => {
+            tracing::warn!(%address, %error, "STUN responder unavailable; peer-to-peer clients need another --stun server")
+        }
+    }
+    Ok(())
 }
 
 /// Run a relay. Each connection is scoped to its URL path, so unrelated hosts
@@ -89,6 +127,7 @@ pub async fn serve(options: Options) -> Result<()> {
     tracing::info!(address = %server.local_addr()?, %fingerprint, "relay ready; clients and hosts pass --relay-fingerprint to pin it");
     // Printed for scripts and tests that need the fingerprint before logs flush.
     println!("RELAY FINGERPRINT {fingerprint}");
+    start_stun(&options).await?;
     let origin = moq_net::Origin::random().produce();
     while let Some(request) = server.accept().await {
         let namespace = request.path().trim_matches('/').to_owned();
@@ -320,7 +359,7 @@ pub async fn connect_with_keep_alive(
 }
 
 /// Publish one message; the returned handles must outlive its reader.
-async fn publish_one(
+pub(crate) async fn publish_one(
     origin: &moq_net::origin::Producer,
     path: &str,
     payload: Vec<u8>,
@@ -330,7 +369,7 @@ async fn publish_one(
 
 /// Publish a message of several frames in one group. Readers that expect one
 /// frame (older hosts reading a confirmation) see only the first.
-async fn publish(
+pub(crate) async fn publish(
     origin: &moq_net::origin::Producer,
     path: &str,
     frames: Vec<Vec<u8>>,
@@ -349,11 +388,24 @@ async fn publish(
     Ok((broadcast, track))
 }
 
-async fn read_one(broadcast: &moq_net::broadcast::Consumer) -> Result<bytes::Bytes> {
+pub(crate) async fn read_one(broadcast: &moq_net::broadcast::Consumer) -> Result<bytes::Bytes> {
     read_frames(broadcast, 1)
         .await?
         .pop()
         .context("empty handshake message")
+}
+
+/// The single-frame message the peer announces at `path` on this link.
+pub(crate) async fn read_announced(link: &Link, path: &str) -> Result<bytes::Bytes> {
+    let announced = link.incoming.consume();
+    tokio::select! {
+        broadcast = announced.announced_broadcast(path) => {
+            read_one(&broadcast.context("relay closed before the host answered")?).await
+        }
+        error = link.session.closed() => {
+            anyhow::bail!("relay closed the connection: {error} (check --relay-key)")
+        }
+    }
 }
 
 /// Up to the first `count` frames of a message (extra frames are ignored;
@@ -523,7 +575,13 @@ pub struct Accepted {
 /// `require_device_key`, credentials the host's records alone would
 /// authenticate (the host pairing token and devices without a key) get no
 /// reply at all. Ends when the relay connection does.
+///
+/// With `p2p`, peer-to-peer signalling hellos (`<attempt>/p2p-hello`, see
+/// `crate::p2p`) go through the same bounds and checks, under their own
+/// domain-separated credential; once confirmed they exchange candidates and
+/// never become a session here.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 pub async fn intake(
     session: moq_net::Session,
     incoming: moq_net::origin::Producer,
@@ -532,7 +590,9 @@ pub async fn intake(
     identity: Arc<e2e::HostIdentity>,
     accepted: tokio::sync::mpsc::Sender<Accepted>,
     require_device_key: bool,
+    p2p: Option<Arc<crate::p2p::Host>>,
 ) -> Result<()> {
+    use crate::p2p::paths;
     let mut announced = incoming.consume().announced();
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HELLOS));
     // Client ephemerals already answered (bounded, oldest evicted first).
@@ -553,8 +613,14 @@ pub async fn intake(
             continue;
         };
         let path = announce.path.to_string();
-        let Some(session_id) = path.strip_suffix("/hello") else {
-            continue;
+        let signal_hello = format!("/{}", paths::HELLO);
+        let (session_id, signalling) = match (
+            path.strip_suffix("/hello"),
+            path.strip_suffix(signal_hello.as_str()),
+        ) {
+            (Some(session_id), _) => (session_id, false),
+            (None, Some(session_id)) if p2p.is_some() => (session_id, true),
+            _ => continue,
         };
         if !valid_namespace(session_id) {
             continue;
@@ -564,13 +630,14 @@ pub async fn intake(
             continue;
         };
         let session_id = session_id.to_owned();
-        let (incoming, outgoing, access, identity, accepted, seen) = (
+        let (incoming, outgoing, access, identity, accepted, seen, p2p) = (
             incoming.clone(),
             outgoing.clone(),
             access.clone(),
             identity.clone(),
             accepted.clone(),
             seen.clone(),
+            p2p.clone(),
         );
         handlers.spawn(async move {
             let _permit = permit;
@@ -595,8 +662,22 @@ pub async fn intake(
                     set.remove(&old);
                 }
             }
+            // The request is bound into the transcript, so a relay cannot
+            // move a hello between the session and signalling paths.
+            if signalling != (hello.request == crate::p2p::SIGNAL_REQUEST) {
+                return;
+            }
             let mut candidates = access.relay_credentials();
-            let hashes: Vec<[u8; 32]> = candidates.iter().map(|c| c.hash).collect();
+            let hashes: Vec<[u8; 32]> = candidates
+                .iter()
+                .map(|c| {
+                    if signalling {
+                        crate::p2p::signal_credential(&c.hash)
+                    } else {
+                        c.hash
+                    }
+                })
+                .collect();
             let Some(index) = e2e::HostIdentity::identify(&hello, &hashes) else {
                 tracing::warn!("rejected unauthorized relayed client");
                 return;
@@ -609,20 +690,26 @@ pub async fn intake(
                 return;
             }
             let (credential, device_key) = (candidate.hash, candidate.device_key);
-            let Ok((reply, pending)) = identity.respond(&hello, &credential) else {
+            let Ok((reply, pending)) = identity.respond(&hello, &hashes[index]) else {
                 return;
             };
             let Ok(reply) = serde_json::to_vec(&reply) else {
                 return;
             };
-            let Ok(reply) = publish_one(&outgoing, &format!("{session_id}/reply"), reply).await
+            let (reply_path, confirm_path) = if signalling {
+                (paths::REPLY, paths::CONFIRM)
+            } else {
+                ("reply", "confirm")
+            };
+            let Ok(reply) =
+                publish_one(&outgoing, &format!("{session_id}/{reply_path}"), reply).await
             else {
                 return;
             };
             let confirmed = tokio::time::timeout(CONFIRM_TIMEOUT, async {
                 let broadcast = incoming
                     .consume()
-                    .announced_broadcast(format!("{session_id}/confirm").as_str())
+                    .announced_broadcast(format!("{session_id}/{confirm_path}").as_str())
                     .await
                     .context("no confirmation")?;
                 let objects = read_frames(
@@ -645,6 +732,22 @@ pub async fn intake(
                     return;
                 }
             };
+            if let Some(p2p) = p2p.filter(|_| signalling) {
+                let grant = crate::p2p::Grant {
+                    credential,
+                    device_key,
+                };
+                if let Err(error) = p2p
+                    .answer(&keys, &session_id, &incoming, &outgoing, grant)
+                    .await
+                {
+                    tracing::info!(
+                        error = format!("{error:#}"),
+                        "peer-to-peer signalling failed"
+                    );
+                }
+                return;
+            }
             let _ = accepted
                 .send(Accepted {
                     session_id,

@@ -77,6 +77,9 @@ pub struct Options {
     /// Direct connections are unaffected.
     #[arg(long, requires = "relay")]
     pub relay_require_device_key: bool,
+    /// Peer-to-peer connections signalled through the relay (src/p2p.rs).
+    #[command(flatten)]
+    pub p2p: crate::p2p::HostArgs,
     /// Experimental: permit clients that explicitly opt in to forward an SSH agent.
     #[arg(long)]
     pub allow_ssh_agent: bool,
@@ -265,6 +268,18 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         (None, _, _) => None,
     };
     let relay_namespace = crate::relay::namespace(&pairing.fingerprint)?;
+    // Direct peer-to-peer sessions, signalled through the relay; they reach
+    // the same authorization below as the main listener's.
+    let (p2p, mut p2p_requests) = match (&relay_endpoint, &identity, &relay_identity) {
+        (Some(endpoint), Some(identity), Some(_)) if !options.p2p.no_p2p => {
+            let (host, requests) =
+                crate::p2p::Host::start(&options.p2p, endpoint.clone(), identity)?;
+            (Some(host), Some(requests))
+        }
+        _ => (None, None),
+    };
+    // Closes the socket and any gateway mapping however serve() returns.
+    let _p2p_guard = p2p.clone().map(crate::p2p::CloseOnDrop);
     // Connected relay, confirmed sessions from its intake task, and the tasks
     // (session intake, presence, enrollment).
     let mut relay: Option<(
@@ -297,6 +312,7 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
                         e2e.clone(),
                         sender,
                         options.relay_require_device_key,
+                        p2p.clone(),
                     ));
                     let mut tasks = vec![
                         crate::relay::AbortOnDrop(intake),
@@ -321,7 +337,16 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
             }
         }
         let request = tokio::select! {
-            request = server.accept() => match request { Some(request) => request, None => break },
+            request = server.accept() => match request { Some(request) => crate::p2p::Incoming::Listener(request), None => break },
+            Some(request) = async {
+                match p2p_requests.as_mut() {
+                    Some(requests) => requests.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                tracing::info!(remote = %request.remote, "peer-to-peer connection; checking its credential");
+                crate::p2p::Incoming::P2p(request)
+            }
             accepted = async {
                 match relay.as_mut() {
                     Some((_, receiver, _)) => receiver.recv().await,
@@ -359,20 +384,32 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
             .strip_prefix("/teleport/")
             .unwrap_or("")
             .to_owned();
+        // A peer-to-peer request must present the very credential its
+        // signalling exchange authenticated (with its device key, if any).
+        let grant = request.grant().cloned();
         let authorized = access.as_ref().map_or_else(
             || bool::from(supplied.as_bytes().ct_eq(pairing.token.as_bytes())),
             |access| access.authorized(&supplied),
-        );
+        ) && grant.as_ref().is_none_or(|grant| {
+            bool::from(crate::e2e::credential_hash(&supplied).ct_eq(&grant.credential))
+        });
         if !authorized {
-            let _ = request.close(403).await;
+            request.close().await;
             tracing::warn!("rejected unauthorized client");
             continue;
         }
-        let _session_lease = if let Some(access) = &access {
-            match access.begin_session(&supplied) {
+        let session_lease = if let Some(access) = &access {
+            // Peer-to-peer: lease with the key proof of the signalling
+            // exchange, so stored device keys bind it as on the relay.
+            let lease = match &grant {
+                Some(grant) => access
+                    .begin_session_hash(grant.credential.to_vec(), grant.device_key.as_deref()),
+                None => access.begin_session(&supplied),
+            };
+            match lease {
                 Ok(lease) => Some(lease),
                 Err(_) => {
-                    let _ = request.close(403).await;
+                    request.close().await;
                     continue;
                 }
             }
@@ -382,7 +419,14 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         restore_capture(capture).await;
         let result = tokio::select! {
             result = connection(request, options, capture) => result,
-            _ = async { loop { tokio::time::sleep(Duration::from_secs(1)).await; if access.as_ref().is_some_and(|access| !access.authorized(&supplied)) { break; } } } => Err(anyhow::anyhow!("device access revoked")),
+            _ = async { loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let revoked = match (&session_lease, &grant) {
+                    (Some(lease), Some(_)) => !lease.authorized(),
+                    _ => access.as_ref().is_some_and(|access| !access.authorized(&supplied)),
+                };
+                if revoked { break; }
+            } } => Err(anyhow::anyhow!("device access revoked")),
             _ = &mut shutdown => { capture.end_session().await; break; }
         };
         capture.end_session().await;
@@ -456,22 +500,19 @@ async fn shutdown_signal() -> Result<()> {
 }
 
 async fn connection(
-    request: moq_native::Request,
+    request: crate::p2p::Incoming,
     options: &Options,
     capture: &mut Capture,
 ) -> Result<()> {
     let query = request.query().map(str::to_owned);
     let outgoing = moq_net::Origin::random().produce();
     let incoming = moq_net::Origin::random().produce();
-    let session = request
-        .with_publisher(&outgoing)
-        .with_subscriber(incoming.clone())
-        .ok();
+    let session = request.ok(&outgoing, incoming.clone());
     run_session(
         query.as_deref(),
         outgoing,
         incoming,
-        async { Ok(session.await?) },
+        session,
         options,
         capture,
     )

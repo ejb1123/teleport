@@ -92,6 +92,9 @@ pub struct Options {
         hide_env_values = true
     )]
     pub relay_key: Option<String>,
+    /// Peer-to-peer path for `--route auto` (src/p2p.rs).
+    #[command(flatten)]
+    pub p2p: crate::p2p::ClientArgs,
     /// Retry dropped sessions until the connection window is closed.
     #[arg(long)]
     pub reconnect: bool,
@@ -150,6 +153,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionPath {
     Direct,
+    /// Direct QUIC through hole punching, signalled via the relay; the
+    /// candidate type that won once known.
+    P2p(Option<crate::p2p::Kind>),
     Relay,
 }
 
@@ -157,13 +163,19 @@ impl SessionPath {
     fn as_str(self) -> &'static str {
         match self {
             Self::Direct => "direct",
+            Self::P2p(_) => "p2p",
             Self::Relay => "relay",
         }
     }
 
     fn description(self) -> &'static str {
+        use crate::p2p::Kind;
         match self {
             Self::Direct => "direct (pinned TLS)",
+            Self::P2p(Some(Kind::Host)) => "p2p, host candidate (pinned TLS)",
+            Self::P2p(Some(Kind::Srflx)) => "p2p, server-reflexive candidate (pinned TLS)",
+            Self::P2p(Some(Kind::Mapped)) => "p2p, port-mapped candidate (pinned TLS)",
+            Self::P2p(None) => "p2p (pinned TLS)",
             Self::Relay => "relay (end-to-end encrypted)",
         }
     }
@@ -200,6 +212,9 @@ impl Options {
     /// Bound for a whole connection attempt, including a failed direct try.
     fn connect_timeout(&self) -> Duration {
         match self.effective_route() {
+            Ok(crate::relay::Route::Auto) if self.p2p.enabled() => {
+                CONNECT_TIMEOUT + DIRECT_ATTEMPT.max(crate::p2p::ATTEMPT_TIMEOUT)
+            }
             Ok(crate::relay::Route::Auto) => CONNECT_TIMEOUT + DIRECT_ATTEMPT,
             _ => CONNECT_TIMEOUT,
         }
@@ -210,6 +225,8 @@ struct Link {
     path: SessionPath,
     /// Relay handshake and bridges; dropping it ends a relayed session.
     _relay: Option<crate::relay::ClientSession>,
+    /// The peer-to-peer socket (and any gateway mapping) of a p2p session.
+    _p2p: Option<crate::p2p::Connected>,
     remote: moq_net::broadcast::Consumer,
     ssh_agent: Option<crate::ssh_agent::Task>,
     session: moq_net::Session,
@@ -224,36 +241,71 @@ struct Link {
 }
 
 /// Connect along the configured route. `auto` tries the direct address for
-/// [`DIRECT_ATTEMPT`], then the relay; it only falls back when the direct
-/// transport itself failed, never after a host answered. Both paths
-/// authenticate the host by its pinned certificate; the relay path always
-/// adds end-to-end encryption.
+/// [`DIRECT_ATTEMPT`] and, alongside it, a peer-to-peer path signalled
+/// through the relay; then the relay itself. It only falls back when a
+/// transport failed, never after a host answered. Every path authenticates
+/// the host by its pinned certificate; the relay path always adds end-to-end
+/// encryption.
 async fn connect(options: &Options) -> Result<Link> {
+    let started = Instant::now();
     let link = match options.effective_route()? {
         crate::relay::Route::Direct => connect_via(options, SessionPath::Direct, None).await?,
         crate::relay::Route::Relay => connect_via(options, SessionPath::Relay, None).await?,
-        crate::relay::Route::Auto => {
-            match connect_via(options, SessionPath::Direct, Some(DIRECT_ATTEMPT)).await {
-                Ok(link) => link,
-                Err(error) if error.downcast_ref::<DirectUnreachable>().is_some() => {
-                    tracing::info!(
-                        error = format!("{error:#}"),
-                        "direct path unavailable; trying the relay"
-                    );
-                    connect_via(options, SessionPath::Relay, None)
-                        .await
-                        .context("direct path unavailable and relay failed")?
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        crate::relay::Route::Auto => match connect_direct_or_p2p(options).await? {
+            Some(link) => link,
+            None => connect_via(options, SessionPath::Relay, None)
+                .await
+                .context("direct path unavailable and relay failed")?,
+        },
     };
     tracing::info!(
         path = link.path.as_str(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
         "connection path chosen: {}",
         link.path.description()
     );
     Ok(link)
+}
+
+/// `--route auto` before the relay: the direct address (for at most
+/// [`DIRECT_ATTEMPT`]) and, at the same time, a peer-to-peer path signalled
+/// through the relay. The first to connect wins. `None` means both failed at
+/// the transport level and the relay may be tried; an error from a host that
+/// answered is returned as is.
+async fn connect_direct_or_p2p(options: &Options) -> Result<Option<Link>> {
+    let unreachable = |error: &anyhow::Error| error.downcast_ref::<DirectUnreachable>().is_some();
+    let direct = connect_via(options, SessionPath::Direct, Some(DIRECT_ATTEMPT));
+    let p2p = connect_via(options, SessionPath::P2p(None), None);
+    tokio::pin!(direct, p2p);
+    let (mut direct_done, mut p2p_done) = (false, !options.p2p.enabled());
+    while !(direct_done && p2p_done) {
+        tokio::select! {
+            result = &mut direct, if !direct_done => {
+                direct_done = true;
+                match result {
+                    Ok(link) => return Ok(Some(link)),
+                    Err(error) if unreachable(&error) => tracing::info!(
+                        error = format!("{error:#}"),
+                        "direct path unavailable"
+                    ),
+                    Err(error) => return Err(error),
+                }
+            }
+            result = &mut p2p, if !p2p_done => {
+                p2p_done = true;
+                match result {
+                    Ok(link) => return Ok(Some(link)),
+                    Err(error) if error.downcast_ref::<crate::p2p::Unavailable>().is_some() => tracing::info!(
+                        error = format!("{error:#}"),
+                        "peer-to-peer path unavailable"
+                    ),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    tracing::info!("direct path unavailable; trying the relay");
+    Ok(None)
 }
 
 async fn connect_via(
@@ -261,6 +313,7 @@ async fn connect_via(
     path: SessionPath,
     direct_timeout: Option<Duration>,
 ) -> Result<Link> {
+    let mut path = path;
     let agent_path = options
         .forward_ssh_agent
         .then(crate::ssh_agent::agent_path)
@@ -300,10 +353,12 @@ async fn connect_via(
             )
             .await?,
         ),
-        (None, SessionPath::Relay) => anyhow::bail!("the relay path needs --relay"),
-        (_, SessionPath::Direct) => None,
+        (None, SessionPath::Relay | SessionPath::P2p(_)) => {
+            anyhow::bail!("the relay and p2p paths need --relay")
+        }
+        (_, SessionPath::Direct | SessionPath::P2p(_)) => None,
     };
-    config.tls.fingerprint = vec![pairing.fingerprint];
+    config.tls.fingerprint = vec![pairing.fingerprint.clone()];
     let (outgoing, incoming) = match &relay {
         Some(relay) => (relay.outgoing.clone(), relay.incoming.clone()),
         None => (
@@ -335,9 +390,33 @@ async fn connect_via(
     } else {
         None
     };
-    let session = match &relay {
-        Some(relay) => relay.link.session.clone(),
-        None => {
+    let mut p2p = None;
+    let session = match (&relay, &options.relay, path) {
+        (Some(relay), _, _) => relay.link.session.clone(),
+        (None, Some(relay_url), SessionPath::P2p(_)) => {
+            let mut target = url.path().to_owned();
+            if let Some(query) = url.query() {
+                target = format!("{target}?{query}");
+            }
+            let connected = crate::p2p::connect(
+                &options.p2p,
+                &crate::relay::Endpoint {
+                    url: relay_url.clone(),
+                    fingerprint: options.relay_fingerprint.clone(),
+                    key: options.relay_key.clone(),
+                },
+                &pairing,
+                target,
+                &outgoing,
+                incoming.clone(),
+            )
+            .await?;
+            path = SessionPath::P2p(Some(connected.kind));
+            let session = connected.session.clone();
+            p2p = Some(connected);
+            session
+        }
+        _ => {
             let client = config
                 .init()?
                 .with_publisher(&outgoing)
@@ -441,6 +520,7 @@ async fn connect_via(
     Ok(Link {
         path,
         _relay: relay,
+        _p2p: p2p,
         remote,
         ssh_agent,
         session,
@@ -3629,7 +3709,16 @@ mod tests {
         assert_eq!(parse(&relay).effective_route().unwrap(), Route::Relay);
         let auto = parse(&[relay[0], relay[1], "--route", "auto"]);
         assert_eq!(auto.effective_route().unwrap(), Route::Auto);
-        assert_eq!(auto.connect_timeout(), CONNECT_TIMEOUT + DIRECT_ATTEMPT);
+        // The peer-to-peer attempt runs alongside the direct one.
+        assert_eq!(
+            auto.connect_timeout(),
+            CONNECT_TIMEOUT + crate::p2p::ATTEMPT_TIMEOUT
+        );
+        let without_p2p = parse(&[relay[0], relay[1], "--route", "auto", "--no-p2p"]);
+        assert_eq!(
+            without_p2p.connect_timeout(),
+            CONNECT_TIMEOUT + DIRECT_ATTEMPT
+        );
         let direct = parse(&[relay[0], relay[1], "--route", "direct"]);
         assert_eq!(direct.effective_route().unwrap(), Route::Direct);
         // Auto falls back only on the marked transport failure.

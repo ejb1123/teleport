@@ -530,7 +530,7 @@ impl ClientHandshake {
 
     /// Everything a client computes needs only the hash: this is also what an
     /// attacker holding the host's records can do (tests use it as such).
-    fn from_hash(
+    pub(crate) fn from_hash(
         credential_hash: [u8; 32],
         request: &str,
         device: Option<DeviceKey>,
