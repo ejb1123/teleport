@@ -202,6 +202,7 @@ pub async fn login(
         Ok(Pairing {
             token: token.to_owned(),
             fingerprint: fingerprint.to_owned(),
+            device_key: None,
         })
     })
     .await
@@ -461,6 +462,7 @@ mod tests {
             Pairing {
                 token: identity.token,
                 fingerprint: fingerprint.clone(),
+                device_key: None,
             },
         )?;
         let mut config = Config::new(&directory, "/unused-test-helper".into())?;

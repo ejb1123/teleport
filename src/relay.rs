@@ -10,6 +10,8 @@
 //!
 //! * `<session>/hello`   client → host: `e2e::ClientHello`
 //! * `<session>/reply`   host → client: `e2e::HostReply`
+//! * `<session>/confirm` client → host: sealed key confirmation (and device
+//!   signature), see `e2e::PendingSession`
 //! * `<session>/controls` client → host: sealed input/pointer/agent tracks
 //! * `<session>/desktop`  host → client: sealed metadata/video/audio/updates
 //!
@@ -22,13 +24,11 @@ use crate::{
     e2e::{self, ClientHandshake, Direction, SessionKeys},
     protocol,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use clap::Args;
 use std::{sync::Arc, time::Duration};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
-/// Track key label for the client's key-confirmation object.
-const CONFIRM_TRACK: &str = "confirm";
 /// Host-side bounds on unauthenticated handshake work.
 #[cfg(target_os = "linux")]
 const HELLO_READ_TIMEOUT: Duration = Duration::from_secs(2);
@@ -225,6 +225,16 @@ async fn publish_one(
     path: &str,
     payload: Vec<u8>,
 ) -> Result<(moq_net::broadcast::Producer, moq_net::track::Producer)> {
+    publish(origin, path, vec![payload]).await
+}
+
+/// Publish a message of several frames in one group. Readers that expect one
+/// frame (older hosts reading a confirmation) see only the first.
+async fn publish(
+    origin: &moq_net::origin::Producer,
+    path: &str,
+    frames: Vec<Vec<u8>>,
+) -> Result<(moq_net::broadcast::Producer, moq_net::track::Producer)> {
     let mut broadcast =
         origin.create_broadcast(path, moq_net::broadcast::Route::new().with_announce(true))?;
     let mut track = broadcast.create_track(
@@ -232,12 +242,26 @@ async fn publish_one(
         moq_net::track::Info::default().with_ordered(true),
     )?;
     let mut group = track.append_group()?;
-    group.write_frame(moq_net::Timestamp::now(), bytes::Bytes::from(payload))?;
+    for frame in frames {
+        group.write_frame(moq_net::Timestamp::now(), bytes::Bytes::from(frame))?;
+    }
     group.finish()?;
     Ok((broadcast, track))
 }
 
 async fn read_one(broadcast: &moq_net::broadcast::Consumer) -> Result<bytes::Bytes> {
+    read_frames(broadcast, 1)
+        .await?
+        .pop()
+        .context("empty handshake message")
+}
+
+/// Up to the first `count` frames of a message (extra frames are ignored;
+/// fewer means the sender finished the message early).
+async fn read_frames(
+    broadcast: &moq_net::broadcast::Consumer,
+    count: usize,
+) -> Result<Vec<bytes::Bytes>> {
     let mut track = broadcast
         .track("message")?
         .subscribe(moq_net::track::Subscription::default().with_group_start(0))
@@ -246,9 +270,14 @@ async fn read_one(broadcast: &moq_net::broadcast::Consumer) -> Result<bytes::Byt
         .recv_group()
         .await?
         .context("handshake message missing")?;
-    protocol::read_frame(&mut group, protocol::MAX_CONTROL)
-        .await?
-        .context("empty handshake message")
+    let mut frames = Vec::with_capacity(count);
+    while frames.len() < count {
+        match protocol::read_frame(&mut group, protocol::MAX_CONTROL).await? {
+            Some(frame) => frames.push(frame),
+            None => break,
+        }
+    }
+    Ok(frames)
 }
 
 /// Client side: plaintext origins the unchanged session code uses, bridged to
@@ -280,7 +309,12 @@ pub async fn client(
 ) -> Result<ClientSession> {
     let link = connect(endpoint, &namespace(&pairing.fingerprint)?).await?;
     let session_id = hex(&e2e::random::<16>());
-    let handshake = ClientHandshake::new(&pairing.token, request)?;
+    let device = pairing
+        .device_key
+        .as_deref()
+        .map(e2e::DeviceKey::from_hex)
+        .transpose()?;
+    let handshake = ClientHandshake::new(&pairing.token, request, device)?;
     let hello = publish_one(
         &link.outgoing,
         &format!("{session_id}/hello"),
@@ -303,14 +337,15 @@ pub async fn client(
     .await
     .context("host did not answer through the relay; is it running with the same --relay and is this device still authorized?")??;
     let reply: e2e::HostReply = serde_json::from_slice(&reply).context("malformed host reply")?;
-    let keys = Arc::new(handshake.finish(&reply, &pairing.fingerprint)?);
-    // Key confirmation: the host starts nothing (no lease, no capture) until
-    // this authenticates, so a replayed hello costs it no more than a reply.
-    let confirm = publish_one(
+    let established = handshake.finish(&reply, &pairing.fingerprint)?;
+    let keys = Arc::new(established.keys);
+    // Key confirmation (plus the device signature for keyed credentials): the
+    // host starts nothing (no lease, no capture) until this authenticates, so
+    // a replayed hello costs it no more than a reply.
+    let confirm = publish(
         &link.outgoing,
         &format!("{session_id}/confirm"),
-        keys.sealer(Direction::ClientToHost, CONFIRM_TRACK)?
-            .seal(0, &keys.session_id())?,
+        established.confirmation,
     )
     .await?;
     tracing::info!(session = %hex(&keys.session_id()), "end-to-end encrypted relay session established");
@@ -370,6 +405,9 @@ pub struct Accepted {
     pub request: String,
     /// The credential the hello named, as `SHA-256(token)`.
     pub credential: [u8; 32],
+    /// The device public key whose transcript signature the client proved,
+    /// if the host stored one for the credential.
+    pub device_key: Option<Vec<u8>>,
     pub keys: Arc<SessionKeys>,
     _reply: (moq_net::broadcast::Producer, moq_net::track::Producer),
 }
@@ -379,9 +417,12 @@ pub struct Accepted {
 /// Unauthenticated work is bounded: hellos are read concurrently (at most
 /// [`MAX_PENDING_HELLOS`] at once, each within [`HELLO_READ_TIMEOUT`]), a
 /// client ephemeral key is answered at most once, unknown credentials get no
-/// reply, and a client must prove the session keys within
-/// [`CONFIRM_TIMEOUT`] before it is handed to the session loop. Ends when the
-/// relay connection does.
+/// reply, and a client must prove the session keys (and, for a device with a
+/// stored public key, sign the transcript with its device key) within
+/// [`CONFIRM_TIMEOUT`] before it is handed to the session loop. With
+/// `require_device_key`, credentials the host's records alone would
+/// authenticate (the host pairing token and devices without a key) get no
+/// reply at all. Ends when the relay connection does.
 #[cfg(target_os = "linux")]
 pub async fn intake(
     session: moq_net::Session,
@@ -390,6 +431,7 @@ pub async fn intake(
     access: Arc<crate::access::ServerState>,
     identity: Arc<e2e::HostIdentity>,
     accepted: tokio::sync::mpsc::Sender<Accepted>,
+    require_device_key: bool,
 ) -> Result<()> {
     let mut announced = incoming.consume().announced();
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HELLOS));
@@ -453,13 +495,21 @@ pub async fn intake(
                     set.remove(&old);
                 }
             }
-            let candidates = access.credential_hashes();
-            let Some(index) = e2e::HostIdentity::identify(&hello, &candidates) else {
+            let mut candidates = access.relay_credentials();
+            let hashes: Vec<[u8; 32]> = candidates.iter().map(|c| c.hash).collect();
+            let Some(index) = e2e::HostIdentity::identify(&hello, &hashes) else {
                 tracing::warn!("rejected unauthorized relayed client");
                 return;
             };
-            let credential = candidates[index];
-            let Ok((reply, keys)) = identity.respond(&hello, &credential) else {
+            let candidate = candidates.swap_remove(index);
+            if require_device_key && candidate.hash_only() {
+                tracing::warn!(
+                    "refused relayed credential without a device key (--relay-require-device-key); re-enroll the device"
+                );
+                return;
+            }
+            let (credential, device_key) = (candidate.hash, candidate.device_key);
+            let Ok((reply, pending)) = identity.respond(&hello, &credential) else {
                 return;
             };
             let Ok(reply) = serde_json::to_vec(&reply) else {
@@ -475,23 +525,32 @@ pub async fn intake(
                     .announced_broadcast(format!("{session_id}/confirm").as_str())
                     .await
                     .context("no confirmation")?;
-                let sealed = read_one(&broadcast).await?;
-                let opened = keys
-                    .opener(Direction::ClientToHost, CONFIRM_TRACK, e2e::Order::Strict)?
-                    .open(0, &sealed)?;
-                ensure!(opened == keys.session_id(), "confirmation mismatch");
-                Ok::<_, anyhow::Error>(())
+                let objects = read_frames(
+                    &broadcast,
+                    e2e::PendingSession::expected_objects(device_key.as_deref()),
+                )
+                .await?;
+                let objects: Vec<&[u8]> = objects.iter().map(|object| &object[..]).collect();
+                pending.confirm(&objects, device_key.as_deref())
             })
             .await;
-            if !matches!(confirmed, Ok(Ok(()))) {
-                tracing::warn!("relayed client did not confirm the session keys");
-                return;
-            }
+            let keys = match confirmed {
+                Ok(Ok(keys)) => keys,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "relayed client did not confirm the session");
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!("relayed client did not confirm the session in time");
+                    return;
+                }
+            };
             let _ = accepted
                 .send(Accepted {
                     session_id,
                     request: hello.request,
                     credential,
+                    device_key,
                     keys: Arc::new(keys),
                     _reply: reply,
                 })

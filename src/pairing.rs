@@ -55,6 +55,8 @@ struct Keys {
     confirmation: hmac::Key,
     encryption: aead::LessSafeKey,
     transcript: Vec<u8>,
+    /// Device-key registration after the credential (`crate::e2e`).
+    registration: crate::e2e::Registration,
 }
 impl Keys {
     fn new(shared: &[u8], client: &[u8], host: &[u8]) -> Result<Self> {
@@ -86,10 +88,15 @@ impl Keys {
             )
             .map_err(|_| anyhow::anyhow!("pairing cipher initialization failed"))?,
         );
+        let registration = crate::e2e::Registration::new(
+            &derive(b"teleport/device-key-registration/v1")?,
+            &transcript,
+        )?;
         Ok(Self {
             confirmation,
             encryption,
             transcript,
+            registration,
         })
     }
     #[cfg(target_os = "linux")]
@@ -144,6 +151,16 @@ async fn read_packet(stream: &mut TcpStream, maximum: usize) -> Result<Vec<u8>> 
 }
 
 pub async fn pair(address: &str, code: &str) -> Result<Pairing> {
+    pair_with(address, code, true).await
+}
+
+/// A client from before device keys: takes the credential and hangs up.
+#[cfg(test)]
+pub(crate) async fn pair_without_device_key(address: &str, code: &str) -> Result<Pairing> {
+    pair_with(address, code, false).await
+}
+
+async fn pair_with(address: &str, code: &str, register_key: bool) -> Result<Pairing> {
     validate_address(address)?;
     let code = normalize(code)?;
     tokio::time::timeout(TIMEOUT, async {
@@ -167,7 +184,15 @@ pub async fn pair(address: &str, code: &str) -> Result<Pairing> {
         let packet = read_packet(&mut stream, 4096).await.context(
             "pairing rejected; code may be wrong, used, expired, or locked after five attempts",
         )?;
-        keys.open(packet)
+        // Device keys are generated here, never accepted from the host.
+        let pairing = Pairing {
+            device_key: None,
+            ..keys.open(packet)?
+        };
+        if !register_key {
+            return Ok(pairing);
+        }
+        Ok(crate::access::register_device_key(&mut stream, &keys.registration, pairing).await)
     })
     .await
     .context("pairing timed out; check host code and TCP firewall")?
@@ -298,11 +323,16 @@ pub(crate) async fn accept_with_access(
             .map_err(|_| anyhow::anyhow!("pairing code closed or replaced"))?;
     }
     *used = true;
-    let device = access
-        .map(|access| access.access.enroll_device("Code-paired device"))
-        .transpose()?;
-    write_packet(stream, &keys.seal(device.as_ref().unwrap_or(pairing))?).await?;
-    Ok(())
+    let Some(access) = access else {
+        // The host's own pairing file: nothing to register a key against.
+        return write_packet(stream, &keys.seal(pairing)?).await;
+    };
+    let device = access.access.enroll_device("Code-paired device")?;
+    write_packet(stream, &keys.seal(&device.pairing)?).await?;
+    access
+        .access
+        .accept_device_key(stream, &keys.registration, &device.id)
+        .await
 }
 
 #[cfg(test)]
@@ -343,6 +373,7 @@ mod tests {
         let pairing = Pairing {
             token: "a".repeat(64),
             fingerprint: "b".repeat(64),
+            device_key: None,
         };
         let mut encrypted = kb.seal(&pairing)?;
         assert_eq!(ka.open(encrypted.clone())?.token, pairing.token);
@@ -359,6 +390,7 @@ mod tests {
         let credential = Pairing {
             token: "a".repeat(64),
             fingerprint: "b".repeat(64),
+            device_key: None,
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?.to_string();
@@ -367,7 +399,10 @@ mod tests {
             serve(listener, "123456", &saved, Duration::from_secs(10)).await
         });
         assert!(pair(&address, "000000").await.is_err());
-        assert_eq!(pair(&address, "123456").await?.token, credential.token);
+        let paired = pair(&address, "123456").await?;
+        assert_eq!(paired.token, credential.token);
+        // The host's own pairing file has no device record to key.
+        assert!(paired.device_key.is_none());
         host.await??;
         assert!(pair(&address, "123456").await.is_err());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
