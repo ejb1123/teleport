@@ -20,7 +20,9 @@ teleport relay --listen 0.0.0.0:4444 --identity-dir ~/.local/state/teleport/rela
 ```
 
 `--identity-dir` keeps the relay's certificate across restarts so the pinned
-fingerprint stays valid. Allow UDP 4444 to the relay. `--key` (or
+fingerprint stays valid. Allow UDP 4444 to the relay, and UDP 3478 for its
+STUN responder (used for [peer-to-peer](#peer-to-peer-through-nats);
+`--stun-listen ADDRESS|off` moves or disables it). `--key` (or
 `TELEPORT_RELAY_KEY`) admits only hosts and clients that present the same key
 with `--relay-key`; without it, anyone who can reach the relay could join a
 host's namespace and observe traffic sizes and timing (never content) or
@@ -54,16 +56,18 @@ The host address is not contacted in relay mode. `--relay` may also come from
 |---|---|
 | `direct` | Only the host address (default without `--relay`). |
 | `relay` | Only the relay (default with `--relay`). |
-| `auto` | The host address for at most 2.5 s, then the relay. |
+| `auto` | The host address for at most 2.5 s and, at the same time, a [peer-to-peer](#peer-to-peer-through-nats) path signalled through the relay; then the relay. |
 
 `auto` falls back only when the direct *transport* fails (no answer, refused, or
 a different certificate at that address); once a host has answered on the direct
-path, its errors are reported, not retried through the relay. Both paths
-authenticate the host by the same pinned fingerprint, and the relay path is
-always end-to-end encrypted, so neither direction of fallback downgrades
+or peer-to-peer path, its errors are reported, not retried through the relay.
+Every path authenticates the host by the same pinned fingerprint, and the relay
+path is always end-to-end encrypted, so no direction of fallback downgrades
 security. Every reconnect (`--reconnect`) chooses again. The chosen path is
-logged (`connection path chosen: relay (end-to-end encrypted)`) and shown in the
-Stats overlay (F8) as `Path`.
+logged (`connection path chosen: relay (end-to-end encrypted)`, with
+`elapsed_ms`) and shown in the Stats overlay (F8) as `Path`: `direct`,
+`p2p, server-reflexive candidate` (or `host`/`port-mapped candidate`), or
+`relay`.
 
 ## Launcher
 
@@ -270,7 +274,169 @@ in particular reveals typing cadence. It can also drop or delay traffic, which
 ends or degrades the session but cannot inject content. During enrollment it
 additionally sees the pairing rendezvous namespace (derived from the random
 rendezvous, never from the code) and the sizes and timing of PAKE or TLS
-messages it cannot read.
+messages it cannot read. For peer-to-peer signalling it sees that an exchange
+took place, but not the addresses exchanged; as the default STUN server it
+sees the public address of each end's peer-to-peer socket (see
+[threat model](#threat-model-and-privacy)).
+
+## Peer-to-peer through NATs
+
+With a relay configured and `--route auto` (the launcher's default), the
+client also tries to reach the host *directly* when neither has a port
+forward: ICE-lite style hole punching, with the relay used only to exchange
+addresses (`src/p2p.rs`, `src/stun.rs`). A direct path avoids the relay
+detour (in the namespace test, 23 ms instead of 86 ms input round trip; see
+[measurements](#measurements)).
+
+### Flow
+
+1. **One socket per end.** The host opens a peer-to-peer QUIC socket
+   (`--p2p-listen`, default `[::]:0`, beside its usual `--listen`); the client
+   opens one per attempt. A custom quinn `AsyncUdpSocket` wraps each: datagrams
+   that carry the STUN magic cookie (and so lack QUIC's fixed bit) go to a
+   small STUN agent, everything else to quinn. STUN and punches therefore
+   leave from the very socket, and NAT mapping, that QUIC uses. (moq-native
+   owns the main listener's socket and does not expose it, so the host's
+   peer-to-peer socket is a second quinn endpoint with the same TLS identity
+   and transport settings.)
+2. **Candidates.** Each end gathers: `host` — its interface addresses with
+   that socket's port (loopback, link-local and container/VM bridges left
+   out); `srflx` — its public address as a STUN server saw it; `mapped` — with
+   `--upnp`, a NAT-PMP mapping from the default gateway (Linux; deleted on
+   exit; UPnP-IGD and PCP are not implemented). The STUN server defaults to the
+   self-hosted relay's responder (`moqt://` relay host, UDP 3478). Nothing is
+   sent to a public STUN server unless named with `--stun HOST:PORT`
+   (repeatable); `--no-stun` sends none. Provider (`https://`) relays get no
+   STUN traffic.
+3. **Signalling** is an end-to-end handshake of its own through the relay, at
+   `<attempt>/p2p-hello`, `p2p-reply`, `p2p-confirm`, `p2p-offer`,
+   `p2p-answer`: the same X25519 exchange, host transcript signature,
+   key confirmation and device-key signature as a session, with the same
+   host-side bounds (8 pending, timeouts, replay cache, unknown credentials
+   unanswered, `--relay-require-device-key`). It is domain-separated from
+   sessions: the credential identifier and keys use
+   `HMAC(SHA-256(token), "teleport-p2p-signal-v1")` instead of `SHA-256(token)`,
+   and the hello's (signed) request is `teleport-p2p-v1`. A relay can
+   therefore neither turn a signalling exchange into a relayed session (or
+   the reverse) nor get an older host to answer it. After the host has
+   verified the confirmation, the client sends its candidates and the host
+   answers with its own, each sealed (ChaCha20-Poly1305) under keys derived
+   from that handshake's transcript and specific to direction and track.
+   Signalling never leases the credential or captures anything.
+4. **Punching.** On a valid offer the host *arms* its peer-to-peer socket for
+   30 s, sends STUN Binding indications from it to each client candidate
+   (11 rounds over 3 s), then answers. Its NAT now expects the client. The
+   first six rounds (400 ms) carry an IP TTL of 2, set per datagram: they
+   cross the host's own router but expire before the client's NAT. A
+   conntrack NAT without an inbound firewall would otherwise record the
+   unsolicited punch and remap the client's port when the client's own
+   packets to the host go out. Later rounds use the normal TTL, for a host
+   NAT further than one hop away.
+5. **Connectivity.** The client dials every host candidate from its own
+   socket (host candidates first, 30 ms apart) and keeps the first QUIC
+   handshake whose certificate has the pinned SHA-256 fingerprint; the others
+   are dropped before any credential is sent. The MoQ session on top is an
+   ordinary direct session: the credential travels in the SETUP path inside
+   that pinned TLS connection, and the host authorizes, leases and revokes it
+   exactly as on `--listen`. Hole punching changes reachability, never
+   authentication.
+6. **Budget.** Signalling (relay connection, STUN, handshake, answer) must
+   finish within 2.5 s and a handshake within 1.5 s more. All of it runs
+   alongside the 2.5 s direct attempt; if both fail, the relay is used as
+   before.
+
+### Compatibility
+
+Peer-to-peer happens only when both ends support and allow it:
+
+- A new client asks only through the relay. An older host (or one with
+  `--no-p2p`) cannot recognise the domain-separated hello and stays silent;
+  the client waits at most 2.5 s, during the direct attempt it makes anyway,
+  then uses the relay. Measured: 3.43–3.46 s to connect, as before.
+- An older client never sends a signalling hello; a new host behaves as
+  before for it. `teleport client --no-p2p` restores the old behaviour.
+- `--route direct` and `--route relay` are unchanged.
+
+### Threat model and privacy
+
+- **Authentication is unchanged.** The host is authenticated by its pinned
+  certificate in the peer-to-peer TLS handshake, as on a LAN; the client by
+  its credential, checked by the same code as `--listen`. A forged candidate
+  can only point the client at a server that fails the pin, before the
+  credential is sent.
+- **The relay** sees that a signalling exchange happens (path names, sizes,
+  timing) but not the candidates, which are sealed; it cannot inject, alter,
+  replay or move them between sessions (AEAD keyed by the transcript,
+  strict counters). It already knows both ends' public IP addresses from its
+  own connections. It can block signalling, which only means the relay is
+  used.
+- **The STUN server** (by default the relay itself) learns the public
+  address and port of each end's peer-to-peer socket, as it would for any
+  STUN client. Naming a public server with `--stun` discloses that to its
+  operator.
+- **The other end** learns your addresses: the host gets the client's
+  interface and public addresses, and the client the host's, but only after
+  completing the authenticated handshake (including its device-key signature
+  where the host stored one) — an unauthorized relay client learns nothing.
+  Over the relay neither end sees the other's address; with peer-to-peer
+  they do, as with a direct connection. Use `--no-p2p` (either end) or
+  `--route relay` to keep addresses private from the peer.
+- **Exposure.** The host's peer-to-peer socket listens on all interfaces by
+  default but ignores QUIC Initials unless an authenticated signalling
+  exchange armed it in the last 30 s, and then admits only what `--listen`
+  would. Punches go only to candidates of an authenticated client (at most
+  88 datagrams of 20 bytes per exchange).
+- **The relay's STUN responder** answers Binding requests only (no
+  attributes echoed), at most 2000 per second, so its use as a reflection
+  amplifier is small (a 20-byte request gets a 32- or 44-byte answer).
+
+### Measurements
+
+`tests/p2p.rs`, debug build, two Linux MASQUERADE NATs with 5 ms per access
+link and the relay 15 ms further away, so ~20 ms RTT between the peers and
+~80 ms through the relay; input probe round trips while the pointer streams
+at 500 Hz. Two serial runs of every scenario (2026-10-16, load average
+5.4–8.4):
+
+| Scenario | Path | Connect (s) | Probe p50 / p95 (ms) |
+| --- | --- | --- | --- |
+| Cone NATs with router firewall | p2p, server-reflexive | 1.33–1.36 | 23.2–24.0 / 24.1–27.2 |
+| Cone NATs without inbound firewall | p2p, server-reflexive | 1.32–1.35 | 23.2–24.0 / 25.2–28.6 |
+| Client NAT symmetric (`--random-fully`) | relay | 3.57–3.64 | 84.2–87.5 / 86.2–94.3 |
+| Peer UDP blocked | relay | 3.60–3.63 | 87.4–87.5 / 94.5–95.6 |
+| Host `--no-p2p` (as an older host) | relay | 3.42–3.45 | 84.1–87.3 / 86.4–93.6 |
+| Client `--no-p2p` (previous behaviour) | relay | 3.43–3.47 | 85.1–87.2 / 88.3–92.9 |
+
+The direct address is unreachable in every scenario, so the previous
+behaviour spends the full 2.5 s direct attempt before the relay. Peer-to-peer
+connects in about 1.3 s (about 1.15 s of it relay signalling, since each
+relay message costs an announce and subscribe round trip; the QUIC handshake
+itself takes ~60 ms) and removes the relay detour from every round trip:
+about 24 ms instead of 86 ms here. When punching fails after successful
+signalling, connecting takes 0.1–0.2 s longer than before. Before the
+low-TTL first punches, the run without an inbound firewall fell back to the
+relay.
+
+### Limitations
+
+- **Symmetric NATs** (a new public port per destination, as with
+  `--random-fully` or many carrier-grade NATs) defeat this scheme: the client
+  falls back to the relay, which is the only TURN-like path. Port prediction
+  and birthday-style probing are not implemented.
+- Relays without the STUN responder (provider relays, or `--stun-listen off`)
+  leave only host candidates unless `--stun` names a server: peer-to-peer then
+  works on a LAN or with `--upnp`, not across two NATs.
+- `--upnp` speaks NAT-PMP only, and finds the gateway on Linux only.
+- A session does not migrate between paths: one that started on the relay
+  stays there until it reconnects.
+- The host's peer-to-peer socket listens on a random port each start (fix it
+  with `--p2p-listen` for firewall rules).
+- The low-TTL punches assume the host's NAT is its first hop. Behind a
+  second NAT (carrier-grade, or a VM behind its host) the outer NAT opens only
+  with the later full-TTL punches, so the client's first QUIC Initial may be
+  lost and the handshake waits for its retransmission (about 1 s, within the
+  1.5 s budget); if that outer NAT also has no inbound firewall, those
+  punches can arrive first and spoil the client's mapping.
 
 ## Provider relays (Cloudflare)
 
@@ -309,8 +475,23 @@ for testing); report what you find.
   streams while its stripped credential and the host token are refused;
   and first pairing purely through the relay (wrong code, single use, then a
   relayed session decoding video); `--route auto` with an unreachable address
-  connects through the relay (and directly when the address works); presence
+  connects through the relay after a peer-to-peer exchange that offers no
+  usable (loopback) candidate, and directly when the address works; presence
   online, then offline after the host stops.
+- `cargo test --bin teleport stun:: p2p:: natpmp::` — STUN encoding and
+  decoding (RFC 5769 vectors, malformed and foreign messages, the relay's
+  responder); candidate validation (unspecified, loopback, multicast,
+  broadcast, reserved, link-local, port 0, too many); candidates sealed to
+  their session, track and direction (another session, tampering, an
+  unsealed list from the relay rejected); the domain-separated signalling
+  credential; STUN on the QUIC socket (spoofed answers ignored), a punch and
+  a pinned QUIC handshake on the same socket (wrong pin refused), per-datagram
+  TTL; NAT-PMP against a fake gateway.
+- `cargo test --test p2p -- --ignored` — unprivileged namespaces with two
+  NATs and a distant relay (see [measurements](#measurements)): hole punching
+  with and without router firewalls (relay used only for signalling, host sees
+  the client's NAT address), and the relay fallback for a symmetric client
+  NAT, blocked peer UDP, a host with `--no-p2p` and a client with `--no-p2p`.
 - `cargo test --bin teleport relay_enroll:: system_login::` — relay stream
   framing (order, gaps, byte limit), wrong code and replayed pairing
   transcripts, Linux login keeping the password inside pinned TLS.

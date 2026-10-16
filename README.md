@@ -341,9 +341,11 @@ to separate networking/decoding problems from portal/capture problems.
 - HDR requires the experimental patched-KWin/Mac path; see [its limitations](docs/hdr.md).
 - Gamepads need a Linux host with `/dev/uinput` access and have no rumble;
   see [gamepads](docs/gamepad.md).
-- No file transfer, virtual display, IME, monitor hotplug,
-  keychain-backed credentials or automatic NAT traversal yet.
-- Direct LAN/VPN connections only. A bitrate above available bandwidth
+- No file transfer, virtual display, IME, monitor hotplug or
+  keychain-backed credentials yet. NAT traversal needs a relay for
+  signalling; behind a symmetric NAT the session uses the relay itself
+  (there is no other TURN-like fallback).
+- Without a relay: direct LAN/VPN connections only. A bitrate above available bandwidth
   causes skipped video groups. Severe control loss/reordering disconnects the
   session instead of silently dropping keyboard/button events.
 - Windows is a future client target, not an implemented or tested platform.
@@ -382,6 +384,16 @@ encrypted and authenticated against the pinned host identity. In the launcher,
 select a desktop and click **Relay** to save a relay URL, its fingerprint, key and a
 route (**Direct, then relay** by default). Desktops with a relay show signed
 online/offline presence. See [relay mode](docs/relay.md).
+
+**Peer-to-peer through NATs** (development): with a relay and the default
+route, the client also tries a direct path between two NATed networks. Both
+ends learn their public address from the relay's built-in STUN responder
+(UDP 3478), exchange addresses end-to-end encrypted through the relay, and
+punch holes from their QUIC sockets; the session then runs directly, pinned to
+the host certificate as on a LAN. Stats (F8) shows `Path p2p, ...`; behind a
+symmetric NAT or with UDP blocked the relay is used as before. `--no-p2p`
+turns it off on either end; `--upnp` opts in to a NAT-PMP port mapping. See
+[peer-to-peer](docs/relay.md#peer-to-peer-through-nats).
 
 ## Development and checks
 

@@ -424,7 +424,8 @@ What is on `main`/this branch, from README, docs and code:
     resolution matching, VRR, Opus buffer tuning.
 - **Network:**
   - QUIC via MoQ (moq-lite-05). Direct UDP 4443 needs reachability (port
-    forward or VPN). There is no STUN, hole punching or UPnP.
+    forward or VPN). (Since 2026-10-16, G1: with a relay, `auto` also hole
+    punches a direct path through NATs, using STUN and opt-in NAT-PMP.)
   - Optional E2E-encrypted relay: self-hosted `teleport relay` or a provider
     (Cloudflare not yet verified). Route `direct`/`relay`/`auto` (2.5 s
     direct, then relay). Signed presence.
@@ -493,7 +494,7 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Constant FPS / static refinement | Yes | Keepalive frame only | Missing | |
 | Congestion control | BUD, 2 modes | QUIC RTT/loss controller | Partial | Capped-link utilisation and resolution/FPS step-down still open (H12) |
 | FEC | Unknown (BUD internals) | None (QUIC retransmit) | Unknown | |
-| P2P NAT traversal (STUN, hole punch, UPnP) | Yes | No | **Missing** | |
+| P2P NAT traversal (STUN, hole punch, UPnP) | Yes | STUN + hole punching via relay signalling, NAT-PMP opt-in (2026-10-16) | Mostly closed | No UPnP-IGD/PCP; symmetric NATs use the relay (G1) |
 | Relay | Enterprise only, customer-hosted, not E2E (DTLS via relay unclear) | Any user, self-hosted, E2E encrypted, auto fallback | **Teleport ahead** | |
 | CGNAT / double NAT | Unsupported | Works via relay | **Teleport ahead** | |
 | Cloud account required | Yes | No | **Teleport ahead** | |
@@ -580,6 +581,18 @@ File references are the likely touch points.
 
 **G1. Direct P2P across NATs: STUN reflexive addresses, QUIC hole punching,
 UPnP/NAT-PMP/PCP. Effort M–L.**
+
+- **Status (2026-10-16): implemented** (docs/relay.md "Peer-to-peer through
+  NATs", review tracker R7). `--route auto` races the direct address against
+  hole punching signalled through the relay (end-to-end sealed,
+  domain-separated handshake); STUN shares the QUIC socket; `teleport relay`
+  answers STUN on UDP 3478; `--upnp` adds a NAT-PMP mapping (not UPnP-IGD or
+  PCP); Stats shows `p2p` with the candidate type. Namespace test: two
+  MASQUERADE NATs connect directly (input p50 24 ms vs 86 ms via the relay);
+  symmetric NAT and blocked UDP fall back to the relay. Still open:
+  symmetric NATs (no port prediction; the relay is the only TURN-like path),
+  moving a running relayed session to a direct path, and a STUN source when
+  a provider relay is used.
 
 - **Why:** today a WAN session either needs a port forward or goes through the
   relay, which adds +5–30 ms (docs/review-2026-10.md R6). Parsec gets a direct
