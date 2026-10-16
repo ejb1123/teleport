@@ -42,6 +42,9 @@ pub struct StreamStats {
     pub decoder_recoveries: AtomicU64,
     pub stale_frames: AtomicU64,
     pub decode_errors: AtomicU64,
+    /// Frame rate the host is streaming at (0 until known); bounds how many
+    /// queued frames count as a decoder backlog.
+    pub stream_fps: AtomicU64,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -82,6 +85,7 @@ impl Default for StreamStats {
             decoder_recoveries: AtomicU64::new(0),
             stale_frames: AtomicU64::new(0),
             decode_errors: AtomicU64::new(0),
+            stream_fps: AtomicU64::new(0),
         }
     }
 }

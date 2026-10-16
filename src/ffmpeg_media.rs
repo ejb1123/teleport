@@ -341,6 +341,8 @@ mod tests {
     /// their `appsrc` from here).
     pub(super) static PIPELINE_HOOK: Mutex<Option<PipelineHook>> = Mutex::new(None);
     type PipelineHook = Box<dyn Fn(&gst::Pipeline) + Send>;
+    /// Frames the test capture has pushed (to compare with frames encoded).
+    static PUSHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
     unsafe extern "C" {
         fn gst_dmabuf_allocator_new() -> *mut gst::ffi::GstAllocator;
@@ -398,7 +400,10 @@ mod tests {
             ))
         }
 
-        /// Push a frame every 1/fps from a thread until the pipeline stops.
+        /// Push a frame every 1/fps (paced to absolute deadlines, so the
+        /// rate holds at 180 FPS) from a thread until the pipeline stops.
+        /// `TELEPORT_BENCH_JITTER_US` delays each frame by a random 0..=N µs,
+        /// like a compositor's vblank-to-delivery scheduling.
         fn feed(&self, pipeline: &gst::Pipeline, fps: u32) {
             let Some(source) = pipeline.by_name("test_capture") else {
                 return;
@@ -408,8 +413,15 @@ mod tests {
                 Self::Dmabuf(source) => Self::Dmabuf(source.clone()),
                 Self::Cpu(bytes) => Self::Cpu(bytes.clone()),
             };
+            let jitter: u64 = std::env::var("TELEPORT_BENCH_JITTER_US")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
             std::thread::spawn(move || {
                 let allocator = unsafe { gst_dmabuf_allocator_new() };
+                let period = Duration::from_secs(1) / fps;
+                let mut vblank = Instant::now();
+                let mut random = 0x9e37_79b9_7f4a_7c15_u64;
                 loop {
                     let buffer = match &capture {
                         Self::Cpu(bytes) => gst::Buffer::from_slice(bytes.clone()),
@@ -444,7 +456,13 @@ mod tests {
                     if source.push_buffer(buffer).is_err() {
                         break;
                     }
-                    std::thread::sleep(Duration::from_secs(1) / fps);
+                    PUSHED.fetch_add(1, Ordering::Relaxed);
+                    vblank += period;
+                    random ^= random << 13;
+                    random ^= random >> 7;
+                    random ^= random << 17;
+                    let delay = Duration::from_micros(random % (jitter + 1));
+                    std::thread::sleep((vblank + delay).saturating_duration_since(Instant::now()));
                 }
                 unsafe { gst::ffi::gst_object_unref(allocator.cast()) };
             });
@@ -469,15 +487,16 @@ mod tests {
     }
 
     /// Run `encoder()` on a test capture for `seconds` after a warm-up and
-    /// return (encoder label, frames, host CPU ms/frame, capture→packet ms,
-    /// submit→packet ms, last decoded frame).
+    /// return (encoder label, frames encoded, host CPU ms/frame, capture→packet
+    /// ms, submit→packet ms, frames captured, last decoded frame).
+    #[allow(clippy::type_complexity)]
     fn run_capture(
         kind: EncoderKind,
         capture: TestCapture,
         size: (u32, u32),
+        fps: u32,
         seconds: f64,
-    ) -> Result<(String, u64, f64, f64, f64, crate::ffmpeg::Frame)> {
-        let fps = 60;
+    ) -> Result<(String, u64, f64, f64, f64, u64, crate::ffmpeg::Frame)> {
         let description = capture.description(size, fps)?;
         let capture = Arc::new(capture);
         let feeder = capture.clone();
@@ -491,7 +510,7 @@ mod tests {
             &description,
             size,
             fps,
-            20_000,
+            crate::protocol::auto_bitrate(size.0, size.1, fps),
             track,
             kind,
             VideoCodec::H264.into(),
@@ -500,9 +519,17 @@ mod tests {
         let encode = encode?;
         let metrics = encode.encoder_metrics()?;
         std::thread::sleep(Duration::from_millis(500));
-        let (before, cpu_before) = (*metrics.totals.lock().unwrap(), process_cpu());
+        let (before, cpu_before, pushed_before) = (
+            *metrics.totals.lock().unwrap(),
+            process_cpu(),
+            PUSHED.load(Ordering::Relaxed),
+        );
         std::thread::sleep(Duration::from_secs_f64(seconds));
-        let (after, cpu_after) = (*metrics.totals.lock().unwrap(), process_cpu());
+        let (after, cpu_after, pushed_after) = (
+            *metrics.totals.lock().unwrap(),
+            process_cpu(),
+            PUSHED.load(Ordering::Relaxed),
+        );
         encode.error()?;
         let label = metrics.encoder.clone();
         let frames = after.2 - before.2;
@@ -551,6 +578,7 @@ mod tests {
             (cpu_after - cpu_before).as_secs_f64() * 1000.0 / frames as f64,
             per_frame(after.3 - before.3),
             per_frame(after.1 - before.1),
+            pushed_after - pushed_before,
             last.context("nothing decoded")?,
         ))
     }
@@ -608,7 +636,7 @@ mod tests {
                 eprintln!("SKIP {kind:?}: no EGL device exporting DMA-BUFs");
                 continue;
             };
-            let (label, frames, ..) = match run_capture(kind, capture, size, 1.0) {
+            let (label, frames, ..) = match run_capture(kind, capture, size, 60, 1.0) {
                 Ok(result) => result,
                 Err(error) if ZERO_COPY_FAILED.load(Ordering::Relaxed) => {
                     return Err(error.context(format!("{kind:?} zero-copy capture failed")));
@@ -626,6 +654,7 @@ mod tests {
                 kind,
                 TestCapture::new(true, node, size)?.context("source vanished")?,
                 size,
+                60,
                 0.3,
             )?;
             check_colors(&decoded, &label)?;
@@ -641,7 +670,7 @@ mod tests {
             .map(|(kind, _)| kind)
             .find(|kind| {
                 let capture = TestCapture::new(false, None, size).unwrap().unwrap();
-                run_capture(*kind, capture, size, 0.2).is_ok()
+                run_capture(*kind, capture, size, 60, 0.2).is_ok()
             })
             .context("no encoder for the fallback check")?;
         let pipeline = encoder(
@@ -692,33 +721,81 @@ mod tests {
             Ok("vaapi") => EncoderKind::Vaapi,
             _ => EncoderKind::Nvidia,
         };
+        let fps = std::env::var("TELEPORT_BENCH_FPS")
+            .ok()
+            .and_then(|fps| fps.parse().ok())
+            .unwrap_or(60);
         let mut capture = crate::capture::Capture::open_with_options("portal", None, 0).await?;
         let size = (capture.width & !1, capture.height & !1);
+        // Count what PipeWire delivers before the rate limit, and keep the
+        // source to report the format the compositor negotiated.
+        let source = Arc::new(Mutex::new(None::<gst::Element>));
+        let found = source.clone();
+        *PIPELINE_HOOK.lock().unwrap() = Some(Box::new(move |pipeline: &gst::Pipeline| {
+            let Some(element) = pipeline
+                .iterate_elements()
+                .into_iter()
+                .flatten()
+                .find(|element| {
+                    element
+                        .factory()
+                        .is_some_and(|factory| factory.name() == "pipewiresrc")
+                })
+            else {
+                return;
+            };
+            element
+                .static_pad("src")
+                .unwrap()
+                .add_probe(gst::PadProbeType::BUFFER, |_, _| {
+                    PUSHED.fetch_add(1, Ordering::Relaxed);
+                    gst::PadProbeReturn::Ok
+                });
+            *found.lock().unwrap() = Some(element);
+        }));
         let encode = encoder(
             &capture.pipeline_source(),
             size,
-            60,
-            20_000,
+            fps,
+            crate::protocol::auto_bitrate(size.0, size.1, fps),
             moq_net::broadcast::Info::new()
                 .produce()
                 .create_track(VideoCodec::H264.track(), None)?,
             kind,
             VideoCodec::H264.into(),
         )?;
+        *PIPELINE_HOOK.lock().unwrap() = None;
         let metrics = encode.encoder_metrics()?;
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let (before, cpu_before) = (*metrics.totals.lock().unwrap(), process_cpu());
+        if let Some(caps) = source
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|source| source.static_pad("src")?.current_caps())
+        {
+            eprintln!("PipeWire negotiated {caps}");
+        }
+        let (before, cpu_before, delivered_before) = (
+            *metrics.totals.lock().unwrap(),
+            process_cpu(),
+            PUSHED.load(Ordering::Relaxed),
+        );
         tokio::time::sleep(Duration::from_secs(5)).await;
-        let (after, cpu_after) = (*metrics.totals.lock().unwrap(), process_cpu());
+        let (after, cpu_after, delivered_after) = (
+            *metrics.totals.lock().unwrap(),
+            process_cpu(),
+            PUSHED.load(Ordering::Relaxed),
+        );
         encode.error()?;
         let frames = after.2 - before.2;
         ensure!(frames > 0, "no frames captured");
         let per_frame = |sum: u64| sum as f64 / frames as f64 / 1000.0;
         eprintln!(
-            "BENCH portal {} {}x{}: {frames} frames, CPU {:.2} ms/frame, capture->packet {:.2} ms, submit->packet {:.2} ms",
+            "BENCH portal {} {}x{} at {fps}: {} delivered, {frames} frames encoded, CPU {:.2} ms/frame, capture->packet {:.2} ms, submit->packet {:.2} ms",
             metrics.encoder,
             size.0,
             size.1,
+            delivered_after - delivered_before,
             (cpu_after - cpu_before).as_secs_f64() * 1000.0 / frames as f64,
             per_frame(after.3 - before.3),
             per_frame(after.1 - before.1),
@@ -752,8 +829,8 @@ mod tests {
                         eprintln!("SKIP {kind:?}: no EGL device exporting DMA-BUFs");
                         continue;
                     };
-                    match run_capture(kind, capture, size, seconds) {
-                        Ok((label, frames, cpu, capture, encode, decoded)) => {
+                    match run_capture(kind, capture, size, 60, seconds) {
+                        Ok((label, frames, cpu, capture, encode, _, decoded)) => {
                             check_colors(&decoded, &label)?;
                             eprintln!(
                                 "BENCH {label} {}x{}: {frames} frames, CPU {cpu:.2} ms/frame, capture->packet {capture:.2} ms, submit->packet {encode:.2} ms",
@@ -766,6 +843,60 @@ mod tests {
                     }
                 }
             }
+        }
+        ensure!(
+            !ZERO_COPY_FAILED.load(Ordering::Relaxed),
+            "zero-copy fell back"
+        );
+        Ok(())
+    }
+
+    /// High refresh rates: a 2560x1440 (`TELEPORT_BENCH_SIZE`) DMA-BUF source
+    /// at 60/120/180/240 FPS (`TELEPORT_BENCH_FPS`) through NVENC zero-copy.
+    /// Reports frames encoded against frames captured, so a rate limit or a
+    /// slow stage shows up as a lower ratio. Static content: NVENC's own cost on busy
+    /// content is higher than here.
+    #[test]
+    #[ignore = "benchmark; requires NVENC and an EGL device exporting DMA-BUFs"]
+    fn high_rate_capture_benchmark() -> Result<()> {
+        if std::env::var("TELEPORT_TEST_HARDWARE").as_deref() != Ok("1") {
+            eprintln!("SKIP: set TELEPORT_TEST_HARDWARE=1 on a machine with NVENC");
+            return Ok(());
+        }
+        test_tracing();
+        gst::init()?;
+        ZERO_COPY_FAILED.store(false, Ordering::Relaxed);
+        let seconds = std::env::var("TELEPORT_BENCH_SECONDS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(4.0);
+        let rates: Vec<u32> = std::env::var("TELEPORT_BENCH_FPS")
+            .ok()
+            .map(|list| list.split(',').filter_map(|fps| fps.parse().ok()).collect())
+            .unwrap_or_else(|| vec![60, 120, 180, 240]);
+        let size = std::env::var("TELEPORT_BENCH_SIZE")
+            .ok()
+            .and_then(|size| {
+                let (width, height) = size.split_once('x')?;
+                Some((width.parse().ok()?, height.parse().ok()?))
+            })
+            .unwrap_or((2560, 1440));
+        for fps in rates {
+            let Some(capture) = TestCapture::new(true, None, size)? else {
+                eprintln!("SKIP: no EGL device exporting DMA-BUFs");
+                return Ok(());
+            };
+            let (label, frames, cpu, capture, encode, pushed, decoded) =
+                run_capture(EncoderKind::Nvidia, capture, size, fps, seconds)?;
+            check_colors(&decoded, &label)?;
+            eprintln!(
+                "BENCH {label} {}x{} at {fps}: {:.1} captured/s, {:.1} encoded/s ({:.1}%), CPU {cpu:.2} ms/frame, capture->packet {capture:.2} ms, submit->packet {encode:.2} ms",
+                size.0,
+                size.1,
+                pushed as f64 / seconds,
+                frames as f64 / seconds,
+                frames as f64 * 100.0 / pushed.max(1) as f64,
+            );
         }
         ensure!(
             !ZERO_COPY_FAILED.load(Ordering::Relaxed),

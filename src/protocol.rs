@@ -162,6 +162,25 @@ pub struct Desktop {
     /// Older hosts reject unknown events, so clients must check this first.
     #[serde(default)]
     pub gamepads: bool,
+    /// Highest frame rate `ConfigureVideo` accepts; zero for hosts that
+    /// predate the field, which reject anything above [`LEGACY_MAX_FPS`].
+    #[serde(default)]
+    pub max_fps: u32,
+    /// Host accepts `Event::ClientDisplay` and picks the stream size and rate
+    /// from it ([`negotiate`]); older hosts reject unknown events.
+    #[serde(default)]
+    pub display_negotiation: bool,
+}
+
+impl Desktop {
+    /// Highest frame rate this host accepts in `ConfigureVideo`.
+    pub fn accepted_max_fps(&self) -> u32 {
+        if self.max_fps == 0 {
+            LEGACY_MAX_FPS
+        } else {
+            self.max_fps.min(MAX_FPS)
+        }
+    }
 }
 
 /// Largest cursor side accepted on the wire (cursors are usually 16-64 px;
@@ -242,6 +261,10 @@ pub struct Monitor {
     pub name: String,
     pub width: u32,
     pub height: u32,
+    /// Refresh rate in millihertz when the host knows it (X11 RandR); zero
+    /// when unknown (the desktop portal does not report it).
+    #[serde(default)]
+    pub refresh_mhz: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -439,6 +462,52 @@ pub enum Event {
         #[serde(default)]
         local_cursor: bool,
     },
+    /// The client's display and stream choices; the host picks the stream
+    /// size, rate and bitrate from them ([`negotiate`]) and answers with
+    /// `Update::Desktop`. Sent on connect and again when the window's
+    /// display, size or refresh rate changes. Only sent to hosts advertising
+    /// `Desktop::display_negotiation`.
+    ClientDisplay(ClientDisplay),
+}
+
+/// What the client shows video on, and what the user asked for.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClientDisplay {
+    /// Video area in physical pixels; zero when unknown (headless).
+    pub width: u32,
+    pub height: u32,
+    /// Refresh rate of the display showing the window, in millihertz; zero
+    /// when unknown.
+    pub refresh_mhz: u32,
+    /// Explicit stream width (0 = the host monitor's native width); `None`
+    /// matches the client's video area.
+    #[serde(default)]
+    pub stream_width: Option<u32>,
+    /// Frame-rate cap chosen by the user; `None` matches the display.
+    #[serde(default)]
+    pub max_fps: Option<u32>,
+    /// Bitrate in kbit/s; `None` lets the host size it ([`auto_bitrate`]).
+    #[serde(default)]
+    pub bitrate: Option<u32>,
+}
+
+impl ClientDisplay {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.width <= 32_768
+                && self.height <= 32_768
+                && self.refresh_mhz <= 1_000_000
+                && self
+                    .stream_width
+                    .is_none_or(|width| width == 0 || (320..=7680).contains(&width))
+                && self.max_fps.is_none_or(|fps| (1..=MAX_FPS).contains(&fps))
+                && self
+                    .bitrate
+                    .is_none_or(|bitrate| (500..=100_000).contains(&bitrate)),
+            "invalid client display"
+        );
+        Ok(())
+    }
 }
 
 impl Event {
@@ -492,7 +561,7 @@ impl Event {
                 bitrate,
             } => ensure!(
                 (*width == 0 || (320..=7680).contains(width))
-                    && (1..=120).contains(fps)
+                    && (1..=MAX_FPS).contains(fps)
                     && (500..=100_000).contains(bitrate),
                 "invalid video settings"
             ),
@@ -535,6 +604,7 @@ impl Event {
                     && !name.chars().any(char::is_control),
                 "invalid gamepad slot or name"
             ),
+            Self::ClientDisplay(display) => display.validate()?,
             Self::GamepadDisconnected { pad } => {
                 ensure!(*pad < MAX_GAMEPADS, "invalid gamepad slot")
             }
@@ -562,6 +632,110 @@ pub fn validate_video_size(width: u32, height: u32) -> Result<()> {
         "video size exceeds supported limits"
     );
     Ok(())
+}
+
+/// Highest stream frame rate (240 Hz monitors).
+pub const MAX_FPS: u32 = 240;
+/// What hosts without `Desktop::max_fps` accept; they reject anything higher.
+pub const LEGACY_MAX_FPS: u32 = 120;
+/// Frame rate when neither the user, the client display nor the host monitor
+/// gives one.
+pub const DEFAULT_FPS: u32 = 60;
+/// Automatic bitrate up to 60 FPS, in kbit/s: the launcher's long-standing
+/// default. Higher rates scale it ([`high_rate_bitrate`]).
+pub const AUTO_BITRATE: u32 = 20_000;
+/// Bits per pixel per frame a stream above 60 FPS gets at least, before the
+/// frame-rate factor: about 13 Mbps for 1440p and 30 Mbps for 4K.
+const HIGH_RATE_BITS_PER_PIXEL: f64 = 0.06;
+
+/// Whole hertz from millihertz (179 960 → 180, 59 940 → 60); zero stays
+/// unknown.
+pub fn refresh_hz(refresh_mhz: u32) -> u32 {
+    refresh_mhz.saturating_add(500) / 1000
+}
+
+/// The bitrate for a stream that would get `kbps` at 60 FPS. At 60 FPS and
+/// below `kbps` is returned unchanged. Above, it is raised to a per-pixel
+/// floor for the size and scaled by sqrt(fps / 60): more frames per second
+/// each carry less change, so bits per frame may fall (Moonlight uses the
+/// same curve). Never below `kbps`, never above the protocol's 100 Mbps.
+pub fn high_rate_bitrate(kbps: u32, width: u32, height: u32, fps: u32) -> u32 {
+    if fps <= 60 {
+        return kbps;
+    }
+    let floor = f64::from(width) * f64::from(height) * 60.0 * HIGH_RATE_BITS_PER_PIXEL / 1000.0;
+    let scaled = f64::from(kbps).max(floor) * (f64::from(fps) / 60.0).sqrt();
+    (scaled as u32).min(100_000).max(kbps)
+}
+
+/// Bitrate when the user leaves it automatic.
+pub fn auto_bitrate(width: u32, height: u32, fps: u32) -> u32 {
+    high_rate_bitrate(AUTO_BITRATE, width, height, fps)
+}
+
+/// A stream configuration chosen from a [`ClientDisplay`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamChoice {
+    /// Stream width as `ConfigureVideo` takes it: 0 = the monitor's native.
+    pub width: u32,
+    pub fps: u32,
+    pub bitrate: u32,
+}
+
+/// Pick the stream for `display` from a host monitor of `monitor` pixels
+/// refreshing at `monitor_refresh_mhz` (0 = unknown), on a host accepting up
+/// to `host_max_fps`.
+///
+/// Rate: the lowest of the user's cap, the client display's and the host
+/// monitor's refresh rate, and the host's maximum; [`DEFAULT_FPS`] when none
+/// of the first three is known. Size: an explicit width as given; otherwise
+/// the largest size with the monitor's aspect ratio that fits the client's
+/// video area, never above native (no upscaling), and native when the area
+/// is unknown.
+pub fn negotiate(
+    display: &ClientDisplay,
+    monitor: (u32, u32),
+    monitor_refresh_mhz: u32,
+    host_max_fps: u32,
+) -> StreamChoice {
+    let fps = [
+        display.max_fps.unwrap_or(0),
+        refresh_hz(display.refresh_mhz),
+        refresh_hz(monitor_refresh_mhz),
+    ]
+    .into_iter()
+    .filter(|&fps| fps > 0)
+    .min()
+    .unwrap_or(DEFAULT_FPS)
+    .clamp(1, host_max_fps.clamp(1, MAX_FPS));
+    let (monitor_width, monitor_height) = (monitor.0.max(2), monitor.1.max(2));
+    let width = display.stream_width.unwrap_or_else(|| {
+        if display.width == 0 || display.height == 0 || monitor_width <= 320 {
+            return 0;
+        }
+        let scale = (f64::from(display.width) / f64::from(monitor_width))
+            .min(f64::from(display.height) / f64::from(monitor_height));
+        let width = (f64::from(monitor_width) * scale) as u32 / 2 * 2;
+        if width >= monitor_width {
+            0
+        } else {
+            width.max(320)
+        }
+    });
+    let (stream_width, stream_height) = match width {
+        0 => (monitor_width, monitor_height),
+        width => (
+            width,
+            (u64::from(width) * u64::from(monitor_height) / u64::from(monitor_width)) as u32,
+        ),
+    };
+    StreamChoice {
+        width,
+        fps,
+        bitrate: display
+            .bitrate
+            .unwrap_or_else(|| auto_bitrate(stream_width, stream_height, fps)),
+    }
 }
 
 /// Read untrusted MoQ frames with an application-level size limit.
@@ -1060,7 +1234,7 @@ mod tests {
         assert!(
             Event::ConfigureVideo {
                 width: 0,
-                fps: 120,
+                fps: 240,
                 bitrate: 100_000
             }
             .validate()
@@ -1070,7 +1244,7 @@ mod tests {
             (319, 60, 8000),
             (7681, 60, 8000),
             (1920, 0, 8000),
-            (1920, 121, 8000),
+            (1920, 241, 8000),
             (1920, 60, 100_001),
         ] {
             assert!(
@@ -1121,5 +1295,166 @@ mod tests {
         assert_eq!(evdev(Application), Some(127));
         assert_eq!(evdev(F13), Some(183));
         assert_eq!(evdev(F24), Some(194));
+    }
+
+    #[test]
+    fn high_frame_rates_are_capability_gated_both_ways() {
+        // A new client reading an old host: no max_fps, no negotiation.
+        let old: Desktop = serde_json::from_value(serde_json::json!({ "version": 2,
+            "width": 1280, "height": 720, "fps": 60, "source": "X11",
+            "monitors": [{ "id": 0, "name": "A", "width": 2560, "height": 1440 }],
+            "active_monitor": 0, "audio": false, "clipboard": false,
+            "configurable_video": true }))
+        .unwrap();
+        assert_eq!(old.accepted_max_fps(), LEGACY_MAX_FPS);
+        assert!(!old.display_negotiation);
+        assert_eq!(old.monitors[0].refresh_mhz, 0);
+        // An old client reading a new host ignores the new fields (no
+        // deny_unknown_fields on the wire types).
+        let new = serde_json::to_value(Desktop {
+            max_fps: MAX_FPS,
+            display_negotiation: true,
+            ..old.clone()
+        })
+        .unwrap();
+        assert_eq!(new["max_fps"], 240);
+        let mut capped = old.clone();
+        capped.max_fps = 1000;
+        assert_eq!(capped.accepted_max_fps(), MAX_FPS);
+        // An old host keeps refusing above 120; new hosts accept up to 240.
+        let configure = |fps| Event::ConfigureVideo {
+            width: 0,
+            fps,
+            bitrate: 20_000,
+        };
+        assert!(configure(180).validate().is_ok());
+        assert!(configure(241).validate().is_err());
+        // The event round-trips; old hosts fail closed on unknown events,
+        // which is why clients only send it to hosts advertising negotiation.
+        let event = Event::ClientDisplay(ClientDisplay {
+            width: 2560,
+            height: 1440,
+            refresh_mhz: 179_960,
+            stream_width: None,
+            max_fps: Some(240),
+            bitrate: None,
+        });
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains(r#""type":"client_display""#), "{json}");
+        let back: Event = serde_json::from_str(&json).unwrap();
+        back.validate().unwrap();
+        assert!(!back.is_lossy());
+        for invalid in [
+            ClientDisplay {
+                max_fps: Some(241),
+                ..Default::default()
+            },
+            ClientDisplay {
+                max_fps: Some(0),
+                ..Default::default()
+            },
+            ClientDisplay {
+                stream_width: Some(100),
+                ..Default::default()
+            },
+            ClientDisplay {
+                bitrate: Some(100_001),
+                ..Default::default()
+            },
+            ClientDisplay {
+                refresh_mhz: 2_000_000,
+                ..Default::default()
+            },
+        ] {
+            assert!(Event::ClientDisplay(invalid).validate().is_err());
+        }
+    }
+
+    #[test]
+    fn negotiation_takes_the_lowest_known_rate_and_fits_the_client() {
+        let qhd = (2560, 1440);
+        let display = |width, height, refresh_mhz, max_fps| ClientDisplay {
+            width,
+            height,
+            refresh_mhz,
+            stream_width: None,
+            max_fps,
+            bitrate: None,
+        };
+        // 179.96 Hz client, 179.96 Hz host monitor, no cap: 180 at native.
+        let choice = negotiate(&display(2560, 1440, 179_960, None), qhd, 179_960, MAX_FPS);
+        assert_eq!((choice.width, choice.fps), (0, 180));
+        // A user cap, a slower client display, a slower host monitor and an
+        // old host's limit each win when lowest.
+        assert_eq!(
+            negotiate(&display(0, 0, 179_960, Some(120)), qhd, 0, MAX_FPS).fps,
+            120
+        );
+        assert_eq!(
+            negotiate(&display(0, 0, 59_940, Some(240)), qhd, 179_960, MAX_FPS).fps,
+            60
+        );
+        assert_eq!(
+            negotiate(&display(0, 0, 240_000, None), qhd, 143_856, MAX_FPS).fps,
+            144
+        );
+        assert_eq!(
+            negotiate(&display(0, 0, 179_960, None), qhd, 0, LEGACY_MAX_FPS).fps,
+            120
+        );
+        // Nothing known: the default rate.
+        assert_eq!(negotiate(&display(0, 0, 0, None), qhd, 0, MAX_FPS).fps, 60);
+        // Size: fit the client's area with the monitor's aspect ratio.
+        let window = negotiate(&display(1280, 800, 60_000, None), qhd, 0, MAX_FPS);
+        assert_eq!(window.width, 1280);
+        let tall = negotiate(&display(1920, 1200, 60_000, None), qhd, 0, MAX_FPS);
+        assert_eq!(tall.width, 1920);
+        let wide = negotiate(&display(1600, 720, 60_000, None), qhd, 0, MAX_FPS);
+        assert_eq!(wide.width, 1280);
+        // Larger than the monitor, or unknown: native, never upscaled.
+        assert_eq!(
+            negotiate(&display(3840, 2160, 60_000, None), qhd, 0, MAX_FPS).width,
+            0
+        );
+        assert_eq!(negotiate(&display(0, 0, 0, None), qhd, 0, MAX_FPS).width, 0);
+        // Tiny windows stay at a usable minimum.
+        assert_eq!(
+            negotiate(&display(200, 100, 0, None), qhd, 0, MAX_FPS).width,
+            320
+        );
+        // Explicit choices pass through.
+        let explicit = ClientDisplay {
+            stream_width: Some(1920),
+            bitrate: Some(12_000),
+            ..display(1280, 720, 60_000, None)
+        };
+        let choice = negotiate(&explicit, qhd, 0, MAX_FPS);
+        assert_eq!((choice.width, choice.bitrate), (1920, 12_000));
+        // Automatic bitrate follows the chosen size and rate.
+        assert_eq!(
+            negotiate(&display(2560, 1440, 179_960, None), qhd, 0, MAX_FPS).bitrate,
+            auto_bitrate(2560, 1440, 180)
+        );
+    }
+
+    #[test]
+    fn automatic_bitrate_only_grows_above_60_fps() {
+        for fps in [1, 30, 60] {
+            assert_eq!(high_rate_bitrate(8000, 3840, 2160, fps), 8000);
+            assert_eq!(auto_bitrate(2560, 1440, fps), AUTO_BITRATE);
+        }
+        // 1440p: max(20, 13.3) Mbps × sqrt(fps / 60).
+        assert_eq!(auto_bitrate(2560, 1440, 120), 28_284);
+        assert_eq!(auto_bitrate(2560, 1440, 180), 34_641);
+        assert_eq!(auto_bitrate(2560, 1440, 240), 40_000);
+        // The per-pixel floor lifts a low base at large sizes.
+        assert_eq!(high_rate_bitrate(8000, 2560, 1440, 180), 22_986);
+        assert_eq!(high_rate_bitrate(8000, 1280, 720, 180), 13_856);
+        // Never above the protocol maximum, never below the base.
+        assert_eq!(auto_bitrate(7680, 4320, 240), 100_000);
+        assert_eq!(high_rate_bitrate(100_000, 320, 180, 240), 100_000);
+        assert_eq!(refresh_hz(179_960), 180);
+        assert_eq!(refresh_hz(59_940), 60);
+        assert_eq!(refresh_hz(0), 0);
     }
 }

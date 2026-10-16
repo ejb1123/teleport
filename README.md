@@ -158,11 +158,28 @@ to an existing logged-in graphical session, not login-screen/reboot access.
 
 ## Audio, clipboard and quality
 
-Choose native, 1080p-width, 1440p-width, 720p-width or 4K-width in the launcher,
-along with 30/60/120 FPS, 8/20/40 Mbps and H.264/H.265. Scaling preserves the selected monitor's aspect
-ratio; it does not change the Linux monitor's mode. Native uses the size reported
+The launcher defaults to **Match client** size, **Match display** frame rate and
+**Auto bitrate**: the client tells the host its window size (physical pixels)
+and its display's refresh rate, and the host streams at the lowest of that
+rate, its own monitor's refresh rate (X11, or what the KWin screencast states)
+and the user's cap, up to 240 FPS, at the largest size of the host monitor's
+aspect ratio that fits the window (never upscaled). Moving the window to another
+display, a mode change, fullscreen or a resize renegotiates once it has settled
+for a second, and only if the stream would change (a resize by 10% or more).
+Explicit choices remain: native, 1080p-, 1440p-, 720p- or 4K-width; 60, 120,
+144, 165, 180 or 240 FPS (a cap); 8/20/40/80 Mbps; H.264/H.265. Auto bitrate is
+20 Mbps up to 60 FPS and scales above (34.6 Mbps at 1440p180). Hosts from
+before 240 FPS support stream at most 120 FPS; the client says so and clamps.
+Scaling preserves the selected monitor's aspect ratio; it does not change the
+Linux monitor's mode (the desktop portal cannot). Native uses the size reported
 by capture, which may be logical pixels on scaled Wayland desktops. Settings are
 session-local and switching displays retains the selected quality policy.
+
+Frames are presented as they arrive: adaptive vsync where the GL driver offers
+it (GLX), otherwise no vsync wait, so a variable-refresh (FreeSync/G-Sync)
+display follows the stream when the compositor enables VRR for the fullscreen
+window. `--vsync` (launcher: **VSync on**) waits for every refresh instead, for
+fixed-refresh displays that tear.
 For explicit CLI settings:
 
 ```sh
@@ -170,7 +187,7 @@ nix run . -- client LINUX_IP:4443 --pairing-file pairing.json \
   --width 0 --fps 60 --bitrate 20000 --codec h265 --stats
 ```
 
-`--width 0` means native; a positive width requests scaling, with a supported
+`--width match --fps match --bitrate auto` negotiate as above. `--width 0` means native; a positive width requests scaling, with a supported
 ceiling of 7680 pixels wide, 8192 high and 33,554,432 total pixels. Actual encoder
 hardware may have lower limits. Host CLI defaults remain 1280 wide for older
 clients; a new client's quality request overrides this for its own session.
@@ -324,9 +341,10 @@ to separate networking/decoding problems from portal/capture problems.
 
 - Native SDL window, resizable with letterboxing and correctly mapped pointer
   coordinates; video, keyboard, three mouse buttons, and scrolling.
-- Host CLI defaults to 1280-pixel stream width, 60 fps cap, 8 Mbps H.264;
-  the launcher requests native/60fps/20Mbps. Tune with `--width`,
-  `--fps`, and `--bitrate` (kilobits/second). Aspect ratio is retained.
+- Host CLI defaults to 1280-pixel stream width, 60 fps (up to 240 with `--fps`),
+  8 Mbps H.264 (scaled above 60 fps unless `--bitrate` is given); the launcher
+  matches the client window and display. Tune with `--width`, `--fps`, and
+  `--bitrate` (kilobits/second). Aspect ratio is retained.
 - Auto hardware encoding with CPU x264/x265 fallback, low-delay settings and short
   keyframe groups. Frames still copy through CPU memory; zero-copy rendering
   is not implemented. FPS in the stats overlay is decoded/displayed frame

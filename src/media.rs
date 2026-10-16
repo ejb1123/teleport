@@ -133,6 +133,32 @@ impl Pipeline {
         }
     }
 
+    /// The capture source's frame-rate ceiling in millihertz, when it states
+    /// one: a PipeWire screencast negotiates `max-framerate`, which KWin sets
+    /// to the monitor's refresh rate (whole hertz, rounded down: 179.96 Hz
+    /// becomes 179) and never exceeds. The portal reports no refresh rate
+    /// otherwise.
+    pub fn source_refresh_mhz(&self) -> Option<u32> {
+        self.0
+            .iterate_elements()
+            .into_iter()
+            .flatten()
+            .filter(|element| {
+                element
+                    .factory()
+                    .is_some_and(|factory| factory.name() == "pipewiresrc")
+            })
+            .find_map(|source| {
+                let caps = source.static_pad("src")?.current_caps()?;
+                let rate = caps
+                    .structure(0)?
+                    .get::<gst::Fraction>("max-framerate")
+                    .ok()?;
+                let mhz = i64::from(rate.numer()) * 1000 / i64::from(rate.denom()).max(1);
+                u32::try_from(mhz).ok().filter(|&mhz| mhz >= 1000)
+            })
+    }
+
     /// Make the next captured frame an IDR that starts a new MoQ group.
     #[cfg(target_os = "linux")]
     pub fn request_keyframe(&self) -> Result<()> {
@@ -1077,7 +1103,14 @@ pub async fn receive_video_with_stats(
 }
 
 const MAX_DECODE_BACKLOG_AGE: Duration = Duration::from_millis(150);
+/// Queued frames that count as a backlog: 12, or 200 ms of frames above 60 FPS
+/// (12 frames would be only 67 ms at 180 FPS, so a small burst would discard
+/// the group).
 const MAX_DECODE_BACKLOG_FRAMES: u64 = 12;
+
+fn max_backlog_frames(stats: &crate::stats::StreamStats) -> u64 {
+    MAX_DECODE_BACKLOG_FRAMES.max(stats.stream_fps.load(Ordering::Relaxed) / 5)
+}
 const MAX_DECODE_BACKLOG_BYTES: u64 = 8 * 1024 * 1024;
 const VA_STARTUP_GRACE: Duration = Duration::from_millis(750);
 
@@ -1204,7 +1237,7 @@ impl RecoveryBudget {
 
 fn decoder_backlogged(source: &AppSrc, stats: &crate::stats::StreamStats) -> bool {
     let frames = source.current_level_buffers();
-    frames >= MAX_DECODE_BACKLOG_FRAMES
+    frames >= max_backlog_frames(stats)
         || source.current_level_bytes() >= MAX_DECODE_BACKLOG_BYTES
         || (frames > 0
             && stats

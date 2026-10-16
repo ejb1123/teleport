@@ -22,6 +22,8 @@ use tokio::{runtime::Runtime, sync::mpsc};
 mod controllers;
 #[path = "multi_display.rs"]
 mod multi_display;
+#[path = "stream_settings.rs"]
+pub mod stream_settings;
 
 #[derive(Args, Clone)]
 pub struct Options {
@@ -102,15 +104,31 @@ pub struct Options {
     /// Select this monitor on connection (zero-based).
     #[arg(long)]
     pub monitor: Option<usize>,
-    /// Requested stream width; 0 uses the monitor's native resolution.
+    /// Requested stream width; 0 uses the monitor's native resolution,
+    /// `match` the size of this window (renegotiated as it changes).
+    #[arg(long, value_parser = stream_settings::parse_width)]
+    pub width: Option<stream_settings::Setting>,
+    /// Frame-rate cap (1-240); `match` follows this display's refresh rate.
+    /// Hosts that know their monitor's refresh rate never exceed it.
+    #[arg(long, value_parser = stream_settings::parse_fps)]
+    pub fps: Option<stream_settings::Setting>,
+    /// Requested video bitrate in kbit/s; `auto` sizes it for the stream
+    /// (20000 up to 60 fps, more above).
+    #[arg(long, value_parser = stream_settings::parse_bitrate)]
+    pub bitrate: Option<stream_settings::Setting>,
+    /// Wait for vertical sync before showing each frame (no tearing on
+    /// fixed-refresh displays, up to one refresh of extra latency). By default
+    /// frames are shown as they arrive, which variable-refresh displays follow.
     #[arg(long)]
-    pub width: Option<u32>,
-    /// Requested stream frame rate.
-    #[arg(long)]
-    pub fps: Option<u32>,
-    /// Requested video bitrate in kbit/s.
-    #[arg(long)]
-    pub bitrate: Option<u32>,
+    pub vsync: bool,
+    /// Headless runs: pretend to show video on a WxH display at R mHz
+    /// (`1280x720@60000`); a second one is switched to halfway through.
+    #[arg(long, hide = true, requires = "headless_frames", value_parser = stream_settings::parse_display)]
+    pub smoke_display: Vec<stream_settings::LocalDisplay>,
+    /// Headless runs: treat the host as one from before display negotiation
+    /// and 240 FPS (ConfigureVideo, at most 120 FPS).
+    #[arg(long, hide = true, requires = "headless_frames")]
+    pub smoke_legacy_host: bool,
     /// Show the streaming performance overlay immediately (F8 toggles it).
     #[arg(long)]
     pub stats: bool,
@@ -779,6 +797,46 @@ fn session_window(options: &Options) -> Result<SessionWindow> {
     Ok((sdl, video, canvas))
 }
 
+/// Sync of the session window's presents. By default frames are shown as
+/// they arrive, so a variable-refresh display (FreeSync/G-Sync, enabled by
+/// the compositor for fullscreen windows that present promptly) refreshes in
+/// step with the stream and nothing queues behind a fixed vsync: adaptive
+/// vsync (swap interval -1: synced when on time, a late frame tears instead
+/// of waiting a refresh) where the GL driver offers it (GLX with
+/// EXT_swap_control_tear), otherwise no wait at all (EGL, as on Wayland,
+/// rejects -1). `--vsync` waits for every refresh instead (no tearing on
+/// fixed-refresh displays). Whether VRR is active is up to the display and
+/// compositor and is not visible here.
+fn configure_presentation(
+    video: &sdl2::VideoSubsystem,
+    canvas: &sdl2::render::Canvas<sdl2::video::Window>,
+    vsync: bool,
+) -> &'static str {
+    if vsync {
+        // Any renderer; SDL maps it to the swap interval or Metal/D3D present.
+        return if unsafe { sdl2::sys::SDL_RenderSetVSync(canvas.raw(), 1) } == 0 {
+            "vsync (--vsync)"
+        } else {
+            "vsync unavailable; immediate"
+        };
+    }
+    // SDL created the renderer without PRESENTVSYNC (interval 0). Swap
+    // intervals apply to the current context, which is the renderer's.
+    let gl = canvas.info().name.starts_with("opengl")
+        && !unsafe { sdl2::sys::SDL_GL_GetCurrentContext() }.is_null();
+    if gl
+        && video
+            .gl_set_swap_interval(sdl2::video::SwapInterval::LateSwapTearing)
+            .is_ok()
+    {
+        return "adaptive vsync (late frames tear)";
+    }
+    if gl {
+        let _ = video.gl_set_swap_interval(sdl2::video::SwapInterval::Immediate);
+    }
+    "immediate (no vsync wait)"
+}
+
 fn renderer_accelerated(canvas: &sdl2::render::Canvas<sdl2::video::Window>) -> bool {
     canvas.info().flags & sdl2::sys::SDL_RendererFlags::SDL_RENDERER_ACCELERATED as u32 != 0
 }
@@ -934,6 +992,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         link.desktop.dynamic_range == protocol::DynamicRange::Sdr
     };
     let stream_stats = std::sync::Arc::new(crate::stats::StreamStats::default());
+    stream_stats
+        .stream_fps
+        .store(link.desktop.fps.into(), Ordering::Relaxed);
     let format = media::VideoFormat {
         codec: link.desktop.codec,
         dynamic_range: link.desktop.dynamic_range,
@@ -1020,6 +1081,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     }
     let audio_source = audio.as_ref().map(|(_, source)| source.clone());
     let audio_notices = updates_sender.clone();
+    let local_notices = updates_sender.clone();
     let network_stats = stream_stats.clone();
     let keyframe_requests = desktop.keyframe_requests;
     // IETF MoQ Transport sessions (provider relays) deliver no datagrams.
@@ -1068,36 +1130,37 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     if let Some(index) = options.monitor {
         send(&events, Event::SelectMonitor { index })?;
     }
-    let configure_video =
-        options.width.is_some() || options.fps.is_some() || options.bitrate.is_some();
-    let requested_configuration = configure_video.then_some((
-        options.width.unwrap_or(desktop.width),
-        options.fps.unwrap_or(desktop.fps),
-        options.bitrate.unwrap_or(if desktop.bitrate > 0 {
-            desktop.bitrate
-        } else {
-            20_000
-        }),
-    ));
+    // Stream size and rate: negotiated from this window's display with hosts
+    // that support it, computed here (and clamped) for older hosts.
+    let legacy_host = |desktop: &mut Desktop| {
+        if options.smoke_legacy_host {
+            desktop.max_fps = 0;
+            desktop.display_negotiation = false;
+        }
+    };
+    legacy_host(&mut desktop);
+    let mut negotiation =
+        stream_settings::Negotiation::new(options.width, options.fps, options.bitrate, &desktop);
+    let mut local_display = match &window_state {
+        Some((_, _, canvas)) => stream_settings::LocalDisplay::of_window(canvas),
+        None => options.smoke_display.first().copied().unwrap_or_default(),
+    };
+    let mut requested_configuration = None;
     let expected_initial_updates =
-        usize::from(options.monitor.is_some()) + usize::from(configure_video);
-    if configure_video {
+        usize::from(options.monitor.is_some()) + usize::from(negotiation.is_some());
+    if let Some(negotiation) = negotiation.as_mut() {
         ensure!(
             desktop.configurable_video,
             "this host does not support video quality settings; update the host or omit --width/--fps/--bitrate"
         );
-        send(
-            &events,
-            Event::ConfigureVideo {
-                width: options.width.unwrap_or(desktop.width),
-                fps: options.fps.unwrap_or(desktop.fps),
-                bitrate: options.bitrate.unwrap_or(if desktop.bitrate > 0 {
-                    desktop.bitrate
-                } else {
-                    20_000
-                }),
-            },
-        )?;
+        let outgoing = negotiation.outgoing(&desktop, local_display);
+        if let Some(text) = outgoing.notice {
+            tracing::warn!(%text, "host limits the frame rate");
+            let _ = local_notices.try_send(Update::Notice { text });
+        }
+        requested_configuration = outgoing.requested;
+        send(&events, outgoing.event)?;
+        negotiation.sent(local_display);
     }
     if let Some(frames) = options.headless_frames {
         ensure!(frames > 0, "headless frame count must be positive");
@@ -1109,6 +1172,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let mut max_frame_gap = Duration::ZERO;
         let mut switched = false;
         let mut clipboard_ok = false;
+        // --smoke-display with a second display: the host's answer to it.
+        let mut display_changed_at: Option<Desktop> = None;
+        let mut frames_after_display_change = 0_u32;
         // --smoke-input-latency: probe send times by id, and completed round trips.
         let mut probes_in_flight = std::collections::BTreeMap::<u64, Instant>::new();
         let mut probe_rtts = Vec::<Duration>::new();
@@ -1143,6 +1209,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                             "host changed codec during an active session; reconnect to change codec"
                         );
                         desktop = next;
+                        legacy_host(&mut desktop);
+                        stream_stats
+                            .stream_fps
+                            .store(desktop.fps.into(), Ordering::Relaxed);
                         *image.lock().unwrap() = None;
                         initial_updates = initial_updates.saturating_sub(1);
                         if initial_updates == 0
@@ -1212,6 +1282,23 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         text: CLIPBOARD_SMOKE.into(),
                     }))?;
                     runtime.block_on(events.send(Event::ClipboardRequest))?;
+                }
+                if let (Some(&changed), Some(negotiation)) =
+                    (options.smoke_display.get(1), negotiation.as_mut())
+                {
+                    if count == frames / 2 {
+                        // As if the window moved to another display.
+                        let outgoing = negotiation.outgoing(&desktop, changed);
+                        send(&events, outgoing.event)?;
+                        negotiation.sent(changed);
+                        display_changed_at = Some(desktop.clone());
+                    } else if display_changed_at.as_ref().is_some_and(|before| {
+                        desktop.video_start_group != before.video_start_group
+                            || (desktop.width, desktop.fps) != (before.width, before.fps)
+                    }) && frame.width == desktop.width
+                    {
+                        frames_after_display_change += 1;
+                    }
                 }
                 if options.smoke_switch_monitor {
                     if count == 5 {
@@ -1325,6 +1412,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             !options.smoke_clipboard || clipboard_ok,
             "clipboard did not roundtrip"
         );
+        ensure!(
+            options.smoke_display.len() < 2 || frames_after_display_change > 0,
+            "host did not follow the display change"
+        );
         let snapshot = stream_stats.snapshot();
         let (mean_ready_us, mean_queue_us, mean_decode_us, mean_convert_us) =
             stream_stats.mean_timings_us();
@@ -1353,6 +1444,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             mean_convert_us,
             width = desktop.width,
             height = desktop.height,
+            fps = desktop.fps,
+            bitrate = desktop.bitrate,
+            frames_after_display_change,
             received_bytes = snapshot.received_bytes,
             received_frames = snapshot.received_frames,
             decoded_frames = snapshot.decoded_frames,
@@ -1374,6 +1468,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         return Ok(false);
     }
     let (sdl, video, mut canvas) = window_state.take().context("session window missing")?;
+    let presentation = configure_presentation(&video, &canvas, options.vsync);
+    tracing::info!(presentation, "session presentation sync");
     // Dropped with the session: the host removes its pads when it ends.
     let mut controllers = controllers::Controllers::new(&sdl);
     let mut graphics_name =
@@ -1460,6 +1556,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     // so the loop blocks between them instead of polling every millisecond.
     let woken = register_render_wake();
     let mut present_timer = PresentTimer::new();
+    // The window's display, re-read every DISPLAY_POLL for renegotiation
+    // and the stats overlay.
+    let mut last_display_poll = Instant::now();
     // Decoder store time of the frame drawn by the next present.
     let mut frame_decoded_at: Option<Instant> = None;
     'running: loop {
@@ -1505,6 +1604,24 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             !awaiting_initial || initial_settings_started.elapsed() < Duration::from_secs(15),
             "host did not apply the requested display/video settings within 15 seconds"
         );
+        if last_display_poll.elapsed() >= DISPLAY_POLL {
+            last_display_poll = Instant::now();
+            local_display = stream_settings::LocalDisplay::of_window(&canvas);
+            // Moved to another display, mode changed, resized or fullscreen
+            // toggled: follow it once it settles and only if the stream changes.
+            if let Some(negotiation) = negotiation.as_mut()
+                && !awaiting_initial
+                && let Some(changed) = negotiation.poll(&desktop, local_display, last_display_poll)
+            {
+                let outgoing = negotiation.outgoing(&desktop, changed);
+                tracing::info!(client = ?changed, "renegotiating the stream for this window");
+                notice = outgoing
+                    .notice
+                    .unwrap_or_else(|| "Matching the stream to this window…".into());
+                send(&events, outgoing.event)?;
+                negotiation.sent(changed);
+            }
+        }
         if desktop.telemetry && last_probe.elapsed() >= Duration::from_secs(1) {
             if pending_probe.is_some_and(|(_, sent)| sent.elapsed() >= Duration::from_secs(3)) {
                 pending_probe = None;
@@ -1559,9 +1676,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         "host changed codec during an active session; reconnect to change codec"
                     );
                     desktop = next;
+                    stream_stats
+                        .stream_fps
+                        .store(desktop.fps.into(), Ordering::Relaxed);
                     host_bitrate = desktop.bitrate;
                     tracing::info!(
-                        requested_kbps = options.bitrate,
+                        requested_kbps = ?options.bitrate,
                         accepted_cap_kbps = desktop.bitrate,
                         width = desktop.width,
                         height = desktop.height,
@@ -2147,13 +2267,35 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     desktop.codec.label()
                 ),
                 format!("Presented             {fps:.1} fps"),
+                format!(
+                    "Stream                {} x {} at {} fps   |   {}",
+                    desktop.width,
+                    desktop.height,
+                    desktop.fps,
+                    match (&negotiation, desktop.display_negotiation) {
+                        (None, _) => "host settings",
+                        (Some(_), true) => "negotiated with host",
+                        (Some(_), false) => "requested (older host)",
+                    }
+                ),
+                format!(
+                    "Local display         {} x {} px at {}   |   {presentation}",
+                    local_display.width,
+                    local_display.height,
+                    match local_display.refresh_mhz {
+                        0 => "unknown refresh".to_owned(),
+                        mhz => format!("{} Hz", protocol::refresh_hz(mhz)),
+                    }
+                ),
                 format!("Video payload (main)  {mbps:.2} Mbps (not wire bitrate)"),
                 format!(
                     "Request / accepted cap {} / {:.2} Mbps",
-                    options.bitrate.map_or_else(
-                        || "host default".into(),
-                        |rate| format!("{:.2}", rate as f64 / 1000.0)
-                    ),
+                    match options.bitrate {
+                        None => "host default".into(),
+                        Some(stream_settings::Setting::Match) => "auto".into(),
+                        Some(stream_settings::Setting::Value(rate)) =>
+                            format!("{:.2}", f64::from(rate) / 1000.0),
+                    },
                     desktop.bitrate as f64 / 1000.0
                 ),
                 format!("Path                  {}", session_path.description()),
@@ -2222,6 +2364,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 "RTT includes control scheduling, not just network transit.".into(),
                 "Capture, scanout and end-to-end latency: unmeasured.".into(),
             ];
+            let refresh = protocol::refresh_hz(local_display.refresh_mhz);
+            if refresh > 0 && refresh < desktop.fps {
+                stats_lines.push(format!(
+                    "Display refreshes at {refresh} Hz, below the {} fps stream",
+                    desktop.fps
+                ));
+            }
             if let Some(headroom) = hdr_headroom {
                 stats_lines.push(format!("HDR display headroom  {headroom:.2} × SDR white"));
             }
@@ -2528,6 +2677,8 @@ const TOOLBAR_HEIGHT: u32 = crate::fullscreen::HEIGHT;
 /// Longest render-loop sleep when nothing wakes it: bounds how late polled
 /// state (pipeline errors, toolbar hiding, probes) is noticed.
 const IDLE_WAIT: Duration = Duration::from_millis(10);
+/// How often the window's size and display are re-read (cheap SDL queries).
+const DISPLAY_POLL: Duration = Duration::from_millis(250);
 
 /// SDL user event type that wakes the session render loop (decoded frame,
 /// host update or session end); 0 until registered.
