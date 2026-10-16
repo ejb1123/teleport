@@ -64,6 +64,9 @@ teleport login HOST:4443 --username work --device-name work-linux
 Allow TCP on the host's listening port for enrollment and UDP for streaming,
 restricted to the intended network. With a password configured, enrollment TCP
 stays available. Disabling password login closes it unless a code window is open.
+A host using a relay also accepts password enrollment through it, with no
+reachable port: `teleport login HOST:4443 --username work --relay-host ID --relay ...`
+(see [enrollment through the relay](relay.md#enrollment-through-the-relay)).
 
 To use another address for the same host (for example LAN versus ZeroTier), select
 the saved host, edit its address and click **Use saved identity**. This explicitly

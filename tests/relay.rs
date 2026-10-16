@@ -44,6 +44,10 @@ fn setup() -> Setup {
 
 /// `versions` restricts the relay (e.g. IETF-only, as provider relays are).
 fn setup_with_versions(versions: &[&str]) -> Setup {
+    setup_with(versions, &[])
+}
+
+fn setup_with(versions: &[&str], host_args: &[&str]) -> Setup {
     let temp = tempfile::tempdir().unwrap();
     let relay_address = free_udp();
     let mut relay = Process(
@@ -79,6 +83,7 @@ fn setup_with_versions(versions: &[&str]) -> Setup {
             .arg("--identity-dir")
             .arg(temp.path().join("identity"))
             .args(["--relay-key", RELAY_KEY])
+            .args(host_args)
             .args([
                 "--relay",
                 &relay_url,
@@ -241,4 +246,104 @@ fn relayed_session_works_over_ietf_moq_transport_like_provider_relays() {
             "{version}: no input: {stdout}"
         );
     }
+}
+
+fn host_log(setup: &Setup) -> String {
+    std::fs::read_to_string(setup.temp.path().join("host.log")).unwrap_or_default()
+}
+
+/// The pairing link a host started with `--relay --pair` prints.
+fn relay_pairing_link(setup: &Setup) -> String {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !host_log(setup).contains("relay pairing open") {
+        assert!(
+            Instant::now() < deadline,
+            "host did not open relay pairing:\n{}",
+            host_log(setup)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    host_log(setup)
+        .lines()
+        .find_map(|line| line.strip_prefix("Relay pairing link: "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("host did not print a relay pairing link")
+        .to_owned()
+}
+
+/// `teleport pair` through the relay only: the direct address is
+/// unreachable and only names the saved profile.
+fn pair_via_relay(setup: &Setup, config: &std::path::Path, link: &str) -> Output {
+    use std::io::Write;
+    let mut child = teleport()
+        .args(["pair", "127.0.0.1:9", "--relay", &setup.relay_url])
+        .args(["--relay-fingerprint", &setup.relay_fingerprint])
+        .args(["--relay-key", RELAY_KEY])
+        .env("XDG_CONFIG_HOME", config)
+        .env_remove("TELEPORT_RELAY_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{link}").unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+#[ignore = "requires local UDP sockets and GStreamer plugins"]
+fn first_pairing_and_session_work_through_the_relay_alone() {
+    let setup = setup_with(&[], &["--pair"]);
+    let link = relay_pairing_link(&setup);
+    let (prefix, code) = link.rsplit_once('/').unwrap();
+    let config = setup.temp.path().join("config");
+    // A wrong code reveals nothing and saves nothing.
+    let wrong = if code == "000-000" {
+        "000-001"
+    } else {
+        "000-000"
+    };
+    let output = pair_via_relay(&setup, &config, &format!("{prefix}/{wrong}"));
+    assert!(
+        !output.status.success(),
+        "wrong relay pairing code accepted"
+    );
+    assert!(!config.join("teleport/profiles.json").exists());
+    // The right link pairs, purely through the relay.
+    let output = pair_via_relay(&setup, &config, &link);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "relay pairing failed: {stdout}{}\nhost log:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        host_log(&setup)
+    );
+    assert!(!stdout.contains(code), "client echoed the pairing code");
+    let profiles: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config.join("teleport/profiles.json")).unwrap())
+            .unwrap();
+    let credential = std::path::PathBuf::from(profiles[0]["pairing_file"].as_str().unwrap());
+    let issued: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&credential).unwrap()).unwrap();
+    let host: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(setup.temp.path().join("identity/pairing.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(issued["fingerprint"], host["fingerprint"]);
+    assert_ne!(
+        issued["token"], host["token"],
+        "expected a per-device credential"
+    );
+    // The code is single use.
+    let output = pair_via_relay(&setup, &setup.temp.path().join("again"), &link);
+    assert!(!output.status.success(), "relay pairing code reused");
+    // The saved credential opens a normal relayed session.
+    let output = client(&setup, &credential, &setup.relay_fingerprint);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("SMOKE PASS"),
+        "relayed session after relay pairing failed: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("end-to-end encrypted relay session established"));
 }

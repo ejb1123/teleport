@@ -80,6 +80,13 @@ pub struct Response {
     pub devices: Vec<Device>,
     pub pairing_open: bool,
     pub code: Option<String>,
+    /// With a relay: the pairing link (rendezvous and code; as secret as the code).
+    #[serde(default)]
+    pub relay_pairing: Option<String>,
+    /// With a relay: this host's relay id (its namespace; not secret), used
+    /// by `teleport login --relay-host`.
+    #[serde(default)]
+    pub relay_host: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 pub struct Device {
@@ -220,6 +227,8 @@ struct Code {
 struct Network {
     listener: Option<Arc<TcpListener>>,
     code: Option<Code>,
+    /// Relay rendezvous serving the open code (see `crate::relay_enroll`).
+    rendezvous: Option<(String, crate::relay::AbortOnDrop)>,
 }
 pub struct Control {
     access: Arc<crate::access::ServerState>,
@@ -229,6 +238,7 @@ pub struct Control {
     changed: Arc<Notify>,
     epoch: AtomicU64,
     system: Option<crate::system_login::Config>,
+    relay: Option<crate::relay::Endpoint>,
 }
 pub struct Service {
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -249,20 +259,258 @@ impl Drop for Service {
         }
     }
 }
+/// Rate-limit source for every relayed attempt: the relay hides client
+/// addresses, so relayed logins share one bucket (plus the global limit).
+const RELAY_SOURCE: std::net::IpAddr = std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED);
+
+/// A newly opened one-time pairing code.
+pub struct OpenedPairing {
+    /// `123-456`, for direct (TCP) pairing.
+    pub code: String,
+    /// `teleport://relay/<rendezvous>/<code>` when the host uses a relay.
+    pub relay_link: Option<String>,
+}
+
+/// Prefix the already-read protocol magic back onto a stream so handlers can
+/// read it themselves.
+struct Rewind<S> {
+    magic: [u8; 8],
+    offset: usize,
+    inner: S,
+}
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Rewind<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.offset < this.magic.len() {
+            let size = (this.magic.len() - this.offset).min(buffer.remaining());
+            buffer.put_slice(&this.magic[this.offset..this.offset + size]);
+            this.offset += size;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::pin::Pin::new(&mut this.inner).poll_read(context, buffer)
+    }
+}
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Rewind<S> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_write(context, buffer)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(context)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+    }
+}
+
 impl Control {
-    pub async fn open_pairing(&self) -> Result<String> {
+    pub async fn open_pairing(self: &Arc<Self>) -> Result<OpenedPairing> {
         let mut network = self.network.lock().await;
         self.bind(&mut network).await?;
         let value = format!("{:06}", rand::random_range(0..1_000_000u32));
         let printable = format!("{}-{}", &value[..3], &value[3..]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+        let generation = self.epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+        // A new code always replaces the previous rendezvous.
+        network.rendezvous = None;
+        let relay_link = if let Some(endpoint) = &self.relay {
+            let invite = crate::relay_enroll::Invite::new(&value)?;
+            let task = tokio::spawn(self.clone().rendezvous(
+                endpoint.clone(),
+                invite.namespace(),
+                generation,
+                deadline,
+            ));
+            let link = invite.link();
+            network.rendezvous = Some((link.clone(), crate::relay::AbortOnDrop(task)));
+            Some(link)
+        } else {
+            None
+        };
         network.code = Some(Code {
             value,
-            deadline: tokio::time::Instant::now() + Duration::from_secs(300),
+            deadline,
             attempts: 5,
-            generation: self.epoch.fetch_add(1, Ordering::SeqCst).wrapping_add(1),
+            generation,
         });
         self.changed.notify_one();
-        Ok(printable)
+        Ok(OpenedPairing {
+            code: printable,
+            relay_link,
+        })
+    }
+
+    fn pairing_current(&self, generation: u64, deadline: tokio::time::Instant) -> bool {
+        self.epoch.load(Ordering::SeqCst) == generation && tokio::time::Instant::now() < deadline
+    }
+
+    /// Serve the open code on its relay rendezvous until the code is used,
+    /// closed, replaced or expires. Attempts share the code's five-attempt
+    /// budget with direct TCP pairing.
+    async fn rendezvous(
+        self: Arc<Self>,
+        endpoint: crate::relay::Endpoint,
+        namespace: String,
+        generation: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        let closed = async {
+            while self.pairing_current(generation, deadline) {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        };
+        tokio::pin!(closed);
+        loop {
+            let connected = tokio::select! {
+                connected = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    crate::relay::connect(&endpoint, &namespace),
+                ) => connected,
+                _ = &mut closed => return Ok(()),
+            };
+            match connected {
+                Ok(Ok(link)) => {
+                    tracing::info!(relay = %endpoint.url, "relay pairing open");
+                    let control = Arc::downgrade(&self);
+                    let serve = crate::relay_enroll::serve(
+                        link.session.clone(),
+                        link.incoming.clone(),
+                        link.outgoing.clone(),
+                        move |stream| {
+                            let control = control.clone();
+                            async move {
+                                let Some(control) = control.upgrade() else {
+                                    return;
+                                };
+                                if let Err(error) =
+                                    control.exchange(stream, RELAY_SOURCE, true).await
+                                {
+                                    tracing::warn!(%error, "relayed pairing attempt rejected (code not logged)");
+                                }
+                            }
+                        },
+                    );
+                    tokio::pin!(serve);
+                    tokio::select! {
+                        result = &mut serve => {
+                            if let Err(error) = result {
+                                tracing::warn!(%error, "relay pairing connection lost; reconnecting");
+                            }
+                        }
+                        _ = &mut closed => {
+                            // Accept nothing new, but keep the connection (and
+                            // running exchanges) long enough to deliver a
+                            // credential that was just issued.
+                            tokio::time::sleep(Duration::from_secs(15)).await;
+                            drop(link);
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(Err(error)) => tracing::warn!(%error, "relay unavailable for pairing; retrying"),
+                Err(_) => tracing::warn!("relay connection for pairing timed out; retrying"),
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => (),
+                _ = &mut closed => return Ok(()),
+            }
+        }
+    }
+
+    /// Accept enrollment on a relay connection to the host's own namespace:
+    /// password (OPAQUE), system login (pinned TLS) and code pairing.
+    pub async fn serve_relay(
+        self: Arc<Self>,
+        session: moq_net::Session,
+        incoming: moq_net::origin::Producer,
+        outgoing: moq_net::origin::Producer,
+    ) -> Result<()> {
+        let control = Arc::downgrade(&self);
+        drop(self);
+        crate::relay_enroll::serve(session, incoming, outgoing, move |stream| {
+            let control = control.clone();
+            async move {
+                let Some(control) = control.upgrade() else {
+                    return;
+                };
+                if let Err(error) = control.exchange(stream, RELAY_SOURCE, false).await {
+                    tracing::warn!(%error, "relayed enrollment rejected");
+                }
+            }
+        })
+        .await
+    }
+
+    /// One enrollment exchange on any transport, dispatched by protocol magic.
+    /// `pairing_only` restricts a pairing rendezvous to code pairing.
+    async fn exchange(
+        self: &Arc<Self>,
+        mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+        source: std::net::IpAddr,
+        pairing_only: bool,
+    ) -> Result<()> {
+        let mut magic = [0; 8];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut magic))
+            .await
+            .context("enrollment protocol header timed out")??;
+        let mut stream = Rewind {
+            magic,
+            offset: 0,
+            inner: stream,
+        };
+        match &magic {
+            b"TPAUTH01" if !pairing_only => {
+                crate::access::handle(stream, source, self.access.clone()).await
+            }
+            b"TPSYS001" if !pairing_only => {
+                let config = self.system.as_ref().context("system login is disabled")?;
+                crate::system_login::handle(stream, source, config, self.access.clone()).await
+            }
+            b"TPPAIR01" => {
+                let attempt = {
+                    let mut network = self.network.lock().await;
+                    let code = network.code.as_mut().context("pairing closed")?;
+                    ensure!(
+                        code.attempts > 0 && code.deadline > tokio::time::Instant::now(),
+                        "pairing expired"
+                    );
+                    code.attempts -= 1;
+                    code.clone()
+                };
+                let mut used = false;
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    crate::pairing::accept_with_access(
+                        &mut stream,
+                        &attempt.value,
+                        &self.pairing,
+                        &mut used,
+                        attempt.deadline,
+                        Some(crate::pairing::DeviceEnrollment {
+                            access: &self.access,
+                            epoch: &self.epoch,
+                            generation: attempt.generation,
+                        }),
+                    ),
+                )
+                .await
+                .context("pairing exchange timed out")?
+            }
+            _ => anyhow::bail!("unsupported enrollment protocol"),
+        }
     }
     async fn bind(&self, network: &mut Network) -> Result<()> {
         if network.listener.is_none() {
@@ -274,14 +522,20 @@ impl Control {
         }
         Ok(())
     }
-    async fn request(&self, request: Request) -> Result<Response> {
+    async fn request(self: &Arc<Self>, request: Request) -> Result<Response> {
         let mut code = None;
+        let mut relay_pairing = None;
         match request {
             Request::Status => (),
-            Request::OpenPairing => code = Some(self.open_pairing().await?),
+            Request::OpenPairing => {
+                let opened = self.open_pairing().await?;
+                code = Some(opened.code);
+                relay_pairing = opened.relay_link;
+            }
             Request::ClosePairing => {
                 let mut network = self.network.lock().await;
                 network.code = None;
+                network.rendezvous = None;
                 self.epoch.fetch_add(1, Ordering::SeqCst);
                 self.changed.notify_one();
             }
@@ -335,6 +589,11 @@ impl Control {
                     && c.generation == self.epoch.load(Ordering::SeqCst)
             }),
             code,
+            relay_pairing,
+            relay_host: self
+                .relay
+                .as_ref()
+                .and_then(|_| crate::relay::namespace(&self.pairing.fingerprint).ok()),
         })
     }
     async fn network(self: Arc<Self>) -> Result<()> {
@@ -363,61 +622,12 @@ impl Control {
                 continue;
             };
             let accepted = tokio::select! { biased; _ = self.changed.notified() => continue, result = listener.accept() => result?, _ = tokio::time::sleep(Duration::from_secs(1)) => continue };
-            let (mut stream, _) = accepted;
+            let (stream, peer) = accepted;
             // A single bounded enrollment exchange at a time limits resource use.
-            let exchange = tokio::time::timeout(Duration::from_secs(95), async {
-                let mut magic = [0; 8];
-                tokio::time::timeout(Duration::from_secs(5), async {
-                    loop {
-                        let n = stream.peek(&mut magic).await?;
-                        ensure!(n > 0, "closed enrollment connection");
-                        if n == 8 {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    Ok::<_, anyhow::Error>(())
-                })
-                .await
-                .context("enrollment protocol header timed out")??;
-                if &magic == b"TPAUTH01" {
-                    crate::access::handle(stream, self.access.clone()).await?;
-                } else if &magic == b"TPSYS001" {
-                    let config = self.system.as_ref().context("system login is disabled")?;
-                    crate::system_login::handle(stream, config, self.access.clone()).await?;
-                } else if &magic == b"TPPAIR01" {
-                    let attempt = {
-                        let mut network = self.network.lock().await;
-                        let code = network.code.as_mut().context("pairing closed")?;
-                        ensure!(
-                            code.attempts > 0 && code.deadline > tokio::time::Instant::now(),
-                            "pairing expired"
-                        );
-                        code.attempts -= 1;
-                        code.clone()
-                    };
-                    let mut used = false;
-                    let result = tokio::time::timeout(
-                        Duration::from_secs(10),
-                        crate::pairing::accept_with_access(
-                            &mut stream,
-                            &attempt.value,
-                            &self.pairing,
-                            &mut used,
-                            attempt.deadline,
-                            Some(crate::pairing::DeviceEnrollment {
-                                access: &self.access,
-                                epoch: &self.epoch,
-                                generation: attempt.generation,
-                            }),
-                        ),
-                    )
-                    .await
-                    .context("pairing exchange timed out")?;
-                    result?;
-                }
-                Ok::<_, anyhow::Error>(())
-            });
+            let exchange = tokio::time::timeout(
+                Duration::from_secs(95),
+                self.exchange(stream, peer.ip(), false),
+            );
             tokio::select! { _ = exchange => (), _ = self.changed.notified() => () }
         }
     }
@@ -429,7 +639,7 @@ pub async fn start(
     pairing: crate::protocol::Pairing,
     access: Arc<crate::access::ServerState>,
 ) -> Result<(Service, Arc<Control>)> {
-    start_with_system(directory, address, pairing, access, None).await
+    start_with_system(directory, address, pairing, access, None, None).await
 }
 
 pub async fn start_with_system(
@@ -438,6 +648,7 @@ pub async fn start_with_system(
     pairing: crate::protocol::Pairing,
     access: Arc<crate::access::ServerState>,
     helper: Option<PathBuf>,
+    relay: Option<crate::relay::Endpoint>,
 ) -> Result<(Service, Arc<Control>)> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     check_directory(directory)?;
@@ -468,10 +679,12 @@ pub async fn start_with_system(
         network: Mutex::new(Network {
             listener: None,
             code: None,
+            rendezvous: None,
         }),
         changed: Arc::new(Notify::new()),
         epoch: AtomicU64::new(0),
         system,
+        relay,
     });
     if control.access.status().username.is_some() || control.system.is_some() {
         control.bind(&mut *control.network.lock().await).await?;
@@ -583,6 +796,106 @@ mod tests {
         assert!(!access.authorized(&device.token));
         assert!(access.authorized(&pairing.token));
         assert!(!control.request(Request::Status).await?.pairing_open);
+        Ok(())
+    }
+
+    /// Password enrollment and code pairing purely through a real (in-process)
+    /// relay, with no TCP reachable by the client.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires local UDP sockets"]
+    async fn password_and_code_enrollment_through_a_relay() -> Result<()> {
+        use crate::relay_enroll::{self, Invite};
+        use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject};
+        const PASSWORD: &str = "Relay test passphrase, not production!";
+        let directory = tempfile::tempdir()?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        // A self-hosted relay with a pinned certificate and an access key.
+        let relay_identity = directory.path().join("relay");
+        let certificate = crate::identity::open(&relay_identity)?.certificate;
+        let der = CertificateDer::from_pem_file(&certificate)?;
+        let relay_fingerprint =
+            crate::relay::hex(ring::digest::digest(&ring::digest::SHA256, der.as_ref()).as_ref());
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0")?;
+        let relay_address = socket.local_addr()?;
+        drop(socket);
+        let relay = tokio::spawn(crate::relay::serve(crate::relay::Options {
+            listen: relay_address.to_string(),
+            identity_dir: Some(relay_identity),
+            versions: Vec::new(),
+            key: Some("relay key".into()),
+        }));
+        let endpoint = crate::relay::Endpoint {
+            url: format!("moqt://{relay_address}").parse()?,
+            fingerprint: Some(relay_fingerprint),
+            key: Some("relay key".into()),
+        };
+        // The host: password set, enrollment served on its relay namespace.
+        let host = directory.path().join("host");
+        std::fs::create_dir(&host)?;
+        std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o700))?;
+        let pairing = crate::protocol::Pairing {
+            token: "a".repeat(64),
+            fingerprint: "b".repeat(64),
+        };
+        let access = crate::access::ServerState::open(&host, pairing.clone())?;
+        access.set_password("ej", PASSWORD)?;
+        let (_service, control) = start_with_system(
+            &host,
+            "127.0.0.1:0".parse()?,
+            pairing.clone(),
+            access.clone(),
+            None,
+            Some(endpoint.clone()),
+        )
+        .await?;
+        let namespace = crate::relay::namespace(&pairing.fingerprint)?;
+        let link = crate::relay::connect(&endpoint, &namespace).await?;
+        let _enrollment = tokio::spawn(control.clone().serve_relay(
+            link.session.clone(),
+            link.incoming.clone(),
+            link.outgoing.clone(),
+        ));
+        let status = control.request(Request::Status).await?;
+        assert_eq!(status.relay_host.as_deref(), Some(namespace.as_str()));
+        // OPAQUE through the relay; a wrong password or host id gets nothing.
+        assert!(
+            relay_enroll::login(
+                &endpoint,
+                &namespace,
+                "ej",
+                "Wrong passphrase, rejected!",
+                "x"
+            )
+            .await
+            .is_err()
+        );
+        let device =
+            relay_enroll::login(&endpoint, &namespace, "ej", PASSWORD, "relay device").await?;
+        assert!(access.authorized(&device.token));
+        assert_eq!(device.fingerprint, pairing.fingerprint);
+        // Code pairing on the rendezvous the opened code names.
+        let opened = control.request(Request::OpenPairing).await?;
+        let link = opened.relay_pairing.expect("relay pairing link");
+        let invite = Invite::parse(&link)?;
+        assert_eq!(invite.code, opened.code.unwrap().replace('-', ""));
+        let wrong = Invite {
+            code: if invite.code == "000000" {
+                "000001"
+            } else {
+                "000000"
+            }
+            .into(),
+            ..invite.clone()
+        };
+        // The rendezvous connects asynchronously; requests wait for it.
+        assert!(relay_enroll::pair(&endpoint, &wrong).await.is_err());
+        let paired = relay_enroll::pair(&endpoint, &invite).await?;
+        assert!(access.authorized(&paired.token));
+        assert_eq!(access.status().devices.len(), 2);
+        assert!(!control.request(Request::Status).await?.pairing_open);
+        // Single use.
+        assert!(relay_enroll::pair(&endpoint, &invite).await.is_err());
+        relay.abort();
         Ok(())
     }
 

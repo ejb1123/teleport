@@ -110,6 +110,10 @@ it in process arguments:
 nix run . -- pair LINUX_IP:4443
 ```
 
+A host that uses a [relay](docs/relay.md) also prints a relay pairing link;
+`pair ... --relay URL` reads it instead, so pairing needs no reachable host
+port ([details](docs/pairing.md#pairing-through-a-relay-no-reachable-host-port)).
+
 Manual file import remains available through **Pairing file** on the sign-in screen
 or drag-and-drop onto that screen.
 To use that alternative, copy the file over an existing trusted SSH connection:

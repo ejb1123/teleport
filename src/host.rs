@@ -180,6 +180,11 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         .as_deref()
         .map(|directory| crate::access::ServerState::open(directory, pairing.clone()))
         .transpose()?;
+    let relay_endpoint = options.relay.clone().map(|url| crate::relay::Endpoint {
+        url,
+        fingerprint: options.relay_fingerprint.clone(),
+        key: options.relay_key.clone(),
+    });
     let admin = if let (Some(directory), Some(access)) =
         (options.identity_dir.as_deref(), access.as_ref())
     {
@@ -190,6 +195,7 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
                 pairing.clone(),
                 access.clone(),
                 options.system_auth_helper.clone(),
+                relay_endpoint.clone(),
             )
             .await?,
         )
@@ -209,18 +215,18 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
     if options.pair
         && let Some((_, control)) = &admin
     {
+        let opened = control.open_pairing().await?;
         println!(
             "Pairing code: {} (one use, expires in 5 minutes)",
-            control.open_pairing().await?
+            opened.code
         );
+        if let Some(link) = opened.relay_link {
+            // As secret as the code; clients read it from stdin, never argv.
+            println!("Relay pairing link: {link} (same code; enter it in `teleport pair --relay`)");
+        }
     }
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
-    let relay_endpoint = options.relay.clone().map(|url| crate::relay::Endpoint {
-        url,
-        fingerprint: options.relay_fingerprint.clone(),
-        key: options.relay_key.clone(),
-    });
     let relay_identity = match (&relay_endpoint, &identity, &access) {
         (Some(_), Some(identity), Some(_)) => Some(Arc::new(identity.e2e()?)),
         (Some(_), _, _) => {
@@ -229,11 +235,12 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         (None, _, _) => None,
     };
     let relay_namespace = crate::relay::namespace(&pairing.fingerprint)?;
-    // Connected relay, confirmed sessions from its intake task, and the task.
+    // Connected relay, confirmed sessions from its intake task, and the tasks
+    // (session intake, enrollment).
     let mut relay: Option<(
         crate::relay::Link,
         tokio::sync::mpsc::Receiver<crate::relay::Accepted>,
-        crate::relay::AbortOnDrop,
+        Vec<crate::relay::AbortOnDrop>,
     )> = None;
     let mut relay_retry = Instant::now();
     loop {
@@ -254,7 +261,18 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
                         e2e.clone(),
                         sender,
                     ));
-                    relay = Some((link, receiver, crate::relay::AbortOnDrop(intake)));
+                    let mut tasks = vec![crate::relay::AbortOnDrop(intake)];
+                    // Password and system-login enrollment through the relay.
+                    if let Some((_, control)) = &admin {
+                        tasks.push(crate::relay::AbortOnDrop(tokio::spawn(
+                            control.clone().serve_relay(
+                                link.session.clone(),
+                                link.incoming.clone(),
+                                link.outgoing.clone(),
+                            ),
+                        )));
+                    }
+                    relay = Some((link, receiver, tasks));
                 }
                 Err(error) => {
                     tracing::warn!(%error, "relay unavailable; retrying in 5 s");
