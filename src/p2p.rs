@@ -1291,6 +1291,15 @@ impl Host {
         Ok((host, receiver))
     }
 
+    /// Stop accepting and delete a gateway mapping (the accept task keeps
+    /// this value alive, so dropping it at exit would not).
+    pub fn close(&self) {
+        self.endpoint
+            .quic
+            .close(quinn::VarInt::from_u32(0), b"host shutdown");
+        drop(self.endpoint.mapping.lock().unwrap().take());
+    }
+
     fn armed(&self) -> bool {
         self.armed_until
             .lock()

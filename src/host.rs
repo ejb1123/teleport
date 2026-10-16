@@ -391,6 +391,9 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
             tracing::warn!(%error, "client disconnected");
         }
     }
+    if let Some(p2p) = &p2p {
+        p2p.close();
+    }
     server.close().await;
     Ok(())
 }
