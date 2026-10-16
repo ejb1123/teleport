@@ -679,6 +679,21 @@ pub struct HdrImage {
 }
 pub type LatestImage = Arc<Mutex<Option<Image>>>;
 
+/// Called (from decoder threads) after a new frame is stored, so a client
+/// render loop can block until there is something to present instead of
+/// polling. Set once per process by the windowed client.
+static PRESENTER_WAKE: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+pub fn set_presenter_wake(wake: fn()) {
+    let _ = PRESENTER_WAKE.set(wake);
+}
+
+pub fn wake_presenter() {
+    if let Some(wake) = PRESENTER_WAKE.get() {
+        wake();
+    }
+}
+
 fn add_video_reference(buffer: &mut gst::BufferRef, key: u64) {
     static REFERENCE: std::sync::OnceLock<gst::Caps> = std::sync::OnceLock::new();
     let reference =
@@ -877,6 +892,8 @@ pub fn decoder_with_stats_presentation(
                     if video_group.is_some() {
                         stats.ready_frames.fetch_add(1, Ordering::Relaxed);
                     }
+                    drop(latest);
+                    wake_presenter();
                     return Ok(gst::FlowSuccess::Ok);
                 }
                 let frame = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(
@@ -967,6 +984,8 @@ pub fn decoder_with_stats_presentation(
                 if video_group.is_some() {
                     stats.ready_frames.fetch_add(1, Ordering::Relaxed);
                 }
+                drop(latest);
+                wake_presenter();
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),

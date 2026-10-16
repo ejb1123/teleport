@@ -502,6 +502,8 @@ pub(super) fn decoder(
                         if group.is_some() {
                             stats.ready_frames.fetch_add(1, Ordering::Relaxed);
                         }
+                        drop(latest);
+                        wake_presenter();
                     }
                     Ok(())
                 };

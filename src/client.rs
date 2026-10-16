@@ -13,6 +13,7 @@ use sdl2::{
 };
 use std::{
     path::PathBuf,
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
     time::{Duration, Instant},
 };
 use tokio::{runtime::Runtime, sync::mpsc};
@@ -730,6 +731,7 @@ async fn receive_updates(
         let update: Update = serde_json::from_slice(&bytes)?;
         update.validate()?;
         sender.send(update).await.context("session window closed")?;
+        media::wake_presenter();
     }
 }
 
@@ -1024,7 +1026,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let mut ssh_agent = link.ssh_agent;
         let _origin = link._origin;
         let _broadcast = link._broadcast;
-        tokio::select! {
+        let result = tokio::select! {
             result = crate::ssh_agent::closed(&mut ssh_agent) => result,
             result = media::receive_video_with_stats(link.video, source, feedback, network_stats, keyframe_requests) => result,
             result = send_input(link.input, link.pointer, pointer_datagrams, receiver) => result,
@@ -1034,11 +1036,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     && let Err(error) = crate::audio::receive(track, source).await {
                         tracing::warn!(%error, "remote audio stopped; desktop remains connected");
                         let _ = audio_notices.send(Update::Notice { text: "Audio stopped; reconnect to retry audio".into() }).await;
+                        media::wake_presenter();
                 }
                 std::future::pending::<Result<()>>().await
             } => result,
-            error = link.session.closed() => anyhow::bail!("connection closed: {error}"),
-        }
+            error = link.session.closed() => Err(anyhow::anyhow!("connection closed: {error}")),
+        };
+        // The render loop sleeps until woken; let it see the session end now.
+        media::wake_presenter();
+        result
     }));
     // The host restarts its video without the pointer once we opt in. That
     // extra `Update::Desktop` is not counted as an expected initial update
@@ -1431,7 +1437,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     // cannot drive a full present per event; new video frames never wait.
     let mut deferred_redraw = false;
     let mut last_present: Option<Instant> = None;
+    // Decoded frames, host updates and the session ending push a wake event,
+    // so the loop blocks between them instead of polling every millisecond.
+    let woken = register_render_wake();
+    let mut present_timer = PresentTimer::new();
+    // Decoder store time of the frame drawn by the next present.
+    let mut frame_decoded_at: Option<Instant> = None;
     'running: loop {
+        present_timer.iterations += 1;
+        WAKE_QUEUED.store(false, Ordering::Release);
         let mut redraw = first_draw || deferred_redraw;
         let mut new_frame = false;
         let was_bound = keyboard_capture.active();
@@ -1567,6 +1581,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let mut motion = None;
         let mut relative = (0_i32, 0_i32);
         for mut event in event_pump.poll_iter() {
+            if matches!(event, SdlEvent::User { type_, .. } if type_ == WAKE_EVENT.load(Ordering::Relaxed))
+            {
+                continue;
+            }
             redraw = true;
             keyboard_capture.follow(displays.focused_window(canvas.window()));
             displays.route_pointer(&mut event, canvas.window());
@@ -1927,6 +1945,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             redraw = true;
             new_frame = true;
             decoded_age = frame.decoded_at.elapsed();
+            frame_decoded_at = Some(frame.decoded_at);
+            present_timer.picked_up(frame.decoded_at);
             protocol::validate_video_size(frame.width, frame.height)?;
             'frame: {
                 if let Some(gpu) = frame.gpu.take() {
@@ -2006,11 +2026,22 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             && last_present.is_some_and(|at| at.elapsed() < Duration::from_millis(4));
         if (!redraw || throttled) && stats.elapsed() < Duration::from_secs(1) {
             deferred_redraw = throttled;
-            // Wake at once for input (a plain sleep delayed motion and keys by
-            // up to 2 ms); otherwise look for a decoded frame within 1 ms.
+            // Input, decoded frames, host updates and the session ending all
+            // wake this at once. The timeout only paces throttled input redraws
+            // and polled state (stats, probes, toolbar hiding, pipeline errors).
             // A null event only peeks, so poll_iter still sees every event.
+            let wait = if !woken {
+                Duration::from_millis(1)
+            } else if throttled {
+                Duration::from_millis(4)
+                    .saturating_sub(last_present.map_or(Duration::ZERO, |at| at.elapsed()))
+            } else {
+                IDLE_WAIT
+            }
+            .min(Duration::from_secs(1).saturating_sub(stats.elapsed()));
+            let wait_ms = wait.as_micros().div_ceil(1000).clamp(1, 1000) as i32;
             unsafe {
-                sdl2::sys::SDL_WaitEventTimeout(std::ptr::null_mut(), 1);
+                sdl2::sys::SDL_WaitEventTimeout(std::ptr::null_mut(), wait_ms);
             }
             continue;
         }
@@ -2456,6 +2487,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         } else {
             canvas.present();
         }
+        if let Some(decoded_at) = frame_decoded_at.take() {
+            present_timer.presented(decoded_at);
+        }
         if options
             .exit_after_frames
             .is_some_and(|limit| total_frames >= limit)
@@ -2464,12 +2498,134 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         }
         last_present = Some(Instant::now());
     }
+    present_timer.log();
     let _ = events.try_send(Event::ReleaseAll);
     // Disconnect also triggers host-side release of every held key/button.
     Ok(reconnect)
 }
 
 const TOOLBAR_HEIGHT: u32 = crate::fullscreen::HEIGHT;
+
+/// Longest render-loop sleep when nothing wakes it: bounds how late polled
+/// state (pipeline errors, toolbar hiding, probes) is noticed.
+const IDLE_WAIT: Duration = Duration::from_millis(10);
+
+/// SDL user event type that wakes the session render loop (decoded frame,
+/// host update or session end); 0 until registered.
+static WAKE_EVENT: AtomicU32 = AtomicU32::new(0);
+/// At most one wake event is queued; the loop clears this before it looks for
+/// new work, so a frame stored after that always queues another wake.
+static WAKE_QUEUED: AtomicBool = AtomicBool::new(false);
+
+fn wake_render_loop() {
+    let kind = WAKE_EVENT.load(Ordering::Acquire);
+    if kind == 0 || WAKE_QUEUED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // SAFETY: an all-zero SDL_Event is valid; only its type is set.
+    let mut event: sdl2::sys::SDL_Event = unsafe { std::mem::zeroed() };
+    event.type_ = kind;
+    // SAFETY: SDL_PushEvent is thread-safe and copies the event.
+    if unsafe { sdl2::sys::SDL_PushEvent(&mut event) } != 1 {
+        WAKE_QUEUED.store(false, Ordering::Release);
+    }
+}
+
+/// Registers the wake event (once per process) and routes decoder frame
+/// notifications to it. False when SDL has no user event types left; the
+/// loop then keeps its 1 ms poll.
+fn register_render_wake() -> bool {
+    if WAKE_EVENT.load(Ordering::Acquire) == 0 {
+        // SAFETY: called on the SDL thread after SDL_Init.
+        let kind = unsafe { sdl2::sys::SDL_RegisterEvents(1) };
+        if kind == u32::MAX {
+            return false;
+        }
+        WAKE_EVENT.store(kind, Ordering::Release);
+    }
+    media::set_presenter_wake(wake_render_loop);
+    true
+}
+
+/// Decoder-ready → presented latency and render-loop cost, logged when the
+/// window closes so loop scheduling changes can be compared (H9).
+struct PresentTimer {
+    started: Instant,
+    cpu_start: Duration,
+    iterations: u64,
+    /// Microseconds from a frame being stored by the decoder to its present.
+    samples: Vec<u32>,
+    /// Microseconds from a frame being stored to the loop taking it.
+    pickups: Vec<u32>,
+}
+
+impl PresentTimer {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            cpu_start: thread_cpu_time(),
+            iterations: 0,
+            samples: Vec::new(),
+            pickups: Vec::new(),
+        }
+    }
+    fn picked_up(&mut self, decoded_at: Instant) {
+        Self::sample(&mut self.pickups, decoded_at);
+    }
+    fn presented(&mut self, decoded_at: Instant) {
+        Self::sample(&mut self.samples, decoded_at);
+    }
+    fn sample(samples: &mut Vec<u32>, since: Instant) {
+        if samples.len() < 1 << 20 {
+            samples.push(since.elapsed().as_micros().min(u32::MAX as u128) as u32);
+        }
+    }
+    fn log(self) {
+        let wall = self.started.elapsed().as_secs_f64().max(1e-3);
+        let cpu = thread_cpu_time()
+            .saturating_sub(self.cpu_start)
+            .as_secs_f64();
+        // Mean, p50, p95 and max in microseconds.
+        let summary = |mut samples: Vec<u32>| {
+            samples.sort_unstable();
+            let at = |p: usize| {
+                samples
+                    .get((samples.len() * p / 100).min(samples.len().saturating_sub(1)))
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let mean = samples.iter().map(|&us| u64::from(us)).sum::<u64>()
+                / (samples.len() as u64).max(1);
+            format!(
+                "{mean}/{}/{}/{}",
+                at(50),
+                at(95),
+                samples.last().copied().unwrap_or(0)
+            )
+        };
+        tracing::info!(
+            frames = self.samples.len(),
+            ready_to_pickup_us = summary(self.pickups),
+            ready_to_present_us = summary(self.samples),
+            loop_iterations_per_s = (self.iterations as f64 / wall).round() as u64,
+            loop_cpu_percent = format!("{:.1}", cpu * 100.0 / wall),
+            "video presentation summary (mean/p50/p95/max)"
+        );
+    }
+}
+
+/// CPU time consumed by the calling thread (the render loop).
+fn thread_cpu_time() -> Duration {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: valid out-pointer; the clock is supported on Linux and macOS.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) } != 0 {
+        return Duration::ZERO;
+    }
+    Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+}
 
 fn display_mode_rect() -> Rect {
     Rect::new(12, 51, 172, 27)

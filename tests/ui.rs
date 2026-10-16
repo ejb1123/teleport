@@ -1342,3 +1342,92 @@ fn native_launcher_shows_relay_presence() {
     wait_dot(0x606c7c, "the desktop offline", Duration::from_secs(40));
     drop(launcher);
 }
+
+/// Windowed render loop timing (H9): decoder-ready → present latency and the
+/// loop's own CPU while video streams (60 FPS, or `TELEPORT_TEST_FPS`).
+/// Prints the client's summary so runs can be compared; only asserts that
+/// frames were presented.
+#[test]
+#[ignore = "requires Xvfb, UDP and GStreamer runtime plugins; prints timings"]
+fn windowed_presentation_latency() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut display = Process(
+        Command::new("Xvfb")
+            .args([
+                "-displayfd",
+                "1",
+                "-screen",
+                "0",
+                "1600x1000x24",
+                "-nolisten",
+                "tcp",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut number = String::new();
+    std::io::BufReader::new(display.0.stdout.take().unwrap())
+        .read_line(&mut number)
+        .unwrap();
+    let display_name = format!(":{}", number.trim());
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let pairing = temp.path().join("pairing.json");
+    let fps = std::env::var("TELEPORT_TEST_FPS").unwrap_or_else(|_| "60".into());
+    let frames = (fps.parse::<u32>().unwrap() * 10).to_string();
+    let mut host = Process(
+        teleport(&display_name)
+            .args([
+                "host",
+                "--source",
+                "test",
+                "--encoder",
+                "software",
+                "--width",
+                "1280",
+                "--fps",
+                &fps,
+                "--listen",
+                &address,
+                "--pairing-file",
+            ])
+            .arg(&pairing)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::read(&pairing)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_none()
+    {
+        assert!(host.0.try_wait().unwrap().is_none(), "host exited");
+        assert!(Instant::now() < deadline, "host never published pairing");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let output = teleport(&display_name)
+        .args([
+            "client",
+            &address,
+            "--software-decoder",
+            "--exit-after-frames",
+            &frames,
+            "--pairing-file",
+        ])
+        .arg(&pairing)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    let log = String::from_utf8_lossy(&output.stdout);
+    let summary = log
+        .lines()
+        .find(|line| line.contains("video presentation summary"))
+        .unwrap_or_else(|| panic!("no presentation summary ({}):\n{log}", output.status));
+    println!("{summary}");
+    assert!(output.status.success(), "client failed:\n{log}");
+    assert!(!summary.contains(" frames=0 "), "no frames presented");
+    drop(host);
+}
