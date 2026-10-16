@@ -105,6 +105,87 @@ fn negotiated_resolution_and_native_portrait() {
 }
 
 #[test]
+#[ignore = "requires local UDP sockets and GStreamer runtime plugins"]
+fn test_host_advertises_and_accepts_gamepad_events() {
+    let temp = tempfile::tempdir().unwrap();
+    let pairing = temp.path().join("pairing.json");
+    let log = temp.path().join("host.log");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let mut host = Process(
+        teleport()
+            .args([
+                "host",
+                "--source",
+                "test",
+                "--encoder",
+                "software",
+                "--listen",
+                &address,
+                "--width",
+                "640",
+                "--pairing-file",
+            ])
+            .arg(&pairing)
+            .stdout(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::read(&pairing)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_none()
+    {
+        assert!(host.0.try_wait().unwrap().is_none(), "test host exited");
+        assert!(Instant::now() < deadline, "test host did not become ready");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // --smoke-input sends connect, button, axis and disconnect to a test host
+    // that advertises gamepads; an unknown or invalid event would end the
+    // session and fail the client.
+    let output = teleport()
+        .args(["client", &address, "--pairing-file"])
+        .arg(&pairing)
+        .args([
+            "--headless-frames",
+            "30",
+            "--software-decoder",
+            "--smoke-input",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("SMOKE PASS"),
+        "gamepad smoke client failed: {stdout} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(host.0.try_wait().unwrap().is_none(), "host exited");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = std::fs::read_to_string(&log).unwrap();
+        if text.contains("gamepad connected") && text.contains("gamepad disconnected") {
+            assert!(
+                text.contains("virtual_device=false"),
+                "test host must not create a uinput device: {text}"
+            );
+            assert!(
+                !text.contains("could not be injected"),
+                "pad event rejected: {text}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host never handled the pad: {text}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
 #[ignore = "requires local TCP/UDP sockets and GStreamer plugins"]
 fn one_time_code_saves_trust_and_connects_without_file_transfer() {
     use std::io::{BufRead, Write};

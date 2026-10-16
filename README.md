@@ -334,7 +334,9 @@ to separate networking/decoding problems from portal/capture problems.
 - Initial local approval is required for Wayland. Saved permission is opt-in
   and compositor-dependent. No login-screen access or unattended-access guarantee.
 - HDR requires the experimental patched-KWin/Mac path; see [its limitations](docs/hdr.md).
-- No file transfer, gamepad, virtual display, IME, monitor hotplug,
+- Gamepads need a Linux host with `/dev/uinput` access and have no rumble;
+  see [gamepads](docs/gamepad.md).
+- No file transfer, virtual display, IME, monitor hotplug,
   keychain-backed credentials or automatic NAT traversal yet.
 - Direct LAN/VPN connections only. A bitrate above available bandwidth
   causes skipped video groups. Severe control loss/reordering disconnects the

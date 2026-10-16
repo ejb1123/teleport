@@ -9,6 +9,8 @@ mod clipboard;
 mod e2e;
 mod ffmpeg;
 mod fullscreen;
+#[cfg(target_os = "linux")]
+mod gamepad;
 mod hdr;
 mod hdr_present;
 #[cfg(target_os = "linux")]
