@@ -16,6 +16,9 @@
 //! * `<session>/desktop`  host → client: sealed metadata/video/audio/updates
 //!
 //! `<session>` is 128 random bits chosen by the client per connection.
+//! Enrollment (pairing, password, system login) uses `<attempt>/request` and
+//! `<attempt>/response` streams, here or on a pairing rendezvous namespace;
+//! see `crate::relay_enroll`.
 //!
 //! `teleport relay` runs a minimal self-hosted relay for testing or for users
 //! who prefer their own server to a third-party relay such as Cloudflare's.
@@ -149,11 +152,11 @@ fn versions(requested: &[String]) -> Result<Vec<moq_net::Version>> {
         .collect()
 }
 
-fn valid_namespace(namespace: &str) -> bool {
+pub(crate) fn valid_namespace(namespace: &str) -> bool {
     namespace.len() == 32 && namespace.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
@@ -178,6 +181,37 @@ pub struct Endpoint {
     pub fingerprint: Option<String>,
     /// Access key for a relay started with `--key`.
     pub key: Option<String>,
+}
+
+/// Relay options for the enrollment commands (`pair`, `login`,
+/// `login-system`), matching `teleport client`'s.
+#[derive(Args, Clone, Default)]
+pub struct RelayArgs {
+    /// Enroll through this MoQ relay instead of TCP to the host (the host must
+    /// run with the same --relay). The address is then only the profile name.
+    #[arg(long)]
+    pub relay: Option<url::Url>,
+    /// Pin a self-hosted relay's certificate (printed by `teleport relay`).
+    #[arg(long, requires = "relay")]
+    pub relay_fingerprint: Option<String>,
+    /// Access key for a relay started with `teleport relay --key`.
+    #[arg(
+        long,
+        requires = "relay",
+        env = "TELEPORT_RELAY_KEY",
+        hide_env_values = true
+    )]
+    pub relay_key: Option<String>,
+}
+
+impl RelayArgs {
+    pub fn endpoint(&self) -> Option<Endpoint> {
+        self.relay.clone().map(|url| Endpoint {
+            url,
+            fingerprint: self.relay_fingerprint.clone(),
+            key: self.relay_key.clone(),
+        })
+    }
 }
 
 /// One connection to a relay, scoped to a host namespace.

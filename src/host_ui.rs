@@ -51,6 +51,7 @@ pub fn run() -> Result<()> {
     let mut message = String::from("Checking the local host service…");
     let mut service_state = String::from("unknown");
     let mut pairing_code: Option<(String, Instant)> = None;
+    let mut relay_pairing: Option<String> = None;
     let mut selected: Option<String> = None;
     let mut confirm_action: Option<(usize, Instant)> = None;
     let mut device_offset = 0usize;
@@ -75,9 +76,11 @@ pub fn run() -> Result<()> {
                     Ok(mut response) => {
                         if let Some(code) = response.code.take() {
                             pairing_code = Some((code, Instant::now()));
+                            relay_pairing = response.relay_pairing.take();
                         }
                         if !response.pairing_open {
                             pairing_code = None;
+                            relay_pairing = None;
                         }
                         message = "Host settings updated. Existing trusted devices stay connected unless revoked.".into();
                         status = Some(response);
@@ -218,6 +221,7 @@ pub fn run() -> Result<()> {
                             4 => Some(Action::Admin(Request::OpenPairing)),
                             5 => {
                                 pairing_code = None;
+                                relay_pairing = None;
                                 Some(Action::Admin(Request::ClosePairing))
                             }
                             6 => selected
@@ -363,6 +367,9 @@ pub fn run() -> Result<()> {
             && when.elapsed() < Duration::from_secs(300)
         {
             text(&format!("Code: {code}"), 482, 434, 360)?;
+            if let Some(link) = &relay_pairing {
+                text(&format!("Relay: {link}"), 28, 458, 864)?;
+            }
         }
         text(
             &format!(

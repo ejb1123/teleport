@@ -48,6 +48,50 @@ teleport client host.example:4443 --pairing-file <credential> \
 The host address is not contacted in relay mode. The launcher does not expose
 relay settings yet.
 
+First-time pairing works through the relay too (`--pair` prints a relay
+pairing link; `teleport pair ADDRESS --relay ...` reads it), so the host never
+needs a reachable port. See [enrollment through the relay](#enrollment-through-the-relay).
+
+## Enrollment through the relay
+
+All three ways to obtain a credential run through the relay, unchanged, as the
+same byte streams they use over TCP (`src/relay_enroll.rs`):
+
+| Enrollment | Relay namespace | Client command | End-to-end protection |
+| --- | --- | --- | --- |
+| One-time code (`TPPAIR01`, SPAKE2) | rendezvous from the pairing link | `teleport pair ADDRESS --relay ...` (link on stdin) | PAKE: the code never leaves either end |
+| Password (`TPAUTH01`, OPAQUE) | host namespace (`--relay-host`) | `teleport login ADDRESS --username U --relay-host ID --relay ...` | OPAQUE: authenticates the host fingerprint; the password never leaves the client |
+| Linux account (`TPSYS001`, PAM) | host namespace, from `--fingerprint` | `teleport login-system ADDRESS --username U --fingerprint F --relay ...` | TLS 1.3 pinned to the host certificate, inside the relay stream |
+
+`ID` is the host's relay id (its namespace; not secret), shown as
+`relay_host` by `teleport host-admin status` and logged as `namespace=` when
+the host connects. The client checks that the host OPAQUE authenticated has
+that id. For Linux account login, the password is sent only after the TLS
+handshake inside the relay stream has verified the pinned fingerprint, so the
+relay sees only TLS ciphertext; a wrong pin sends nothing (tested, including
+that the relayed bytes never contain the password). The resulting one-session
+ticket then opens a relayed session (`login-system` passes the relay options
+to the client it starts).
+
+Layout per attempt, `<attempt>` being 128 random bits chosen by the client:
+
+* `<attempt>/request`  client → host
+* `<attempt>/response` host → client
+
+Each is one ordered track; every chunk written is one group with one frame
+(at most 4 KiB). The receiver restores order within a window of 16 groups,
+rejects gaps and duplicates, and treats the end of the track as end of stream.
+The framing adds no security of its own and needs none: every protocol it
+carries authenticates its own transcript, so reordering, truncation or
+injection only makes the exchange fail.
+
+Host-side bounds per relay namespace: at most 4 attempts in flight (others
+ignored), each at most 100 s and 64 KiB per direction, an attempt id served
+once (replay cache of 1024). Password and system-login attempts through the
+relay share one rate-limit source (the relay hides client addresses), in
+addition to the persistent global limit, so a relay user can make relayed
+logins temporarily unavailable — failing closed, like attempts over TCP.
+
 ## What protects the session
 
 The relay terminates QUIC/TLS, so TLS alone would let it read everything and
@@ -129,7 +173,10 @@ session it starts itself, and confirm them. Device keys close that gap:
 IP addresses of both ends, the per-host namespace (derived from, but not equal
 to, the host fingerprint), track names, object sizes and timing. Input timing
 in particular reveals typing cadence. It can also drop or delay traffic, which
-ends or degrades the session but cannot inject content.
+ends or degrades the session but cannot inject content. During enrollment it
+additionally sees the pairing rendezvous namespace (derived from the random
+rendezvous, never from the code) and the sizes and timing of PAKE or TLS
+messages it cannot read.
 
 ## Provider relays (Cloudflare)
 
@@ -160,7 +207,14 @@ for testing); report what you find.
 - `cargo test --test relay -- --ignored` — real relay, host and client
   processes: video and input end to end, forged credential ignored, unpinned
   relay refused, and with `--relay-require-device-key` a code-paired device
-  streams while its stripped credential and the host token are refused.
+  streams while its stripped credential and the host token are refused;
+  and first pairing purely through the relay (wrong code, single use, then a
+  relayed session decoding video).
+- `cargo test --bin teleport relay_enroll:: system_login::` — relay stream
+  framing (order, gaps, byte limit), wrong code and replayed pairing
+  transcripts, Linux login keeping the password inside pinned TLS.
+- `cargo test --bin teleport host_admin:: -- --ignored` — password and code
+  enrollment through an in-process relay.
 
 ## Known limitations
 

@@ -136,7 +136,10 @@ fn validate_hello(hello: &Hello) -> Result<()> {
     Ok(())
 }
 
-async fn write_packet(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+async fn write_packet(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin),
+    data: &[u8],
+) -> Result<()> {
     ensure!(
         !data.is_empty() && data.len() <= MAX_PACKET,
         "invalid access message size"
@@ -182,7 +185,7 @@ async fn read_optional_packet(
 /// it. Any failure leaves the (already valid) credential hash-only, never
 /// unusable; older hosts close the connection here.
 pub(crate) async fn register_device_key(
-    stream: &mut TcpStream,
+    stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
     registration: &crate::e2e::Registration,
     mut pairing: Pairing,
 ) -> Pairing {
@@ -266,6 +269,54 @@ where
         + 'static,
 {
     crate::pairing::validate_address(address)?;
+    tokio::time::timeout(TIMEOUT, async {
+        let stream = TcpStream::connect(address).await.context(
+            "cannot reach password access service; check TCP firewall and host settings",
+        )?;
+        login_over(stream, username, password, device_name, supports_u2f, touch).await
+    })
+    .await
+    .context("password login timed out")?
+}
+
+/// Password login over a relay stream (`crate::relay_enroll`); prompts for a
+/// security-key touch when the host requires it.
+pub(crate) async fn login_relayed(
+    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    username: &str,
+    password: &str,
+    device_name: &str,
+) -> Result<Pairing> {
+    tokio::time::timeout(
+        TIMEOUT,
+        login_over(
+            stream,
+            username,
+            password,
+            device_name,
+            true,
+            |credential, hash| crate::security_key::sign_u2f(&credential, &hash, None),
+        ),
+    )
+    .await
+    .context("password login timed out")?
+}
+
+/// Client side of OPAQUE login over any ordered byte stream. OPAQUE
+/// authenticates the host's fingerprint, so the stream may be untrusted.
+async fn login_over<F>(
+    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    username: &str,
+    password: &str,
+    device_name: &str,
+    supports_u2f: bool,
+    touch: F,
+) -> Result<Pairing>
+where
+    F: FnOnce(crate::security_key::Credential, [u8; 32]) -> Result<crate::security_key::Assertion>
+        + Send
+        + 'static,
+{
     let hello = Hello {
         username: username.into(),
         device_name: device_name.into(),
@@ -276,78 +327,71 @@ where
         !password.is_empty() && password.len() <= 1024,
         "invalid password length"
     );
-    tokio::time::timeout(TIMEOUT, async {
-        let mut stream = TcpStream::connect(address).await.context(
-            "cannot reach password access service; check TCP firewall and host settings",
-        )?;
-        stream.write_all(&MAGIC).await?;
-        let hello_bytes = serde_json::to_vec(&hello)?;
-        write_packet(&mut stream, &hello_bytes).await?;
-        let fingerprint = String::from_utf8(read_packet(&mut stream).await?)?;
-        moq_native::tls::parse_fingerprint(&fingerprint)?;
-        let context = serde_json::to_vec(&(MAGIC, &hello_bytes, &fingerprint))?;
-        let start = ClientLogin::<Suite>::start(&mut OsRng, password.as_bytes())?;
-        write_packet(&mut stream, &start.message.serialize()).await?;
-        let response = CredentialResponse::<Suite>::deserialize(&read_packet(&mut stream).await?)?;
-        let finish = start
-            .state
-            .finish(
-                &mut OsRng,
-                password.as_bytes(),
-                response,
-                ClientLoginFinishParameters {
-                    ksf: Some(&password_ksf()),
-                    context: Some(&context),
-                    identifiers: Identifiers {
-                        client: Some(username.as_bytes()),
-                        server: Some(fingerprint.as_bytes()),
-                    },
+    stream.write_all(&MAGIC).await?;
+    let hello_bytes = serde_json::to_vec(&hello)?;
+    write_packet(&mut stream, &hello_bytes).await?;
+    let fingerprint = String::from_utf8(read_packet(&mut stream).await?)?;
+    moq_native::tls::parse_fingerprint(&fingerprint)?;
+    let context = serde_json::to_vec(&(MAGIC, &hello_bytes, &fingerprint))?;
+    let start = ClientLogin::<Suite>::start(&mut OsRng, password.as_bytes())?;
+    write_packet(&mut stream, &start.message.serialize()).await?;
+    let response = CredentialResponse::<Suite>::deserialize(&read_packet(&mut stream).await?)?;
+    let finish = start
+        .state
+        .finish(
+            &mut OsRng,
+            password.as_bytes(),
+            response,
+            ClientLoginFinishParameters {
+                ksf: Some(&password_ksf()),
+                context: Some(&context),
+                identifiers: Identifiers {
+                    client: Some(username.as_bytes()),
+                    server: Some(fingerprint.as_bytes()),
                 },
-            )
-            .map_err(|_| {
-                anyhow::anyhow!("login failed; check username/password or host access settings")
-            })?;
-        write_packet(&mut stream, &finish.message.serialize()).await?;
-        let mut packet = read_packet(&mut stream).await?;
-        if packet.starts_with(b"TPU2F001") {
-            let challenge: TouchChallenge = serde_json::from_slice(&open_touch(
+            },
+        )
+        .map_err(|_| {
+            anyhow::anyhow!("login failed; check username/password or host access settings")
+        })?;
+    write_packet(&mut stream, &finish.message.serialize()).await?;
+    let mut packet = read_packet(&mut stream).await?;
+    if packet.starts_with(b"TPU2F001") {
+        let challenge: TouchChallenge = serde_json::from_slice(&open_touch(
+            &finish.session_key,
+            TOUCH_REQUEST,
+            &context,
+            packet[8..].to_vec(),
+        )?)?;
+        crate::security_key::validate_u2f_credential(&challenge.credential, &fingerprint)?;
+        eprintln!("Touch your YubiKey to authorize this new device.");
+        let assertion =
+            tokio::task::spawn_blocking(move || touch(challenge.credential, challenge.hash))
+                .await??;
+        write_packet(
+            &mut stream,
+            &seal_touch(
                 &finish.session_key,
-                TOUCH_REQUEST,
+                TOUCH_REPLY,
                 &context,
-                packet[8..].to_vec(),
-            )?)?;
-            crate::security_key::validate_u2f_credential(&challenge.credential, &fingerprint)?;
-            eprintln!("Touch your YubiKey to authorize this new device.");
-            let assertion =
-                tokio::task::spawn_blocking(move || touch(challenge.credential, challenge.hash))
-                    .await??;
-            write_packet(
-                &mut stream,
-                &seal_touch(
-                    &finish.session_key,
-                    TOUCH_REPLY,
-                    &context,
-                    serde_json::to_vec(&assertion)?,
-                )?,
-            )
-            .await?;
-            packet = read_packet(&mut stream).await?;
-        }
-        let pairing = open_credential(&finish.session_key, &context, packet)?;
-        ensure!(
-            pairing.fingerprint == fingerprint,
-            "authenticated host identity mismatch"
-        );
-        // Device keys are generated here, never accepted from the host.
-        let pairing = Pairing {
-            device_key: None,
-            ..pairing
-        };
-        let registration = crate::e2e::Registration::new(&finish.session_key, &context)?;
-        Ok(register_device_key(&mut stream, &registration, pairing).await)
-    })
-    .await
-    .context("password login timed out")?
+                serde_json::to_vec(&assertion)?,
+            )?,
+        )
+        .await?;
+        packet = read_packet(&mut stream).await?;
+    }
+    let pairing = open_credential(&finish.session_key, &context, packet)?;
+    ensure!(
+        pairing.fingerprint == fingerprint,
+        "authenticated host identity mismatch"
+    );
+    // Device keys are generated here, never accepted from the host.
+    let pairing = Pairing {
+        device_key: None,
+        ..pairing
+    };
+    let registration = crate::e2e::Registration::new(&finish.session_key, &context)?;
+    Ok(register_device_key(&mut stream, &registration, pairing).await)
 }
 
 #[cfg(target_os = "linux")]
@@ -760,7 +804,7 @@ mod server {
         /// the connection instead, which leaves a hash-only device.
         pub(crate) async fn accept_device_key(
             &self,
-            stream: &mut TcpStream,
+            stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
             registration: &crate::e2e::Registration,
             id: &str,
         ) -> Result<()> {
@@ -1006,12 +1050,18 @@ mod server {
         pub id: String,
     }
 
-    pub async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> Result<()> {
+    /// Host side of password login. `source` keys the per-source rate limit
+    /// (all relayed attempts share one); the persistent global limit always applies.
+    pub async fn handle(
+        mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+        source: IpAddr,
+        state: Arc<ServerState>,
+    ) -> Result<()> {
         let _permit = state
             .slots
             .try_acquire()
             .map_err(|_| anyhow::anyhow!("login temporarily unavailable"))?;
-        state.admit(stream.peer_addr()?.ip())?;
+        state.admit(source)?;
         tokio::time::timeout(TIMEOUT, async {
             let (finish, context, hello, generation, u2f) =
                 tokio::time::timeout(Duration::from_secs(15), async {
@@ -1156,7 +1206,8 @@ mod server {
                 while let Ok((stream, _)) = listener.accept().await {
                     let state = state.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = handle(stream, state).await {
+                        let source = stream.peer_addr().unwrap().ip();
+                        if let Err(error) = handle(stream, source, state).await {
                             eprintln!("test access rejection: {error:#}");
                         }
                     });

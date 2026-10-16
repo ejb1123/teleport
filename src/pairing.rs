@@ -7,20 +7,20 @@ use ring::{aead, digest, hkdf, hmac};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
 use std::time::Duration;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
 };
 
 const MAGIC: &[u8; 8] = b"TPPAIR01";
 const CLIENT: &[u8] = b"teleport/pair/v1/client";
 const HOST: &[u8] = b"teleport/pair/v1/host";
-const TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
 const LIFETIME: Duration = Duration::from_secs(300);
 #[cfg(target_os = "linux")]
 const ATTEMPTS: u8 = 5;
 
-fn normalize(code: &str) -> Result<String> {
+pub(crate) fn normalize(code: &str) -> Result<String> {
     ensure!(
         code.len() <= 32,
         "enter the six-digit pairing code from the host"
@@ -133,13 +133,13 @@ impl Keys {
     }
 }
 
-async fn write_packet(stream: &mut TcpStream, data: &[u8]) -> Result<()> {
+async fn write_packet(stream: &mut (impl AsyncWrite + Unpin), data: &[u8]) -> Result<()> {
     ensure!(data.len() <= 4096, "pairing message too large");
     stream.write_u16(data.len() as u16).await?;
     stream.write_all(data).await?;
     Ok(())
 }
-async fn read_packet(stream: &mut TcpStream, maximum: usize) -> Result<Vec<u8>> {
+async fn read_packet(stream: &mut (impl AsyncRead + Unpin), maximum: usize) -> Result<Vec<u8>> {
     let length = stream.read_u16().await? as usize;
     ensure!(
         length > 0 && length <= maximum,
@@ -164,38 +164,54 @@ async fn pair_with(address: &str, code: &str, register_key: bool) -> Result<Pair
     validate_address(address)?;
     let code = normalize(code)?;
     tokio::time::timeout(TIMEOUT, async {
-        let mut stream = TcpStream::connect(address).await.context(
+        let stream = TcpStream::connect(address).await.context(
             "cannot reach pairing service; start host with --pair and allow TCP on its port",
         )?;
-        let (state, message) = Spake2::<Ed25519Group>::start_a(
-            &Password::new(code.as_bytes()),
-            &Identity::new(CLIENT),
-            &Identity::new(HOST),
-        );
-        stream.write_all(MAGIC).await?;
-        write_packet(&mut stream, &message).await?;
-        let remote = read_packet(&mut stream, 128).await?;
-        let shared = state
-            .finish(&remote)
-            .map_err(|_| anyhow::anyhow!("invalid pairing exchange"))?;
-        let keys = Keys::new(&shared, &message, &remote)?;
-        let confirmation = hmac::sign(&keys.confirmation, &keys.transcript);
-        write_packet(&mut stream, confirmation.as_ref()).await?;
-        let packet = read_packet(&mut stream, 4096).await.context(
-            "pairing rejected; code may be wrong, used, expired, or locked after five attempts",
-        )?;
-        // Device keys are generated here, never accepted from the host.
-        let pairing = Pairing {
-            device_key: None,
-            ..keys.open(packet)?
-        };
-        if !register_key {
-            return Ok(pairing);
-        }
-        Ok(crate::access::register_device_key(&mut stream, &keys.registration, pairing).await)
+        pair_over(stream, &code, register_key).await
     })
     .await
     .context("pairing timed out; check host code and TCP firewall")?
+}
+
+/// Client side of code pairing over any ordered byte stream: direct TCP, or a
+/// relay stream (`crate::relay_enroll`). The caller bounds the time.
+/// Client side of code pairing over any ordered byte stream (TCP or relay).
+/// `register_key`: create and register a device key after the credential
+/// (false only to emulate clients from before device keys).
+pub(crate) async fn pair_over(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    code: &str,
+    register_key: bool,
+) -> Result<Pairing> {
+    let code = normalize(code)?;
+    let (state, message) = Spake2::<Ed25519Group>::start_a(
+        &Password::new(code.as_bytes()),
+        &Identity::new(CLIENT),
+        &Identity::new(HOST),
+    );
+    stream.write_all(MAGIC).await?;
+    write_packet(&mut stream, &message).await?;
+    stream.flush().await?;
+    let remote = read_packet(&mut stream, 128).await?;
+    let shared = state
+        .finish(&remote)
+        .map_err(|_| anyhow::anyhow!("invalid pairing exchange"))?;
+    let keys = Keys::new(&shared, &message, &remote)?;
+    let confirmation = hmac::sign(&keys.confirmation, &keys.transcript);
+    write_packet(&mut stream, confirmation.as_ref()).await?;
+    stream.flush().await?;
+    let packet = read_packet(&mut stream, 4096).await.context(
+        "pairing rejected; code may be wrong, used, expired, or locked after five attempts",
+    )?;
+    // Device keys are generated here, never accepted from the host.
+    let pairing = Pairing {
+        device_key: None,
+        ..keys.open(packet)?
+    };
+    if !register_key {
+        return Ok(pairing);
+    }
+    Ok(crate::access::register_device_key(&mut stream, &keys.registration, pairing).await)
 }
 
 #[cfg(target_os = "linux")]
@@ -263,7 +279,7 @@ async fn serve(
 
 #[cfg(target_os = "linux")]
 pub(crate) async fn accept(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     code: &str,
     pairing: &Pairing,
     used: &mut bool,
@@ -281,7 +297,7 @@ pub(crate) struct DeviceEnrollment<'a> {
 
 #[cfg(target_os = "linux")]
 pub(crate) async fn accept_with_access(
-    stream: &mut TcpStream,
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     code: &str,
     pairing: &Pairing,
     used: &mut bool,
@@ -302,6 +318,7 @@ pub(crate) async fn accept_with_access(
         .map_err(|_| anyhow::anyhow!("invalid pairing exchange"))?;
     let keys = Keys::new(&shared, &client, &host)?;
     write_packet(stream, &host).await?;
+    stream.flush().await?;
     let proof = read_packet(stream, 32).await?;
     hmac::verify(&keys.confirmation, &keys.transcript, &proof)
         .map_err(|_| anyhow::anyhow!("pairing authentication failed"))?;
@@ -325,10 +342,13 @@ pub(crate) async fn accept_with_access(
     *used = true;
     let Some(access) = access else {
         // The host's own pairing file: nothing to register a key against.
-        return write_packet(stream, &keys.seal(pairing)?).await;
+        write_packet(stream, &keys.seal(pairing)?).await?;
+        stream.flush().await?;
+        return Ok(());
     };
     let device = access.access.enroll_device("Code-paired device")?;
     write_packet(stream, &keys.seal(&device.pairing)?).await?;
+    stream.flush().await?;
     access
         .access
         .accept_device_key(stream, &keys.registration, &device.id)

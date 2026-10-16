@@ -28,6 +28,7 @@ mod pairing;
 mod profiles;
 mod protocol;
 mod relay;
+mod relay_enroll;
 mod security_key;
 mod ssh_agent;
 mod stats;
@@ -59,7 +60,12 @@ enum Command {
     /// Open the native saved-host connection window.
     Launcher,
     /// Pair once using the short-lived code shown by a host started with --pair.
-    Pair { address: String },
+    /// With --relay, enter the host's relay pairing link instead of the code.
+    Pair {
+        address: String,
+        #[command(flatten)]
+        relay: relay::RelayArgs,
+    },
     /// Log in with a Teleport account and save this device's trusted credential.
     Login {
         address: String,
@@ -67,6 +73,12 @@ enum Command {
         username: String,
         #[arg(long, default_value = "Teleport client")]
         device_name: String,
+        /// With --relay: the host's relay id (`relay_host` in
+        /// `teleport host-admin status`).
+        #[arg(long, requires = "relay")]
+        relay_host: Option<String>,
+        #[command(flatten)]
+        relay: relay::RelayArgs,
     },
     /// Log in once using the Linux host user's existing password (requires PAM setup).
     LoginSystem {
@@ -78,6 +90,8 @@ enum Command {
         fingerprint: String,
         #[arg(long)]
         software_renderer: bool,
+        #[command(flatten)]
+        relay: relay::RelayArgs,
     },
     /// Open local host settings. Does not expose administration over the network.
     #[cfg(target_os = "linux")]
@@ -124,17 +138,26 @@ fn main() -> Result<()> {
             username,
             fingerprint,
             software_renderer,
+            relay,
         }) => {
             use std::io::Write;
             moq_native::tls::parse_fingerprint(&fingerprint)?;
             let password =
                 zeroize::Zeroizing::new(rpassword::prompt_password("Linux account password: ")?);
-            let pairing = runtime.block_on(system_login::login(
-                &address,
-                &username,
-                &password,
-                &fingerprint,
-            ))?;
+            let pairing = match relay.endpoint() {
+                Some(endpoint) => runtime.block_on(relay_enroll::login_system(
+                    &endpoint,
+                    &username,
+                    &password,
+                    &fingerprint,
+                ))?,
+                None => runtime.block_on(system_login::login(
+                    &address,
+                    &username,
+                    &password,
+                    &fingerprint,
+                ))?,
+            };
             drop(password);
             let mut credential = tempfile::NamedTempFile::new()?;
             let data = zeroize::Zeroizing::new(serde_json::to_vec(&pairing)?);
@@ -148,6 +171,16 @@ fn main() -> Result<()> {
                 .arg(credential.path());
             if software_renderer {
                 child.arg("--software-renderer");
+            }
+            if let Some(url) = &relay.relay {
+                child.arg("--relay").arg(url.as_str());
+                if let Some(pin) = &relay.relay_fingerprint {
+                    child.arg("--relay-fingerprint").arg(pin);
+                }
+                // Through the environment, not argv (visible to other users).
+                if let Some(key) = &relay.relay_key {
+                    child.env("TELEPORT_RELAY_KEY", key);
+                }
             }
             anyhow::ensure!(
                 child.status()?.success(),
@@ -166,11 +199,30 @@ fn main() -> Result<()> {
             address,
             username,
             device_name,
+            relay_host,
+            relay,
         }) => {
+            let endpoint = relay.endpoint();
+            let relay_host = match &endpoint {
+                Some(_) => Some(relay_host.context(
+                    "--relay needs --relay-host (relay_host in `teleport host-admin status` on the host)",
+                )?),
+                None => None,
+            };
             let password =
                 zeroize::Zeroizing::new(rpassword::prompt_password("Teleport password: ")?);
-            let pairing =
-                runtime.block_on(access::login(&address, &username, &password, &device_name))?;
+            let pairing = match (endpoint, relay_host) {
+                (Some(endpoint), Some(host)) => runtime.block_on(relay_enroll::login(
+                    &endpoint,
+                    &host,
+                    &username,
+                    &password,
+                    &device_name,
+                ))?,
+                _ => {
+                    runtime.block_on(access::login(&address, &username, &password, &device_name))?
+                }
+            };
             let profile = profiles::save_pairing(&address, &pairing, &mut profiles::load()?)?;
             println!(
                 "Logged in and saved: {}",
@@ -191,13 +243,30 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Pair { address }) => {
+        Some(Command::Pair { address, relay }) => {
             use std::io::{BufRead, Read, Write};
-            print!("Pairing code from the host: ");
+            let endpoint = relay.endpoint();
+            // Check the profile name before spending a one-time code.
+            pairing::validate_address(&address)?;
+            // The code (or link) is read from stdin, never argv.
+            print!(
+                "{}",
+                if endpoint.is_some() {
+                    "Relay pairing link from the host: "
+                } else {
+                    "Pairing code from the host: "
+                }
+            );
             std::io::stdout().flush()?;
-            let mut code = String::new();
-            std::io::stdin().lock().take(128).read_line(&mut code)?;
-            let pairing = runtime.block_on(pairing::pair(&address, &code))?;
+            let mut code = zeroize::Zeroizing::new(String::new());
+            std::io::stdin().lock().take(256).read_line(&mut code)?;
+            let pairing = match endpoint {
+                Some(endpoint) => runtime.block_on(relay_enroll::pair(
+                    &endpoint,
+                    &relay_enroll::Invite::parse(&code)?,
+                ))?,
+                None => runtime.block_on(pairing::pair(&address, &code))?,
+            };
             let profile = profiles::save_pairing(&address, &pairing, &mut profiles::load()?)?;
             println!(
                 "Paired and saved: {}",

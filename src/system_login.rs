@@ -165,6 +165,24 @@ pub async fn login(
     fingerprint: &str,
 ) -> Result<Pairing> {
     crate::pairing::validate_address(address)?;
+    tokio::time::timeout(LOGIN_TIMEOUT, async {
+        let stream = TcpStream::connect(address).await?;
+        login_over(stream, username, password, fingerprint).await
+    })
+    .await
+    .context("system login timed out")?
+}
+
+/// System login over any ordered byte stream, e.g. a relay stream
+/// (`crate::relay_enroll`): TLS pinned to `fingerprint` runs end to end inside
+/// it, so an untrusted transport never sees the password. The caller bounds
+/// the time.
+pub(crate) async fn login_over(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    username: &str,
+    password: &str,
+    fingerprint: &str,
+) -> Result<Pairing> {
     validate_credentials(username, password)?;
     let expected = moq_native::tls::parse_fingerprint(fingerprint)?;
     let mut options = moq_native::tls::Client::default();
@@ -173,40 +191,35 @@ pub async fn login(
     tls.alpn_protocols = vec![ALPN.to_vec()];
     // No early data: credentials are sent only after certificate verification.
     tls.enable_early_data = false;
-    tokio::time::timeout(LOGIN_TIMEOUT, async {
-        let mut stream = TcpStream::connect(address).await?;
-        stream.write_all(MAGIC).await?;
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
-        let name = tokio_rustls::rustls::pki_types::ServerName::try_from("teleport.local")?;
-        let mut stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, connector.connect(name, stream))
-            .await
-            .context("system login TLS handshake timed out")?
-            .context("system login host identity verification failed")?;
-        ensure!(
-            stream.get_ref().1.alpn_protocol() == Some(ALPN),
-            "invalid system login protocol"
-        );
-        write_frame(&mut stream, &request(username, password)?).await?;
-        let reply = read_frame(&mut stream).await?;
-        ensure!(reply.len() == 129 && reply[0] == 1, "system login failed");
-        let token = std::str::from_utf8(&reply[1..65])?;
-        let fingerprint = std::str::from_utf8(&reply[65..])?;
-        ensure!(
-            token.bytes().all(|byte| byte.is_ascii_hexdigit()),
-            "invalid system login credential"
-        );
-        ensure!(
-            moq_native::tls::parse_fingerprint(fingerprint)? == expected,
-            "system login returned a different host identity"
-        );
-        Ok(Pairing {
-            token: token.to_owned(),
-            fingerprint: fingerprint.to_owned(),
-            device_key: None,
-        })
+    stream.write_all(MAGIC).await?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
+    let name = tokio_rustls::rustls::pki_types::ServerName::try_from("teleport.local")?;
+    let mut stream = tokio::time::timeout(HANDSHAKE_TIMEOUT, connector.connect(name, stream))
+        .await
+        .context("system login TLS handshake timed out")?
+        .context("system login host identity verification failed")?;
+    ensure!(
+        stream.get_ref().1.alpn_protocol() == Some(ALPN),
+        "invalid system login protocol"
+    );
+    write_frame(&mut stream, &request(username, password)?).await?;
+    let reply = read_frame(&mut stream).await?;
+    ensure!(reply.len() == 129 && reply[0] == 1, "system login failed");
+    let token = std::str::from_utf8(&reply[1..65])?;
+    let fingerprint = std::str::from_utf8(&reply[65..])?;
+    ensure!(
+        token.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "invalid system login credential"
+    );
+    ensure!(
+        moq_native::tls::parse_fingerprint(fingerprint)? == expected,
+        "system login returned a different host identity"
+    );
+    Ok(Pairing {
+        token: token.to_owned(),
+        fingerprint: fingerprint.to_owned(),
+        device_key: None,
     })
-    .await
-    .context("system login timed out")?
 }
 
 #[cfg(target_os = "linux")]
@@ -256,12 +269,12 @@ impl Config {
 
 #[cfg(target_os = "linux")]
 pub async fn handle(
-    mut stream: TcpStream,
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    ip: std::net::IpAddr,
     config: &Config,
     access: Arc<crate::access::ServerState>,
 ) -> Result<()> {
     tokio::time::timeout(LOGIN_TIMEOUT, async {
-        let ip = stream.peer_addr()?.ip();
         let mut magic = [0; 8];
         tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut magic)).await??;
         ensure!(&magic == MAGIC, "invalid system login protocol");
@@ -503,7 +516,8 @@ mod tests {
         let server_state = state.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await?;
-            handle(stream, &config, server_state).await
+            let ip = stream.peer_addr()?.ip();
+            handle(stream, ip, &config, server_state).await
         });
         let result = login(&address, username, password, &fingerprint).await;
         server.await??;
@@ -520,6 +534,66 @@ mod tests {
         }
         // PAM login must never create a saved device record.
         assert!(state.status().devices.is_empty());
+        Ok(())
+    }
+
+    /// Through a relay, the password travels only inside TLS pinned to the
+    /// host: the relay never sees it, and a wrong pin sends nothing.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn relayed_login_keeps_the_password_inside_pinned_tls() -> Result<()> {
+        use crate::relay_enroll::tests::{Recorder, loopback, origin};
+        use tokio_rustls::rustls::pki_types::{CertificateDer, pem::PemObject};
+        const PASSWORD: &str = "fixture password";
+        let temp = tempfile::tempdir()?;
+        let directory = temp.path().join("identity");
+        let identity = crate::identity::open(&directory)?;
+        let der = CertificateDer::from_pem_file(&identity.certificate)?;
+        let fingerprint: String = ring::digest::digest(&ring::digest::SHA256, der.as_ref())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let state = crate::access::ServerState::open(
+            &directory,
+            Pairing {
+                token: identity.token,
+                fingerprint: fingerprint.clone(),
+                device_key: None,
+            },
+        )?;
+        let origin = origin();
+        for (attempt, pin) in [("6", "0".repeat(64)), ("7", fingerprint.clone())] {
+            let mut config = Config::new(&directory, "/unused-test-helper".into())?;
+            config.authenticate_test = Some(|_, username, password| {
+                ensure!(username == "ej" && password == PASSWORD, "rejected");
+                Ok(())
+            });
+            let relayed = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (client, host) = loopback(&origin, &attempt.repeat(32));
+            let server = {
+                let (state, relayed) = (state.clone(), relayed.clone());
+                tokio::spawn(async move {
+                    let source = std::net::Ipv6Addr::UNSPECIFIED.into();
+                    handle(Recorder(host, relayed), source, &config, state).await
+                })
+            };
+            let result = login_over(client, "ej", PASSWORD, &pin).await;
+            let _ = server.await?;
+            let seen = relayed.lock().unwrap().clone();
+            assert!(seen.starts_with(MAGIC));
+            assert!(
+                !seen
+                    .windows(PASSWORD.len())
+                    .any(|window| window == PASSWORD.as_bytes()),
+                "password visible to the relay"
+            );
+            if pin == fingerprint {
+                assert!(state.authorized(&result?.token));
+            } else {
+                assert!(result.is_err(), "unpinned host accepted");
+            }
+        }
         Ok(())
     }
 
