@@ -18,8 +18,8 @@
 //!    injects them, and only a client that completed the handshake (including
 //!    its device signature) learns the host's addresses.
 //! 3. **Connectivity.** The host sends a few STUN indications from its QUIC
-//!    socket to the client's candidates, opening its NAT for them, then
-//!    answers. The client dials every host candidate from its own QUIC socket
+//!    socket to the client's candidates, opening its NAT for them (the first
+//!    ones with a TTL too small to reach the client's NAT), then answers. The client dials every host candidate from its own QUIC socket
 //!    (staggered) and keeps the first QUIC handshake that verifies the pinned
 //!    certificate. The session on top is an ordinary direct session: the
 //!    credential rides the MoQ SETUP path and the host authorizes and leases
@@ -79,10 +79,26 @@ const STUN_TIMEOUT: Duration = Duration::from_millis(700);
 const STUN_RETRANSMIT: Duration = Duration::from_millis(200);
 /// Spacing between QUIC dials to successive candidates.
 const DIAL_STAGGER: Duration = Duration::from_millis(30);
-/// Host punch times (ms after the offer): dense first, then sparse while the
-/// client may still be dialing.
+/// Host punch times (ms after the offer) and IP TTL. The first punches carry
+/// a TTL of 2: enough to cross the host's own router (creating its NAT
+/// mapping) but expiring before the client's NAT, so they cannot make a
+/// conntrack-based NAT there (one without an inbound firewall) remap the
+/// client's port before the client's own packets went out. Later ones, sent
+/// once the client is dialing, use the normal TTL for NATs further away.
 #[cfg(target_os = "linux")]
-const PUNCH_SCHEDULE_MS: [u64; 11] = [0, 20, 50, 100, 200, 400, 700, 1000, 1500, 2000, 3000];
+const PUNCH_SCHEDULE: [(u64, Option<u8>); 11] = [
+    (0, Some(2)),
+    (20, Some(2)),
+    (50, Some(2)),
+    (100, Some(2)),
+    (200, Some(2)),
+    (400, Some(2)),
+    (700, None),
+    (1000, None),
+    (1500, None),
+    (2000, None),
+    (3000, None),
+];
 /// Candidates accepted from a peer (the rest of the message is rejected).
 const MAX_CANDIDATES: usize = 8;
 const MAX_HOST_CANDIDATES: usize = 5;
@@ -294,6 +310,10 @@ type Pending = HashMap<stun::TransactionId, (SocketAddr, tokio::sync::oneshot::S
 #[derive(Debug)]
 struct Demux {
     inner: Arc<dyn quinn::AsyncUdpSocket>,
+    /// The same socket (a duplicated descriptor), for punches that need
+    /// per-datagram options quinn's sender does not offer.
+    #[cfg(target_os = "linux")]
+    raw: std::net::UdpSocket,
     pending: Mutex<Pending>,
     ipv6: bool,
 }
@@ -362,6 +382,76 @@ impl Demux {
                 result => return result,
             }
         }
+    }
+
+    /// Send one datagram with IP TTL (hop limit) `ttl`, leaving the socket's
+    /// own TTL, and so concurrent QUIC traffic, untouched. Best effort: a
+    /// full send buffer drops the punch.
+    #[cfg(target_os = "linux")]
+    fn send_with_ttl(&self, destination: SocketAddr, contents: &[u8], ttl: u8) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        let Some(destination) = self.destination(destination) else {
+            return Err(io::Error::from(io::ErrorKind::Unsupported));
+        };
+        // SAFETY: zeroed sockaddr_storage/msghdr are valid; every pointer in
+        // the msghdr refers to locals that outlive the sendmsg call, and the
+        // control buffer is aligned and large enough for one int cmsg.
+        unsafe {
+            let mut address: libc::sockaddr_storage = std::mem::zeroed();
+            let (length, level, kind) = match destination {
+                SocketAddr::V4(v4) => {
+                    let sin = &mut *(&mut address as *mut _ as *mut libc::sockaddr_in);
+                    sin.sin_family = libc::AF_INET as libc::sa_family_t;
+                    sin.sin_port = v4.port().to_be();
+                    sin.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+                    (
+                        std::mem::size_of::<libc::sockaddr_in>(),
+                        libc::IPPROTO_IP,
+                        libc::IP_TTL,
+                    )
+                }
+                SocketAddr::V6(v6) => {
+                    let sin6 = &mut *(&mut address as *mut _ as *mut libc::sockaddr_in6);
+                    sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                    sin6.sin6_port = v6.port().to_be();
+                    sin6.sin6_addr.s6_addr = v6.ip().octets();
+                    // IPv4-mapped destinations take the IPv4 path and its TTL.
+                    let (level, kind) = if v6.ip().to_ipv4_mapped().is_some() {
+                        (libc::IPPROTO_IP, libc::IP_TTL)
+                    } else {
+                        (libc::IPPROTO_IPV6, libc::IPV6_HOPLIMIT)
+                    };
+                    (std::mem::size_of::<libc::sockaddr_in6>(), level, kind)
+                }
+            };
+            let mut iov = libc::iovec {
+                iov_base: contents.as_ptr() as *mut libc::c_void,
+                iov_len: contents.len(),
+            };
+            let value = libc::c_int::from(ttl);
+            let mut control = [0u64; 8];
+            let space = libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) as usize;
+            let mut message: libc::msghdr = std::mem::zeroed();
+            message.msg_name = &mut address as *mut _ as *mut libc::c_void;
+            message.msg_namelen = length as libc::socklen_t;
+            message.msg_iov = &mut iov;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+            message.msg_controllen = space;
+            let header = libc::CMSG_FIRSTHDR(&message);
+            (*header).cmsg_level = level;
+            (*header).cmsg_type = kind;
+            (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+            std::ptr::copy_nonoverlapping(
+                &value as *const libc::c_int as *const u8,
+                libc::CMSG_DATA(header),
+                std::mem::size_of::<libc::c_int>(),
+            );
+            if libc::sendmsg(self.raw.as_raw_fd(), &message, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
 }
 
@@ -451,10 +541,14 @@ impl Endpoint {
             }
         };
         let ipv6 = socket.local_addr()?.is_ipv6();
+        #[cfg(target_os = "linux")]
+        let raw = socket.try_clone()?;
         let runtime: Arc<dyn quinn::Runtime> = Arc::new(quinn::TokioRuntime);
         let inner = runtime.wrap_udp_socket(socket)?;
         let socket = Arc::new(Demux {
             inner,
+            #[cfg(target_os = "linux")]
+            raw,
             pending: Mutex::new(HashMap::new()),
             ipv6,
         });
@@ -1294,11 +1388,14 @@ impl Host {
         let targets: Vec<SocketAddr> = remote.iter().map(|c| c.address).collect();
         tokio::spawn(async move {
             let started = Instant::now();
-            for at in PUNCH_SCHEDULE_MS {
+            for (at, ttl) in PUNCH_SCHEDULE {
                 tokio::time::sleep_until((started + Duration::from_millis(at)).into()).await;
                 let punch = stun::binding_indication(&e2e::random::<12>());
                 for target in &targets {
-                    let _ = socket.send_raw(*target, &punch).await;
+                    let _ = match ttl {
+                        Some(ttl) => socket.send_with_ttl(*target, &punch, ttl),
+                        None => socket.send_raw(*target, &punch).await,
+                    };
                 }
             }
         });
@@ -1554,5 +1651,64 @@ mod tests {
         // A different pin fails the handshake.
         let wrong = "ab".repeat(32);
         assert!(dial(&client, &[candidate], &wrong).await.is_err());
+    }
+
+    /// Low-TTL punches carry the requested TTL (read back with IP_RECVTTL)
+    /// on both an IPv4 and a dual-stack socket, and leave the socket's own
+    /// TTL alone.
+    #[tokio::test]
+    async fn punches_carry_their_own_ttl() {
+        use std::os::fd::AsRawFd;
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let on: libc::c_int = 1;
+        // SAFETY: plain setsockopt with an int option on a valid socket.
+        let set = unsafe {
+            libc::setsockopt(
+                receiver.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_RECVTTL,
+                &on as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0);
+        let received_ttl = || -> u8 {
+            let mut buffer = [0u8; 64];
+            let mut iov = libc::iovec {
+                iov_base: buffer.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buffer.len(),
+            };
+            let mut control = [0u64; 8];
+            // SAFETY: the msghdr points at live locals sized as declared.
+            unsafe {
+                let mut message: libc::msghdr = std::mem::zeroed();
+                message.msg_iov = &mut iov;
+                message.msg_iovlen = 1;
+                message.msg_control = control.as_mut_ptr() as *mut libc::c_void;
+                message.msg_controllen = std::mem::size_of_val(&control);
+                assert!(libc::recvmsg(receiver.as_raw_fd(), &mut message, 0) > 0);
+                let header = libc::CMSG_FIRSTHDR(&message);
+                assert!(!header.is_null());
+                assert_eq!((*header).cmsg_type, libc::IP_TTL);
+                *(libc::CMSG_DATA(header) as *const libc::c_int) as u8
+            }
+        };
+        let target = receiver.local_addr().unwrap();
+        for bind in ["127.0.0.1:0", "[::]:0"] {
+            let endpoint = Endpoint::bind(bind.parse().unwrap(), None).unwrap();
+            endpoint
+                .socket
+                .send_with_ttl(target, &stun::binding_indication(&[0; 12]), 2)
+                .unwrap();
+            assert_eq!(received_ttl(), 2, "{bind}");
+            endpoint
+                .send_raw(target, &stun::binding_indication(&[1; 12]))
+                .await
+                .unwrap();
+            assert!(received_ttl() > 2, "{bind}");
+        }
     }
 }

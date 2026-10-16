@@ -12,11 +12,15 @@
 //!
 //! Both NATs are Linux MASQUERADE with a home-router firewall (inbound only
 //! for established flows), i.e. endpoint-independent mapping with port
-//! preservation and address-and-port-dependent filtering. With
-//! `--random-fully` on NAT B the client's NAT becomes symmetric (a new
-//! public port per destination), which hole punching cannot traverse, so the
-//! client must fall back to the relay. Link delays make the relay detour
-//! measurable: about 20 ms RTT direct versus 80 ms through the relay.
+//! preservation and address-and-port-dependent filtering. Without that
+//! firewall, an unsolicited packet leaves a conntrack entry on the router that
+//! makes it remap the port of a later outgoing flow to the same peer; the
+//! host's first punches carry a low TTL so they never reach the client's NAT
+//! (covered too). With `--random-fully` on NAT B the client's NAT becomes
+//! symmetric (a new public port per destination), which hole punching cannot
+//! traverse, so the client must fall back to the relay. Link delays make the
+//! relay detour measurable: about 20 ms RTT direct versus 80 ms through the
+//! relay.
 
 use std::{collections::BTreeMap, process::Command};
 
@@ -28,6 +32,9 @@ struct Scenario {
     client_nat: &'static str,
     /// Drop all UDP between the two NATs in the core (only the relay works).
     block_peer_udp: bool,
+    /// NATs without the inbound firewall: unsolicited packets reach the
+    /// router itself and leave conntrack entries behind.
+    open_routers: bool,
     host_args: &'static str,
     client_args: &'static str,
 }
@@ -98,13 +105,14 @@ router() {{
     at "$1" ip route add default via "$2"
     at "$1" sysctl -qw net.ipv4.ip_forward=1
     at "$1" iptables -t nat -A POSTROUTING -o wan -j MASQUERADE $3
+    [ "$4" = 1 ] || return 0
     for chain in INPUT FORWARD; do
         at "$1" iptables -A $chain -i wan -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
         at "$1" iptables -A $chain -i wan -j DROP
     done
 }}
-router $NATA 198.51.100.1 ""
-router $NATB 203.0.113.1 "{client_nat}"
+router $NATA 198.51.100.1 "" {firewall}
+router $NATB 203.0.113.1 "{client_nat}" {firewall}
 if [ {block} = 1 ]; then
     iptables -A FORWARD -p udp -s 198.51.100.0/24 -d 203.0.113.0/24 -j DROP
     iptables -A FORWARD -p udp -s 203.0.113.0/24 -d 198.51.100.0/24 -j DROP
@@ -134,6 +142,7 @@ at $CLIENT "$TELEPORT" client 10.1.0.2:4443 --pairing-file "$DIR/identity/pairin
 sleep 0.3
 "#,
         client_nat = scenario.client_nat,
+        firewall = u8::from(!scenario.open_routers),
         block = u8::from(scenario.block_peer_udp),
         key = RELAY_KEY,
         host_args = scenario.host_args,
@@ -197,36 +206,44 @@ fn teleport_binary() -> std::ffi::OsString {
 #[test]
 #[ignore = "requires unprivileged user/network namespaces, iproute2, iptables (NAT, conntrack) and GStreamer plugins"]
 fn hole_punching_connects_two_nated_peers_directly() {
-    let outcome = run(&Scenario {
-        name: "p2p",
-        client_nat: "",
-        block_peer_udp: false,
-        host_args: "",
-        client_args: "",
-    });
-    assert!(
-        outcome
-            .stdout
-            .contains("connection path chosen: p2p, server-reflexive candidate"),
-        "{}",
-        outcome.stdout
-    );
-    // The relay carried only signalling: no relayed session was set up.
-    assert!(
-        !outcome.stdout.contains("relay session established"),
-        "{}",
-        outcome.stdout
-    );
-    // The host saw the client's NAT B address: the packets crossed both NATs.
-    assert!(
-        outcome
-            .host_log
-            .contains("peer-to-peer connection; checking its credential remote=203.0.113.2:"),
-        "{}",
-        outcome.host_log
-    );
-    // About 20 ms RTT direct (80 ms via the relay); probes add little.
-    assert!(outcome.field("probe_p50_us") < 60_000, "{}", outcome.stdout);
+    for (name, open_routers) in [("p2p", false), ("p2p_open_nat", true)] {
+        let outcome = run(&Scenario {
+            name,
+            client_nat: "",
+            block_peer_udp: false,
+            open_routers,
+            host_args: "",
+            client_args: "",
+        });
+        assert!(
+            outcome
+                .stdout
+                .contains("connection path chosen: p2p, server-reflexive candidate"),
+            "[{name}] {}",
+            outcome.stdout
+        );
+        // The relay carried only signalling: no relayed session was set up.
+        assert!(
+            !outcome.stdout.contains("relay session established"),
+            "[{name}] {}",
+            outcome.stdout
+        );
+        // The host saw the client's NAT B address: the packets crossed both
+        // NATs.
+        assert!(
+            outcome
+                .host_log
+                .contains("peer-to-peer connection; checking its credential remote=203.0.113.2:"),
+            "[{name}] {}",
+            outcome.host_log
+        );
+        // About 20 ms RTT direct (80 ms via the relay); probes add little.
+        assert!(
+            outcome.field("probe_p50_us") < 60_000,
+            "[{name}] {}",
+            outcome.stdout
+        );
+    }
 }
 
 #[test]
@@ -236,6 +253,7 @@ fn symmetric_nat_falls_back_to_the_relay() {
         name: "symmetric",
         client_nat: "--random-fully",
         block_peer_udp: false,
+        open_routers: false,
         host_args: "",
         client_args: "",
     });
@@ -276,6 +294,7 @@ fn blocked_peer_udp_and_old_hosts_use_the_relay() {
         name: "blocked",
         client_nat: "",
         block_peer_udp: true,
+        open_routers: false,
         host_args: "",
         client_args: "",
     });
@@ -290,6 +309,7 @@ fn blocked_peer_udp_and_old_hosts_use_the_relay() {
         name: "host_no_p2p",
         client_nat: "",
         block_peer_udp: false,
+        open_routers: false,
         host_args: "--no-p2p",
         client_args: "",
     });
@@ -308,6 +328,7 @@ fn blocked_peer_udp_and_old_hosts_use_the_relay() {
         name: "client_no_p2p",
         client_nat: "",
         block_peer_udp: false,
+        open_routers: false,
         host_args: "",
         client_args: "--no-p2p",
     });
