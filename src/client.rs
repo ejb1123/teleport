@@ -351,7 +351,7 @@ async fn send_input(
                 )?;
                 unconfirmed = Some((motion_id, event));
             }
-            Event::Button { .. } | Event::Scroll { .. } => {
+            Event::Button { .. } | Event::Scroll { .. } | Event::RelativeMotion { .. } => {
                 // Clicks and wheel steps land where the pointer was: repeat the
                 // latest position reliably, in order, right before them.
                 if let Some((id, motion)) = unconfirmed.take() {
@@ -1018,6 +1018,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     for _ in 0..600 {
                         runtime.block_on(events.send(Event::Ping))?;
                     }
+                    let relative = desktop
+                        .relative_pointer
+                        .then_some(Event::RelativeMotion { dx: 25, dy: -15 });
                     for event in [
                         Event::Motion { x: 0.5, y: 0.5 },
                         Event::Key {
@@ -1032,7 +1035,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                             code: 29,
                             down: true,
                         },
-                    ] {
+                    ]
+                    .into_iter()
+                    .chain(relative)
+                    {
                         runtime.block_on(events.send(event))?;
                     }
                 }
@@ -1182,6 +1188,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut host_encoder = "Waiting / unavailable".to_owned();
     let mut displays = multi_display::Displays::new(remote, options, events.clone());
     let mut keyboard_capture = crate::keyboard_capture::Capture::default();
+    // Pointer lock for games; the guard releases it on every exit path.
+    let mut pointer_lock = PointerLock::default();
     let mut shortcuts = crate::keyboard_capture::Shortcuts::default();
     let mut chrome = crate::fullscreen::Chrome::new();
     let mut placement: Option<crate::fullscreen::Placement> = None;
@@ -1314,6 +1322,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             }
         }
         let mut motion = None;
+        let mut relative = (0_i32, 0_i32);
         for mut event in event_pump.poll_iter() {
             redraw = true;
             keyboard_capture.follow(displays.focused_window(canvas.window()));
@@ -1329,6 +1338,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             ) && !displays.owns_keyboard_focus(canvas.window())
             {
                 motion = None;
+                if pointer_lock.set(false) {
+                    notice = "Mouse released after leaving the session window".into();
+                }
                 shortcuts = crate::keyboard_capture::Shortcuts::default();
                 send(&events, Event::ReleaseAll)?;
             }
@@ -1342,6 +1354,19 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                             &mut keyboard_capture,
                             displays.focused_window(canvas.window()),
                         );
+                    }
+                    Action::PointerLock => {
+                        motion = None;
+                        notice = if pointer_lock.active() {
+                            pointer_lock.set(false);
+                            "Mouse released".into()
+                        } else if !desktop.relative_pointer {
+                            "Host does not support mouse lock; update the host".into()
+                        } else if pointer_lock.set(true) {
+                            "Mouse locked for games \u{2014} Ctrl+Alt+M releases".into()
+                        } else {
+                            "Mouse lock unavailable on this display".into()
+                        };
                     }
                     Action::Disconnect => break 'running,
                     Action::Stats => show_stats = !show_stats,
@@ -1382,6 +1407,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 y,
                 ..
             } = event
+                && !pointer_lock.active()
                 && chrome.visible()
                 && chrome.blocks_pointer(y)
             {
@@ -1539,6 +1565,22 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     scancode: Some(code),
                     ..
                 } => protocol::evdev(code).map(|code| Event::Key { code, down: false }),
+                SdlEvent::MouseMotion { xrel, yrel, .. } if pointer_lock.active() => {
+                    relative.0 = relative.0.saturating_add(xrel);
+                    relative.1 = relative.1.saturating_add(yrel);
+                    None
+                }
+                SdlEvent::MouseButtonDown { mouse_btn, .. } if pointer_lock.active() => {
+                    flush_relative(&events, &mut relative)?;
+                    button(mouse_btn).map(|button| Event::Button { button, down: true })
+                }
+                SdlEvent::MouseButtonUp { mouse_btn, .. } if pointer_lock.active() => {
+                    flush_relative(&events, &mut relative)?;
+                    button(mouse_btn).map(|button| Event::Button {
+                        button,
+                        down: false,
+                    })
+                }
                 SdlEvent::MouseMotion { x, y, .. } => {
                     motion = chrome
                         .pointer(x, y, canvas.window().size(), size)
@@ -1616,6 +1658,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 send(&events, event)?;
             }
         }
+        flush_relative(&events, &mut relative)?;
         if let Some(event) = motion {
             send(&events, event)?;
         }
@@ -2397,6 +2440,55 @@ fn check_network(network: &mut Network, runtime: &Runtime) -> Result<()> {
     Ok(())
 }
 
+/// SDL relative mouse mode (pointer lock) for games. Never traps the user:
+/// released on focus loss, by the same shortcut, and on drop.
+#[derive(Default)]
+struct PointerLock {
+    active: bool,
+}
+
+impl PointerLock {
+    fn active(&self) -> bool {
+        self.active
+    }
+
+    /// Returns whether the state changed.
+    fn set(&mut self, on: bool) -> bool {
+        if on == self.active {
+            return false;
+        }
+        let bool = if on {
+            sdl2::sys::SDL_bool::SDL_TRUE
+        } else {
+            sdl2::sys::SDL_bool::SDL_FALSE
+        };
+        // Safety: plain SDL state call on the thread that owns the video
+        // subsystem (the session event loop).
+        let applied = unsafe { sdl2::sys::SDL_SetRelativeMouseMode(bool) } == 0;
+        self.active = on && applied;
+        applied || !on
+    }
+}
+
+impl Drop for PointerLock {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
+
+/// Send coalesced pointer-lock movement, split into protocol-sized steps.
+fn flush_relative(events: &mpsc::Sender<Event>, relative: &mut (i32, i32)) -> Result<()> {
+    let max = protocol::MAX_RELATIVE_MOTION as i32;
+    while *relative != (0, 0) {
+        let dx = relative.0.clamp(-max, max);
+        let dy = relative.1.clamp(-max, max);
+        send(events, Event::RelativeMotion { dx, dy })?;
+        relative.0 -= dx;
+        relative.1 -= dy;
+    }
+    Ok(())
+}
+
 fn send(events: &mpsc::Sender<Event>, event: Event) -> Result<()> {
     event.validate()?;
     match events.try_send(event) {
@@ -2424,6 +2516,25 @@ fn button(button: MouseButton) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_pointer_lock_movement_is_split_without_loss() {
+        let (sender, mut receiver) = mpsc::channel(16);
+        let max = protocol::MAX_RELATIVE_MOTION as i32;
+        let mut relative = (2 * max + 7, -max - 1);
+        flush_relative(&sender, &mut relative).unwrap();
+        assert_eq!(relative, (0, 0));
+        let (mut dx, mut dy) = (0, 0);
+        while let Ok(event) = receiver.try_recv() {
+            let Event::RelativeMotion { dx: x, dy: y } = event else {
+                panic!("unexpected {event:?}")
+            };
+            assert!(event.validate().is_ok());
+            dx += x;
+            dy += y;
+        }
+        assert_eq!((dx, dy), (2 * max + 7, -max - 1));
+    }
 
     #[test]
     fn session_text_maps_to_native_pixels_at_integer_and_fractional_dpi() {

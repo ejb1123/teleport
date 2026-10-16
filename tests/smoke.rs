@@ -623,7 +623,13 @@ fn x11_capture_input_and_native_window() {
             .all(|byte| *byte == 0)
     );
     let pointer = connection.query_pointer(root).unwrap().reply().unwrap();
-    assert!((pointer.root_x - 399).abs() <= 1 && (pointer.root_y - 299).abs() <= 1);
+    // Absolute move to the centre, then a pointer-lock delta of (+25, -15).
+    assert!(
+        (pointer.root_x - 424).abs() <= 1 && (pointer.root_y - 284).abs() <= 1,
+        "pointer at ({}, {})",
+        pointer.root_x,
+        pointer.root_y
+    );
 
     // Suspend only our isolated test client, simulating sleep/network loss while
     // Ctrl is held. The host must release it without a clean client disconnect.

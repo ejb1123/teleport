@@ -505,6 +505,30 @@ impl Capture {
                     Backend::Test => (),
                 }
             }
+            Event::RelativeMotion { dx, dy } => match &self.backend {
+                Backend::Portal { proxy, session, .. } => {
+                    proxy
+                        .notify_pointer_motion(session, f64::from(dx), f64::from(dy))
+                        .await?
+                }
+                Backend::X11 {
+                    connection, root, ..
+                } => {
+                    // XTest motion with detail = 1 is relative to the current position.
+                    connection
+                        .xtest_fake_input(
+                            xproto::MOTION_NOTIFY_EVENT,
+                            1,
+                            0,
+                            *root,
+                            dx.clamp(i16::MIN.into(), i16::MAX.into()) as i16,
+                            dy.clamp(i16::MIN.into(), i16::MAX.into()) as i16,
+                            0,
+                        )?
+                        .check()?;
+                }
+                Backend::Test => (),
+            },
             Event::Scroll { x, y } => match &self.backend {
                 Backend::Portal { proxy, session, .. } => {
                     if y != 0 {

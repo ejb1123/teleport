@@ -15,6 +15,23 @@ Capture is off by default and is not persisted across reconnects.
 - Keypad, Num Lock, ISO backslash, application/menu and F13–F24 have physical
   key mappings. This does not synchronize lock-key LEDs or keyboard layouts.
 
+## Mouse lock for games
+
+First-person and other raw-input games need relative mouse movement, not an
+absolute pointer position. Press **Ctrl+Alt+M** (Control+Option+M on macOS)
+to lock the local pointer to the session: it disappears, mouse movement is
+sent as relative deltas, and every click goes to the remote desktop (the
+toolbar stops intercepting clicks). Press **Ctrl+Alt+M** again to release it.
+It is also released automatically when the session window loses focus and on
+any exit or error, so it can never trap the mouse. Ctrl+Alt+Q still
+disconnects.
+
+Deltas travel on the reliable input track (a lost delta would be lost
+movement). The host injects them with XTest on X11 and the RemoteDesktop
+portal's relative pointer motion on Wayland. Both ends need this version: an
+older host reports that it does not support mouse lock. Combine with
+**Ctrl+Alt+K** so game keys and Alt+Tab reach the remote side.
+
 This is a best-effort OS keyboard grab, **not a guarantee of every system key**.
 SDL's grab-state getter is not proof that a compositor forwards every shortcut.
 OS-reserved secure shortcuts cannot always be intercepted. Wayland needs

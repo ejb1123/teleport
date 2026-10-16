@@ -804,6 +804,7 @@ fn desktop_for_monitor(
         video_start_group,
         keyframe_requests: true,
         pointer_datagrams: true,
+        relative_pointer: true,
     })
 }
 

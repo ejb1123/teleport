@@ -61,6 +61,8 @@ impl Drop for Capture {
 #[derive(Debug, PartialEq)]
 pub enum Action {
     Toggle,
+    /// Ctrl+Alt+M: lock/unlock the pointer for games (relative motion).
+    PointerLock,
     Disconnect,
     Stats,
     Swallow,
@@ -70,6 +72,7 @@ pub enum Action {
 #[derive(Default)]
 pub struct Shortcuts {
     toggle_down: bool,
+    lock_down: bool,
     stats_down: bool,
 }
 impl Shortcuts {
@@ -98,6 +101,15 @@ impl Shortcuts {
             self.toggle_down = down;
             return Some(if first {
                 Action::Toggle
+            } else {
+                Action::Swallow
+            });
+        }
+        if key == Keycode::M && (self.lock_down || (down && chord)) {
+            let first = down && !repeat && !self.lock_down;
+            self.lock_down = down;
+            return Some(if first {
+                Action::PointerLock
             } else {
                 Action::Swallow
             });
@@ -158,6 +170,30 @@ mod tests {
             );
             assert_eq!(
                 shortcuts.event(&key(Keycode::K, true, Mod::NOMOD, false), captured),
+                None
+            );
+        }
+    }
+    #[test]
+    fn pointer_lock_chord_toggles_once_and_swallows_its_release() {
+        for captured in [false, true] {
+            let mut shortcuts = Shortcuts::default();
+            let chord = Mod::LCTRLMOD | Mod::LALTMOD;
+            assert_eq!(
+                shortcuts.event(&key(Keycode::M, true, chord, false), captured),
+                Some(Action::PointerLock)
+            );
+            assert_eq!(
+                shortcuts.event(&key(Keycode::M, true, chord, true), captured),
+                Some(Action::Swallow)
+            );
+            assert_eq!(
+                shortcuts.event(&key(Keycode::M, false, Mod::NOMOD, false), captured),
+                Some(Action::Swallow)
+            );
+            // Plain M is typed into the remote desktop.
+            assert_eq!(
+                shortcuts.event(&key(Keycode::M, true, Mod::NOMOD, false), captured),
                 None
             );
         }

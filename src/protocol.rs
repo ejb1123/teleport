@@ -129,6 +129,9 @@ pub struct Desktop {
     /// Host reads pointer datagrams once the client declares them.
     #[serde(default)]
     pub pointer_datagrams: bool,
+    /// Host injects `Event::RelativeMotion` (pointer lock for games).
+    #[serde(default)]
+    pub relative_pointer: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -185,6 +188,9 @@ pub struct Input {
 /// Track carrying pointer motion as unreliable, latest-wins QUIC datagrams so a
 /// lost packet never stalls key events queued behind it on the input track.
 pub const POINTER_TRACK: &str = "pointer";
+
+/// Largest per-event pointer delta; clients split larger movements.
+pub const MAX_RELATIVE_MOTION: u32 = 4096;
 
 /// One pointer datagram. Only `Motion` and `MonitorMotion` are accepted.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -253,6 +259,13 @@ pub enum Event {
         /// Auxiliary monitor stream index; `None` is the primary stream.
         #[serde(default)]
         monitor: Option<usize>,
+    },
+    /// Raw pointer movement while the client has locked the pointer (games).
+    /// Reliable and ordered: unlike absolute positions, a lost delta is lost
+    /// movement. Only sent to hosts advertising `Desktop::relative_pointer`.
+    RelativeMotion {
+        dx: i32,
+        dy: i32,
     },
     /// Client capabilities the host may rely on for this session. Only sent to
     /// hosts advertising `Desktop::keyframe_requests`.
@@ -324,6 +337,11 @@ impl Event {
             ),
             Self::Button { button, .. } => ensure!((1..=3).contains(button), "unsupported button"),
             Self::Key { code, .. } => ensure!((1..=127).contains(code), "unsupported key"),
+            Self::RelativeMotion { dx, dy } => ensure!(
+                dx.unsigned_abs() <= MAX_RELATIVE_MOTION
+                    && dy.unsigned_abs() <= MAX_RELATIVE_MOTION,
+                "relative motion out of range"
+            ),
             Self::Scroll { x, y } => ensure!(
                 x.abs_diff(0) <= 20 && y.abs_diff(0) <= 20,
                 "scroll out of range"
@@ -567,6 +585,33 @@ mod tests {
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
         }
+    }
+    #[test]
+    fn relative_motion_is_bounded_reliable_and_negotiated() {
+        let max = MAX_RELATIVE_MOTION as i32;
+        assert!(
+            Event::RelativeMotion { dx: max, dy: -max }
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            Event::RelativeMotion { dx: max + 1, dy: 0 }
+                .validate()
+                .is_err()
+        );
+        assert!(
+            Event::RelativeMotion {
+                dx: 0,
+                dy: i32::MIN
+            }
+            .validate()
+            .is_err()
+        );
+        // A dropped delta is lost movement: never shed under backpressure.
+        assert!(!Event::RelativeMotion { dx: 1, dy: 1 }.is_lossy());
+        let old: Desktop = serde_json::from_value(serde_json::json!({ "version": 2, "width": 1, "height": 1, "fps": 1,
+            "source": "test", "monitors": [], "active_monitor": 0, "audio": false, "clipboard": false })).unwrap();
+        assert!(!old.relative_pointer);
     }
     #[test]
     fn keyframe_requests_roundtrip_and_bound_monitor_index() {
