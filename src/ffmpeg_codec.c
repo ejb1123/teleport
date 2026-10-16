@@ -26,7 +26,7 @@ typedef struct {
     const uint8_t *data;
     int size, width, height, key;
     int64_t pts;
-    /* Output 3: a reference to the decoded CUDA frame (no download). The
+    /* Output 3: a reference to the decoded CUDA or VA-API frame (no download). The
      * caller owns it and releases it with tp_gpu_frame_free. */
     AVFrame *gpu;
 } TpOutput;
@@ -65,7 +65,8 @@ static int color_frame(AVFrame *frame, int hdr) {
 }
 
 /* name: an encoder name, or decoder device type ("software", "cuda",
- * "vaapi", "qsv", "videotoolbox"). output: 0 RGB24, 1 NV12, 2 P010. */
+ * "vaapi", "qsv", "videotoolbox", optionally "type@device"). output: 0 RGB24,
+ * 1 NV12, 2 P010, 3 GPU frame reference (CUDA or VA-API, no download). */
 TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
                        int width, int height, int fps, int kbps, int output, int gop, int *error) {
     int result = AVERROR(ENOMEM);
@@ -159,7 +160,16 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
             }
         }
     } else if (strcmp(name, "software")) {
-        enum AVHWDeviceType type = av_hwdevice_find_type_by_name(name);
+        /* "type@device" opens a specific device, e.g. "vaapi@/dev/dri/renderD128"
+         * to decode on the GPU that presents the frames. */
+        char type_name[32];
+        const char *device = strchr(name, '@');
+        size_t type_length = device ? (size_t)(device - name) : strlen(name);
+        if (type_length >= sizeof type_name || (device && !device[1])) { result = AVERROR(EINVAL); goto fail; }
+        memcpy(type_name, name, type_length);
+        type_name[type_length] = '\0';
+        if (device) device++;
+        enum AVHWDeviceType type = av_hwdevice_find_type_by_name(type_name);
         if (type == AV_HWDEVICE_TYPE_NONE) { result = AVERROR(ENOSYS); goto fail; }
         for (int index = 0;; ++index) {
             const AVCodecHWConfig *config = avcodec_get_hw_config(implementation, index);
@@ -168,7 +178,7 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
                 codec->hw_format = config->pix_fmt; break;
             }
         }
-        result = av_hwdevice_ctx_create(&codec->ctx->hw_device_ctx, type, NULL, NULL, 0);
+        result = av_hwdevice_ctx_create(&codec->ctx->hw_device_ctx, type, device, NULL, 0);
         if (result < 0) goto fail;
         codec->ctx->get_format = choose_hw;
         /* GPU presentation holds the newest frame until it is drawn. */
@@ -252,7 +262,7 @@ int tp_receive_frame(TpCodec *codec, TpOutput *output) {
     if (!dimensions(frame->width, frame->height)) return AVERROR(EINVAL);
     int64_t pts = frame->pts;
     if (codec->output_format == 3) {
-        if (frame->format != AV_PIX_FMT_CUDA) return AVERROR(EINVAL);
+        if (frame->format != AV_PIX_FMT_CUDA && frame->format != AV_PIX_FMT_VAAPI) return AVERROR(EINVAL);
         AVFrame *reference = av_frame_clone(frame);
         if (!reference) return AVERROR(ENOMEM);
         *output = (TpOutput){.width = frame->width, .height = frame->height, .pts = pts, .gpu = reference};

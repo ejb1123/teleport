@@ -206,7 +206,7 @@ mod tests {
             );
             let stats = Arc::new(crate::stats::StreamStats::default());
             let (decode, input, image) =
-                decoder(true, stats.clone(), codec.into(), true, false, false)?;
+                decoder(true, stats.clone(), codec.into(), true, false, None)?;
             ensure!(
                 decode.0.by_name("video_decoder").is_none(),
                 "unexpected GStreamer decoder"
@@ -273,6 +273,57 @@ fn neutral_frame(width: u32, height: u32, hdr: bool) -> Vec<u8> {
     }
 }
 
+/// Decode the synthetic stream with `name` and require timestamped frames of
+/// the probe size (and, for output 3, GPU-resident frames).
+fn probe_decoder(name: &str, format: VideoFormat, packets: &[Vec<u8>], output: i32) -> Result<()> {
+    let mut decoder = Codec::new(config(name, format, output))?;
+    let mut frames = 0;
+    for (index, packet) in packets.iter().enumerate() {
+        decoder.submit(packet, index as u64 + 1)?;
+        while let Some(frame) = decoder.receive()? {
+            ensure!(
+                (frame.width, frame.height) == (64, 48),
+                "invalid probe size"
+            );
+            ensure!(frame.pts.is_some(), "decoder lost frame timestamps");
+            ensure!(
+                output != 3 || frame.gpu.is_some(),
+                "decoder did not keep frames on the GPU"
+            );
+            frames += 1;
+        }
+    }
+    ensure!(frames > 0, "decoder produced no verified output");
+    Ok(())
+}
+
+/// Whether `name` (e.g. "vaapi@/dev/dri/renderD128", the presenter's own GPU)
+/// decodes GPU-resident frames of `format`. Cached per process.
+#[cfg(target_os = "linux")]
+fn gpu_decoder_verified(name: &str, format: VideoFormat) -> bool {
+    type Cache = BTreeMap<(String, bool), bool>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Mutex::default).lock().unwrap();
+    let key = (name.to_owned(), format.codec == VideoCodec::H265);
+    if let Some(&verified) = cache.get(&key) {
+        return verified;
+    }
+    let verified = match synthetic(format)
+        .and_then(|packets| probe_decoder(name, format, &packets, 3))
+    {
+        Ok(()) => {
+            tracing::info!(decoder = name, codec = ?format.codec, "GPU-resident decoder produced verified output");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(decoder = name, %error, "GPU-resident decoder unavailable");
+            false
+        }
+    };
+    cache.insert(key, verified);
+    verified
+}
+
 pub(super) fn select_decoder(software: bool, format: VideoFormat) -> Result<String> {
     type Cache = BTreeMap<(bool, bool, bool), String>;
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
@@ -292,24 +343,7 @@ pub(super) fn select_decoder(software: bool, format: VideoFormat) -> Result<Stri
     };
     let mut last = None;
     for &name in candidates {
-        let probe = || -> Result<()> {
-            let mut decoder = Codec::new(config(name, format, if format.hdr() { 2 } else { 1 }))?;
-            let mut frames = 0;
-            for (index, packet) in packets.iter().enumerate() {
-                decoder.submit(packet, index as u64 + 1)?;
-                while let Some(frame) = decoder.receive()? {
-                    ensure!(
-                        (frame.width, frame.height) == (64, 48),
-                        "invalid probe size"
-                    );
-                    ensure!(frame.pts.is_some(), "decoder lost frame timestamps");
-                    frames += 1;
-                }
-            }
-            ensure!(frames > 0, "decoder produced no verified output");
-            Ok(())
-        };
-        match probe() {
+        match probe_decoder(name, format, &packets, if format.hdr() { 2 } else { 1 }) {
             Ok(()) => {
                 tracing::info!(backend="ffmpeg", decoder=name, codec=?format.codec, "direct decoder produced verified output");
                 cache.insert(key, name.into());
@@ -330,23 +364,32 @@ pub(super) fn decoder(
     format: VideoFormat,
     nv12: bool,
     native: bool,
-    gpu: bool,
+    gpu: Option<&str>,
 ) -> Result<(Pipeline, AppSrc, LatestImage)> {
     format.validate()?;
     ensure!(
         !native,
         "direct FFmpeg native-surface presentation is not integrated yet; unset TELEPORT_MAC_GPU_VIDEO or explicitly select TELEPORT_VIDEO_BACKEND=gstreamer"
     );
-    let name = select_decoder(software, format)?;
-    // GPU-resident frames only for an 8-bit CUDA decode the caller can present.
-    let output = if format.hdr() {
-        2
-    } else if gpu && name == "cuda" {
-        3
+    let selected = select_decoder(software, format)?;
+    // GPU-resident frames only for an 8-bit decode on the presenter's own GPU
+    // ("cuda", or "vaapi@<render node>" of its EGL display).
+    #[cfg(target_os = "linux")]
+    let gpu = gpu.filter(|preferred| {
+        !software
+            && !format.hdr()
+            && (*preferred == selected || gpu_decoder_verified(preferred, format))
+    });
+    #[cfg(not(target_os = "linux"))]
+    let gpu = gpu.filter(|preferred| !format.hdr() && *preferred == selected);
+    let (name, output) = if format.hdr() {
+        (selected, 2)
+    } else if let Some(preferred) = gpu {
+        (preferred.to_owned(), 3)
     } else if nv12 {
-        1
+        (selected, 1)
     } else {
-        0
+        (selected, 0)
     };
     let state = Arc::new(State {
         codec: Mutex::new(Codec::new(config(&name, format, output))?),

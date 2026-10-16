@@ -734,20 +734,22 @@ pub fn decoder_with_stats_output(
     decoder_with_stats_presentation(force_software, stats, format.into(), prefer_nv12, false)
 }
 
-/// Decoder whose CUDA output stays on the GPU for zero-copy presentation
-/// (`Image::gpu`). Falls back to NV12 frames when the selected decoder is not
-/// CUDA (or the stream is HDR), so callers must handle both.
+/// Decoder whose output stays on the GPU for zero-copy presentation
+/// (`Image::gpu`), decoded by `gpu_decoder` (the presenter's own GPU: "cuda"
+/// or "vaapi@<render node>"). Falls back to NV12 frames when that decoder is
+/// unavailable (or the stream is HDR), so callers must handle both.
 #[cfg(target_os = "linux")]
 pub fn decoder_with_gpu_frames(
     stats: Arc<crate::stats::StreamStats>,
     format: VideoFormat,
+    gpu_decoder: &str,
 ) -> Result<(Pipeline, AppSrc, LatestImage)> {
     format.validate()?;
     ensure!(
         crate::ffmpeg::enabled()?,
         "GPU-resident frames need the direct FFmpeg backend"
     );
-    ffmpeg_media::decoder(false, stats, format, true, false, true)
+    ffmpeg_media::decoder(false, stats, format, true, false, Some(gpu_decoder))
 }
 
 pub fn decoder_with_stats_presentation(
@@ -765,7 +767,7 @@ pub fn decoder_with_stats_presentation(
             format,
             prefer_nv12,
             native_surface,
-            false,
+            None,
         );
     }
     ensure!(
@@ -2798,7 +2800,7 @@ mod tests {
             bytes::Bytes::copy_from_slice(keyframe.buffer().unwrap().map_readable()?.as_slice());
         let stats = Arc::new(crate::stats::StreamStats::default());
         let (pipeline, input, image) =
-            ffmpeg_media::decoder(true, stats.clone(), codec.into(), false, false, false)?;
+            ffmpeg_media::decoder(true, stats.clone(), codec.into(), false, false, None)?;
 
         // A buffer the callback cannot process must be counted, not fatal.
         input.push_buffer(gst::Buffer::from_slice(keyframe.clone()))?;

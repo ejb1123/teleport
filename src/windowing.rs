@@ -28,6 +28,14 @@ pub fn init() -> Result<(Sdl, VideoSubsystem)> {
     {
         sdl2::hint::set("SDL_VIDEODRIVER", "x11");
     }
+    // SDL's X11 GL contexts are GLX by default, which cannot import DMA-BUFs.
+    // Opt in to EGL so Intel/AMD VA-API frames can be presented zero-copy
+    // (sdl2-compat maps this to SDL3's SDL_VIDEO_FORCE_EGL). Must precede
+    // SDL's GL library load. Wayland contexts are always EGL.
+    #[cfg(target_os = "linux")]
+    if std::env::var("TELEPORT_X11_EGL").as_deref() == Ok("1") {
+        sdl2::hint::set("SDL_VIDEO_X11_FORCE_EGL", "1");
+    }
     let sdl = sdl2::init().map_err(anyhow::Error::msg)?;
     let video = sdl.video().map_err(anyhow::Error::msg).context(
         "Could not initialize local window backend; check DISPLAY/Wayland or SDL_VIDEODRIVER",

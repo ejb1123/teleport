@@ -69,7 +69,7 @@ pub struct Config {
     pub height: u32,
     pub fps: u32,
     pub kbps: u32,
-    /// 0 = RGB24, 1 = NV12, 2 = P010LE.
+    /// 0 = RGB24, 1 = NV12, 2 = P010LE, 3 = GPU frame (CUDA or VA-API).
     pub output: i32,
     /// Encoder keyframe interval in frames; 0 keeps the fps/4 default.
     pub gop: u32,
@@ -109,7 +109,7 @@ pub struct Frame {
     pub height: u32,
     pub key: bool,
     pub pts: Option<u64>,
-    /// Output 3: the decoded CUDA frame itself (no download).
+    /// Output 3: the decoded CUDA or VA-API frame itself (no download).
     pub gpu: Option<GpuFrame>,
 }
 impl Codec {
@@ -225,12 +225,13 @@ impl Codec {
     }
 }
 
-/// A reference to a decoded CUDA frame kept on the GPU (decoder output 3).
-/// Holding it keeps one decoder surface alive; dropping it releases it.
+/// A reference to a decoded CUDA or VA-API frame kept on the GPU (decoder
+/// output 3). Holding it keeps one decoder surface alive; dropping it
+/// releases it.
 pub struct GpuFrame(NonNull<c_void>);
 
 // Safety: an AVFrame reference is reference-counted and may be released or
-// read (with its CUDA context pushed) from any thread.
+// read (with its CUDA context pushed, or via a VA-API export) from any thread.
 unsafe impl Send for GpuFrame {}
 
 impl Drop for GpuFrame {
@@ -240,8 +241,11 @@ impl Drop for GpuFrame {
 }
 
 #[cfg(target_os = "linux")]
+type GetProc = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+
+#[cfg(target_os = "linux")]
 unsafe extern "C" {
-    fn tp_cuda_gl_new(get: unsafe extern "C" fn(*const c_char) -> *mut c_void) -> *mut c_void;
+    fn tp_cuda_gl_new(get: GetProc) -> *mut c_void;
     fn tp_cuda_gl_draw(
         presenter: *mut c_void,
         frame: *const c_void,
@@ -252,23 +256,94 @@ unsafe extern "C" {
         framebuffer_height: c_int,
     ) -> c_int;
     fn tp_cuda_gl_free(presenter: *mut c_void);
+    fn tp_vaapi_egl_new(get: GetProc) -> *mut c_void;
+    fn tp_vaapi_egl_render_node(presenter: *const c_void) -> *const c_char;
+    fn tp_vaapi_egl_draw(
+        presenter: *mut c_void,
+        frame: *const c_void,
+        x: c_int,
+        y: c_int,
+        width: c_int,
+        height: c_int,
+        framebuffer_height: c_int,
+    ) -> c_int;
+    fn tp_vaapi_egl_free(presenter: *mut c_void);
     #[cfg(test)]
     fn tp_cuda_gl_self_test(frame: *const c_void, rgba: *mut u8) -> c_int;
+    #[cfg(test)]
+    fn tp_vaapi_egl_self_test(
+        node: *const c_char,
+        frame: *const c_void,
+        rgba: *mut u8,
+        iterations: c_int,
+        draw_ns: *mut i64,
+        download_ns: *mut i64,
+    ) -> c_int;
 }
 
-/// Zero-copy presenter for [`GpuFrame`]s in the current OpenGL context:
-/// CUDA copies the planes into GL textures and a shader draws them, so the
-/// frame never leaves the GPU. Must be used on the thread that owns the GL
-/// context it was created in.
+/// How a [`GlPresenter`] gets decoded frames into GL without a CPU copy.
 #[cfg(target_os = "linux")]
-pub struct CudaGl(NonNull<c_void>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuInterop {
+    /// NVIDIA: CUDA copies the planes into registered GL textures.
+    Cuda,
+    /// Intel/AMD: VA-API surfaces exported as dma-bufs and imported as
+    /// EGLImages (EGL contexts only).
+    Vaapi,
+}
+
+/// Zero-copy presenter for [`GpuFrame`]s in the current OpenGL context: the
+/// frame never leaves the GPU and one shader converts limited-range BT.709
+/// NV12 while drawing. Must be used on the thread that owns the GL context
+/// it was created in.
+#[cfg(target_os = "linux")]
+pub struct GlPresenter {
+    pointer: NonNull<c_void>,
+    interop: GpuInterop,
+    render_node: Option<String>,
+}
 
 #[cfg(target_os = "linux")]
-impl CudaGl {
-    /// `None` when libcuda, GL 2.1 shaders or the needed GL entry points are
-    /// unavailable in the current context.
-    pub fn new(get: unsafe extern "C" fn(*const c_char) -> *mut c_void) -> Option<Self> {
-        NonNull::new(unsafe { tp_cuda_gl_new(get) }).map(Self)
+impl GlPresenter {
+    /// CUDA interop. `None` unless the current context is NVIDIA GL with
+    /// GL 2.1 shaders and libcuda loads.
+    pub fn cuda(get: GetProc) -> Option<Self> {
+        NonNull::new(unsafe { tp_cuda_gl_new(get) }).map(|pointer| Self {
+            pointer,
+            interop: GpuInterop::Cuda,
+            render_node: None,
+        })
+    }
+
+    /// DMA-BUF/EGLImage import. `None` unless the current context is EGL
+    /// (not GLX) on a DRM device with dma-buf import and GL_OES_EGL_image.
+    pub fn vaapi(get: GetProc) -> Option<Self> {
+        let pointer = NonNull::new(unsafe { tp_vaapi_egl_new(get) })?;
+        let node = unsafe { tp_vaapi_egl_render_node(pointer.as_ptr()) };
+        let render_node = (!node.is_null()).then(|| {
+            unsafe { CStr::from_ptr(node) }
+                .to_string_lossy()
+                .into_owned()
+        });
+        Some(Self {
+            pointer,
+            interop: GpuInterop::Vaapi,
+            render_node,
+        })
+    }
+
+    pub fn interop(&self) -> GpuInterop {
+        self.interop
+    }
+
+    /// The decoder that produces frames this presenter can draw: CUDA, or
+    /// VA-API pinned to the EGL display's own render node (same GPU).
+    pub fn decoder_name(&self) -> String {
+        match (self.interop, &self.render_node) {
+            (GpuInterop::Vaapi, Some(node)) => format!("vaapi@{node}"),
+            (GpuInterop::Vaapi, None) => "vaapi".into(),
+            (GpuInterop::Cuda, _) => "cuda".into(),
+        }
     }
 
     /// Draw at `rect` (framebuffer pixels, top-left origin). GL state is
@@ -279,9 +354,13 @@ impl CudaGl {
         rect: (i32, i32, u32, u32),
         framebuffer_height: u32,
     ) -> Result<()> {
+        let draw = match self.interop {
+            GpuInterop::Cuda => tp_cuda_gl_draw,
+            GpuInterop::Vaapi => tp_vaapi_egl_draw,
+        };
         let result = unsafe {
-            tp_cuda_gl_draw(
-                self.0.as_ptr(),
+            draw(
+                self.pointer.as_ptr(),
                 frame.0.as_ptr(),
                 rect.0,
                 rect.1,
@@ -290,15 +369,20 @@ impl CudaGl {
                 framebuffer_height.try_into()?,
             )
         };
-        check(result).context("zero-copy CUDA/GL presentation")?;
+        check(result).with_context(|| format!("zero-copy {:?}/GL presentation", self.interop))?;
         Ok(())
     }
 }
 
 #[cfg(target_os = "linux")]
-impl Drop for CudaGl {
+impl Drop for GlPresenter {
     fn drop(&mut self) {
-        unsafe { tp_cuda_gl_free(self.0.as_ptr()) }
+        unsafe {
+            match self.interop {
+                GpuInterop::Cuda => tp_cuda_gl_free(self.pointer.as_ptr()),
+                GpuInterop::Vaapi => tp_vaapi_egl_free(self.pointer.as_ptr()),
+            }
+        }
     }
 }
 
@@ -496,14 +580,21 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires hardware encoder and at least one hardware decoder"]
-    fn zero_copy_cuda_gl_presentation_matches_cpu_decode() -> Result<()> {
-        if std::env::var("TELEPORT_TEST_HARDWARE").as_deref() != Ok("1") {
-            eprintln!("SKIP: set TELEPORT_TEST_HARDWARE=1 on a machine with NVIDIA CUDA and EGL");
-            return Ok(());
+    fn device_suffix_is_validated() {
+        for name in ["vaapi@", "software@x", "@/dev/dri/renderD128"] {
+            let config = Config {
+                encoder: false,
+                name: name.into(),
+                ..software_config(false)
+            };
+            assert!(Codec::new(config).is_err(), "{name} must be rejected");
         }
-        let (width, height) = (640_usize, 360_usize);
-        // Four flat quadrants (limited-range NV12): grey, red-ish, green-ish, blue-ish.
+    }
+
+    /// Four flat quadrants (limited-range NV12): grey, red-ish, green-ish,
+    /// blue-ish, encoded with libx264. Returns the config and packets.
+    #[cfg(target_os = "linux")]
+    fn quadrant_stream(width: usize, height: usize) -> Result<(Config, Vec<Vec<u8>>)> {
         let quadrants = [
             (126_u8, 128_u8, 128_u8),
             (81, 90, 240),
@@ -540,36 +631,37 @@ mod tests {
                 packets.push(packet.bytes);
             }
         }
-        let decode = |name: &str, output: i32| -> Result<Frame> {
-            let mut decoder = Codec::new(Config {
-                encoder: false,
-                name: name.into(),
-                output,
-                ..config.clone()
-            })?;
-            let mut last = None;
-            for (index, packet) in packets.iter().enumerate() {
-                decoder.submit(packet, index as u64)?;
-                while let Some(frame) = decoder.receive()? {
-                    last = Some(frame);
-                }
+        Ok((config, packets))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn decode_last(config: &Config, packets: &[Vec<u8>], name: &str, output: i32) -> Result<Frame> {
+        let mut decoder = Codec::new(Config {
+            encoder: false,
+            name: name.into(),
+            output,
+            ..config.clone()
+        })?;
+        let mut last = None;
+        for (index, packet) in packets.iter().enumerate() {
+            decoder.submit(packet, index as u64)?;
+            while let Some(frame) = decoder.receive()? {
+                last = Some(frame);
             }
-            last.context("no decoded frame")
-        };
-        let cpu = decode("software", 0)?; // RGB24 reference
-        let gpu = decode("cuda", 3)?;
-        let gpu = gpu
-            .gpu
-            .context("CUDA decoder did not keep the frame on the GPU")?;
-        let mut rgba = vec![0_u8; width * height * 4];
-        let result = unsafe { tp_cuda_gl_self_test(gpu.0.as_ptr(), rgba.as_mut_ptr()) };
-        if result == -libc::ENODEV {
-            eprintln!("SKIP: no NVIDIA EGL device");
-            return Ok(());
         }
-        check(result)?;
-        // Compare quadrant centres; glReadPixels rows are bottom-up.
-        for (cx, cy) in [(160, 90), (480, 90), (160, 270), (480, 270)] {
+        last.context("no decoded frame")
+    }
+
+    /// Compare quadrant centres of a bottom-up RGBA readback with the CPU
+    /// RGB24 decode, within ±4 per channel.
+    #[cfg(target_os = "linux")]
+    fn compare_quadrants(cpu: &Frame, rgba: &[u8], width: usize, height: usize) -> Result<()> {
+        for (cx, cy) in [
+            (width / 4, height / 4),
+            (width * 3 / 4, height / 4),
+            (width / 4, height * 3 / 4),
+            (width * 3 / 4, height * 3 / 4),
+        ] {
             let expected = &cpu.bytes[(cy * width + cx) * 3..][..3];
             let actual = &rgba[((height - 1 - cy) * width + cx) * 4..][..3];
             for channel in 0..3 {
@@ -581,6 +673,105 @@ mod tests {
         }
         Ok(())
     }
+
+    #[test]
+    #[ignore = "requires hardware encoder and at least one hardware decoder"]
+    fn zero_copy_cuda_gl_presentation_matches_cpu_decode() -> Result<()> {
+        if std::env::var("TELEPORT_TEST_HARDWARE").as_deref() != Ok("1") {
+            eprintln!("SKIP: set TELEPORT_TEST_HARDWARE=1 on a machine with NVIDIA CUDA and EGL");
+            return Ok(());
+        }
+        let (width, height) = (640_usize, 360_usize);
+        let (config, packets) = quadrant_stream(width, height)?;
+        let cpu = decode_last(&config, &packets, "software", 0)?; // RGB24 reference
+        let gpu = decode_last(&config, &packets, "cuda", 3)?;
+        let gpu = gpu
+            .gpu
+            .context("CUDA decoder did not keep the frame on the GPU")?;
+        let mut rgba = vec![0_u8; width * height * 4];
+        let result = unsafe { tp_cuda_gl_self_test(gpu.0.as_ptr(), rgba.as_mut_ptr()) };
+        if result == -libc::ENODEV {
+            eprintln!("SKIP: no NVIDIA EGL device");
+            return Ok(());
+        }
+        check(result)?;
+        compare_quadrants(&cpu, &rgba, width, height)
+    }
+
+    /// VA-API zero-copy: decode on each DRM render node with a VA driver,
+    /// export the surface as dma-bufs, import it on that node's EGL device
+    /// and compare the offscreen readback with the CPU decode. Also prints
+    /// import+draw vs plain download time per frame at 1080p and 4K.
+    #[test]
+    #[ignore = "requires a VA-API decoder and an EGL device on the same GPU"]
+    fn zero_copy_vaapi_egl_presentation_matches_cpu_decode() -> Result<()> {
+        if std::env::var("TELEPORT_TEST_HARDWARE").as_deref() != Ok("1") {
+            eprintln!("SKIP: set TELEPORT_TEST_HARDWARE=1 on a machine with VA-API and EGL");
+            return Ok(());
+        }
+        let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path().to_string_lossy().into_owned())
+            .filter(|path| path.starts_with("/dev/dri/renderD"))
+            .collect();
+        nodes.sort();
+        let mut passed = 0;
+        for (width, height, iterations) in [
+            (640_usize, 360_usize, 0),
+            (1920, 1080, 50),
+            (3840, 2160, 20),
+        ] {
+            let (config, packets) = quadrant_stream(width, height)?;
+            let cpu = decode_last(&config, &packets, "software", 0)?;
+            for node in &nodes {
+                let name = format!("vaapi@{node}");
+                let gpu = match decode_last(&config, &packets, &name, 3) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        eprintln!("SKIP {name}: {error:#}");
+                        continue;
+                    }
+                };
+                let gpu = gpu
+                    .gpu
+                    .context("VA-API decoder did not keep the frame on the GPU")?;
+                let mut rgba = vec![0_u8; width * height * 4];
+                let (mut draw_ns, mut download_ns) = (0_i64, 0_i64);
+                let node_c = CString::new(node.as_str())?;
+                let result = unsafe {
+                    tp_vaapi_egl_self_test(
+                        node_c.as_ptr(),
+                        gpu.0.as_ptr(),
+                        rgba.as_mut_ptr(),
+                        iterations,
+                        &mut draw_ns,
+                        &mut download_ns,
+                    )
+                };
+                if result == -libc::ENODEV {
+                    eprintln!("SKIP {name}: no EGL device for this render node");
+                    continue;
+                }
+                check(result).with_context(|| format!("{name} at {width}x{height}"))?;
+                compare_quadrants(&cpu, &rgba, width, height)
+                    .with_context(|| format!("{name} at {width}x{height}"))?;
+                if iterations > 0 {
+                    eprintln!(
+                        "{name} {width}x{height}: zero-copy import+draw {:.3} ms, download alone {:.3} ms",
+                        draw_ns as f64 / 1e6,
+                        download_ns as f64 / 1e6
+                    );
+                }
+                eprintln!("PASS {name} {width}x{height}");
+                passed += 1;
+            }
+        }
+        if passed == 0 {
+            eprintln!("SKIP: no VA-API render node with a matching EGL device");
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires hardware encoder and at least one hardware decoder"]
     fn direct_hardware_encode_decode_both_codecs() -> Result<()> {
