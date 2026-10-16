@@ -902,9 +902,16 @@ pub fn run() -> Result<()> {
                         if mute {
                             command.arg("--mute");
                         }
+                        // A Linux-password sign-in yields a single-use ticket
+                        // (kept in the ephemeral directory): retrying it after a
+                        // drop can only be rejected, so that session ends and the
+                        // user signs in again instead.
+                        let single_use = ephemeral
+                            .as_ref()
+                            .is_some_and(|directory| credential.starts_with(directory.path()));
                         if agent_consent.enabled_for(&profile.address) {
                             command.arg("--forward-ssh-agent");
-                        } else {
+                        } else if !single_use {
                             // Survive Wi-Fi drops and host restarts. Agent
                             // forwarding is never resumed automatically.
                             command.arg("--reconnect");

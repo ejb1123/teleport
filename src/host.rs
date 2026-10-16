@@ -20,6 +20,9 @@ use subtle::ConstantTimeEq;
 /// as gone (for example a revoked portal session) rather than a transient error.
 const MAX_CONSECUTIVE_INPUT_FAILURES: u32 = 50;
 
+/// In-session portal recreations allowed per minute before giving up.
+const MAX_PORTAL_RECOVERIES_PER_MINUTE: usize = 3;
+
 /// Minimum spacing between client-requested IDRs per stream.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -544,13 +547,85 @@ async fn run_session(
     // Set once the client declares it requests keyframes on loss; every encoder
     // in this session then spaces periodic IDRs LONG_KEY_INTERVAL_SECONDS apart.
     let mut long_gop = false;
+    // Set when the compositor drops our portal session (e.g. all outputs
+    // vanished while sleeping monitors woke). Recovered in place below.
+    let mut portal_lost = false;
+    let mut portal_recoveries: Vec<Instant> = Vec::new();
     loop {
+        if portal_lost {
+            portal_lost = false;
+            let now = Instant::now();
+            portal_recoveries.retain(|at| now.duration_since(*at) < Duration::from_secs(60));
+            ensure!(
+                portal_recoveries.len() < MAX_PORTAL_RECOVERIES_PER_MINUTE,
+                "desktop portal session keeps failing; check the compositor and reconnect"
+            );
+            portal_recoveries.push(now);
+            tracing::warn!(
+                "desktop portal session lost (displays changed or session revoked); recreating it"
+            );
+            capture.release_all().await;
+            // Stop the dead PipeWire stream before opening the new session.
+            drop(pipeline);
+            for index in std::mem::take(&mut monitor_streams).into_keys() {
+                publish_update(
+                    &mut updates,
+                    Update::MonitorStreamStopped {
+                        index,
+                        reason: "Host display changed".into(),
+                        requested: false,
+                    },
+                )?;
+            }
+            capture
+                .reopen()
+                .await
+                .context("recreating the desktop portal session")?;
+            video_start_group = video_barrier(&video)?;
+            let info = desktop(options, capture, video_start_group)?;
+            pipeline = media::encoder(
+                &capture.pipeline_source_for_range(options.dynamic_range)?,
+                (info.width, info.height),
+                options.fps,
+                options.bitrate,
+                video.clone(),
+                options.encoder,
+                media::VideoFormat {
+                    codec: options.codec,
+                    dynamic_range: options.dynamic_range,
+                },
+            )?;
+            if long_gop {
+                pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS));
+            }
+            adaptation = media::BitrateController::new(options.bitrate);
+            network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
+            encoder_metrics = pipeline.encoder_metrics()?;
+            adaptive = !options.fixed_bitrate;
+            last_feedback = Instant::now();
+            input_failures = 0;
+            publish_update(&mut updates, Update::Desktop { desktop: info })?;
+            publish_update(
+                &mut updates,
+                Update::Notice {
+                    text: "Host displays changed; video restarted".into(),
+                },
+            )?;
+            tracing::info!("desktop portal session recreated");
+        }
         tokio::select! {
             result = crate::ssh_agent::closed(&mut ssh_agent) => return result,
             result = &mut incoming => return result,
             error = session.closed() => anyhow::bail!("{error}"),
             _ = check.tick() => {
-                pipeline.error()?;
+                if let Err(error) = pipeline.error() {
+                    // On Wayland a capture failure is usually the portal stream
+                    // going away with its outputs; try a fresh session first.
+                    ensure!(capture.is_portal(), error);
+                    tracing::warn!(error = format!("{error:#}"), "capture pipeline failed");
+                    portal_lost = true;
+                    continue;
+                }
                 let failed: Vec<_> = monitor_streams.iter().filter_map(|(&index, stream)| stream.pipeline.error().err().map(|error| (index, error))).collect();
                 for (index, error) in failed {
                     monitor_streams.remove(&index);
@@ -742,6 +817,12 @@ async fn run_session(
                         event.validate()?;
                         match capture.input(event).await {
                             Ok(()) => input_failures = 0,
+                            Err(error) if crate::capture::portal_session_lost(&error) => {
+                                // Injecting into a dead session only fails again (and
+                                // KDE may revoke it entirely): recreate it now.
+                                tracing::warn!(error = format!("{error:#}"), "portal rejected input");
+                                portal_lost = true;
+                            }
                             Err(error) => {
                                 input_failures += 1;
                                 ensure!(

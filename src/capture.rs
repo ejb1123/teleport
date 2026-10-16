@@ -43,6 +43,9 @@ pub struct Capture {
     backend: Backend,
     keys: BTreeSet<u16>,
     buttons: BTreeSet<u8>,
+    /// How this capture was opened, so a lost portal session can be recreated.
+    source: String,
+    restore_token_path: Option<std::path::PathBuf>,
 }
 
 enum Backend {
@@ -183,6 +186,8 @@ impl Capture {
             ],
             active_monitor: 0,
             backend: Backend::Test,
+            source: source.to_owned(),
+            restore_token_path: restore_token_path.map(Path::to_path_buf),
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
         };
@@ -608,6 +613,36 @@ impl Capture {
         }
     }
 
+    /// Whether input and capture go through the desktop portal (Wayland).
+    pub fn is_portal(&self) -> bool {
+        matches!(self.backend, Backend::Portal { .. })
+    }
+
+    /// Replace a lost portal session with a new one, restored from the saved
+    /// token (no local dialog when the compositor honours it). Keeps the
+    /// active monitor when it still exists.
+    pub async fn reopen(&mut self) -> Result<()> {
+        let monitor = self.active_monitor;
+        self.close().await;
+        let mut fresh = match Self::open_with_options(
+            &self.source,
+            self.restore_token_path.as_deref(),
+            monitor,
+        )
+        .await
+        {
+            Ok(capture) => capture,
+            // The monitor may be gone after an output change; start on the first.
+            Err(error) if monitor != 0 => {
+                tracing::warn!(%error, monitor, "previous monitor unavailable; reopening on the first");
+                Self::open_with_options(&self.source, self.restore_token_path.as_deref(), 0).await?
+            }
+            Err(error) => return Err(error),
+        };
+        std::mem::swap(self, &mut fresh);
+        Ok(())
+    }
+
     pub async fn close(&mut self) {
         self.release_all().await;
         if let Backend::Portal { session, .. } = &self.backend {
@@ -736,9 +771,36 @@ fn write_restore_token(path: &Path, token: &str) -> Result<()> {
     result.context("saving portal restore token")
 }
 
+/// Whether a portal error means our RemoteDesktop session is gone or no
+/// longer allowed to inject (KDE closes it when its outputs disappear, e.g.
+/// when sleeping monitors wake). Such a session never recovers by retrying.
+pub fn portal_session_lost(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    [
+        "Invalid session",
+        "non-existing session",
+        "is not allowed to call",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recognises_kde_lost_session_errors_only() {
+        for text in [
+            "Portal request failed: org.freedesktop.zbus.Error: Invalid session",
+            "Portal request failed: org.freedesktop.zbus.Error: Session is not allowed to call NotifyPointer methods",
+        ] {
+            assert!(portal_session_lost(&anyhow::anyhow!("{text}")), "{text}");
+        }
+        assert!(!portal_session_lost(&anyhow::anyhow!(
+            "Portal request failed: timeout"
+        )));
+        assert!(!portal_session_lost(&anyhow::anyhow!("unsupported key")));
+    }
 
     #[tokio::test]
     async fn independent_monitor_source_and_motion_preserve_primary_and_held_keys() {
