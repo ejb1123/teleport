@@ -57,12 +57,18 @@ its own layer (`src/e2e.rs`, `src/bridge.rs`):
 - **Host authentication is unchanged:** the host signs the handshake transcript
   with the private key of the same TLS certificate the client already pins by
   SHA-256 fingerprint. A relay cannot complete the handshake as the host.
-- **The credential is never sent.** The client proves it holds an accepted
-  credential with `HMAC(SHA-256(token), ephemeral key)`. Hosts already store
-  only `SHA-256(token)` for devices and tickets. A fresh ephemeral key per
-  session keeps these identifiers unlinkable for the relay.
+- **The credential is never sent.** The client names its credential with
+  `HMAC(SHA-256(token), ephemeral key ‖ request)`. Hosts store only
+  `SHA-256(token)` for devices and tickets. A fresh ephemeral key per session
+  keeps these identifiers unlinkable for the relay.
+- **Device keys.** Devices enrolled by password login or code pairing also
+  hold an Ed25519 key; the host stores only its public half. Such a device
+  signs the handshake transcript (both ephemeral keys, the credential
+  identifier, the request and the host certificate), and the host requires
+  that signature before it accepts anything from the client. See
+  [Device keys](#device-keys).
 - **Session keys** come from an X25519 exchange mixed with the credential hash
-  (forward secret; only a holder of an accepted credential can derive them).
+  (forward secret; only an end of the handshake can derive them).
 - **Every object** — video, audio, input, pointer, clipboard, SSH-agent
   traffic, control updates — is sealed with ChaCha20-Poly1305 under a key
   specific to its direction and track. Objects cannot be moved between tracks,
@@ -72,8 +78,9 @@ its own layer (`src/e2e.rs`, `src/bridge.rs`):
   credential MAC and the host signature; a relay that alters them is not
   recognised by the host and is rejected by the client.
 - **Nothing starts before key confirmation.** After verifying the host, the
-  client sends a sealed confirmation. Only when it authenticates does the host
-  lease the credential (claiming a single-use ticket) and capture the desktop.
+  client sends a sealed confirmation (and, for a keyed device, its sealed
+  transcript signature). Only when it authenticates does the host lease the
+  credential (claiming a single-use ticket) and capture the desktop.
   A replayed hello is answered at most once and never gets further.
 - **Bounded handshake work:** at most 8 hellos are processed concurrently,
   each read within 2 s and confirmed within 5 s; a client ephemeral key is
@@ -83,6 +90,39 @@ its own layer (`src/e2e.rs`, `src/bridge.rs`):
   enforced exactly as for direct sessions.
 - **The relay itself is pinned** with `--relay-fingerprint` (self-signed relay)
   or verified against system roots (a provider with a public certificate).
+
+## Device keys
+
+Relayed hellos are recognised by `SHA-256(token)`, which is also what the host
+stores in `access.json`. On its own, the stored hash would let anyone who read
+the host's access record compute a valid hello, derive the session keys of a
+session it starts itself, and confirm them. Device keys close that gap:
+
+- **Enrollment.** After a password login (OPAQUE) or a code pairing (SPAKE2)
+  delivers the device token, the client generates an Ed25519 key, sends its
+  public half to the host sealed under a key derived from that enrollment's
+  shared secret, and keeps the private seed in its pairing file (0600, next to
+  the token, field `device_key`) only after the host's authenticated
+  acknowledgement. The host stores the public key with the device record
+  (`public_key`). A key, once registered, is never replaced.
+- **Relayed sessions.** The client's confirmation carries a signature over the
+  transcript hash (both ephemeral keys, credential identifier, request, host
+  certificate), sealed so the relay cannot link it to a device. The host hands
+  out session keys only after the signature verifies against the stored
+  public key, and leases a keyed device only for that verified key. A party
+  holding only the stored hash gets the host's (non-secret) reply and nothing
+  else; its own key, a signature from another session, or a tampered
+  signature are rejected.
+- **Compatibility.** Old pairing files (no `device_key`) and old
+  `access.json` records (no `public_key`) load unchanged and stay
+  hash-authenticated. Old hosts ignore the extra confirmation object; old
+  clients close the connection after the token, which leaves a hash-only
+  device. Direct connections are unchanged: they present the token itself.
+- **`--relay-require-device-key`** (host): relayed hellos for credentials the
+  host's records alone would authenticate (the host pairing file's token and
+  devices without a key) get no reply. System-login tickets stay allowed: they
+  live only in memory, last 60 s and are single-use. Re-enroll older devices
+  (password login or a pairing code) before enabling it.
 
 ## What the relay can still see
 
@@ -111,20 +151,35 @@ for testing); report what you find.
 
 - `cargo test --bin teleport e2e:: bridge:: relay::` — handshake, tamper,
   splice, replay, wrong host/credential, request alteration, and a check that
-  bytes read off the relay do not contain the plaintext.
+  bytes read off the relay do not contain the plaintext; device keys: a
+  stored-hash-only client, a foreign key, tampered, missing, swapped and
+  transplanted signatures are all rejected, legacy devices still work.
+- `cargo test --bin teleport access:: protocol:: host_admin::` — key
+  registration in code pairing (and an old client that skips it), leases that
+  require the proven key, old `access.json` and pairing files loading.
 - `cargo test --test relay -- --ignored` — real relay, host and client
   processes: video and input end to end, forged credential ignored, unpinned
-  relay refused.
+  relay refused, and with `--relay-require-device-key` a code-paired device
+  streams while its stripped credential and the host token are refused.
 
 ## Known limitations
 
-- **The host's access record now authenticates relayed sessions.** Hosts
-  store `SHA-256(token)` for devices and tickets; relay mode accepts that hash
-  as proof (the token itself is never sent). Anyone who obtains the host's
-  `access.json` or identity directory could therefore open relayed sessions as
-  those devices. On a direct connection the hash alone is not enough. Protect
-  the identity directory as a secret. The planned fix is per-device key pairs
-  registered at pairing (the host would store only public keys).
+- **Hash-only credentials remain for compatibility.** Devices enrolled before
+  device keys (or by older clients) and the host's own pairing token are still
+  authenticated through the relay by `SHA-256(token)`, so anyone who obtains
+  the host's identity directory can open relayed sessions as them (the host
+  pairing file holds that token in clear anyway). Re-enroll such devices and
+  run the host with `--relay-require-device-key`; protect the identity
+  directory as a secret regardless.
+- **The host's records still identify devices.** A party holding
+  `access.json` can recognise which device a relayed hello names and get the
+  host's reply, but cannot confirm a session for a keyed device. Someone who
+  can *write* the identity directory can replace public keys and is out of
+  scope (as with any host compromise).
+- **A lost acknowledgement leaves a device unusable through the relay** if the
+  host stored the key but the client never saw the acknowledgement (the
+  connection dropped in between): the client then keeps no key. Re-enroll it;
+  direct connections are unaffected.
 - Objects within one media group can be reordered by the relay (each is still
   authenticated); the decoder treats it like loss.
 - One relayed session at a time, as for direct sessions.

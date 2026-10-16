@@ -36,6 +36,8 @@ struct Setup {
     relay_url: String,
     relay_fingerprint: String,
     temp: tempfile::TempDir,
+    /// The host's direct address (UDP sessions, TCP code pairing).
+    host_address: String,
 }
 
 fn setup() -> Setup {
@@ -44,7 +46,12 @@ fn setup() -> Setup {
 
 /// `versions` restricts the relay (e.g. IETF-only, as provider relays are).
 fn setup_with_versions(versions: &[&str]) -> Setup {
+    setup_with(versions, &[])
+}
+
+fn setup_with(versions: &[&str], host_args: &[&str]) -> Setup {
     let temp = tempfile::tempdir().unwrap();
+    let host_address = free_udp();
     let relay_address = free_udp();
     let mut relay = Process(
         teleport()
@@ -75,7 +82,8 @@ fn setup_with_versions(versions: &[&str]) -> Setup {
     let host = Process(
         teleport()
             .args(["host", "--source", "test", "--encoder", "software"])
-            .args(["--listen", &free_udp(), "--width", "640"])
+            .args(["--listen", &host_address, "--width", "640"])
+            .args(host_args)
             .arg("--identity-dir")
             .arg(temp.path().join("identity"))
             .args(["--relay-key", RELAY_KEY])
@@ -104,6 +112,7 @@ fn setup_with_versions(versions: &[&str]) -> Setup {
         relay_url,
         relay_fingerprint,
         temp,
+        host_address,
     }
 }
 
@@ -241,4 +250,140 @@ fn relayed_session_works_over_ietf_moq_transport_like_provider_relays() {
             "{version}: no input: {stdout}"
         );
     }
+}
+
+/// Enroll a device by code pairing through the host's admin socket, as a
+/// current client does (it registers a device key); returns the pairing file.
+fn enroll(setup: &Setup) -> std::path::PathBuf {
+    use std::io::{Read, Write};
+    let identity = setup.temp.path().join("identity");
+    let mut socket = std::os::unix::net::UnixStream::connect(identity.join("admin.sock")).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let request = serde_json::to_vec(&serde_json::json!("OpenPairing")).unwrap();
+    socket
+        .write_all(&(request.len() as u32).to_be_bytes())
+        .unwrap();
+    socket.write_all(&request).unwrap();
+    let mut length = [0; 4];
+    socket.read_exact(&mut length).unwrap();
+    let mut response = vec![0; u32::from_be_bytes(length) as usize];
+    socket.read_exact(&mut response).unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+    let code = response["code"].as_str().expect("pairing code").to_owned();
+    let config = setup.temp.path().join("config");
+    let mut child = teleport()
+        .args(["pair", &setup.host_address])
+        .env("XDG_CONFIG_HOME", &config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{code}").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "code enrollment failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let profiles: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config.join("teleport/profiles.json")).unwrap())
+            .unwrap();
+    std::path::PathBuf::from(profiles[0]["pairing_file"].as_str().unwrap())
+}
+
+/// Run a client that the host must refuse, until the host logs `needle`.
+fn refused(setup: &Setup, pairing: &std::path::Path, needle: &str) {
+    let log_path = setup.temp.path().join("host.log");
+    let before = std::fs::read_to_string(&log_path).unwrap_or_default().len();
+    let mut child = Process(
+        teleport()
+            .args(["client", "127.0.0.1:9", "--pairing-file"])
+            .arg(pairing)
+            .args([
+                "--relay",
+                &setup.relay_url,
+                "--relay-fingerprint",
+                &setup.relay_fingerprint,
+                "--relay-key",
+                RELAY_KEY,
+            ])
+            .args(["--headless-frames", "30", "--software-decoder"])
+            .env_remove("TELEPORT_RELAY_KEY")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if log[before..].contains(needle) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host never logged {needle:?}:\n{}",
+            &log[before..]
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = child.0.kill();
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.0.stdout.take() {
+        use std::io::Read;
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    assert!(
+        !stdout.contains("SMOKE PASS"),
+        "refused client streamed anyway"
+    );
+}
+
+#[test]
+#[ignore = "requires local UDP/TCP sockets and GStreamer plugins"]
+fn relay_requires_device_keys_when_asked() {
+    let setup = setup_with(&[], &["--relay-require-device-key"]);
+    // A code-paired device registers a key and streams through the relay.
+    let keyed = enroll(&setup);
+    let credential: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&keyed).unwrap()).unwrap();
+    let seed = credential["device_key"]
+        .as_str()
+        .expect("no device key saved");
+    let access = std::fs::read_to_string(setup.temp.path().join("identity/access.json")).unwrap();
+    assert!(
+        access.contains("public_key") && !access.contains(seed),
+        "host must store the public key only"
+    );
+    let output = client(&setup, &keyed, &setup.relay_fingerprint);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("SMOKE PASS"),
+        "keyed relayed session failed: {stdout}{}\nhost log:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        std::fs::read_to_string(setup.temp.path().join("host.log")).unwrap_or_default()
+    );
+    // The same credential without its device key, which is all the host's
+    // records allow: the handshake is answered but never accepted.
+    let stripped = setup.temp.path().join("stripped.json");
+    std::fs::write(
+        &stripped,
+        serde_json::to_vec(&serde_json::json!({
+            "token": credential["token"],
+            "fingerprint": credential["fingerprint"],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    refused(&setup, &stripped, "device did not sign the session");
+    // The host's own pairing token is hash-only: refused outright.
+    refused(
+        &setup,
+        &setup.temp.path().join("identity/pairing.json"),
+        "refused relayed credential without a device key",
+    );
 }

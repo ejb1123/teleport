@@ -541,6 +541,7 @@ mod tests {
         let pairing = crate::protocol::Pairing {
             token: "a".repeat(64),
             fingerprint: "b".repeat(64),
+            device_key: None,
         };
         let access = crate::access::ServerState::open(directory.path(), pairing.clone())?;
         let reservation = TcpListener::bind("127.0.0.1:0").await?;
@@ -577,6 +578,37 @@ mod tests {
             crate::pairing::pair(&address.to_string(), response.code.as_deref().unwrap()).await?;
         assert_ne!(device.token, pairing.token);
         assert!(access.authorized(&device.token));
+        // The code-paired device registered a relay key; the host holds only
+        // its public half, so its hash alone cannot open a relayed session.
+        let public =
+            crate::e2e::DeviceKey::from_hex(device.device_key.as_deref().unwrap())?.public_key();
+        let hash = crate::e2e::credential_hash(&device.token);
+        assert!(
+            access
+                .relay_credentials()
+                .iter()
+                .any(|c| c.hash == hash && c.device_key.as_deref() == Some(&public[..]))
+        );
+        assert!(access.begin_session_hash(hash.to_vec(), None).is_err());
+        // A client from before device keys still enrolls (hash-only).
+        let response = control.request(Request::OpenPairing).await?;
+        let old = crate::pairing::pair_without_device_key(
+            &address.to_string(),
+            response.code.as_deref().unwrap(),
+        )
+        .await?;
+        assert!(old.device_key.is_none() && access.authorized(&old.token));
+        let old_hash = crate::e2e::credential_hash(&old.token);
+        assert!(
+            access
+                .relay_credentials()
+                .iter()
+                .any(|c| c.hash == old_hash && c.hash_only())
+        );
+        let id = access.status().devices[1].id.clone();
+        control.request(Request::RevokeDevice { id }).await?;
+        assert!(!access.authorized(&old.token));
+        assert_eq!(access.status().devices.len(), 1);
         assert_eq!(access.status().devices.len(), 1);
         let id = access.status().devices[0].id.clone();
         control.request(Request::RevokeDevice { id }).await?;
@@ -593,6 +625,7 @@ mod tests {
         let pairing = crate::protocol::Pairing {
             token: "a".repeat(64),
             fingerprint: "b".repeat(64),
+            device_key: None,
         };
         let access = crate::access::ServerState::open(directory.path(), pairing.clone())?;
         let (service, _) = start(directory.path(), "127.0.0.1:0".parse()?, pairing, access).await?;
@@ -614,6 +647,7 @@ mod tests {
         let pairing = crate::protocol::Pairing {
             token: "a".repeat(64),
             fingerprint: "b".repeat(64),
+            device_key: None,
         };
         let access = crate::access::ServerState::open(&directory, pairing.clone())?;
         let (_service, _) = start(&directory, "127.0.0.1:0".parse()?, pairing, access).await?;

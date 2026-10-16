@@ -20,6 +20,23 @@
 //!    secret *and* the credential hash, salted with the transcript hash:
 //!    forward secrecy from the ephemeral exchange, and only a holder of an
 //!    accepted credential can read or write the session.
+//! 4. Client → host confirmation: the session identifier sealed under the
+//!    client-to-host key, and, for a device enrolled with a [`DeviceKey`], an
+//!    Ed25519 signature over the transcript (both ephemerals, the credential
+//!    identifier, the request and the host certificate), also sealed. The
+//!    host hands out [`SessionKeys`] only through
+//!    [`PendingSession::confirm`], which requires that signature whenever the
+//!    host stored a public key for the credential.
+//!
+//! Why the signature matters: hosts store `SHA-256(token)`, and steps 1–3 need
+//! nothing more. Without step 4's signature, anyone who read the host's access
+//! record could play the client: pick an ephemeral, compute the identifier,
+//! derive the keys and confirm. The host stores only the public half of a
+//! device key, so its records no longer suffice for keyed devices. Their
+//! session keys still need the X25519 secret of one end, so a party holding
+//! the stored hash cannot read a legitimate session either. Devices enrolled
+//! before device keys, the host's own pairing token and system-login tickets
+//! remain hash-authenticated (see `docs/relay.md`).
 //!
 //! Objects: each track gets its own ChaCha20-Poly1305 key derived from the
 //! direction key and the track name, so nonces never collide across tracks and
@@ -44,6 +61,12 @@ use subtle::ConstantTimeEq;
 
 const PROTOCOL: &[u8] = b"teleport-e2e-v1";
 const HOST_SIGNATURE_LABEL: &[u8] = b"teleport-e2e-v1 host transcript";
+const DEVICE_SIGNATURE_LABEL: &[u8] = b"teleport-e2e-v1 device transcript";
+/// Track key label for the client's key-confirmation objects.
+const CONFIRM_TRACK: &str = "confirm";
+/// Length of an Ed25519 public key as stored by hosts.
+pub const DEVICE_PUBLIC_KEY_LEN: usize = 32;
+const DEVICE_SIGNATURE_LEN: usize = 64;
 /// Unordered tracks accept objects up to this many counters behind the newest.
 const REPLAY_WINDOW: u64 = 1024;
 /// Counter prefix carried in clear before each sealed object.
@@ -73,6 +96,152 @@ pub fn credential_hash(token: &str) -> [u8; 32] {
         .as_ref()
         .try_into()
         .expect("SHA-256 is 32 bytes")
+}
+
+/// A device's relay signing key (Ed25519). The client keeps the seed in its
+/// private pairing file; the host stores only [`DeviceKey::public_key`], so
+/// the host's records alone can no longer open relayed sessions as the device.
+pub struct DeviceKey(signature::Ed25519KeyPair);
+
+impl DeviceKey {
+    /// A fresh key and its hex seed for the pairing file.
+    pub fn generate() -> Result<(Self, String)> {
+        let seed = zeroize::Zeroizing::new(random::<32>());
+        let hex: String = seed.iter().map(|byte| format!("{byte:02x}")).collect();
+        Ok((Self::from_seed(&seed)?, hex))
+    }
+
+    pub fn from_hex(hex: &str) -> Result<Self> {
+        ensure!(
+            hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid device key"
+        );
+        let mut seed = zeroize::Zeroizing::new([0u8; 32]);
+        for (byte, pair) in seed.iter_mut().zip(hex.as_bytes().chunks(2)) {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair)?, 16)?;
+        }
+        Self::from_seed(&seed)
+    }
+
+    fn from_seed(seed: &[u8; 32]) -> Result<Self> {
+        signature::Ed25519KeyPair::from_seed_unchecked(seed)
+            .map(Self)
+            .map_err(|_| anyhow!("invalid device key"))
+    }
+
+    pub fn public_key(&self) -> [u8; DEVICE_PUBLIC_KEY_LEN] {
+        self.0
+            .public_key()
+            .as_ref()
+            .try_into()
+            .expect("Ed25519 public keys are 32 bytes")
+    }
+
+    fn sign_transcript(&self, transcript: &[u8; 32]) -> Vec<u8> {
+        self.0.sign(&device_signed(transcript)).as_ref().to_vec()
+    }
+}
+
+fn device_signed(transcript: &[u8; 32]) -> Vec<u8> {
+    let mut signed = DEVICE_SIGNATURE_LABEL.to_vec();
+    signed.extend_from_slice(transcript);
+    signed
+}
+
+/// Device-key registration at enrollment, carried inside a channel that is
+/// already mutually authenticated (an OPAQUE login or a SPAKE2 code pairing)
+/// after the host has issued the device's token:
+///
+/// 1. client → host: the device public key, sealed with a key derived from
+///    the enrollment secret and bound to the enrollment context;
+/// 2. host → client: the same public key, sealed in the other direction, once
+///    the host has stored it.
+///
+/// A client keeps its private key only after a valid acknowledgement, so it
+/// never believes itself keyed when the host is not. Older peers simply close
+/// the connection after the token, which leaves a hash-only (legacy) device.
+pub struct Registration {
+    to_host: aead::LessSafeKey,
+    to_client: aead::LessSafeKey,
+    context: Vec<u8>,
+}
+
+impl Registration {
+    /// `secret` is the enrollment's shared secret (or a key derived from it);
+    /// `context` is its transcript, which both ends already agree on.
+    pub fn new(secret: &[u8], context: &[u8]) -> Result<Self> {
+        let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, b"teleport device key registration v1")
+            .extract(secret);
+        let key = |label: &[u8]| -> Result<aead::LessSafeKey> {
+            let raw: [u8; 32] = expand(&prk, &[label])?;
+            Ok(aead::LessSafeKey::new(
+                aead::UnboundKey::new(&aead::CHACHA20_POLY1305, &raw)
+                    .map_err(|_| anyhow!("invalid registration key"))?,
+            ))
+        };
+        Ok(Self {
+            to_host: key(b"client to host")?,
+            to_client: key(b"host to client")?,
+            context: context.to_vec(),
+        })
+    }
+
+    fn seal(&self, key: &aead::LessSafeKey, public: &[u8; DEVICE_PUBLIC_KEY_LEN]) -> Vec<u8> {
+        let nonce = random::<12>();
+        let mut body = public.to_vec();
+        key.seal_in_place_append_tag(
+            aead::Nonce::assume_unique_for_key(nonce),
+            aead::Aad::from(&self.context),
+            &mut body,
+        )
+        .expect("sealing a 32-byte message cannot fail");
+        let mut packet = nonce.to_vec();
+        packet.extend_from_slice(&body);
+        packet
+    }
+
+    fn open(&self, key: &aead::LessSafeKey, packet: &[u8]) -> Result<[u8; DEVICE_PUBLIC_KEY_LEN]> {
+        ensure!(
+            packet.len() == 12 + DEVICE_PUBLIC_KEY_LEN + aead::MAX_TAG_LEN,
+            "invalid device key registration"
+        );
+        let mut body = packet[12..].to_vec();
+        let opened = key
+            .open_in_place(
+                aead::Nonce::assume_unique_for_key(packet[..12].try_into().unwrap()),
+                aead::Aad::from(&self.context),
+                &mut body,
+            )
+            .map_err(|_| anyhow!("device key registration failed authentication"))?;
+        Ok(opened.try_into().expect("length checked above"))
+    }
+
+    /// Client: the registration request.
+    pub fn request(&self, key: &DeviceKey) -> Vec<u8> {
+        self.seal(&self.to_host, &key.public_key())
+    }
+
+    /// Host: the public key a registration request carries.
+    #[cfg(target_os = "linux")]
+    pub fn open_request(&self, packet: &[u8]) -> Result<[u8; DEVICE_PUBLIC_KEY_LEN]> {
+        self.open(&self.to_host, packet)
+    }
+
+    /// Host: acknowledge a stored public key.
+    #[cfg(target_os = "linux")]
+    pub fn acknowledge(&self, public: &[u8; DEVICE_PUBLIC_KEY_LEN]) -> Vec<u8> {
+        self.seal(&self.to_client, public)
+    }
+
+    /// Client: check that the host stored exactly this key.
+    pub fn verify_acknowledgement(&self, key: &DeviceKey, packet: &[u8]) -> Result<()> {
+        let stored = self.open(&self.to_client, packet)?;
+        ensure!(
+            bool::from(stored.ct_eq(&key.public_key())),
+            "host acknowledged a different device key"
+        );
+        Ok(())
+    }
 }
 
 /// Also MACs the connection request, so a relay cannot alter it without the
@@ -305,10 +474,30 @@ pub struct ClientHandshake {
     secret: agreement::EphemeralPrivateKey,
     hello: ClientHello,
     credential_hash: [u8; 32],
+    device: Option<DeviceKey>,
+}
+
+/// A client's verified handshake: the session keys and the confirmation
+/// objects to send to the host (in order, in one group).
+pub struct Established {
+    pub keys: SessionKeys,
+    pub confirmation: Vec<Vec<u8>>,
 }
 
 impl ClientHandshake {
-    pub fn new(token: &str, request: &str) -> Result<Self> {
+    /// `device` is the credential's device key, if it was enrolled with one;
+    /// the confirmation then carries its transcript signature.
+    pub fn new(token: &str, request: &str, device: Option<DeviceKey>) -> Result<Self> {
+        Self::from_hash(credential_hash(token), request, device)
+    }
+
+    /// Everything a client computes needs only the hash: this is also what an
+    /// attacker holding the host's records can do (tests use it as such).
+    fn from_hash(
+        credential_hash: [u8; 32],
+        request: &str,
+        device: Option<DeviceKey>,
+    ) -> Result<Self> {
         let rng = SystemRandom::new();
         let secret = agreement::EphemeralPrivateKey::generate(&agreement::X25519, &rng)
             .map_err(|_| anyhow!("ephemeral key generation failed"))?;
@@ -317,7 +506,6 @@ impl ClientHandshake {
             .map_err(|_| anyhow!("ephemeral public key failed"))?
             .as_ref()
             .to_vec();
-        let credential_hash = credential_hash(token);
         let hello = ClientHello {
             credential_id: credential_id(&credential_hash, &ephemeral, request),
             ephemeral,
@@ -327,6 +515,7 @@ impl ClientHandshake {
             secret,
             hello,
             credential_hash,
+            device,
         })
     }
 
@@ -335,8 +524,9 @@ impl ClientHandshake {
     }
 
     /// Verify the host against the pinned certificate fingerprint (hex
-    /// SHA-256 of the certificate DER, as in pairing files) and derive keys.
-    pub fn finish(self, reply: &HostReply, pinned_fingerprint: &str) -> Result<SessionKeys> {
+    /// SHA-256 of the certificate DER, as in pairing files), derive keys and
+    /// build the key confirmation (with the device signature, if keyed).
+    pub fn finish(self, reply: &HostReply, pinned_fingerprint: &str) -> Result<Established> {
         let pinned = moq_native::tls::parse_fingerprint(pinned_fingerprint)
             .map_err(|error| anyhow!("invalid pinned fingerprint: {error}"))?;
         let actual = digest::digest(&digest::SHA256, &reply.certificate);
@@ -359,7 +549,63 @@ impl ClientHandshake {
             |shared| shared.to_vec(),
         )
         .map_err(|_| anyhow!("key agreement failed"))?;
-        SessionKeys::derive(&shared, &self.credential_hash, &transcript)
+        let keys = SessionKeys::derive(&shared, &self.credential_hash, &transcript)?;
+        // Sealed so the relay cannot link the signature to a device key.
+        let mut sealer = keys.sealer(Direction::ClientToHost, CONFIRM_TRACK)?;
+        let mut confirmation = vec![sealer.seal(0, &keys.session_id())?];
+        if let Some(device) = &self.device {
+            confirmation.push(sealer.seal(0, &device.sign_transcript(&transcript))?);
+        }
+        Ok(Established { keys, confirmation })
+    }
+}
+
+/// A host's answered handshake. Its keys are released only by
+/// [`PendingSession::confirm`], so nothing can be accepted from a client that
+/// has not confirmed them (and, for a keyed device, signed the transcript).
+#[cfg(target_os = "linux")]
+pub struct PendingSession {
+    keys: SessionKeys,
+    transcript: [u8; 32],
+}
+
+#[cfg(target_os = "linux")]
+impl PendingSession {
+    /// Confirmation objects to read for a credential with or without a
+    /// stored device key.
+    pub fn expected_objects(device_key: Option<&[u8]>) -> usize {
+        1 + usize::from(device_key.is_some())
+    }
+
+    /// Check the client's confirmation. `device_key` is the public key the
+    /// host stored for the credential: when present, a valid transcript
+    /// signature by it is required; knowing the credential hash is not enough.
+    pub fn confirm(self, objects: &[&[u8]], device_key: Option<&[u8]>) -> Result<SessionKeys> {
+        let mut opener = self
+            .keys
+            .opener(Direction::ClientToHost, CONFIRM_TRACK, Order::Strict)?;
+        let first = objects.first().context("missing key confirmation")?;
+        let opened = opener.open(0, first)?;
+        ensure!(
+            bool::from(opened.ct_eq(&self.keys.session_id())),
+            "key confirmation mismatch"
+        );
+        if let Some(public) = device_key {
+            ensure!(
+                public.len() == DEVICE_PUBLIC_KEY_LEN,
+                "invalid stored device key"
+            );
+            let sealed = objects.get(1).context("device did not sign the session")?;
+            let proof = opener.open(0, sealed)?;
+            ensure!(
+                proof.len() == DEVICE_SIGNATURE_LEN,
+                "malformed device signature"
+            );
+            signature::UnparsedPublicKey::new(&signature::ED25519, public)
+                .verify(&device_signed(&self.transcript), &proof)
+                .map_err(|_| anyhow!("device signature is invalid"))?;
+        }
+        Ok(self.keys)
     }
 }
 
@@ -404,11 +650,13 @@ impl HostIdentity {
     }
 
     /// Answer a hello whose credential has been identified and authorized.
+    /// The reply reveals nothing secret; the session keys stay inside the
+    /// [`PendingSession`] until the client confirms them.
     pub fn respond(
         &self,
         hello: &ClientHello,
         credential_hash: &[u8; 32],
-    ) -> Result<(HostReply, SessionKeys)> {
+    ) -> Result<(HostReply, PendingSession)> {
         ensure!(
             hello.ephemeral.len() == 32
                 && hello.credential_id.len() == 32
@@ -445,7 +693,7 @@ impl HostIdentity {
                 certificate: self.certificate.clone(),
                 signature,
             },
-            keys,
+            PendingSession { keys, transcript },
         ))
     }
 }
@@ -471,11 +719,14 @@ pub fn test_session() -> (SessionKeys, SessionKeys) {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     let host = HostIdentity::new(der, &certified.signing_key.serialize_der()).unwrap();
-    let client = ClientHandshake::new("token", "").unwrap();
-    let (reply, host_keys) = host
+    let client = ClientHandshake::new("token", "", None).unwrap();
+    let (reply, pending) = host
         .respond(client.hello(), &credential_hash("token"))
         .unwrap();
-    (client.finish(&reply, &fingerprint).unwrap(), host_keys)
+    let established = client.finish(&reply, &fingerprint).unwrap();
+    let objects: Vec<&[u8]> = established.confirmation.iter().map(Vec::as_slice).collect();
+    let host_keys = pending.confirm(&objects, None).unwrap();
+    (established.keys, host_keys)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -510,15 +761,274 @@ mod tests {
     }
 
     fn handshake(fixture: &Fixture, token: &str) -> (SessionKeys, SessionKeys) {
-        let client = ClientHandshake::new(token, "codec=h264").unwrap();
+        let client = ClientHandshake::new(token, "codec=h264", None).unwrap();
         let candidates = [credential_hash("someone else"), credential_hash(token)];
         let index = HostIdentity::identify(client.hello(), &candidates).unwrap();
-        let (reply, host_keys) = fixture
+        let (reply, pending) = fixture
             .host
             .respond(client.hello(), &candidates[index])
             .unwrap();
-        let client_keys = client.finish(&reply, &fixture.fingerprint).unwrap();
-        (client_keys, host_keys)
+        let established = client.finish(&reply, &fixture.fingerprint).unwrap();
+        let host_keys = confirm(pending, &established.confirmation, None).unwrap();
+        (established.keys, host_keys)
+    }
+
+    fn confirm(
+        pending: PendingSession,
+        objects: &[Vec<u8>],
+        device_key: Option<&[u8]>,
+    ) -> Result<SessionKeys> {
+        let objects: Vec<&[u8]> = objects.iter().map(Vec::as_slice).collect();
+        pending.confirm(&objects, device_key)
+    }
+
+    /// One relayed handshake attempt, as far as the host is concerned: the
+    /// client side is built from `credential_hash` alone (what an attacker
+    /// with the host's records has) plus an optional device key.
+    fn attempt(
+        fixture: &Fixture,
+        credential: [u8; 32],
+        device: Option<DeviceKey>,
+        stored_key: Option<&[u8]>,
+    ) -> Result<(SessionKeys, SessionKeys)> {
+        let client = ClientHandshake::from_hash(credential, "codec=h264", device)?;
+        let index = HostIdentity::identify(client.hello(), &[credential]).context("unknown")?;
+        assert_eq!(index, 0);
+        let (reply, pending) = fixture.host.respond(client.hello(), &credential)?;
+        let established = client.finish(&reply, &fixture.fingerprint)?;
+        let host = confirm(pending, &established.confirmation, stored_key)?;
+        Ok((established.keys, host))
+    }
+
+    #[test]
+    fn keyed_device_handshake_agrees_and_signature_stays_sealed() {
+        let fixture = fixture();
+        let (device, _) = DeviceKey::generate().unwrap();
+        let public = device.public_key();
+        let client = ClientHandshake::new("device-token", "codec=h264", Some(device)).unwrap();
+        let (reply, pending) = fixture
+            .host
+            .respond(client.hello(), &credential_hash("device-token"))
+            .unwrap();
+        let established = client.finish(&reply, &fixture.fingerprint).unwrap();
+        assert_eq!(established.confirmation.len(), 2);
+        assert_eq!(PendingSession::expected_objects(Some(&public)), 2);
+        assert_eq!(PendingSession::expected_objects(None), 1);
+        let host = confirm(pending, &established.confirmation, Some(&public)).unwrap();
+        assert_eq!(established.keys.session_id(), host.session_id());
+        let sealed = established
+            .keys
+            .sealer(Direction::ClientToHost, "input")
+            .unwrap()
+            .seal(0, b"x")
+            .unwrap();
+        assert_eq!(
+            host.opener(Direction::ClientToHost, "input", Order::Strict)
+                .unwrap()
+                .open(0, &sealed)
+                .unwrap(),
+            b"x"
+        );
+    }
+
+    #[test]
+    fn stored_hash_alone_cannot_complete_a_keyed_devices_handshake() {
+        let fixture = fixture();
+        // What the host keeps for an enrolled device: SHA-256(token) and the
+        // device's public key. The attacker has both, but not the token or
+        // the device's private key.
+        let (device, _) = DeviceKey::generate().unwrap();
+        let public = device.public_key();
+        let stored_hash = credential_hash("device-token");
+        // Sanity: the genuine device gets in.
+        assert!(attempt(&fixture, stored_hash, Some(device), Some(&public)).is_ok());
+        // The hash alone produces a valid identifier and a host reply...
+        let error = attempt(&fixture, stored_hash, None, Some(&public))
+            .err()
+            .expect("hash-only client accepted for a keyed device");
+        assert!(error.to_string().contains("did not sign"), "{error:#}");
+        // ...and signing with the attacker's own key does not help.
+        let (own, _) = DeviceKey::generate().unwrap();
+        let error = attempt(&fixture, stored_hash, Some(own), Some(&public))
+            .err()
+            .expect("foreign device key accepted");
+        assert!(
+            error.to_string().contains("signature is invalid"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn tampered_or_transplanted_device_signatures_fail() {
+        let fixture = fixture();
+        let (device, seed) = DeviceKey::generate().unwrap();
+        let public = device.public_key();
+        let credential = credential_hash("device-token");
+        type Mutate<'a> = &'a dyn Fn(&mut Vec<Vec<u8>>, &SessionKeys, &[u8; 32]);
+        let run = |mutate: Mutate| {
+            let device = DeviceKey::from_hex(&seed).unwrap();
+            let client = ClientHandshake::from_hash(credential, "codec=h264", Some(device))?;
+            let (reply, pending) = fixture.host.respond(client.hello(), &credential)?;
+            let transcript = pending.transcript;
+            let mut established = client.finish(&reply, &fixture.fingerprint)?;
+            mutate(
+                &mut established.confirmation,
+                &established.keys,
+                &transcript,
+            );
+            confirm(pending, &established.confirmation, Some(&public))
+        };
+        assert!(run(&|_, _, _| {}).is_ok());
+        // Bit flip in the sealed signature.
+        assert!(run(&|objects, _, _| *objects[1].last_mut().unwrap() ^= 1).is_err());
+        // Signature missing, duplicated or swapped with the confirmation.
+        assert!(run(&|objects, _, _| objects.truncate(1)).is_err());
+        assert!(run(&|objects, _, _| objects[1] = objects[0].clone()).is_err());
+        assert!(run(&|objects, _, _| objects.swap(0, 1)).is_err());
+        assert!(run(&|objects, _, _| objects.clear()).is_err());
+        // A genuine device signature over a different transcript (another
+        // session, another request, another host), re-sealed by someone who
+        // knows this session's keys, is rejected.
+        let other = |transcript: &[u8; 32]| {
+            let mut changed = *transcript;
+            changed[0] ^= 1;
+            DeviceKey::from_hex(&seed)
+                .unwrap()
+                .sign_transcript(&changed)
+        };
+        assert!(
+            run(&|objects, keys, transcript| {
+                let mut sealer = keys.sealer(Direction::ClientToHost, CONFIRM_TRACK).unwrap();
+                *objects = vec![
+                    sealer.seal(0, &keys.session_id()).unwrap(),
+                    sealer.seal(0, &other(transcript)).unwrap(),
+                ];
+            })
+            .is_err()
+        );
+        // The correct signature re-sealed the same way is fine (the check
+        // above failed on the signature, not on the sealing).
+        assert!(
+            run(&|objects, keys, transcript| {
+                let device = DeviceKey::from_hex(&seed).unwrap();
+                let mut sealer = keys.sealer(Direction::ClientToHost, CONFIRM_TRACK).unwrap();
+                *objects = vec![
+                    sealer.seal(0, &keys.session_id()).unwrap(),
+                    sealer.seal(0, &device.sign_transcript(transcript)).unwrap(),
+                ];
+            })
+            .is_ok()
+        );
+        // A signature captured from one session never fits another, even
+        // for the same device and request: the transcript covers both
+        // ephemerals.
+        let client = ClientHandshake::from_hash(
+            credential,
+            "codec=h264",
+            Some(DeviceKey::from_hex(&seed).unwrap()),
+        )
+        .unwrap();
+        let (reply, _) = fixture.host.respond(client.hello(), &credential).unwrap();
+        let first = client.finish(&reply, &fixture.fingerprint).unwrap();
+        let captured_signature = first
+            .keys
+            .opener(Direction::ClientToHost, CONFIRM_TRACK, Order::Strict)
+            .map(|mut opener| {
+                opener.open(0, &first.confirmation[0]).unwrap();
+                opener.open(0, &first.confirmation[1]).unwrap()
+            })
+            .unwrap();
+        assert!(
+            run(&|objects, keys, _| {
+                let mut sealer = keys.sealer(Direction::ClientToHost, CONFIRM_TRACK).unwrap();
+                *objects = vec![
+                    sealer.seal(0, &keys.session_id()).unwrap(),
+                    sealer.seal(0, &captured_signature).unwrap(),
+                ];
+            })
+            .is_err()
+        );
+        // A malformed stored key fails closed.
+        let client = ClientHandshake::from_hash(credential, "codec=h264", None).unwrap();
+        let (reply, pending) = fixture.host.respond(client.hello(), &credential).unwrap();
+        let established = client.finish(&reply, &fixture.fingerprint).unwrap();
+        assert!(confirm(pending, &established.confirmation, Some(&[0; 31])).is_err());
+    }
+
+    #[test]
+    fn legacy_devices_keep_hash_authentication_both_ways() {
+        let fixture = fixture();
+        let credential = credential_hash("legacy-token");
+        // Old client (no key) to a host that stored no key.
+        assert!(attempt(&fixture, credential, None, None).is_ok());
+        // A keyed client to a host that never registered its key (an older
+        // host, or a lost acknowledgement): the extra object is ignored.
+        let (device, _) = DeviceKey::generate().unwrap();
+        let (client, host) = attempt(&fixture, credential, Some(device), None).unwrap();
+        assert_eq!(client.session_id(), host.session_id());
+        // An unkeyed confirmation still has to be right.
+        let client = ClientHandshake::from_hash(credential, "codec=h264", None).unwrap();
+        let (reply, pending) = fixture.host.respond(client.hello(), &credential).unwrap();
+        let mut established = client.finish(&reply, &fixture.fingerprint).unwrap();
+        *established.confirmation[0].last_mut().unwrap() ^= 1;
+        assert!(confirm(pending, &established.confirmation, None).is_err());
+    }
+
+    #[test]
+    fn device_keys_roundtrip_through_hex_and_reject_garbage() {
+        let (key, hex) = DeviceKey::generate().unwrap();
+        assert_eq!(
+            DeviceKey::from_hex(&hex).unwrap().public_key(),
+            key.public_key()
+        );
+        assert_ne!(DeviceKey::generate().unwrap().1, hex);
+        for bad in ["", "00", &"g".repeat(64), &"0".repeat(63), &"0".repeat(66)] {
+            assert!(DeviceKey::from_hex(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn device_key_registration_is_bound_to_its_enrollment() {
+        let (key, _) = DeviceKey::generate().unwrap();
+        let client = Registration::new(b"enrollment secret", b"context").unwrap();
+        let host = Registration::new(b"enrollment secret", b"context").unwrap();
+        let request = client.request(&key);
+        assert!(
+            !request
+                .windows(DEVICE_PUBLIC_KEY_LEN)
+                .any(|w| w == key.public_key())
+        );
+        let public = host.open_request(&request).unwrap();
+        assert_eq!(public, key.public_key());
+        let ack = host.acknowledge(&public);
+        client.verify_acknowledgement(&key, &ack).unwrap();
+        // Directions are distinct: a reflected request is not an ack.
+        assert!(client.verify_acknowledgement(&key, &request).is_err());
+        assert!(host.open_request(&ack).is_err());
+        // Another enrollment (secret or context) cannot inject or ack a key.
+        for (secret, context) in [
+            (&b"other secret"[..], &b"context"[..]),
+            (b"enrollment secret", b"other"),
+        ] {
+            let other = Registration::new(secret, context).unwrap();
+            assert!(other.open_request(&request).is_err());
+            assert!(
+                client
+                    .verify_acknowledgement(&key, &other.acknowledge(&public))
+                    .is_err()
+            );
+        }
+        // Tampering, truncation and an ack for a different key fail.
+        let mut tampered = request.clone();
+        tampered[20] ^= 1;
+        assert!(host.open_request(&tampered).is_err());
+        assert!(host.open_request(&request[..request.len() - 1]).is_err());
+        let (other_key, _) = DeviceKey::generate().unwrap();
+        assert!(
+            client
+                .verify_acknowledgement(&key, &host.acknowledge(&other_key.public_key()))
+                .is_err()
+        );
     }
 
     #[test]
@@ -554,8 +1064,8 @@ mod tests {
     #[test]
     fn hello_never_contains_the_token_and_is_unlinkable() {
         let token = "0123456789abcdef0123456789abcdef";
-        let first = ClientHandshake::new(token, "codec=h264").unwrap();
-        let second = ClientHandshake::new(token, "codec=h264").unwrap();
+        let first = ClientHandshake::new(token, "codec=h264", None).unwrap();
+        let second = ClientHandshake::new(token, "codec=h264", None).unwrap();
         let wire = serde_json::to_vec(first.hello()).unwrap();
         assert!(!wire.windows(token.len()).any(|w| w == token.as_bytes()));
         assert_ne!(first.hello().credential_id, second.hello().credential_id);
@@ -563,7 +1073,7 @@ mod tests {
 
     #[test]
     fn unknown_credential_is_not_identified() {
-        let client = ClientHandshake::new("revoked or never issued", "codec=h264").unwrap();
+        let client = ClientHandshake::new("revoked or never issued", "codec=h264", None).unwrap();
         let candidates = [credential_hash("a"), credential_hash("b")];
         assert_eq!(HostIdentity::identify(client.hello(), &candidates), None);
     }
@@ -571,19 +1081,19 @@ mod tests {
     #[test]
     fn client_rejects_wrong_host_or_forged_reply() {
         let fixture = fixture();
-        let client = ClientHandshake::new("token", "codec=h264").unwrap();
+        let client = ClientHandshake::new("token", "codec=h264", None).unwrap();
         let (reply, _) = fixture
             .host
             .respond(client.hello(), &credential_hash("token"))
             .unwrap();
         // A relay (or anyone) presenting a different, unpinned certificate.
-        let client2 = ClientHandshake::new("token", "codec=h264").unwrap();
+        let client2 = ClientHandshake::new("token", "codec=h264", None).unwrap();
         let (reply2, _) = fixture
             .host
             .respond(client2.hello(), &credential_hash("token"))
             .unwrap();
         assert!(
-            ClientHandshake::new("token", "codec=h264")
+            ClientHandshake::new("token", "codec=h264", None)
                 .unwrap()
                 .finish(&reply, &fixture.other_fingerprint)
                 .is_err()
@@ -591,7 +1101,7 @@ mod tests {
         // A reply signed for another hello cannot be replayed to this client.
         assert!(client.finish(&reply2, &fixture.fingerprint).is_err());
         // A substituted ephemeral key breaks the signature.
-        let fresh = ClientHandshake::new("token", "codec=h264").unwrap();
+        let fresh = ClientHandshake::new("token", "codec=h264", None).unwrap();
         let (mut forged, _) = fixture
             .host
             .respond(fresh.hello(), &credential_hash("token"))
@@ -603,7 +1113,7 @@ mod tests {
     #[test]
     fn client_detects_a_relay_altering_its_request() {
         let fixture = fixture();
-        let client = ClientHandshake::new("token", "codec=h264").unwrap();
+        let client = ClientHandshake::new("token", "codec=h264", None).unwrap();
         let mut altered = client.hello().clone();
         altered.request = "codec=h264&ssh-agent=1".into();
         // The host no longer recognises the credential at all...
@@ -622,24 +1132,30 @@ mod tests {
     #[test]
     fn wrong_credential_cannot_read_or_write_the_session() {
         let fixture = fixture();
-        let client = ClientHandshake::new("guess", "codec=h264").unwrap();
+        let client = ClientHandshake::new("guess", "codec=h264", None).unwrap();
         // Host answered as if the hello were for a different credential.
         let (reply, host) = fixture
             .host
             .respond(client.hello(), &credential_hash("real"))
             .unwrap();
         let client = client.finish(&reply, &fixture.fingerprint).unwrap();
+        // The host's pending keys (reachable here only because tests see
+        // private fields) cannot open what the client seals...
         let sealed = client
+            .keys
             .sealer(Direction::ClientToHost, "input")
             .unwrap()
             .seal(0, b"x")
             .unwrap();
         assert!(
-            host.opener(Direction::ClientToHost, "input", Order::Strict)
+            host.keys
+                .opener(Direction::ClientToHost, "input", Order::Strict)
                 .unwrap()
                 .open(0, &sealed)
                 .is_err()
         );
+        // ...and its confirmation fails, so they are never released.
+        assert!(confirm(host, &client.confirmation, None).is_err());
     }
 
     #[test]

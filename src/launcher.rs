@@ -183,7 +183,7 @@ impl AgentConsent {
 impl Drop for Approval {
     fn drop(&mut self) {
         if let Some(pairing) = &mut self.pairing {
-            pairing.token.zeroize();
+            pairing.zeroize_secrets();
         }
     }
 }
@@ -354,7 +354,7 @@ pub fn run() -> Result<()> {
                                     .trusted_fingerprint()?;
                                 if let Some(pin) = pin {
                                     if !pin.eq_ignore_ascii_case(&pairing.fingerprint) {
-                                        pairing.token.zeroize();
+                                        pairing.zeroize_secrets();
                                         anyhow::bail!(
                                             "HOST IDENTITY CHANGED: saved trust was not replaced"
                                         );
@@ -366,7 +366,7 @@ pub fn run() -> Result<()> {
                                         &mut profiles,
                                         &mut ephemeral,
                                     )?);
-                                    pairing.token.zeroize();
+                                    pairing.zeroize_secrets();
                                     page = Page::Home;
                                     connect_requested = true;
                                 } else {
@@ -468,7 +468,7 @@ pub fn run() -> Result<()> {
                                             status = format!("Could not save access: {error}")
                                         }
                                     }
-                                    pairing.token.zeroize();
+                                    pairing.zeroize_secrets();
                                 } else {
                                     auth_requested = true;
                                 }
@@ -1542,6 +1542,7 @@ mod tests {
         let pairing = crate::protocol::Pairing {
             token: "a".repeat(64),
             fingerprint: "b".repeat(64),
+            device_key: None,
         };
         let (profile, directory) = super::session_profile("desktop:4443", &pairing)?;
         crate::profiles::check_private_file(profile.pairing_file.as_ref().unwrap())?;

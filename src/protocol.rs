@@ -68,6 +68,12 @@ pub const MAX_CONTROL: usize = MAX_TEXT * 6 + 1024;
 pub struct Pairing {
     pub token: String,
     pub fingerprint: String,
+    /// Hex Ed25519 seed of this device's relay key (`crate::e2e::DeviceKey`),
+    /// present when the host registered its public half at enrollment. Older
+    /// pairing files have none and keep working as hash-authenticated
+    /// credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_key: Option<String>,
 }
 
 impl Pairing {
@@ -77,12 +83,28 @@ impl Pairing {
         Ok(pairing)
     }
 
+    /// Wipe the secrets held in memory (token and device key seed).
+    pub fn zeroize_secrets(&mut self) {
+        use zeroize::Zeroize;
+        self.token.zeroize();
+        if let Some(key) = &mut self.device_key {
+            key.zeroize();
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.token.len() == 64 && self.token.bytes().all(|b| b.is_ascii_hexdigit()),
             "invalid pairing token"
         );
         moq_native::tls::parse_fingerprint(&self.fingerprint)?;
+        // Any 32-byte seed is a valid Ed25519 key (`crate::e2e::DeviceKey`).
+        ensure!(
+            self.device_key
+                .as_ref()
+                .is_none_or(|key| key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())),
+            "invalid device key"
+        );
         Ok(())
     }
 }
@@ -659,6 +681,40 @@ pub fn evdev(scancode: sdl2::keyboard::Scancode) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairing_files_with_and_without_device_keys() {
+        let token = "ab".repeat(32);
+        let fingerprint = "cd".repeat(32);
+        // A pairing file written before device keys.
+        let old: Pairing = serde_json::from_value(serde_json::json!({
+            "token": token, "fingerprint": fingerprint,
+        }))
+        .unwrap();
+        old.validate().unwrap();
+        assert!(old.device_key.is_none());
+        // Hash-only credentials serialize exactly as before, so older
+        // clients and hosts read what this version writes.
+        assert_eq!(
+            serde_json::to_value(&old).unwrap(),
+            serde_json::json!({ "token": token, "fingerprint": fingerprint })
+        );
+        let keyed = Pairing {
+            device_key: Some("0f".repeat(32)),
+            ..old.clone()
+        };
+        keyed.validate().unwrap();
+        let reparsed: Pairing =
+            serde_json::from_slice(&serde_json::to_vec(&keyed).unwrap()).unwrap();
+        assert_eq!(reparsed.device_key, keyed.device_key);
+        for bad in ["", "0f", &"zz".repeat(32), &"0f".repeat(33)] {
+            let pairing = Pairing {
+                device_key: Some(bad.into()),
+                ..old.clone()
+            };
+            assert!(pairing.validate().is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn monitor_controls_validate_indexes_and_payloads() {

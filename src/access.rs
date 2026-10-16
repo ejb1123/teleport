@@ -156,6 +156,53 @@ async fn read_packet(stream: &mut (impl tokio::io::AsyncRead + Unpin)) -> Result
     Ok(packet)
 }
 
+/// Bound on the optional device-key step that follows a credential.
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A packet, or `None` if the peer closed the connection cleanly first.
+#[cfg(target_os = "linux")]
+async fn read_optional_packet(
+    stream: &mut (impl tokio::io::AsyncRead + Unpin),
+) -> Result<Option<Vec<u8>>> {
+    match read_packet(stream).await {
+        Ok(packet) => Ok(Some(packet)),
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Client side of `crate::e2e::Registration` after receiving `pairing`:
+/// register a fresh device key and keep it only once the host acknowledged
+/// it. Any failure leaves the (already valid) credential hash-only, never
+/// unusable; older hosts close the connection here.
+pub(crate) async fn register_device_key(
+    stream: &mut TcpStream,
+    registration: &crate::e2e::Registration,
+    mut pairing: Pairing,
+) -> Pairing {
+    let result = tokio::time::timeout(REGISTRATION_TIMEOUT, async {
+        let (key, seed) = crate::e2e::DeviceKey::generate()?;
+        write_packet(stream, &registration.request(&key)).await?;
+        registration.verify_acknowledgement(&key, &read_packet(stream).await?)?;
+        Ok::<_, anyhow::Error>(seed)
+    })
+    .await;
+    match result {
+        Ok(Ok(seed)) => pairing.device_key = Some(seed),
+        Ok(Err(error)) => {
+            tracing::info!(%error, "host did not register a device key; relayed sessions use the credential hash")
+        }
+        Err(_) => tracing::info!("device key registration timed out"),
+    }
+    pairing
+}
+
 fn credential_key(session: &[u8]) -> Result<aead::LessSafeKey> {
     let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, &MAGIC).extract(session);
     let mut key = [0; 32];
@@ -291,7 +338,13 @@ where
             pairing.fingerprint == fingerprint,
             "authenticated host identity mismatch"
         );
-        Ok(pairing)
+        // Device keys are generated here, never accepted from the host.
+        let pairing = Pairing {
+            device_key: None,
+            ..pairing
+        };
+        let registration = crate::e2e::Registration::new(&finish.session_key, &context)?;
+        Ok(register_device_key(&mut stream, &registration, pairing).await)
     })
     .await
     .context("password login timed out")?
@@ -337,6 +390,30 @@ mod server {
     struct Device {
         summary: DeviceSummary,
         token_hash: Vec<u8>,
+        /// Ed25519 public half of the device's relay key, registered at
+        /// enrollment (`crate::e2e::Registration`). Absent for devices
+        /// enrolled before device keys or by clients that did not register
+        /// one; those stay hash-authenticated through a relay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        public_key: Option<Vec<u8>>,
+    }
+
+    /// A credential a relayed hello may name (see `crate::e2e`).
+    pub struct RelayCredential {
+        /// `SHA-256(token)`.
+        pub hash: [u8; 32],
+        /// Required transcript-signing key, for devices that registered one.
+        pub device_key: Option<Vec<u8>>,
+        /// A memory-only, single-use system-login ticket.
+        pub ticket: bool,
+    }
+
+    impl RelayCredential {
+        /// Authenticated by data the host stores on disk alone: the host
+        /// pairing token or a device without a registered key.
+        pub fn hash_only(&self) -> bool {
+            self.device_key.is_none() && !self.ticket
+        }
     }
     #[derive(Clone, Serialize, Deserialize)]
     struct Account {
@@ -368,6 +445,13 @@ mod server {
         generation: u64,
         deadline: std::time::Instant,
         active: bool,
+    }
+    /// What a session presented beyond the credential hash.
+    enum KeyProof<'a> {
+        /// The bearer token itself (direct connections).
+        Token,
+        /// A relayed hello, with the device key whose signature was verified.
+        Relay(Option<&'a [u8]>),
     }
     pub struct SessionLease {
         state: Arc<ServerState>,
@@ -423,7 +507,10 @@ mod server {
                 }
                 for device in &record.devices {
                     ensure!(
-                        device.token_hash.len() == 32,
+                        device.token_hash.len() == 32
+                            && device.public_key.as_ref().is_none_or(|key| {
+                                key.len() == crate::e2e::DEVICE_PUBLIC_KEY_LEN
+                            }),
                         "invalid stored device credential"
                     );
                 }
@@ -618,30 +705,75 @@ mod server {
                 && self.authorized_hash(&token_hash(token))
         }
 
-        /// Every currently acceptable credential as `SHA-256(token)`: the
-        /// legacy host token, managed devices and live system-login tickets.
-        /// A relayed hello names one of these without revealing the token.
-        pub fn credential_hashes(&self) -> Vec<[u8; 32]> {
-            let mut hashes = Vec::new();
-            let mut push = |hash: &[u8]| {
+        /// Every currently acceptable credential as `SHA-256(token)`, with
+        /// its device key if it has one: the legacy host token, managed
+        /// devices and live system-login tickets. A relayed hello names one
+        /// of these without revealing the token.
+        pub fn relay_credentials(&self) -> Vec<RelayCredential> {
+            let mut credentials = Vec::new();
+            let mut push = |hash: &[u8], device_key: Option<&Vec<u8>>, ticket| {
                 if let Ok(hash) = hash.try_into() {
-                    hashes.push(hash);
+                    credentials.push(RelayCredential {
+                        hash,
+                        device_key: device_key.cloned(),
+                        ticket,
+                    });
                 }
             };
-            push(&token_hash(&self.legacy.token));
+            push(&token_hash(&self.legacy.token), None, false);
             if let Ok(record) = self.record.lock() {
                 for device in &record.devices {
-                    push(&device.token_hash);
+                    push(&device.token_hash, device.public_key.as_ref(), false);
                 }
             }
             if self.system_login_allowed()
                 && let Ok(sessions) = self.system_sessions.lock()
             {
                 for hash in sessions.keys() {
-                    push(hash);
+                    push(hash, None, true);
                 }
             }
-            hashes
+            credentials
+        }
+
+        /// Store the relay public key of a device issued by this enrollment.
+        /// Only once per device: a key, once registered, is never replaced.
+        fn register_device_key(
+            &self,
+            id: &str,
+            public_key: &[u8; crate::e2e::DEVICE_PUBLIC_KEY_LEN],
+        ) -> Result<()> {
+            self.update(|r| {
+                let device = r
+                    .devices
+                    .iter_mut()
+                    .find(|d| d.summary.id == id)
+                    .context("device was revoked during enrollment")?;
+                ensure!(device.public_key.is_none(), "device key already registered");
+                device.public_key = Some(public_key.to_vec());
+                Ok(())
+            })
+        }
+
+        /// Host side of `crate::e2e::Registration` after the device's token
+        /// was sent (code pairing and password login): an older client closes
+        /// the connection instead, which leaves a hash-only device.
+        pub(crate) async fn accept_device_key(
+            &self,
+            stream: &mut TcpStream,
+            registration: &crate::e2e::Registration,
+            id: &str,
+        ) -> Result<()> {
+            let Some(packet) =
+                tokio::time::timeout(REGISTRATION_TIMEOUT, read_optional_packet(stream))
+                    .await
+                    .context("device key registration timed out")??
+            else {
+                return Ok(());
+            };
+            let public_key = registration.open_request(&packet)?;
+            self.register_device_key(id, &public_key)?;
+            write_packet(stream, &registration.acknowledge(&public_key)).await
         }
 
         /// Authorization by `SHA-256(token)`, for relayed sessions where the
@@ -717,6 +849,7 @@ mod server {
             Ok(Pairing {
                 token,
                 fingerprint: self.legacy.fingerprint.clone(),
+                device_key: None,
             })
         }
 
@@ -728,11 +861,27 @@ mod server {
                 token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit()),
                 "unauthorized session"
             );
-            self.begin_session_hash(token_hash(token))
+            // The token itself was presented, which proves more than the hash.
+            self.claim(token_hash(token), KeyProof::Token)
         }
 
         /// [`Self::begin_session`] by `SHA-256(token)` (relayed sessions).
-        pub fn begin_session_hash(self: &Arc<Self>, hash: Vec<u8>) -> Result<SessionLease> {
+        /// `proven_key` is the device key whose transcript signature the
+        /// client proved; a device with a registered key is leased only with
+        /// that key, so the stored hash alone never suffices for it.
+        pub fn begin_session_hash(
+            self: &Arc<Self>,
+            hash: Vec<u8>,
+            proven_key: Option<&[u8]>,
+        ) -> Result<SessionLease> {
+            self.claim(hash, KeyProof::Relay(proven_key))
+        }
+
+        fn claim(self: &Arc<Self>, hash: Vec<u8>, proof: KeyProof) -> Result<SessionLease> {
+            let key_proven = |registered: Option<&[u8]>| match (registered, &proof) {
+                (None, _) | (_, KeyProof::Token) => true,
+                (Some(key), KeyProof::Relay(proven)) => proven.is_some_and(|p| p == key),
+            };
             // Atomic authorization and claim; absence from the ticket map must
             // never turn a concurrently revoked ticket into reusable trust.
             let record = self
@@ -741,7 +890,9 @@ mod server {
                 .map_err(|_| anyhow::anyhow!("access unavailable"))?;
             let saved = bool::from(token_hash(&self.legacy.token).ct_eq(&hash))
                 | record.devices.iter().fold(false, |accepted, d| {
-                    accepted | bool::from(d.token_hash.ct_eq(&hash))
+                    accepted
+                        | (bool::from(d.token_hash.ct_eq(&hash))
+                            & key_proven(d.public_key.as_deref()))
                 });
             let mut sessions = self
                 .system_sessions
@@ -792,62 +943,67 @@ mod server {
             Ok(())
         }
 
-        fn issue(&self, generation: u64, name: &str) -> Result<Pairing> {
-            let token = crate::identity::token();
-            self.update(|r| {
+        fn issue(&self, generation: u64, name: &str) -> Result<IssuedDevice> {
+            self.add_device(name, "password", |r| {
                 ensure!(
                     r.generation == generation && r.account.is_some(),
                     "login failed"
                 );
-                ensure!(
-                    r.devices.len() < 128,
-                    "device limit reached; remove an old device on the host"
-                );
-                r.devices.push(Device {
-                    summary: DeviceSummary {
-                        id: crate::identity::token(),
-                        name: name.into(),
-                        created_unix: now(),
-                        source: "password".into(),
-                    },
-                    token_hash: token_hash(&token),
-                });
                 Ok(())
-            })?;
-            Ok(Pairing {
-                token,
-                fingerprint: self.legacy.fingerprint.clone(),
             })
         }
 
         /// Local trusted caller only: invoke after one-time code proof succeeds.
-        pub fn enroll_device(&self, name: &str) -> Result<Pairing> {
+        pub fn enroll_device(&self, name: &str) -> Result<IssuedDevice> {
             ensure!(
                 !name.is_empty() && name.len() <= 128 && !name.chars().any(char::is_control),
                 "invalid device name"
             );
+            self.add_device(name, "pairing", |_| Ok(()))
+        }
+
+        fn add_device(
+            &self,
+            name: &str,
+            source: &str,
+            check: impl FnOnce(&Record) -> Result<()>,
+        ) -> Result<IssuedDevice> {
             let token = crate::identity::token();
+            let id = crate::identity::token();
             self.update(|r| {
+                check(r)?;
                 ensure!(
                     r.devices.len() < 128,
                     "device limit reached; remove an old device on the host"
                 );
                 r.devices.push(Device {
                     summary: DeviceSummary {
-                        id: crate::identity::token(),
+                        id: id.clone(),
                         name: name.into(),
                         created_unix: now(),
-                        source: "pairing".into(),
+                        source: source.into(),
                     },
                     token_hash: token_hash(&token),
+                    public_key: None,
                 });
                 Ok(())
             })?;
-            Ok(Pairing {
-                token,
-                fingerprint: self.legacy.fingerprint.clone(),
+            Ok(IssuedDevice {
+                pairing: Pairing {
+                    token,
+                    fingerprint: self.legacy.fingerprint.clone(),
+                    device_key: None,
+                },
+                id,
             })
         }
+    }
+
+    /// A newly issued device credential.
+    pub struct IssuedDevice {
+        /// What the client receives (the host keeps only its hash).
+        pub pairing: Pairing,
+        pub id: String,
     }
 
     pub async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> Result<()> {
@@ -948,8 +1104,8 @@ mod server {
                 )?)?;
                 state.accept_touch(generation, &hash, &assertion)?;
             }
-            let pairing = state.issue(generation, &hello.device_name)?;
-            let mut payload = serde_json::to_vec(&pairing)?;
+            let issued = state.issue(generation, &hello.device_name)?;
+            let mut payload = serde_json::to_vec(&issued.pairing)?;
             let nonce: [u8; 12] = rand::random();
             credential_key(&finish.session_key)?
                 .seal_in_place_append_tag(
@@ -961,7 +1117,10 @@ mod server {
             let mut packet = nonce.to_vec();
             packet.extend_from_slice(&payload);
             write_packet(&mut stream, &packet).await?;
-            Ok(())
+            let registration = crate::e2e::Registration::new(&finish.session_key, &context)?;
+            state
+                .accept_device_key(&mut stream, &registration, &issued.id)
+                .await
         })
         .await
         .context("login timed out")?
@@ -981,6 +1140,7 @@ mod server {
                 Pairing {
                     token: "a".repeat(64),
                     fingerprint: "b".repeat(64),
+                    device_key: None,
                 },
             )?;
             state.set_password("ej", PASSWORD)?;
@@ -1019,6 +1179,18 @@ mod server {
             let first = login(&address, "ej", PASSWORD, "work").await?;
             let second = login(&address, "ej", PASSWORD, "other").await?;
             assert_ne!(first.token, second.token);
+            // Each login registered its own device key; the host stored only
+            // the public halves.
+            let seed = first.device_key.clone().expect("device key registered");
+            assert_ne!(second.device_key, first.device_key);
+            let public = crate::e2e::DeviceKey::from_hex(&seed)?.public_key();
+            assert!(
+                state
+                    .relay_credentials()
+                    .iter()
+                    .any(|c| c.device_key.as_deref() == Some(&public[..]))
+            );
+            assert!(!fs::read_to_string(&state.path)?.contains(&seed));
             assert!(state.authorized(&first.token));
             assert!(state.authorized(&second.token));
             assert!(!state.authorized(&"f".repeat(64)));
@@ -1065,7 +1237,7 @@ mod server {
             let saved = state.issue(generation, "existing device")?;
             state.require_u2f(credential.clone())?;
             assert!(state.status().u2f_required);
-            assert!(state.authorized(&saved.token));
+            assert!(state.authorized(&saved.pairing.token));
             assert!(state.authorized(&state.legacy.token));
             let (address, task) = listener(state.clone()).await?;
             assert!(
@@ -1201,6 +1373,82 @@ mod server {
         }
 
         #[test]
+        fn device_keys_gate_relayed_leases_and_old_records_still_load() -> Result<()> {
+            let (_temporary, state) = state()?;
+            let keyed = state.enroll_device("keyed")?;
+            let legacy = state.enroll_device("legacy")?;
+            let (key, _) = crate::e2e::DeviceKey::generate()?;
+            let public = key.public_key();
+            state.register_device_key(&keyed.id, &public)?;
+            // A key is registered once; it can never be swapped afterwards.
+            let (other, _) = crate::e2e::DeviceKey::generate()?;
+            assert!(
+                state
+                    .register_device_key(&keyed.id, &other.public_key())
+                    .is_err()
+            );
+            assert!(
+                state
+                    .register_device_key("no such device", &public)
+                    .is_err()
+            );
+            let hash = |issued: &IssuedDevice| token_hash(&issued.pairing.token);
+            let credentials = state.relay_credentials();
+            let find = |h: &[u8]| credentials.iter().find(|c| c.hash[..] == *h).unwrap();
+            assert_eq!(find(&hash(&keyed)).device_key.as_deref(), Some(&public[..]));
+            assert!(!find(&hash(&keyed)).hash_only());
+            assert!(find(&hash(&legacy)).hash_only());
+            assert!(find(&token_hash(&state.legacy.token)).hash_only());
+            let ticket = state.issue_system_session(state.system_generation()?)?;
+            let ticket_credential = state.relay_credentials();
+            let ticket_credential = ticket_credential
+                .iter()
+                .find(|c| c.hash[..] == token_hash(&ticket.token)[..])
+                .unwrap();
+            assert!(ticket_credential.ticket && !ticket_credential.hash_only());
+
+            // Relayed: the stored hash alone does not lease a keyed device,
+            // nor does a different key; the proven key does.
+            assert!(state.begin_session_hash(hash(&keyed), None).is_err());
+            assert!(
+                state
+                    .begin_session_hash(hash(&keyed), Some(&other.public_key()))
+                    .is_err()
+            );
+            drop(state.begin_session_hash(hash(&keyed), Some(&public))?);
+            // Legacy devices and the host token keep hash authentication.
+            drop(state.begin_session_hash(hash(&legacy), None)?);
+            drop(state.begin_session_hash(token_hash(&state.legacy.token), None)?);
+            // Direct connections present the token itself: unchanged.
+            drop(state.begin_session(&keyed.pairing.token)?);
+            assert!(state.authorized(&keyed.pairing.token));
+
+            // The record keeps the key across restarts, never a private key,
+            // and an access.json written before device keys still loads.
+            let directory = state.path.parent().unwrap().to_owned();
+            let reopened = ServerState::open(&directory, state.legacy.clone())?;
+            assert!(reopened.begin_session_hash(hash(&keyed), None).is_err());
+            let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&state.path)?)?;
+            for device in record["devices"].as_array_mut().unwrap() {
+                device.as_object_mut().unwrap().remove("public_key");
+            }
+            fs::write(&state.path, serde_json::to_vec(&record)?)?;
+            let old = ServerState::open(&directory, state.legacy.clone())?;
+            assert_eq!(old.status().devices.len(), 2);
+            assert!(
+                old.relay_credentials()
+                    .iter()
+                    .all(|c| c.device_key.is_none())
+            );
+            drop(old.begin_session_hash(hash(&keyed), None)?);
+            // A corrupt stored key fails closed at load.
+            record["devices"][0]["public_key"] = serde_json::json!([1, 2, 3]);
+            fs::write(&state.path, serde_json::to_vec(&record)?)?;
+            assert!(ServerState::open(&directory, state.legacy.clone()).is_err());
+            Ok(())
+        }
+
+        #[test]
         fn persistent_rate_limit_and_revoke_generation() -> Result<()> {
             let (_temporary, state) = state()?;
             let ip: IpAddr = "127.0.0.1".parse()?;
@@ -1220,13 +1468,13 @@ mod server {
             let generation = state.record.lock().unwrap().generation;
             state.set_password("ej", "Another long passphrase!")?;
             assert!(state.issue(generation, "stale-password login").is_err());
-            assert!(state.authorized(&code_device.token));
+            assert!(state.authorized(&code_device.pairing.token));
             let generation = state.record.lock().unwrap().generation;
             state.disable_password()?;
             assert!(state.issue(generation, "disabled-password login").is_err());
-            assert!(state.authorized(&code_device.token));
+            assert!(state.authorized(&code_device.pairing.token));
             state.revoke_all_devices()?;
-            assert!(!state.authorized(&code_device.token));
+            assert!(!state.authorized(&code_device.pairing.token));
             assert!(state.authorized(&state.legacy.token));
             Ok(())
         }
@@ -1364,6 +1612,7 @@ mod tests {
         let pairing = Pairing {
             token: "a".repeat(64),
             fingerprint: "b".repeat(64),
+            device_key: None,
         };
         let session = b"test session secret";
         let nonce = [0u8; 12];

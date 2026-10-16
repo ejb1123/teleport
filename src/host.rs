@@ -50,6 +50,13 @@ pub struct Options {
         hide_env_values = true
     )]
     pub relay_key: Option<String>,
+    /// Accept relayed sessions only from devices enrolled with a device key
+    /// (password login or code pairing by this version or later). Refuses the
+    /// host pairing file's token and older device credentials through the
+    /// relay, which anyone holding the host's identity directory could use.
+    /// Direct connections are unaffected.
+    #[arg(long, requires = "relay")]
+    pub relay_require_device_key: bool,
     /// Experimental: permit clients that explicitly opt in to forward an SSH agent.
     #[arg(long)]
     pub allow_ssh_agent: bool,
@@ -160,6 +167,7 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
             .first()
             .context("no certificate")?
             .clone(),
+        device_key: None,
     };
     let pairing_path = identity
         .as_ref()
@@ -253,6 +261,7 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
                         access.clone(),
                         e2e.clone(),
                         sender,
+                        options.relay_require_device_key,
                     ));
                     relay = Some((link, receiver, crate::relay::AbortOnDrop(intake)));
                 }
@@ -348,7 +357,7 @@ async fn relayed(
 ) -> Result<()> {
     let hash = accepted.credential;
     let _lease = access
-        .begin_session_hash(hash.to_vec())
+        .begin_session_hash(hash.to_vec(), accepted.device_key.as_deref())
         .context("relayed credential not usable")?;
     let bridged = crate::relay::host(link, &accepted)?;
     let session = link.session.clone();

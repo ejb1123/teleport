@@ -337,6 +337,7 @@ mod tests {
         let wrong = crate::protocol::Pairing {
             token: "aa".repeat(32),
             fingerprint: "cd".repeat(32),
+            device_key: None,
         };
         assert!(
             super::save_pairing_in("home:4443", &wrong, &mut stale_pairing, dir.path()).is_err()
@@ -421,6 +422,7 @@ mod tests {
         let legacy = crate::protocol::Pairing {
             token: "aa".repeat(32),
             fingerprint: "bb".repeat(32),
+            device_key: None,
         };
         let credential = dir.path().join("legacy.json");
         super::private_write(&credential, &serde_json::to_vec(&legacy)?)?;
@@ -465,6 +467,7 @@ mod tests {
         let mut pairing = crate::protocol::Pairing {
             token: "aa".repeat(32),
             fingerprint: pin.clone(),
+            device_key: None,
         };
         let trusted = super::save_pairing_in("home:4443", &pairing, &mut profiles, dir.path())?;
         assert_eq!(trusted.label(), "Home");
@@ -518,6 +521,7 @@ mod tests {
         let mut pairing = crate::protocol::Pairing {
             token: "aa".repeat(32),
             fingerprint: "bb".repeat(32),
+            device_key: None,
         };
         let old = super::save_pairing_in(
             "desktop.local:4443",
