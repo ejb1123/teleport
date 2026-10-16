@@ -319,16 +319,37 @@ pub enum Update {
     Cursor {
         cursor: Option<CursorImage>,
     },
+    /// Force feedback a game started on virtual pad `pad`: play `low`
+    /// (strong, low-frequency motor) and `high` (weak, high-frequency) for
+    /// `duration_ms` unless a newer update replaces it; zeros stop it. Only
+    /// sent after the client declared `ClientFeatures::rumble` (older
+    /// clients reject unknown updates).
+    Rumble {
+        pad: u8,
+        low: u16,
+        high: u16,
+        duration_ms: u32,
+    },
 }
+
+/// Longest `Update::Rumble` (SDL's `SDL_GameControllerRumble` limit); hosts
+/// re-send effects that last longer.
+pub const MAX_RUMBLE_MS: u32 = 0xFFFF;
 
 impl Update {
     /// Rejects malformed host data before the client acts on it.
     pub fn validate(&self) -> Result<()> {
-        if let Self::Cursor {
-            cursor: Some(image),
-        } = self
-        {
-            image.validate()?;
+        match self {
+            Self::Cursor {
+                cursor: Some(image),
+            } => image.validate()?,
+            Self::Rumble {
+                pad, duration_ms, ..
+            } => ensure!(
+                *pad < MAX_GAMEPADS && *duration_ms <= MAX_RUMBLE_MS,
+                "invalid rumble"
+            ),
+            _ => (),
         }
         Ok(())
     }
@@ -482,6 +503,11 @@ pub enum Event {
         /// `Desktop::local_cursor`.
         #[serde(default)]
         local_cursor: bool,
+        /// The client plays `Update::Rumble`, so the host gives the pads it
+        /// creates from now on force feedback (`FF_RUMBLE`). Older hosts
+        /// ignore the field.
+        #[serde(default)]
+        rumble: bool,
     },
     /// The session's video codec. Sent as the very first input event to hosts
     /// advertising `Desktop::codec_selection`, which wait for it before
@@ -1007,6 +1033,7 @@ mod tests {
                 keyframe_requests: true,
                 pointer_datagrams: true,
                 local_cursor: true,
+                rumble: true,
             },
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
@@ -1157,6 +1184,7 @@ mod tests {
                 keyframe_requests: true,
                 pointer_datagrams: false,
                 local_cursor: false,
+                rumble: false,
             }
         ));
         let primary: Event = serde_json::from_str(r#"{"type":"request_keyframe"}"#).unwrap();
@@ -1204,6 +1232,36 @@ mod tests {
             desktop.hardware_codecs,
             [VideoCodec::H264, VideoCodec::H265]
         );
+    }
+    #[test]
+    fn rumble_updates_are_bounded_and_declared_by_the_client() {
+        let rumble = |pad, duration_ms| Update::Rumble {
+            pad,
+            low: u16::MAX,
+            high: 0,
+            duration_ms,
+        };
+        assert!(rumble(MAX_GAMEPADS - 1, MAX_RUMBLE_MS).validate().is_ok());
+        assert!(rumble(MAX_GAMEPADS, 100).validate().is_err());
+        assert!(rumble(0, MAX_RUMBLE_MS + 1).validate().is_err());
+        let json = serde_json::to_string(&rumble(1, 250)).unwrap();
+        assert!(json.contains(r#""type":"rumble""#), "{json}");
+        assert!(matches!(
+            serde_json::from_str::<Update>(&json).unwrap(),
+            Update::Rumble {
+                pad: 1,
+                duration_ms: 250,
+                ..
+            }
+        ));
+        // Clients from before rumble never declare it; hosts ignore the
+        // field if they predate it.
+        let features: Event =
+            serde_json::from_str(r#"{"type":"client_features","keyframe_requests":true}"#).unwrap();
+        assert!(matches!(
+            features,
+            Event::ClientFeatures { rumble: false, .. }
+        ));
     }
     #[test]
     fn side_mouse_buttons_are_valid_and_negotiated() {

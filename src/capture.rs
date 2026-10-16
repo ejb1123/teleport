@@ -646,6 +646,12 @@ impl Capture {
         self.gamepads.destroy_all();
     }
 
+    /// The client plays rumble: pads created from now on in this session
+    /// offer force feedback, reported to `sender`.
+    pub fn enable_rumble(&mut self, sender: crate::gamepad::RumbleSender) {
+        self.gamepads.enable_rumble(sender);
+    }
+
     /// Whether `Gamepad*` events can be backed by virtual pads.
     pub fn gamepads_available(&self) -> bool {
         self.gamepads.available()

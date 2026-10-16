@@ -441,8 +441,8 @@ What is on `main`/this branch, from README, docs and code:
   - Disconnect with Ctrl+Alt+Q; hotkeys are fixed.
   - Mouse buttons left, middle, right and (since 2026-10-16, G14)
     back/forward. Precise wheel deltas are forwarded.
-  - Gamepads: SDL to uinput Xbox 360, up to 4. No rumble, motion, touchpad or
-    other pad types.
+  - Gamepads: SDL to uinput Xbox 360, up to 4, with rumble (since 2026-10-16,
+    G12). No motion, touchpad or other pad types.
   - Local cursor on X11 hosts only; on Wayland the cursor stays in the video.
 - **Audio:** desktop output only (an explicit `.monitor`). Opus stereo 128
   kbps with 10 ms frames, no in-band FEC (M8). The client queue is ≤100 ms,
@@ -505,7 +505,7 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Configurable hotkeys / ignore hotkey | Yes | Fixed chords | Missing | S |
 | Cmd/Ctrl swap | Yes | Fixed Cmd→Super | Missing | S |
 | Gamepad (Xbox 360) | Yes (Windows host) | Yes (Linux host, 4 pads) | Parity | |
-| Rumble | Yes | No | **Missing** | |
+| Rumble | Yes | Yes (2026-10-16) | Parity | G12 |
 | DS4 / DualSense emulation, touchpad, motion, haptics | Yes (Windows host) | No | Missing | |
 | Pad remapping UI | Yes | SDL database only | Missing | Low |
 | Pen / tablet | Warp | No | Missing | Low for gamers |
@@ -783,6 +783,12 @@ refresh. Effort M.**
 - **Files:** `src/capture.rs`, `src/client.rs`, `src/protocol.rs`.
 
 **G12. Rumble / force feedback. Effort S–M.**
+
+- **Status (2026-10-16): implemented** as below (docs/gamepad.md, review
+  tracker R4), gated on `ClientFeatures.rumble` instead of a `Desktop`
+  field: the client declares it, and only then do new pads offer
+  `FF_RUMBLE`. Verified with real uinput pads (`EVIOCSFF`/`EV_FF`, and SDL
+  rumbling the virtual pad); not with a physical controller.
 
 - **Why:** Parsec's Xbox 360 emulation includes vibration (GP). Teleport has
   none (docs/gamepad.md). Rumble is the most noticeable missing pad feature.

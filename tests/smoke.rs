@@ -262,6 +262,12 @@ fn test_host_advertises_and_accepts_gamepad_events() {
         "gamepad smoke client failed: {stdout} {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // The client declared rumble; the test host answers the press with one
+    // over the updates track (real pads: gamepad::tests::*rumble*).
+    assert!(
+        stdout.contains("host rumble pad=0"),
+        "no rumble update: {stdout}"
+    );
     assert!(host.0.try_wait().unwrap().is_none(), "host exited");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

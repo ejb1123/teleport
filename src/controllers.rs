@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 const AXES: usize = GAMEPAD_AXES as usize;
 
 struct Slot<C> {
-    _handle: C,
+    handle: C,
     instance: u32,
     name: String,
     announced: bool,
@@ -70,7 +70,7 @@ impl<C> Pads<C> {
         }
         let index = self.slots.iter().position(Option::is_none)?;
         self.slots[index] = Some(Slot {
-            _handle: handle,
+            handle,
             instance,
             name: wire_name(name),
             announced: false,
@@ -165,6 +165,15 @@ impl<C> Pads<C> {
     pub fn len(&self) -> usize {
         self.slots.iter().flatten().count()
     }
+
+    /// The controller behind the host's pad `pad`, once the host knows it.
+    pub fn handle_mut(&mut self, pad: u8) -> Option<&mut C> {
+        self.slots
+            .get_mut(usize::from(pad))?
+            .as_mut()
+            .filter(|slot| slot.announced)
+            .map(|slot| &mut slot.handle)
+    }
 }
 
 /// Queue a lossy axis value; `false` when the queue was full and it must be
@@ -247,6 +256,16 @@ impl Controllers {
                     "Only {MAX_GAMEPADS} gamepads are forwarded; ignoring {name}"
                 ));
             }
+        }
+    }
+
+    /// Play the host's `Update::Rumble` for pad `pad` on its controller.
+    /// Controllers without motors ignore it.
+    pub fn rumble(&mut self, pad: u8, low: u16, high: u16, duration_ms: u32) {
+        if let Some(controller) = self.pads.handle_mut(pad)
+            && let Err(error) = controller.set_rumble(low, high, duration_ms)
+        {
+            tracing::debug!(pad, %error, "controller cannot rumble");
         }
     }
 
@@ -336,6 +355,22 @@ impl Controllers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rumble_finds_the_controller_of_an_announced_pad() {
+        let mut pads = Pads::<&str>::default();
+        assert_eq!(pads.attach(7, "One", [0; AXES], "first"), Some(0));
+        assert_eq!(pads.attach(9, "Two", [0; AXES], "second"), Some(1));
+        assert!(
+            pads.handle_mut(0).is_none(),
+            "the host does not know it yet"
+        );
+        pads.announce();
+        assert_eq!(pads.handle_mut(1).copied(), Some("second"));
+        assert!(pads.handle_mut(2).is_none() && pads.handle_mut(200).is_none());
+        pads.detach(7);
+        assert!(pads.handle_mut(0).is_none(), "unplugged");
+    }
 
     #[test]
     fn slots_announce_coalesce_and_retry_axes() {

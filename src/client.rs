@@ -1273,6 +1273,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 keyframe_requests: true,
                 pointer_datagrams,
                 local_cursor,
+                // Played on the local controller (headless runs log it).
+                rumble: desktop.gamepads,
             },
         )?;
     }
@@ -1386,6 +1388,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         tracing::info!("remote cursor {}x{}", image.width, image.height)
                     }
                     Update::Cursor { cursor: None } => tracing::info!("remote cursor hidden"),
+                    Update::Rumble {
+                        pad,
+                        low,
+                        high,
+                        duration_ms,
+                    } => tracing::info!(pad, low, high, duration_ms, "host rumble"),
                     _ => (),
                 }
             }
@@ -1876,6 +1884,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     notice = text.chars().take(160).collect();
                 }
                 Update::Cursor { cursor } => remote_cursor.set_shape(cursor.as_ref()),
+                Update::Rumble {
+                    pad,
+                    low,
+                    high,
+                    duration_ms,
+                } => controllers.rumble(pad, low, high, duration_ms),
                 _ => (),
             }
         }

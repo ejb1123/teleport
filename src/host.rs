@@ -758,6 +758,8 @@ async fn run_session(
     // video-settings rate limit allows, coalescing bursts into the newest.
     let mut client_display: Option<protocol::ClientDisplay> = None;
     let mut display_pending = false;
+    // Force feedback from the virtual pads, once the client plays rumble.
+    let mut rumble: Option<tokio::sync::mpsc::UnboundedReceiver<crate::gamepad::Rumble>> = None;
     loop {
         if portal_lost {
             portal_lost = false;
@@ -842,6 +844,15 @@ async fn run_session(
         tokio::select! {
             result = crate::ssh_agent::closed(&mut ssh_agent) => return result,
             result = &mut incoming.0 => return result.context("input task failed")?,
+            effect = async {
+                match rumble.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => match effect {
+                Some(crate::gamepad::Rumble { pad, motors }) => publish_update(&mut updates, Update::Rumble { pad, low: motors.low, high: motors.high, duration_ms: motors.duration_ms })?,
+                None => rumble = None,
+            },
             error = session.closed() => anyhow::bail!("{error}"),
             shape = async {
                 match cursor_watcher.as_mut() {
@@ -957,7 +968,12 @@ async fn run_session(
                     // Auxiliary streams currently use fixed bitrate. Their
                     // congestion must never adapt the independent primary.
                     Event::MonitorFeedback { .. } => {}
-                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor } => {
+                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble } => {
+                        if plays_rumble && rumble.is_none() {
+                            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                            capture.enable_rumble(sender);
+                            rumble = Some(receiver);
+                        }
                         if pointer_datagrams && pointer_task.is_none() {
                             pointer_task = Some(AbortOnDrop(tokio::spawn(receive_pointer(controls.clone(), pointer_sender.clone(), last_motion.clone()))));
                         }

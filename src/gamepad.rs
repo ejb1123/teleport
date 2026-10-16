@@ -4,17 +4,38 @@
 //! every controller to the Xbox layout. Each pad is created as a
 //! `045e:028e` "X-Box 360 pad" with the same evdev codes and ranges as the
 //! kernel `xpad` driver, so SDL, Steam Input and games that read evdev all
-//! recognise it without custom mappings. Force feedback is not forwarded.
+//! recognise it without custom mappings.
+//!
+//! When the client plays rumble (`ClientFeatures::rumble`), pads also offer
+//! `FF_RUMBLE` like `xpad`. A thread per pad answers the kernel's effect
+//! uploads and erases on the uinput fd (a game blocks in `EVIOCSFF` until
+//! then) and turns played effects into [`Rumble`] updates for the client.
 
-use crate::protocol::{Event, GAMEPAD_AXES, MAX_GAMEPADS};
+use crate::protocol::{Event, GAMEPAD_AXES, MAX_GAMEPADS, MAX_RUMBLE_MS};
 use anyhow::{Context, Result, ensure};
-use std::{collections::BTreeSet, os::fd::AsRawFd};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    os::fd::AsRawFd,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 const UINPUT_PATH: &str = "/dev/uinput";
 
 const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
 const EV_ABS: u16 = 0x03;
+const EV_FF: u16 = 0x15;
+/// Kernel requests read from the uinput fd: force-feedback upload and erase.
+const EV_UINPUT: u16 = 0x0101;
+const UI_FF_UPLOAD: u16 = 1;
+const UI_FF_ERASE: u16 = 2;
+const FF_RUMBLE: u16 = 0x50;
+/// Effects a game may keep uploaded at once.
+const FF_EFFECTS: u32 = 16;
 const SYN_REPORT: u16 = 0;
 
 const BTN_A: u16 = 0x130;
@@ -170,6 +191,106 @@ impl PadState {
     }
 }
 
+/// What a pad's motors should do now, from the effects a game plays.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Motors {
+    /// Strong (low-frequency) motor: `ff_rumble_effect.strong_magnitude`,
+    /// SDL's `low_frequency_rumble`.
+    pub low: u16,
+    /// Weak (high-frequency) motor.
+    pub high: u16,
+    /// How long to play unless updated; 0 when stopped.
+    pub duration_ms: u32,
+}
+
+/// Rumble for the client's pad `pad` (`Update::Rumble`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rumble {
+    pub pad: u8,
+    pub motors: Motors,
+}
+
+pub type RumbleSender = tokio::sync::mpsc::UnboundedSender<Rumble>;
+
+/// How often an effect without an end is re-sent: one update lasts at most
+/// [`MAX_RUMBLE_MS`].
+const RUMBLE_REFRESH: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug)]
+struct Effect {
+    strong: u16,
+    weak: u16,
+    /// `ff_replay.length`; 0 plays until stopped.
+    length_ms: u16,
+}
+
+/// One pad's uploaded rumble effects and which of them play. Playing
+/// effects add up, saturating, as in the kernel's memless devices.
+#[derive(Default, Debug)]
+pub struct Effects {
+    uploaded: BTreeMap<i16, Effect>,
+    /// Playing effects and when they end (`None`: until stopped).
+    playing: BTreeMap<i16, Option<Instant>>,
+}
+
+impl Effects {
+    /// A new or replaced effect; a replaced one keeps playing with its new
+    /// strength.
+    pub fn upload(&mut self, id: i16, strong: u16, weak: u16, length_ms: u16) {
+        self.uploaded.insert(
+            id,
+            Effect {
+                strong,
+                weak,
+                length_ms,
+            },
+        );
+    }
+
+    pub fn erase(&mut self, id: i16) {
+        self.uploaded.remove(&id);
+        self.playing.remove(&id);
+    }
+
+    /// `EV_FF` for effect `id`: play it `count` times, or stop it on 0.
+    pub fn play(&mut self, id: i16, count: i32, now: Instant) {
+        match self.uploaded.get(&id) {
+            Some(effect) if count > 0 => {
+                let end = (effect.length_ms > 0).then(|| {
+                    let repeats = count.min(1000) as u64;
+                    now + Duration::from_millis(u64::from(effect.length_ms) * repeats)
+                });
+                self.playing.insert(id, end);
+            }
+            _ => {
+                self.playing.remove(&id);
+            }
+        }
+    }
+
+    /// The motors at `now`; finished effects are dropped.
+    pub fn motors(&mut self, now: Instant) -> Motors {
+        self.playing
+            .retain(|_, end| end.is_none_or(|end| end > now));
+        let mut motors = Motors::default();
+        for (id, end) in &self.playing {
+            let Some(effect) = self.uploaded.get(id) else {
+                continue;
+            };
+            motors.low = motors.low.saturating_add(effect.strong);
+            motors.high = motors.high.saturating_add(effect.weak);
+            let left = end.map_or(MAX_RUMBLE_MS, |end| {
+                (end.duration_since(now).as_millis() as u32).clamp(1, MAX_RUMBLE_MS)
+            });
+            motors.duration_ms = motors.duration_ms.max(left);
+        }
+        if motors.low == 0 && motors.high == 0 {
+            motors.duration_ms = 0;
+        }
+        motors
+    }
+}
+
 /// Whether this process can create uinput devices.
 pub fn uinput_writable() -> bool {
     let path = std::ffi::CString::new(UINPUT_PATH).expect("static path");
@@ -180,7 +301,6 @@ const fn ioc(direction: u64, number: u64, size: usize) -> u64 {
     (direction << 30) | ((size as u64) << 16) | ((b'U' as u64) << 8) | number
 }
 const IOC_WRITE: u64 = 1;
-#[cfg(test)]
 const IOC_READ: u64 = 2;
 const UI_DEV_CREATE: u64 = ioc(0, 1, 0);
 const UI_DEV_DESTROY: u64 = ioc(0, 2, 0);
@@ -189,6 +309,19 @@ const UI_ABS_SETUP: u64 = ioc(IOC_WRITE, 4, size_of::<libc::uinput_abs_setup>())
 const UI_SET_EVBIT: u64 = ioc(IOC_WRITE, 100, size_of::<libc::c_int>());
 const UI_SET_KEYBIT: u64 = ioc(IOC_WRITE, 101, size_of::<libc::c_int>());
 const UI_SET_ABSBIT: u64 = ioc(IOC_WRITE, 103, size_of::<libc::c_int>());
+const UI_SET_FFBIT: u64 = ioc(IOC_WRITE, 107, size_of::<libc::c_int>());
+const UI_BEGIN_FF_UPLOAD: u64 = ioc(
+    IOC_READ | IOC_WRITE,
+    200,
+    size_of::<libc::uinput_ff_upload>(),
+);
+const UI_END_FF_UPLOAD: u64 = ioc(IOC_WRITE, 201, size_of::<libc::uinput_ff_upload>());
+const UI_BEGIN_FF_ERASE: u64 = ioc(
+    IOC_READ | IOC_WRITE,
+    202,
+    size_of::<libc::uinput_ff_erase>(),
+);
+const UI_END_FF_ERASE: u64 = ioc(IOC_WRITE, 203, size_of::<libc::uinput_ff_erase>());
 #[cfg(test)]
 const fn ui_get_sysname(len: usize) -> u64 {
     ioc(IOC_READ, 44, len)
@@ -200,9 +333,12 @@ pub struct UinputPad {
 }
 
 impl UinputPad {
-    pub fn create(slot: u8) -> Result<Self> {
+    /// `force_feedback` offers `FF_RUMBLE`; the owner must then serve the
+    /// kernel's requests ([`serve_force_feedback`]).
+    pub fn create(slot: u8, force_feedback: bool) -> Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
         let file = std::fs::OpenOptions::new()
+            .read(true)
             .write(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(UINPUT_PATH)
@@ -237,6 +373,11 @@ impl UinputPad {
             control(UI_ABS_SETUP, pointer as libc::c_ulong, "axis setup")?;
         }
         let mut setup: libc::uinput_setup = unsafe { std::mem::zeroed() };
+        if force_feedback {
+            control(UI_SET_EVBIT, EV_FF.into(), "enable force feedback")?;
+            control(UI_SET_FFBIT, FF_RUMBLE.into(), "enable rumble")?;
+            setup.ff_effects_max = FF_EFFECTS;
+        }
         setup.id.bustype = 0x03; // BUS_USB
         setup.id.vendor = 0x045e;
         setup.id.product = 0x028e;
@@ -302,10 +443,158 @@ impl Drop for UinputPad {
     }
 }
 
+/// Answer one `UI_FF_UPLOAD` request: keep rumble effects, refuse others
+/// (the kernel already refuses types the pad does not offer).
+fn answer_upload(fd: libc::c_int, request_id: u32, effects: &mut Effects) -> Result<()> {
+    let mut upload: libc::uinput_ff_upload = unsafe { std::mem::zeroed() };
+    upload.request_id = request_id;
+    let begin = unsafe { libc::ioctl(fd, UI_BEGIN_FF_UPLOAD as _, &mut upload) };
+    ensure!(
+        begin >= 0,
+        "uinput begin upload: {}",
+        std::io::Error::last_os_error()
+    );
+    let effect = upload.effect;
+    upload.retval = if effect.type_ == FF_RUMBLE {
+        let rumble: libc::ff_rumble_effect =
+            unsafe { std::ptr::read_unaligned(effect.u.as_ptr().cast()) };
+        effects.upload(
+            effect.id,
+            rumble.strong_magnitude,
+            rumble.weak_magnitude,
+            effect.replay.length,
+        );
+        0
+    } else {
+        -libc::EINVAL
+    };
+    let end = unsafe { libc::ioctl(fd, UI_END_FF_UPLOAD as _, &upload) };
+    ensure!(
+        end >= 0,
+        "uinput end upload: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(())
+}
+
+fn answer_erase(fd: libc::c_int, request_id: u32, effects: &mut Effects) -> Result<()> {
+    let mut erase: libc::uinput_ff_erase = unsafe { std::mem::zeroed() };
+    erase.request_id = request_id;
+    let begin = unsafe { libc::ioctl(fd, UI_BEGIN_FF_ERASE as _, &mut erase) };
+    ensure!(
+        begin >= 0,
+        "uinput begin erase: {}",
+        std::io::Error::last_os_error()
+    );
+    effects.erase(erase.effect_id as i16);
+    erase.retval = 0;
+    let end = unsafe { libc::ioctl(fd, UI_END_FF_ERASE as _, &erase) };
+    ensure!(
+        end >= 0,
+        "uinput end erase: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(())
+}
+
+/// Serve force feedback for pad `pad` on its uinput fd until `stop` is set,
+/// the device goes away or the session's receiver is gone. Reports the
+/// motors whenever a game uploads, erases or plays an effect, when effects
+/// end, and every [`RUMBLE_REFRESH`] for effects without an end.
+fn serve_force_feedback(file: std::fs::File, pad: u8, sender: RumbleSender, stop: Arc<AtomicBool>) {
+    let fd = file.as_raw_fd();
+    let mut effects = Effects::default();
+    let mut sent = Motors::default();
+    let mut sent_at = Instant::now();
+    let size = size_of::<libc::input_event>();
+    let mut buffer = vec![0u8; size * 32];
+    while !stop.load(Ordering::Relaxed) {
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Also wakes every 50 ms to end effects and to notice `stop`.
+        let ready = unsafe { libc::poll(&mut poll, 1, 50) };
+        let mut requested = false;
+        if ready > 0 {
+            if poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                break;
+            }
+            let read = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
+            if read < 0 {
+                let error = std::io::Error::last_os_error();
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) {
+                    continue;
+                }
+                tracing::warn!(pad, %error, "virtual gamepad force feedback stopped");
+                break;
+            }
+            for chunk in buffer[..read as usize].chunks_exact(size) {
+                let event: libc::input_event =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast()) };
+                let answered = match (event.type_, event.code) {
+                    (EV_UINPUT, UI_FF_UPLOAD) => {
+                        answer_upload(fd, event.value as u32, &mut effects)
+                    }
+                    (EV_UINPUT, UI_FF_ERASE) => answer_erase(fd, event.value as u32, &mut effects),
+                    (EV_FF, code) => {
+                        effects.play(code as i16, event.value, Instant::now());
+                        Ok(())
+                    }
+                    _ => continue,
+                };
+                requested = true;
+                if let Err(error) = answered {
+                    tracing::warn!(
+                        pad,
+                        error = format!("{error:#}"),
+                        "force feedback request failed"
+                    );
+                }
+            }
+        } else if ready < 0
+            && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+        {
+            break;
+        }
+        let now = Instant::now();
+        let motors = effects.motors(now);
+        let changed = (motors.low, motors.high) != (sent.low, sent.high);
+        let refresh = motors.duration_ms == MAX_RUMBLE_MS && now - sent_at >= RUMBLE_REFRESH;
+        if changed || refresh || (requested && motors.duration_ms > 0) {
+            if sender.send(Rumble { pad, motors }).is_err() {
+                return;
+            }
+            (sent, sent_at) = (motors, now);
+        }
+    }
+    if sent.duration_ms > 0 {
+        let _ = sender.send(Rumble {
+            pad,
+            motors: Motors::default(),
+        });
+    }
+}
+
 struct Pad {
     state: PadState,
     /// `None` for the `--source test` backend: events are accepted and dropped.
     device: Option<UinputPad>,
+    /// Stops the pad's force-feedback thread, if it has one.
+    force_feedback: Option<Arc<AtomicBool>>,
+}
+
+impl Drop for Pad {
+    fn drop(&mut self) {
+        // The thread notices within 50 ms; the device itself is destroyed now.
+        if let Some(stop) = &self.force_feedback {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Pad {
@@ -322,6 +611,8 @@ pub struct Gamepads {
     pads: [Option<Pad>; MAX_GAMEPADS as usize],
     /// Create real uinput devices (false for `--source test`).
     virtual_devices: bool,
+    /// Set for a client that plays rumble: new pads offer force feedback.
+    rumble: Option<RumbleSender>,
 }
 
 impl Gamepads {
@@ -329,7 +620,14 @@ impl Gamepads {
         Self {
             pads: Default::default(),
             virtual_devices,
+            rumble: None,
         }
+    }
+
+    /// The client plays rumble (`ClientFeatures::rumble`); pads created
+    /// from now on in this session offer `FF_RUMBLE` and report to `sender`.
+    pub fn enable_rumble(&mut self, sender: RumbleSender) {
+        self.rumble = Some(sender);
     }
 
     /// Advertise `Desktop::gamepads` only if pads can actually be created.
@@ -353,14 +651,33 @@ impl Gamepads {
                     return existing.emit(&events);
                 }
                 let device = if self.virtual_devices {
-                    Some(UinputPad::create(pad)?)
+                    Some(UinputPad::create(pad, self.rumble.is_some())?)
                 } else {
                     None
                 };
-                tracing::info!(pad, controller = %name, virtual_device = device.is_some(), "gamepad connected");
+                let force_feedback = match (&device, &self.rumble) {
+                    (Some(device), Some(sender)) => {
+                        let stop = Arc::new(AtomicBool::new(false));
+                        let (file, sender, flag) =
+                            (device.file.try_clone()?, sender.clone(), stop.clone());
+                        std::thread::Builder::new()
+                            .name(format!("pad{pad}-rumble"))
+                            .spawn(move || serve_force_feedback(file, pad, sender, flag))?;
+                        Some(stop)
+                    }
+                    _ => None,
+                };
+                tracing::info!(
+                    pad,
+                    controller = %name,
+                    virtual_device = device.is_some(),
+                    rumble = self.rumble.is_some(),
+                    "gamepad connected"
+                );
                 self.pads[usize::from(pad)] = Some(Pad {
                     state: PadState::default(),
                     device,
+                    force_feedback,
                 });
             }
             Event::GamepadDisconnected { pad } => {
@@ -368,9 +685,24 @@ impl Gamepads {
                 tracing::info!(pad, existed = removed.is_some(), "gamepad disconnected");
             }
             Event::GamepadButton { pad, button, down } => {
-                if let Some(pad) = &mut self.pads[usize::from(pad)] {
-                    let events = pad.state.button(button, down);
-                    pad.emit(&events)?;
+                if let Some(state) = &mut self.pads[usize::from(pad)] {
+                    let events = state.state.button(button, down);
+                    state.emit(&events)?;
+                    // The test backend has no games: it answers each press
+                    // with a short rumble so the update path can be tested.
+                    if down
+                        && state.device.is_none()
+                        && let Some(sender) = &self.rumble
+                    {
+                        let _ = sender.send(Rumble {
+                            pad,
+                            motors: Motors {
+                                low: 0x4000,
+                                high: 0x8000,
+                                duration_ms: 100,
+                            },
+                        });
+                    }
                 }
             }
             Event::GamepadAxis { pad, axis, value } => {
@@ -401,6 +733,7 @@ impl Gamepads {
         self.neutralise();
         let count = self.connected();
         self.pads = Default::default();
+        self.rumble = None;
         if count > 0 {
             tracing::info!(count, "virtual gamepads removed");
         }
@@ -521,6 +854,83 @@ mod tests {
         assert_eq!(UI_SET_KEYBIT, 0x4004_5565);
         assert_eq!(UI_SET_ABSBIT, 0x4004_5567);
         assert_eq!(ui_get_sysname(64), 0x8040_552c);
+        assert_eq!(UI_SET_FFBIT, 0x4004_556b);
+        assert_eq!(UI_BEGIN_FF_UPLOAD, 0xc068_55c8);
+        assert_eq!(UI_END_FF_UPLOAD, 0x4068_55c9);
+        assert_eq!(UI_BEGIN_FF_ERASE, 0xc00c_55ca);
+        assert_eq!(UI_END_FF_ERASE, 0x400c_55cb);
+    }
+
+    #[test]
+    fn rumble_effects_add_up_end_and_stop() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let mut effects = Effects::default();
+        assert_eq!(effects.motors(start), Motors::default());
+        effects.upload(0, 0x8000, 0x1000, 300);
+        effects.upload(1, 0x9000, 0x2000, 0);
+        // Uploading alone plays nothing; playing an unknown id is ignored.
+        effects.play(7, 1, start);
+        assert_eq!(effects.motors(start), Motors::default());
+        effects.play(0, 1, start);
+        let motors = effects.motors(at(100));
+        assert_eq!(
+            (motors.low, motors.high, motors.duration_ms),
+            (0x8000, 0x1000, 200)
+        );
+        // A second effect without an end adds up (saturating) and lasts.
+        effects.play(1, 1, at(100));
+        let motors = effects.motors(at(100));
+        assert_eq!((motors.low, motors.high), (u16::MAX, 0x3000));
+        assert_eq!(motors.duration_ms, MAX_RUMBLE_MS);
+        // The timed one ends by itself; the endless one needs a stop.
+        assert_eq!(effects.motors(at(400)).low, 0x9000);
+        effects.play(1, 0, at(500));
+        assert_eq!(effects.motors(at(500)), Motors::default());
+        // Repeats multiply the length; erasing stops a playing effect.
+        effects.play(0, 3, at(1000));
+        assert_eq!(effects.motors(at(1000)).duration_ms, 900);
+        effects.erase(0);
+        assert_eq!(effects.motors(at(1000)), Motors::default());
+        effects.play(0, 1, at(1000));
+        assert_eq!(effects.motors(at(1000)), Motors::default(), "erased");
+    }
+
+    #[test]
+    fn test_backend_answers_presses_with_rumble_once_enabled() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut pads = Gamepads::new(false);
+        let press = Event::GamepadButton {
+            pad: 2,
+            button: 0,
+            down: true,
+        };
+        pads.input(&Event::GamepadConnected {
+            pad: 2,
+            name: "Pad".into(),
+        })
+        .unwrap();
+        pads.input(&press).unwrap();
+        assert!(
+            receiver.try_recv().is_err(),
+            "no rumble before the client asks"
+        );
+        pads.enable_rumble(sender);
+        pads.input(&press).unwrap();
+        let rumble = receiver.try_recv().unwrap();
+        assert_eq!(rumble.pad, 2);
+        assert!(rumble.motors.duration_ms > 0);
+        pads.destroy_all();
+        pads.input(&Event::GamepadConnected {
+            pad: 2,
+            name: "Pad".into(),
+        })
+        .unwrap();
+        pads.input(&press).unwrap();
+        assert!(
+            receiver.try_recv().is_err(),
+            "a new session starts without rumble"
+        );
     }
 
     /// Creates a real device, finds its evdev node and reads back a button,
@@ -742,5 +1152,193 @@ mod tests {
         for axis in [Axis::LeftX, Axis::RightY, Axis::TriggerLeft] {
             assert!(controller.axis(axis).abs() <= 1, "{axis:?} centred");
         }
+    }
+
+    /// The created pad's sysfs directory and its evdev node opened the way a
+    /// game opens it for force feedback (read and write).
+    fn open_evdev(pads: &Gamepads, pad: u8) -> (std::path::PathBuf, std::fs::File) {
+        let sysname = pads.pads[usize::from(pad)]
+            .as_ref()
+            .and_then(|pad| pad.device.as_ref())
+            .expect("a virtual pad")
+            .sysname()
+            .unwrap();
+        let sys = std::path::Path::new("/sys/devices/virtual/input").join(&sysname);
+        let node = std::fs::read_dir(&sys)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.starts_with("event"))
+            .expect("evdev node for the virtual pad");
+        let path = std::path::Path::new("/dev/input").join(&node);
+        for _ in 0..50 {
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+            {
+                return (sys, file);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("cannot open {} for reading and writing", path.display());
+    }
+
+    fn next_rumble(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Rumble>) -> Rumble {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(rumble) = receiver.try_recv() {
+                return rumble;
+            }
+            assert!(Instant::now() < deadline, "no rumble reported");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A game's view: upload a rumble effect with `EVIOCSFF` (which blocks
+    /// until the pad's thread answers the kernel), play it and stop it with
+    /// `EV_FF` writes, then erase it. Each step must reach the client side.
+    #[test]
+    #[ignore = "needs write access to /dev/uinput and read/write access to the created /dev/input/event* node"]
+    fn uinput_pad_rumble_reaches_the_client() {
+        use std::io::Write;
+        const EVIOCSFF: u64 =
+            (1 << 30) | ((size_of::<libc::ff_effect>() as u64) << 16) | ((b'E' as u64) << 8) | 0x80;
+        const EVIOCRMFF: u64 =
+            (1 << 30) | ((size_of::<libc::c_int>() as u64) << 16) | ((b'E' as u64) << 8) | 0x81;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut pads = Gamepads::new(true);
+        assert!(pads.available(), "/dev/uinput is not writable");
+        pads.enable_rumble(sender);
+        pads.input(&Event::GamepadConnected {
+            pad: 3,
+            name: "test".into(),
+        })
+        .unwrap();
+        let (sys, mut device) = open_evdev(&pads, 3);
+        // The capability bitmap is hex words, most significant first.
+        let ff = std::fs::read_to_string(sys.join("capabilities/ff")).unwrap();
+        let words: Vec<u64> = ff
+            .split_whitespace()
+            .rev()
+            .map(|word| u64::from_str_radix(word, 16).unwrap())
+            .collect();
+        let bit = usize::from(FF_RUMBLE);
+        assert!(
+            words
+                .get(bit / 64)
+                .is_some_and(|word| word >> (bit % 64) & 1 == 1),
+            "FF_RUMBLE missing: {ff}"
+        );
+        let mut effect: libc::ff_effect = unsafe { std::mem::zeroed() };
+        effect.type_ = FF_RUMBLE;
+        effect.id = -1;
+        effect.replay.length = 400;
+        unsafe {
+            std::ptr::write_unaligned(
+                effect.u.as_mut_ptr().cast(),
+                libc::ff_rumble_effect {
+                    strong_magnitude: 0x8000,
+                    weak_magnitude: 0x4000,
+                },
+            )
+        };
+        let fd = device.as_raw_fd();
+        let result = unsafe { libc::ioctl(fd, EVIOCSFF as _, &mut effect) };
+        assert!(result >= 0, "EVIOCSFF: {}", std::io::Error::last_os_error());
+        assert!(effect.id >= 0, "kernel assigned an effect id");
+        let play = |device: &mut std::fs::File, value: i32| {
+            let mut record: libc::input_event = unsafe { std::mem::zeroed() };
+            record.type_ = EV_FF;
+            record.code = effect.id as u16;
+            record.value = value;
+            device
+                .write_all(unsafe {
+                    std::slice::from_raw_parts(
+                        (&record as *const libc::input_event).cast::<u8>(),
+                        size_of::<libc::input_event>(),
+                    )
+                })
+                .unwrap();
+        };
+        play(&mut device, 1);
+        let rumble = next_rumble(&mut receiver);
+        assert_eq!(rumble.pad, 3);
+        assert_eq!((rumble.motors.low, rumble.motors.high), (0x8000, 0x4000));
+        assert!(
+            (300..=400).contains(&rumble.motors.duration_ms),
+            "{rumble:?}"
+        );
+        play(&mut device, 0);
+        assert_eq!(next_rumble(&mut receiver).motors, Motors::default());
+        let result = unsafe { libc::ioctl(fd, EVIOCRMFF as _, effect.id as libc::c_int) };
+        assert!(
+            result >= 0,
+            "EVIOCRMFF: {}",
+            std::io::Error::last_os_error()
+        );
+        // A pad created without rumble offers no force feedback.
+        pads.destroy_all();
+        pads.input(&Event::GamepadConnected {
+            pad: 0,
+            name: "test".into(),
+        })
+        .unwrap();
+        let (sys, _) = open_evdev(&pads, 0);
+        let ff = std::fs::read_to_string(sys.join("capabilities/ff")).unwrap();
+        assert!(ff.trim().chars().all(|c| c == '0' || c == ' '), "{ff}");
+        pads.destroy_all();
+    }
+
+    /// What a game using SDL does on the host, and what the client then does
+    /// with the physical pad: `SDL_GameControllerRumble` on the virtual pad
+    /// must come out as the same motor strengths.
+    #[test]
+    #[ignore = "needs write access to /dev/uinput, read/write access to /dev/input/event* and SDL joystick hotplug (udev)"]
+    fn sdl_rumble_on_the_virtual_pad_reaches_the_client() {
+        let sdl = sdl2::init().unwrap();
+        let subsystem = sdl.game_controller().unwrap();
+        let mut pump = sdl.event_pump().unwrap();
+        for _ in pump.poll_iter() {}
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut pads = Gamepads::new(true);
+        pads.enable_rumble(sender);
+        pads.input(&Event::GamepadConnected {
+            pad: 0,
+            name: "test".into(),
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut controller = None;
+        while controller.is_none() && Instant::now() < deadline {
+            for event in pump.poll_iter() {
+                if let sdl2::event::Event::ControllerDeviceAdded { which, .. } = event {
+                    let candidate = subsystem.open(which).unwrap();
+                    if candidate.name().contains("Teleport") || candidate.name().contains("360") {
+                        controller = Some(candidate);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut controller = controller.expect("SDL did not report the virtual pad");
+        assert!(controller.has_rumble(), "SDL sees no rumble on the pad");
+        controller.set_rumble(0x1234, 0xabcd, 500).unwrap();
+        let rumble = next_rumble(&mut receiver);
+        assert_eq!((rumble.motors.low, rumble.motors.high), (0x1234, 0xabcd));
+        assert!(rumble.motors.duration_ms > 0);
+        controller.set_rumble(0, 0, 0).unwrap();
+        // SDL stops by playing a zero effect or stopping it; either way the
+        // motors go quiet.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let rumble = next_rumble(&mut receiver);
+            if (rumble.motors.low, rumble.motors.high) == (0, 0) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "rumble never stopped");
+        }
+        drop(controller);
+        pads.destroy_all();
     }
 }
