@@ -50,9 +50,35 @@ shader converts and draws them under SDL's overlays (`src/cuda_gl.c`). Stats
 disables it; a presentation error switches the process to the CPU path and
 reconnects. Offscreen measurement on an RTX 3080: the GPU→CPU→GPU transfer
 alone drops from 0.67 to 0.22 ms at 1080p and 2.78 to 0.27 ms at 4K, before
-counting the removed conversion and copies. Other decoders (VA-API, Quick Sync,
-software) and macOS still download frames: everything else below applies to
-them. Encoding likewise receives
+counting the removed conversion and copies.
+
+**Zero-copy on Linux with VA-API (Intel/AMD, 2026-10-16):** when the session
+window's GL context is EGL (not GLX) on a DRM device, the client opens the
+VA-API decoder on that EGL display's own render node (`vaapi@/dev/dri/renderDN`),
+exports each decoded surface as DMA-BUFs (`av_hwframe_map` to DRM PRIME, separate
+R8 + GR88 layers), imports them as EGLImages with explicit format modifiers and
+draws them with the same BT.709 shader (`src/vaapi_egl.c`, shared GL code in
+`src/gl_nv12.c`). Stats shows `VA-API DMA-BUF / EGLImage zero-copy`. The same
+safety rules apply: `TELEPORT_ZERO_COPY=0` opts out, a presentation error
+switches the process to the CPU path and reconnects, and GL state is restored.
+SDL contexts are EGL on native Wayland. On X11 (the default whenever `DISPLAY`
+is set) SDL uses GLX, so this path stays off unless `TELEPORT_X11_EGL=1` makes
+SDL use EGL there (`SDL_VIDEO_X11_FORCE_EGL`, mapped by sdl2-compat to SDL3's
+`SDL_VIDEO_FORCE_EGL`); that is opt-in because it also changes the context type
+for every other X11 user, including the NVIDIA path. If the VA-API decoder for
+the window's GPU is unavailable, decoding falls back to the normal selection
+with CPU NV12 presentation.
+
+Measured offscreen on the Intel UHD 630 (EGL device platform, FBO readback,
+machine under load): export + import cost ~0.03 + ~0.045 ms of CPU per frame;
+import + draw + `glFinish` is 1.9–2.5 ms at 1080p and 3.6–9.5 ms at 4K, versus
+6.5–13 ms (1080p) and 27–53 ms (4K) for the VA-API download alone that the CPU
+path pays before its own conversion and upload. Windowed check: a weston
+headless compositor on the Intel GPU (Mesa EGL) showed the host's solid
+#3366cc desktop as (49, 102, 201) under SDL's toolbar.
+
+Quick Sync, software decoding and macOS still download frames: everything
+else below applies to them. Encoding likewise receives
 CPU-addressable captured pixels and uploads when the hardware API requires it.
 Direct codecs provide explicit buffer ownership and timing; they do not prove
 that the reported Intel UHD 630 black flashes are fixed.
@@ -60,7 +86,7 @@ that the reported Intel UHD 630 black flashes are fixed.
 The existing experimental macOS native-surface path
 (`TELEPORT_MAC_GPU_VIDEO=1`) currently requires `TELEPORT_VIDEO_BACKEND=gstreamer`.
 The direct backend rejects that combination rather than pretending to provide
-native surfaces. FFmpeg-to-Metal and Linux DMA-BUF presentation remain future work.
+native surfaces. FFmpeg-to-Metal presentation remains future work.
 
 Verified here: software H.264/H.265, Main10 round-trip and SDR rejection,
 NVENC and Intel VA-API H.264/H.265 feeding CUDA and Intel VA-API decoders, bitrate reopen/reset,
@@ -76,4 +102,6 @@ nix develop --command cargo test --bin teleport ffmpeg -- --include-ignored
 nix develop --command env TELEPORT_TEST_HARDWARE=1 cargo test --bin teleport direct_hardware -- --ignored --nocapture
 nix develop --command env TELEPORT_TEST_HARDWARE=1 TELEPORT_TEST_ENCODER=vaapi cargo test --bin teleport direct_hardware -- --ignored --nocapture
 nix develop --command cargo test --test ffmpeg_interop -- --ignored --nocapture
+# Zero-copy presentation vs CPU decode (CUDA and VA-API; offscreen EGL):
+nix develop --command env TELEPORT_TEST_HARDWARE=1 LD_LIBRARY_PATH=/run/opengl-driver/lib cargo test --bin teleport zero_copy -- --ignored --nocapture
 ```

@@ -807,6 +807,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     };
     #[cfg(not(target_os = "linux"))]
     let zero_copy: Option<()> = None;
+    #[cfg(target_os = "linux")]
+    tracing::info!(
+        zero_copy = zero_copy.is_some(),
+        decoder = zero_copy.as_ref().map(ZeroCopy::decoder_name),
+        "GPU-resident video presentation"
+    );
+    #[cfg(not(target_os = "linux"))]
     tracing::info!(
         zero_copy = zero_copy.is_some(),
         "GPU-resident video presentation"
@@ -823,7 +830,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     } else if zero_copy.is_some() {
         #[cfg(target_os = "linux")]
         {
-            media::decoder_with_gpu_frames(stream_stats.clone(), format)?
+            let decoder = zero_copy.as_ref().map(ZeroCopy::decoder_name);
+            media::decoder_with_gpu_frames(
+                stream_stats.clone(),
+                format,
+                decoder.as_deref().unwrap_or("cuda"),
+            )?
         }
         #[cfg(not(target_os = "linux"))]
         unreachable!()
@@ -1974,7 +1986,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     if native_surface {
                         "VideoToolbox surface / Metal (no video CPU copy)"
                     } else if gpu_frame.is_some() {
-                        "CUDA surface / OpenGL zero-copy (no video CPU copy)"
+                        #[cfg(target_os = "linux")]
+                        {
+                            zero_copy.as_ref().map_or("", ZeroCopy::pixel_path)
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        ""
                     } else if desktop.dynamic_range == protocol::DynamicRange::Hdr10 {
                         "P010 CPU copy / Metal upload"
                     } else if prefer_nv12 {
@@ -2581,12 +2598,17 @@ fn check_network(network: &mut Network, runtime: &Runtime) -> Result<()> {
 #[cfg(target_os = "linux")]
 static ZERO_COPY_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Zero-copy CUDA→GL presenter bound to the session window's GL context.
+/// Zero-copy presenter bound to the session window's GL context: CUDA→GL on
+/// an NVIDIA context, or VA-API dma-buf→EGLImage on an EGL context (Wayland,
+/// or X11 with `TELEPORT_X11_EGL=1`), with the VA-API decoder opened on that
+/// EGL display's own render node. GLX contexts never get the VA-API path.
 /// Other windows (monitor windows) create their own renderer contexts, so
 /// the session context is made current explicitly before every GL use.
 #[cfg(target_os = "linux")]
 struct ZeroCopy {
-    presenter: Option<crate::ffmpeg::CudaGl>,
+    presenter: Option<crate::ffmpeg::GlPresenter>,
+    decoder: String,
+    interop: crate::ffmpeg::GpuInterop,
     window: *mut sdl2::sys::SDL_Window,
     context: sdl2::sys::SDL_GLContext,
 }
@@ -2600,12 +2622,33 @@ impl ZeroCopy {
         if context.is_null() {
             return None;
         }
-        let presenter = crate::ffmpeg::CudaGl::new(sdl2::sys::SDL_GL_GetProcAddress)?;
+        let get = sdl2::sys::SDL_GL_GetProcAddress;
+        let presenter = crate::ffmpeg::GlPresenter::cuda(get)
+            .or_else(|| crate::ffmpeg::GlPresenter::vaapi(get))?;
         Some(Self {
+            decoder: presenter.decoder_name(),
+            interop: presenter.interop(),
             presenter: Some(presenter),
             window: canvas.window().raw(),
             context,
         })
+    }
+
+    /// The decoder whose frames this presenter draws ("cuda" or
+    /// "vaapi@<render node>").
+    fn decoder_name(&self) -> String {
+        self.decoder.clone()
+    }
+
+    fn pixel_path(&self) -> &'static str {
+        match self.interop {
+            crate::ffmpeg::GpuInterop::Cuda => {
+                "CUDA surface / OpenGL zero-copy (no video CPU copy)"
+            }
+            crate::ffmpeg::GpuInterop::Vaapi => {
+                "VA-API DMA-BUF / EGLImage zero-copy (no video CPU copy)"
+            }
+        }
     }
 
     /// Draw `frame` at `rect` (logical pixels), after SDL has flushed what it
