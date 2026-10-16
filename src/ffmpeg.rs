@@ -976,6 +976,77 @@ mod tests {
         Ok(())
     }
 
+    /// Client decode capacity at high rates: 2560x1440 NVENC H.264 of moving
+    /// content at 180 FPS (auto bitrate, one group), decoded as fast as
+    /// possible by CUDA into CPU NV12 (headless and CPU presentation) and
+    /// into GPU frames (zero-copy presentation). Prints frames per second
+    /// and per-frame times; 180 FPS needs under 5.6 ms per frame.
+    #[test]
+    #[ignore = "benchmark; requires NVENC and CUDA decoding"]
+    fn high_rate_decode_benchmark() -> Result<()> {
+        if std::env::var("TELEPORT_TEST_HARDWARE").as_deref() != Ok("1") {
+            eprintln!("SKIP: set TELEPORT_TEST_HARDWARE=1 on a machine with NVENC");
+            return Ok(());
+        }
+        let (width, height, fps, frames) = (2560_usize, 1440_usize, 180, 360);
+        let config = Config {
+            name: "h264_nvenc".into(),
+            width: width as u32,
+            height: height as u32,
+            fps,
+            kbps: crate::protocol::auto_bitrate(width as u32, height as u32, fps),
+            gop: frames as u32,
+            ..software_config(false)
+        };
+        let mut encoder = Codec::new(config.clone())?;
+        let mut packets = Vec::new();
+        let mut raw = vec![128_u8; width * height * 3 / 2];
+        for index in 0..frames {
+            // Diagonal bands scrolling 8 px a frame, like a window drag.
+            for y in 0..height {
+                for (x, pixel) in raw[y * width..][..width].iter_mut().enumerate() {
+                    *pixel = (((x + y + index * 8) / 4) as u8) ^ ((y / 16) as u8);
+                }
+            }
+            encoder.submit(&raw, index as u64 + 1)?;
+            while let Some(packet) = encoder.receive()? {
+                packets.push(packet.bytes);
+            }
+        }
+        let bytes: usize = packets.iter().map(Vec::len).sum();
+        eprintln!(
+            "BENCH encoded {} frames, {:.1} Mbps at {fps} FPS",
+            packets.len(),
+            bytes as f64 * 8.0 * f64::from(fps) / packets.len() as f64 / 1e6
+        );
+        for (output, label) in [(1, "CUDA -> CPU NV12"), (3, "CUDA -> GPU frame")] {
+            let mut decoder = Codec::new(Config {
+                encoder: false,
+                name: "cuda".into(),
+                output,
+                ..config.clone()
+            })?;
+            let mut times = Vec::new();
+            let started = std::time::Instant::now();
+            for (index, packet) in packets.iter().enumerate() {
+                let start = std::time::Instant::now();
+                decoder.submit(packet, index as u64 + 1)?;
+                while decoder.receive()?.is_some() {}
+                times.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            let total = started.elapsed().as_secs_f64();
+            times.sort_by(f64::total_cmp);
+            eprintln!(
+                "BENCH decode {label} {width}x{height}: {:.0} frames/s, mean {:.2} ms, p95 {:.2} ms, max {:.2} ms",
+                times.len() as f64 / total,
+                times.iter().sum::<f64>() / times.len() as f64,
+                times[times.len() * 95 / 100],
+                times[times.len() - 1],
+            );
+        }
+        Ok(())
+    }
+
     /// Host zero-copy capture: an RGBA DMA-BUF exported by the GPU is
     /// scaled/cropped and converted on that GPU straight into NVENC's CUDA
     /// frames or VA-API surfaces; a CPU decode must show the source colours.
