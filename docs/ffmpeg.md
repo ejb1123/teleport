@@ -4,7 +4,7 @@ The default video backend calls libavcodec, libavutil and libswscale directly
 through an opaque C ownership boundary. H.264 and H.265 use send/receive APIs;
 there are no GStreamer video encoder, decoder or parser elements in this path,
 and no spawned FFmpeg process. GStreamer still supplies desktop capture,
-host scaling/color conversion, audio, and the appsrc/appsink scheduling bridge.
+host scaling/color conversion (unless DMA-BUF capture is active), audio, and the appsrc/appsink scheduling bridge.
 MoQ framing, authentication, input and the SDL renderer remain unchanged.
 
 Linux auto encoding probes NVIDIA NVENC first, then Intel Quick Sync, VA-API,
@@ -77,9 +77,44 @@ path pays before its own conversion and upload. Windowed check: a weston
 headless compositor on the Intel GPU (Mesa EGL) showed the host's solid
 #3366cc desktop as (49, 102, 201) under SDL's toolbar.
 
+**Zero-copy capture on Linux (host, 2026-10-16):** with an NVENC or VA-API
+encoder and an SDR PipeWire (portal) source, the host negotiates
+`memory:DMABuf` RGB frames (XR24/AR24/XB24/AB24) with every modifier the
+encoder's GPU can import (queried with `eglQueryDmaBufModifiersEXT` on that
+GPU's EGL device) and never maps them (`src/dmabuf_encode.c`):
+
+- VA-API: the DMA-BUF becomes a VA surface (DRM PRIME 2 import) and the video
+  processor scales and converts it to limited-range BT.709 NV12 straight into
+  a surface of the encoder's pool. The encoder is opened on the first render
+  node with a VA driver so formats are queried on the same GPU; Intel CCS
+  modifiers are not offered.
+- NVIDIA: NVENC takes CUDA frames. The DMA-BUF is imported as an EGLImage on
+  the NVIDIA EGL device of the encoder's CUDA context, a GLES 3 shader samples
+  it as an external texture (so linear, external-only layouts work too) and
+  writes luma and half-size chroma textures, and CUDA copies those into the
+  CUDA frame. NVENC's own RGB input was not used: it converts with a fixed
+  matrix and cannot scale or crop.
+
+PipeWire crop metadata is honoured. The compositor's buffer is released only
+after the GPU has read it. Logs show `capture="DMA-BUF zero-copy"` and the
+host encoder in Stats reads `ffmpeg:<encoder> DMA-BUF zero-copy`.
+`TELEPORT_CAPTURE_ZERO_COPY=0` opts out. HDR (P010), Quick Sync, software
+encoders and X11 keep CPU capture. If the encoder's GPU imports none of the
+formats, negotiation fails or the first frame fails to import or encode
+(checked for up to 2 s before the encoder is returned), the encoder is
+rebuilt with CPU capture and the process stops trying DMA-BUFs; a failure
+after that first frame ends the pipeline like any capture error (the host
+recreates it, now on the CPU path).
+
+Measured on this box (see docs/review-2026-10.md, M2): whole-process CPU per
+frame drops from 8–31 ms to 0.8–1.6 ms at 1080p and 4K on both GPUs, and the
+real KDE desktop (KWin on the RTX 3080, 2560x1440) went from 17.8 ms CPU and
+59 ms capture→packet per frame to 1.4 ms and 9 ms.
+
 Quick Sync, software decoding and macOS still download frames: everything
-else below applies to them. Encoding likewise receives
-CPU-addressable captured pixels and uploads when the hardware API requires it.
+else below applies to them. Encoding without DMA-BUF capture likewise
+receives CPU-addressable captured pixels and uploads when the hardware API
+requires it.
 Direct codecs provide explicit buffer ownership and timing; they do not prove
 that the reported Intel UHD 630 black flashes are fixed.
 
@@ -104,4 +139,10 @@ nix develop --command env TELEPORT_TEST_HARDWARE=1 TELEPORT_TEST_ENCODER=vaapi c
 nix develop --command cargo test --test ffmpeg_interop -- --ignored --nocapture
 # Zero-copy presentation vs CPU decode (CUDA and VA-API; offscreen EGL):
 nix develop --command env TELEPORT_TEST_HARDWARE=1 LD_LIBRARY_PATH=/run/opengl-driver/lib cargo test --bin teleport zero_copy -- --ignored --nocapture
+# Host DMA-BUF capture: encode colours, pipeline + fallback, CPU vs zero-copy
+# benchmark (release build for fair CPU-path numbers; one test at a time):
+nix develop --command env TELEPORT_TEST_HARDWARE=1 LD_LIBRARY_PATH=/run/opengl-driver/lib cargo test --release --bin teleport zero_copy_capture -- --ignored --nocapture --test-threads=1
+# The real desktop through the portal (opens its own session; run again with
+# TELEPORT_CAPTURE_ZERO_COPY=0 for the CPU path):
+nix develop --command env TELEPORT_TEST_PORTAL=1 LD_LIBRARY_PATH=/run/opengl-driver/lib cargo test --release --bin teleport portal_capture_benchmark -- --ignored --nocapture
 ```

@@ -9,8 +9,12 @@
 #include <libswscale/swscale.h>
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#include "dmabuf_encode.h"
+#endif
 
 typedef struct {
     AVCodecContext *ctx;
@@ -20,6 +24,10 @@ typedef struct {
     enum AVPixelFormat hw_format, input_format;
     int encoder, hdr, output_format, width, height, fps, kbps;
     int live_bitrate; /* encoder applies bitrate changes in place */
+    /* Encoders opened for GPU input (NVENC on CUDA frames, VA-API on an
+     * explicit render node): the DMA-BUF importer of dmabuf_encode.c. */
+    void *import;
+    char node[32];
 } TpCodec;
 
 typedef struct {
@@ -35,6 +43,9 @@ void tp_gpu_frame_free(AVFrame *frame) { av_frame_free(&frame); }
 
 void tp_codec_free(TpCodec *codec) {
     if (!codec) return;
+#ifdef __linux__
+    tp_import_free(codec->import); /* before the frames context it converts into */
+#endif
     avcodec_free_context(&codec->ctx);
     av_packet_free(&codec->packet);
     av_frame_free(&codec->frame);
@@ -66,9 +77,13 @@ static int color_frame(AVFrame *frame, int hdr) {
 
 /* name: an encoder name, or decoder device type ("software", "cuda",
  * "vaapi", "qsv", "videotoolbox", optionally "type@device"). output: 0 RGB24,
- * 1 NV12, 2 P010, 3 GPU frame reference (CUDA or VA-API, no download). */
+ * 1 NV12, 2 P010, 3 GPU frame reference (CUDA or VA-API, no download).
+ * gpu_input (NVENC, VA-API encoders): also accept DMA-BUF frames
+ * (tp_send_dmabuf); NVENC then takes CUDA frames and VA-API opens the first
+ * render node with a VA driver, as FFmpeg's default does. */
 TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
-                       int width, int height, int fps, int kbps, int output, int gop, int *error) {
+                       int width, int height, int fps, int kbps, int output, int gop,
+                       int gpu_input, int *error) {
     int result = AVERROR(ENOMEM);
     AVDictionary *opts = NULL;
     const AVCodec *implementation = encoder ? avcodec_find_encoder_by_name(name)
@@ -136,9 +151,35 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
             av_dict_set(&opts, "rc", "cbr", 0);
             av_dict_set(&opts, "rc-lookahead", "0", 0);
             av_dict_set(&opts, "forced-idr", "1", 0);
+            if (gpu_input && !hdr) {
+                /* CUDA frames: imported DMA-BUFs are converted straight into
+                 * them; CPU frames are uploaded by tp_send_frame. */
+                result = av_hwdevice_ctx_create(&ctx->hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, NULL, NULL, 0);
+                if (result < 0) goto fail;
+                codec->hw_format = AV_PIX_FMT_CUDA;
+                ctx->pix_fmt = AV_PIX_FMT_CUDA;
+                ctx->hw_frames_ctx = av_hwframe_ctx_alloc(ctx->hw_device_ctx);
+                if (!ctx->hw_frames_ctx) { result = AVERROR(ENOMEM); goto fail; }
+                AVHWFramesContext *frames = (void *)ctx->hw_frames_ctx->data;
+                frames->format = AV_PIX_FMT_CUDA;
+                frames->sw_format = AV_PIX_FMT_NV12;
+                frames->width = width; frames->height = height;
+                result = av_hwframe_ctx_init(ctx->hw_frames_ctx);
+                if (result < 0) goto fail;
+            }
         } else if (strstr(name, "vaapi") || strstr(name, "qsv")) {
             enum AVHWDeviceType type = strstr(name, "vaapi") ? AV_HWDEVICE_TYPE_VAAPI : AV_HWDEVICE_TYPE_QSV;
-            result = av_hwdevice_ctx_create(&ctx->hw_device_ctx, type, NULL, NULL, 0);
+            if (type == AV_HWDEVICE_TYPE_VAAPI && gpu_input) {
+                /* A known node, so DMA-BUF formats are queried on the same GPU. */
+                result = AVERROR(ENODEV);
+                for (int minor = 128; minor < 144 && result < 0; minor++) {
+                    snprintf(codec->node, sizeof codec->node, "/dev/dri/renderD%d", minor);
+                    result = av_hwdevice_ctx_create(&ctx->hw_device_ctx, type, codec->node, NULL, 0);
+                }
+                if (result < 0) codec->node[0] = '\0';
+            } else {
+                result = av_hwdevice_ctx_create(&ctx->hw_device_ctx, type, NULL, NULL, 0);
+            }
             if (result < 0) goto fail;
             codec->hw_format = type == AV_HWDEVICE_TYPE_VAAPI ? AV_PIX_FMT_VAAPI : AV_PIX_FMT_QSV;
             ctx->pix_fmt = codec->hw_format;
@@ -242,6 +283,36 @@ int tp_send_frame(TpCodec *codec, const uint8_t *data, int size, int64_t pts, in
     }
     return avcodec_send_frame(codec->ctx, frame);
 }
+
+#ifdef __linux__
+static int dmabuf_ready(TpCodec *codec) {
+    if (!codec || !codec->encoder || !codec->ctx->hw_frames_ctx) return 0;
+    enum AVHWDeviceType type = ((AVHWFramesContext *)codec->ctx->hw_frames_ctx->data)->device_ctx->type;
+    return type == AV_HWDEVICE_TYPE_CUDA || (type == AV_HWDEVICE_TYPE_VAAPI && codec->node[0]);
+}
+
+/* DRM format modifiers of `fourcc` that tp_send_dmabuf can import; 0 when
+ * this encoder was not opened for GPU input or its GPU cannot import. */
+int tp_codec_dmabuf_modifiers(TpCodec *codec, uint32_t fourcc, uint64_t *modifiers, int capacity) {
+    if (!dmabuf_ready(codec)) return 0;
+    return tp_import_modifiers((TpImport **)&codec->import, codec->ctx->hw_frames_ctx, codec->node,
+        fourcc, modifiers, capacity);
+}
+
+/* Encode a captured DMA-BUF: converted on the GPU into the encoder's own
+ * frames, never mapped. The buffer may be reused once this returns. */
+int tp_send_dmabuf(TpCodec *codec, const TpDmabuf *source, int64_t pts, int force_key) {
+    if (!dmabuf_ready(codec)) return AVERROR(ENOSYS);
+    AVFrame *frame = codec->download;
+    int result = tp_import_convert((TpImport **)&codec->import, codec->ctx->hw_frames_ctx, codec->node,
+        source, frame);
+    if (result < 0) return result;
+    frame->pts = pts;
+    frame->pict_type = force_key ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+    color_frame(frame, codec->hdr);
+    return avcodec_send_frame(codec->ctx, frame);
+}
+#endif
 
 int tp_receive_packet(TpCodec *codec, TpOutput *output) {
     av_packet_unref(codec->packet);

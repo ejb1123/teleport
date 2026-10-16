@@ -22,6 +22,11 @@ use x11rb::{
 /// and a change dropped by the FPS cap is repeated rather than lost.
 const KEEPALIVE_MS: u32 = 250;
 
+/// Caps every PipeWire source description ends with (` ! video/x-raw`):
+/// CPU-mapped frames. The direct FFmpeg encoder replaces it to negotiate
+/// DMA-BUFs for zero-copy capture.
+pub const PIPEWIRE_SYSTEM_MEMORY: &str = "video/x-raw";
+
 /// `--source test` pattern. `TELEPORT_TEST_PATTERN` (e.g. `snow`) lets network
 /// tests use content that fills the configured bitrate; the default ball
 /// compresses to almost nothing and would never stress a link.
@@ -95,7 +100,7 @@ impl Capture {
                     .open_pipe_wire_remote(session)
                     .await?;
                 let source = format!(
-                    "pipewiresrc fd={} path={} do-timestamp=true keepalive-time={KEEPALIVE_MS} ! video/x-raw",
+                    "pipewiresrc fd={} path={} do-timestamp=true keepalive-time={KEEPALIVE_MS} ! {PIPEWIRE_SYSTEM_MEMORY}",
                     remote.as_raw_fd(),
                     nodes[index]
                 );
@@ -358,7 +363,7 @@ impl Capture {
                 test_pattern(self.active_monitor)
             ),
             Backend::Portal { fd, nodes, .. } => format!(
-                "pipewiresrc fd={} path={} do-timestamp=true keepalive-time={KEEPALIVE_MS} ! video/x-raw",
+                "pipewiresrc fd={} path={} do-timestamp=true keepalive-time={KEEPALIVE_MS} ! {PIPEWIRE_SYSTEM_MEMORY}",
                 fd.as_raw_fd(),
                 nodes[self.active_monitor]
             ),

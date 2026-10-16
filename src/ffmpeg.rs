@@ -40,6 +40,7 @@ unsafe extern "C" {
         kbps: c_int,
         output: c_int,
         gop: c_int,
+        gpu_input: c_int,
         error: *mut c_int,
     ) -> *mut c_void;
     fn tp_codec_free(codec: *mut c_void);
@@ -73,6 +74,45 @@ pub struct Config {
     pub output: i32,
     /// Encoder keyframe interval in frames; 0 keeps the fps/4 default.
     pub gop: u32,
+    /// NVENC / VA-API encoders: also accept captured DMA-BUFs
+    /// ([`Codec::submit_dmabuf`]). NVENC then takes CUDA frames.
+    pub gpu_input: bool,
+}
+
+/// A captured DMA-BUF frame (see `src/dmabuf_encode.h`). The descriptors are
+/// borrowed: they must stay open for the duration of the call using them.
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Dmabuf {
+    pub fds: [i32; 4],
+    pub offsets: [u32; 4],
+    pub pitches: [u32; 4],
+    pub planes: i32,
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub width: i32,
+    pub height: i32,
+    pub crop_x: i32,
+    pub crop_y: i32,
+    pub crop_width: i32,
+    pub crop_height: i32,
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn tp_codec_dmabuf_modifiers(
+        codec: *mut c_void,
+        fourcc: u32,
+        modifiers: *mut u64,
+        capacity: c_int,
+    ) -> c_int;
+    fn tp_send_dmabuf(
+        codec: *mut c_void,
+        source: *const Dmabuf,
+        pts: i64,
+        force_key: c_int,
+    ) -> c_int;
 }
 pub struct Codec {
     pointer: NonNull<c_void>,
@@ -128,6 +168,7 @@ impl Codec {
                 config.kbps.try_into()?,
                 config.output,
                 config.gop.try_into()?,
+                config.gpu_input.into(),
                 &mut error,
             )
         };
@@ -157,6 +198,35 @@ impl Codec {
             }
         };
         check(result)?;
+        Ok(())
+    }
+    /// Modifiers of DRM `fourcc` this encoder can take as DMA-BUFs; empty
+    /// unless it was opened with `gpu_input` on a GPU that can import them.
+    #[cfg(target_os = "linux")]
+    pub fn dmabuf_modifiers(&mut self, fourcc: u32) -> Result<Vec<u64>> {
+        let mut modifiers = [0_u64; 64];
+        let count = check(unsafe {
+            tp_codec_dmabuf_modifiers(
+                self.pointer.as_ptr(),
+                fourcc,
+                modifiers.as_mut_ptr(),
+                modifiers.len() as c_int,
+            )
+        })?;
+        Ok(modifiers[..count as usize].to_vec())
+    }
+    /// Encode a captured DMA-BUF, converted on the GPU (no CPU copy). The
+    /// buffer may be reused by its producer once this returns.
+    #[cfg(target_os = "linux")]
+    pub fn submit_dmabuf(&mut self, source: &Dmabuf, pts: u64, force_key: bool) -> Result<()> {
+        check(unsafe {
+            tp_send_dmabuf(
+                self.pointer.as_ptr(),
+                source,
+                pts.try_into()?,
+                force_key.into(),
+            )
+        })?;
         Ok(())
     }
     pub fn receive(&mut self) -> Result<Option<Frame>> {
@@ -224,6 +294,74 @@ impl Codec {
         }
     }
 }
+
+/// Test DMA-BUF: an RGBA texture with four solid quadrants exported from an
+/// EGL device (render `node`, or the NVIDIA device for `None`).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct TestDmabuf {
+    pointer: NonNull<c_void>,
+    pub frame: Dmabuf,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+unsafe extern "C" {
+    fn tp_test_dmabuf_new(
+        node: *const c_char,
+        width: c_int,
+        height: c_int,
+        colors: *const u8,
+        out: *mut Dmabuf,
+        error: *mut c_int,
+    ) -> *mut c_void;
+    fn tp_test_dmabuf_free(source: *mut c_void);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl TestDmabuf {
+    /// `None` when no such EGL device can export DMA-BUFs.
+    pub fn new(
+        node: Option<&str>,
+        width: u32,
+        height: u32,
+        colors: [[u8; 3]; 4],
+    ) -> Result<Option<Self>> {
+        let node = node.map(CString::new).transpose()?;
+        let mut frame = Dmabuf::default();
+        let mut error = 0;
+        let pointer = unsafe {
+            tp_test_dmabuf_new(
+                node.as_ref().map_or(std::ptr::null(), |node| node.as_ptr()),
+                width.try_into()?,
+                height.try_into()?,
+                colors.as_flattened().as_ptr(),
+                &mut frame,
+                &mut error,
+            )
+        };
+        if error == -libc::ENODEV {
+            return Ok(None);
+        }
+        check(error).context("exporting a test DMA-BUF")?;
+        Ok(Some(Self {
+            pointer: NonNull::new(pointer).context("no test DMA-BUF")?,
+            frame,
+        }))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for TestDmabuf {
+    fn drop(&mut self) {
+        unsafe { tp_test_dmabuf_free(self.pointer.as_ptr()) }
+    }
+}
+
+// Safety: the exported descriptors and the EGL objects behind them are not
+// tied to the creating thread (its context is released after creation).
+#[cfg(all(test, target_os = "linux"))]
+unsafe impl Send for TestDmabuf {}
+#[cfg(all(test, target_os = "linux"))]
+unsafe impl Sync for TestDmabuf {}
 
 /// A reference to a decoded CUDA or VA-API frame kept on the GPU (decoder
 /// output 3). Holding it keeps one decoder surface alive; dropping it
@@ -410,6 +548,7 @@ mod tests {
             kbps: 1000,
             output: 1,
             gop: 0,
+            gpu_input: false,
         }
     }
     #[test]
@@ -834,6 +973,105 @@ mod tests {
             }
             ensure!(passed > 0, "no hardware decoder tested");
         }
+        Ok(())
+    }
+
+    /// Host zero-copy capture: an RGBA DMA-BUF exported by the GPU is
+    /// scaled/cropped and converted on that GPU straight into NVENC's CUDA
+    /// frames or VA-API surfaces; a CPU decode must show the source colours.
+    #[test]
+    #[ignore = "requires NVENC or a VA-API encoder and an EGL device exporting DMA-BUFs"]
+    fn zero_copy_dmabuf_encode_matches_source_colours() -> Result<()> {
+        if std::env::var("TELEPORT_TEST_HARDWARE").as_deref() != Ok("1") {
+            eprintln!("SKIP: set TELEPORT_TEST_HARDWARE=1 on a machine with NVENC or VA-API");
+            return Ok(());
+        }
+        let colors = [[200, 40, 40], [40, 180, 60], [50, 60, 210], [230, 230, 230]];
+        let mut targets = vec![("h264_nvenc", None)];
+        let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path().to_string_lossy().into_owned())
+            .filter(|path| path.starts_with("/dev/dri/renderD"))
+            .collect();
+        nodes.sort();
+        targets.extend(nodes.into_iter().map(|node| ("h264_vaapi", Some(node))));
+        let mut passed = 0;
+        for (name, node) in targets {
+            // Same size, 2x downscale, and a crop of the top-left quadrant.
+            for (source_size, size, crop) in [
+                ((640, 360), (640, 360), false),
+                ((1280, 720), (640, 360), false),
+                ((1280, 720), (640, 360), true),
+            ] {
+                let label = format!("{name} {node:?} {source_size:?} -> {size:?} crop={crop}");
+                let config = Config {
+                    name: name.into(),
+                    width: size.0,
+                    height: size.1,
+                    kbps: 4000,
+                    gpu_input: true,
+                    ..software_config(false)
+                };
+                let mut encoder = match Codec::new(config.clone()) {
+                    Ok(encoder) => encoder,
+                    Err(error) => {
+                        eprintln!("SKIP {label}: {error:#}");
+                        break;
+                    }
+                };
+                let Some(source) =
+                    TestDmabuf::new(node.as_deref(), source_size.0, source_size.1, colors)?
+                else {
+                    eprintln!("SKIP {label}: no EGL device exporting DMA-BUFs");
+                    break;
+                };
+                let mut frame = source.frame;
+                if !encoder
+                    .dmabuf_modifiers(frame.fourcc)?
+                    .contains(&frame.modifier)
+                {
+                    eprintln!(
+                        "SKIP {label}: encoder GPU cannot import {:#x}/{:#x}",
+                        frame.fourcc, frame.modifier
+                    );
+                    break;
+                }
+                if crop {
+                    frame.crop_width = frame.width / 2;
+                    frame.crop_height = frame.height / 2;
+                }
+                let mut packets = Vec::new();
+                for index in 0..5 {
+                    encoder.submit_dmabuf(&frame, index, index == 0)?;
+                    while let Some(packet) = encoder.receive()? {
+                        packets.push(packet.bytes);
+                    }
+                }
+                let decoded = decode_last(&config, &packets, "software", 0)?;
+                let (width, height) = (size.0 as usize, size.1 as usize);
+                for (quadrant, (x, y)) in [
+                    (width / 4, height / 4),
+                    (width * 3 / 4, height / 4),
+                    (width / 4, height * 3 / 4),
+                    (width * 3 / 4, height * 3 / 4),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let expected = colors[if crop { 0 } else { quadrant }];
+                    let actual = &decoded.bytes[(y * width + x) * 3..][..3];
+                    for channel in 0..3 {
+                        ensure!(
+                            (expected[channel] as i32 - actual[channel] as i32).abs() <= 8,
+                            "{label}: pixel ({x},{y}) {actual:?}, source {expected:?}"
+                        );
+                    }
+                }
+                eprintln!("PASS {label}");
+                passed += 1;
+            }
+        }
+        ensure!(passed > 0, "no zero-copy encoder tested");
         Ok(())
     }
 }
