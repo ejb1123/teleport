@@ -51,7 +51,6 @@ fn setup_with_versions(versions: &[&str]) -> Setup {
 
 fn setup_with(versions: &[&str], host_args: &[&str]) -> Setup {
     let temp = tempfile::tempdir().unwrap();
-    let host_address = free_udp();
     let relay_address = free_udp();
     let mut relay = Process(
         teleport()
@@ -78,6 +77,7 @@ fn setup_with(versions: &[&str], host_args: &[&str]) -> Setup {
         }
     });
     let relay_url = format!("moqt://{relay_address}");
+    let host_address = free_udp();
     let log = std::fs::File::create(temp.path().join("host.log")).unwrap();
     let host = Process(
         teleport()
@@ -430,6 +430,54 @@ fn pair_via_relay(setup: &Setup, config: &std::path::Path, link: &str) -> Output
     child.wait_with_output().unwrap()
 }
 
+/// Launched as the launcher does for a saved desktop with relay settings:
+/// relay URL and key in the environment, `--route` on the command line.
+fn auto_client(setup: &Setup, address: &str) -> Output {
+    teleport()
+        .args(["client", address, "--pairing-file"])
+        .arg(setup.temp.path().join("identity/pairing.json"))
+        .args(["--route", "auto"])
+        .args(["--relay-fingerprint", &setup.relay_fingerprint])
+        .args(["--headless-frames", "30", "--software-decoder"])
+        .env("TELEPORT_RELAY_URL", &setup.relay_url)
+        .env("TELEPORT_RELAY_KEY", RELAY_KEY)
+        .output()
+        .unwrap()
+}
+
+fn host_fingerprint(setup: &Setup) -> String {
+    let pairing: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(setup.temp.path().join("identity/pairing.json")).unwrap(),
+    )
+    .unwrap();
+    pairing["fingerprint"].as_str().unwrap().to_owned()
+}
+
+fn presence(setup: &Setup, fingerprint: &str) -> String {
+    let output = teleport()
+        .args(["presence", "--relay", &setup.relay_url])
+        .args(["--relay-fingerprint", &setup.relay_fingerprint])
+        .args(["--relay-key", RELAY_KEY])
+        .args(["--host-fingerprint", fingerprint, "--wait", "15"])
+        .env_remove("TELEPORT_RELAY_URL")
+        .env_remove("TELEPORT_RELAY_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "presence check failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Logs share stdout; the verdict is a line of its own.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| ["ONLINE", "OFFLINE", "UNKNOWN"].contains(line))
+        .unwrap_or_else(|| panic!("no presence verdict: {stdout}"))
+        .to_owned()
+}
+
 #[test]
 #[ignore = "requires local UDP sockets and GStreamer plugins"]
 fn first_pairing_and_session_work_through_the_relay_alone() {
@@ -486,4 +534,63 @@ fn first_pairing_and_session_work_through_the_relay_alone() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(stdout.contains("end-to-end encrypted relay session established"));
+}
+
+#[test]
+#[ignore = "requires local UDP sockets and GStreamer plugins"]
+fn auto_route_falls_back_to_the_relay_and_presence_follows_the_host() {
+    let mut setup = setup();
+    let fingerprint = host_fingerprint(&setup);
+    assert_eq!(presence(&setup, &fingerprint), "ONLINE");
+    // Nothing vouches for another host identity in this namespace.
+    assert_ne!(presence(&setup, &"ab".repeat(32)), "ONLINE");
+
+    // The direct address answers nothing: auto must choose the relay.
+    let started = Instant::now();
+    let output = auto_client(&setup, "127.0.0.1:9");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("SMOKE PASS"),
+        "auto route failed: {stdout}{}\nhost log:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        std::fs::read_to_string(setup.temp.path().join("host.log")).unwrap_or_default()
+    );
+    assert!(
+        stdout.contains("direct path unavailable; trying the relay"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("connection path chosen: relay"), "{stdout}");
+    assert!(stdout.contains("end-to-end encrypted relay session established"));
+    assert!(started.elapsed() < Duration::from_secs(40));
+
+    // A reachable direct address wins.
+    let output = auto_client(&setup, &setup.host_address);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("SMOKE PASS"),
+        "auto route (direct) failed: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("connection path chosen: direct"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("relay session established"), "{stdout}");
+
+    // Stop the host: the relay notices the lost connection and the host is
+    // reported offline.
+    setup._host.0.kill().unwrap();
+    setup._host.0.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let state = presence(&setup, &fingerprint);
+        if state == "OFFLINE" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host still reported {state} after it stopped"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }

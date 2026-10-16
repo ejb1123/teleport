@@ -171,8 +171,41 @@ pub fn namespace(fingerprint: &str) -> Result<String> {
     Ok(hex(&context.finish().as_ref()[..16]))
 }
 
+/// How a client reaches a host that also has a relay configured.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Route {
+    /// Try the direct address briefly, then the relay.
+    #[default]
+    Auto,
+    /// Only the direct address.
+    Direct,
+    /// Only the relay (always end-to-end encrypted).
+    Relay,
+}
+
+impl Route {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+        }
+    }
+}
+
 /// How to reach a relay.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Endpoint {
     /// e.g. `moqt://relay.example:4444` (self-hosted) or a provider's
     /// `https://` WebTransport URL; `?jwt=` carries a provider token.
@@ -214,6 +247,27 @@ impl RelayArgs {
     }
 }
 
+impl Endpoint {
+    /// The URL without its query, which may carry a provider token.
+    pub fn display_url(&self) -> String {
+        let mut url = self.url.clone();
+        url.set_query(None);
+        url.to_string()
+    }
+}
+
+impl std::fmt::Debug for Endpoint {
+    // Never print the access key or a provider token in the URL query.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Endpoint")
+            .field("url", &self.display_url())
+            .field("fingerprint", &self.fingerprint)
+            .field("key", &self.key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// One connection to a relay, scoped to a host namespace.
 pub struct Link {
     pub session: moq_net::Session,
@@ -224,6 +278,18 @@ pub struct Link {
 }
 
 pub async fn connect(endpoint: &Endpoint, namespace: &str) -> Result<Link> {
+    connect_with_keep_alive(endpoint, namespace, protocol::QUIC_KEEP_ALIVE).await
+}
+
+/// Keep-alive for idle watchers (presence): below the relay's idle timeout,
+/// with a third of the packets of a session link.
+pub const IDLE_KEEP_ALIVE: Duration = Duration::from_secs(3);
+
+pub async fn connect_with_keep_alive(
+    endpoint: &Endpoint,
+    namespace: &str,
+    keep_alive: Duration,
+) -> Result<Link> {
     let mut url = endpoint.url.clone();
     url.set_path(&format!("/{namespace}"));
     if let Some(key) = &endpoint.key {
@@ -232,7 +298,7 @@ pub async fn connect(endpoint: &Endpoint, namespace: &str) -> Result<Link> {
     let mut config = moq_native::ClientConfig::default();
     config.version = versions(&[])?;
     config.quic.idle_timeout = Some(protocol::QUIC_IDLE_TIMEOUT);
-    config.quic.keep_alive = Some(protocol::QUIC_KEEP_ALIVE);
+    config.quic.keep_alive = Some(keep_alive);
     config.quic.mtu_discovery = Some(protocol::QUIC_MTU_DISCOVERY);
     if let Some(fingerprint) = &endpoint.fingerprint {
         config.tls.fingerprint = vec![fingerprint.clone()];

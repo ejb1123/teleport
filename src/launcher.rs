@@ -39,6 +39,7 @@ fn session_profile(
             address: address.into(),
             pairing_file: Some(path),
             fingerprint: Some(pairing.fingerprint.clone()),
+            relay: None,
         },
         directory,
     ))
@@ -91,6 +92,7 @@ enum Page {
     Home,
     Add,
     Auth,
+    Relay,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AuthMode {
@@ -123,6 +125,54 @@ impl DecoderPreference {
             command.arg("--software-decoder");
         }
     }
+}
+
+/// Pass a desktop's relay settings to the client process. The URL (which may
+/// carry a provider token) and the key travel in the child's environment,
+/// never on its command line, which other local users can read.
+fn apply_relay(profile: &crate::profiles::Profile, command: &mut Command) -> Result<()> {
+    command
+        .env_remove("TELEPORT_RELAY_URL")
+        .env_remove("TELEPORT_RELAY_KEY");
+    let Some(relay) = &profile.relay else {
+        return Ok(());
+    };
+    relay.validate()?;
+    command.env("TELEPORT_RELAY_URL", relay.url.trim());
+    if let Some(pin) = &relay.fingerprint {
+        command.arg("--relay-fingerprint").arg(pin);
+    }
+    if let Some(key) = relay.read_key()? {
+        command.env("TELEPORT_RELAY_KEY", key.as_str());
+    }
+    command.arg("--route").arg(relay.route.as_str());
+    Ok(())
+}
+
+/// Desktops whose presence the launcher follows: relay configured, the relay
+/// path allowed, and a pinned host identity to verify statements against.
+fn presence_targets(profiles: &[crate::profiles::Profile]) -> Vec<crate::presence::Target> {
+    profiles
+        .iter()
+        .filter_map(|profile| {
+            let relay = profile.relay.as_ref()?;
+            if relay.route == crate::relay::Route::Direct {
+                return None;
+            }
+            Some(crate::presence::Target {
+                address: profile.address.clone(),
+                endpoint: relay.endpoint().ok()?,
+                fingerprint: profile.trusted_fingerprint().ok()??,
+            })
+        })
+        .collect()
+}
+
+fn presence_shown(profile: &crate::profiles::Profile) -> bool {
+    profile
+        .relay
+        .as_ref()
+        .is_some_and(|relay| relay.route != crate::relay::Route::Direct)
 }
 
 struct Approval {
@@ -213,10 +263,10 @@ fn authenticated_profile(
     );
     if session_only {
         let (mut profile, directory) = session_profile(address, pairing)?;
-        profile.name = profiles
-            .iter()
-            .find(|p| p.address == address)
-            .map_or_else(String::new, |p| p.name.clone());
+        if let Some(saved) = profiles.iter().find(|p| p.address == address) {
+            profile.name = saved.name.clone();
+            profile.relay = saved.relay.clone();
+        }
         *ephemeral = Some(directory);
         Ok(profile)
     } else {
@@ -233,6 +283,14 @@ pub fn run() -> Result<()> {
     let HOST_SETTINGS = Rect::new(16, 704, 224, 40);
     let SETTINGS = Rect::new(304, 342, 220, 36);
     let SIGN_IN = Rect::new(540, 342, 220, 36);
+    let RELAY = Rect::new(776, 342, 216, 36);
+    let RELAY_URL = Rect::new(304, 220, 688, 44);
+    let RELAY_PIN = Rect::new(304, 300, 688, 44);
+    let RELAY_KEY = Rect::new(304, 380, 688, 44);
+    let route_rect = |index: usize| Rect::new(304 + index as i32 * 232, 456, 220, 38);
+    let SAVE_RELAY = Rect::new(304, 520, 448, 44);
+    let CANCEL_RELAY = Rect::new(764, 520, 228, 44);
+    let FORGET_KEY = Rect::new(832, 346, 160, 28);
     let NAME = Rect::new(304, 220, 688, 44);
     let ADDRESS = Rect::new(304, 300, 688, 44);
     let SAVE = Rect::new(304, 390, 448, 44);
@@ -305,9 +363,79 @@ pub fn run() -> Result<()> {
     let mut clipboard = false;
     let mut mute = false;
     let mut agent_consent = AgentConsent::default();
+    let mut relay_url = String::new();
+    let mut relay_pin = String::new();
+    let mut relay_key = Zeroizing::new(String::new());
+    let mut relay_route = crate::relay::Route::Auto;
+    let mut relay_forget_key = false;
+    let mut presence = crate::presence::Monitor::new();
+    let mut presence_profiles = String::new();
     let started = std::time::Instant::now();
+    // The text field that keyboard input edits on the current page.
+    macro_rules! active_field {
+        () => {
+            match (page, focused) {
+                (Page::Add, 0) => &mut name,
+                (Page::Add, _) => &mut address,
+                (Page::Relay, 0) => &mut relay_url,
+                (Page::Relay, 1) => &mut relay_pin,
+                (Page::Relay, _) => &mut *relay_key,
+                (_, 0) if matches!(mode, AuthMode::Linux | AuthMode::Teleport) => &mut username,
+                _ => &mut *secret,
+            }
+        };
+    }
+    // Save the relay form for the selected desktop (an empty URL removes it).
+    macro_rules! save_relay {
+        () => {
+            if let Some(target) = selected.as_ref().map(|p| p.address.clone()) {
+                let update = if relay_url.trim().is_empty() {
+                    None
+                } else {
+                    Some(crate::profiles::RelayUpdate {
+                        url: relay_url.trim().to_owned(),
+                        fingerprint: Some(relay_pin.trim().to_owned()),
+                        key: if relay_key.trim().is_empty() {
+                            if relay_forget_key {
+                                crate::profiles::RelayKey::Clear
+                            } else {
+                                crate::profiles::RelayKey::Keep
+                            }
+                        } else {
+                            crate::profiles::RelayKey::Set(Zeroizing::new(std::mem::take(
+                                &mut *relay_key,
+                            )))
+                        },
+                        route: relay_route,
+                    })
+                };
+                let removing = update.is_none();
+                match crate::profiles::set_relay(&target, update, &mut profiles) {
+                    Ok(profile) => {
+                        selected = Some(profile);
+                        page = Page::Home;
+                        status = if removing {
+                            "Relay removed. This desktop connects directly.".into()
+                        } else {
+                            "Relay settings saved. The relay key is stored in a private file."
+                                .into()
+                        };
+                    }
+                    Err(error) => status = format!("Could not save relay settings: {error:#}"),
+                }
+                relay_key.zeroize();
+            }
+        };
+    }
 
     'ui: loop {
+        // Follow relay presence for saved desktops in the background; only
+        // restart the watches when the saved desktops change.
+        let current = serde_json::to_string(&profiles).unwrap_or_default();
+        if current != presence_profiles {
+            presence.follow(presence_targets(&profiles));
+            presence_profiles = current;
+        }
         agent_consent.select(
             selected
                 .as_ref()
@@ -493,12 +621,17 @@ pub fn run() -> Result<()> {
                 } => {
                     page = Page::Home;
                     secret.zeroize();
+                    relay_key.zeroize();
                 }
                 Event::KeyDown {
                     keycode: Some(Keycode::Tab),
                     ..
                 } if page != Page::Home => {
-                    focused = 1 - focused.min(1);
+                    focused = if page == Page::Relay {
+                        (focused + 1) % 3
+                    } else {
+                        1 - focused.min(1)
+                    };
                     select_all = false;
                 }
                 Event::KeyDown {
@@ -507,14 +640,7 @@ pub fn run() -> Result<()> {
                     ..
                 } if shortcut(keymod) => select_all = true,
                 Event::TextInput { text, .. } if page != Page::Home => {
-                    let field: &mut String = match (page, focused) {
-                        (Page::Add, 0) => &mut name,
-                        (Page::Add, _) => &mut address,
-                        (_, 0) if matches!(mode, AuthMode::Linux | AuthMode::Teleport) => {
-                            &mut username
-                        }
-                        _ => &mut secret,
-                    };
+                    let field: &mut String = active_field!();
                     if select_all {
                         field.zeroize();
                         select_all = false;
@@ -529,14 +655,7 @@ pub fn run() -> Result<()> {
                     keycode: Some(Keycode::Backspace),
                     ..
                 } if page != Page::Home => {
-                    let field: &mut String = match (page, focused) {
-                        (Page::Add, 0) => &mut name,
-                        (Page::Add, _) => &mut address,
-                        (_, 0) if matches!(mode, AuthMode::Linux | AuthMode::Teleport) => {
-                            &mut username
-                        }
-                        _ => &mut secret,
-                    };
+                    let field: &mut String = active_field!();
                     if select_all {
                         field.zeroize();
                         select_all = false;
@@ -550,14 +669,7 @@ pub fn run() -> Result<()> {
                     ..
                 } if shortcut(keymod) && page != Page::Home => {
                     if let Ok(text) = video.clipboard().clipboard_text() {
-                        let field: &mut String = match (page, focused) {
-                            (Page::Add, 0) => &mut name,
-                            (Page::Add, _) => &mut address,
-                            (_, 0) if matches!(mode, AuthMode::Linux | AuthMode::Teleport) => {
-                                &mut username
-                            }
-                            _ => &mut secret,
-                        };
+                        let field: &mut String = active_field!();
                         if text.len() <= 2048 {
                             field.zeroize();
                             if page == Page::Auth && mode == AuthMode::Code {
@@ -580,6 +692,7 @@ pub fn run() -> Result<()> {
                 } => match page {
                     Page::Home => connect_requested = true,
                     Page::Auth => auth_requested = true,
+                    Page::Relay => save_relay!(),
                     Page::Add => match crate::profiles::save_desktop(
                         name.trim(),
                         address.trim(),
@@ -611,6 +724,40 @@ pub fn run() -> Result<()> {
                 } => {
                     select_all = false;
                     match page {
+                        Page::Relay => {
+                            for (index, rect) in
+                                [RELAY_URL, RELAY_PIN, RELAY_KEY].into_iter().enumerate()
+                            {
+                                if hit(rect, x, y) {
+                                    focused = index;
+                                }
+                            }
+                            for (index, value) in [
+                                crate::relay::Route::Auto,
+                                crate::relay::Route::Direct,
+                                crate::relay::Route::Relay,
+                            ]
+                            .into_iter()
+                            .enumerate()
+                            {
+                                if hit(route_rect(index), x, y) {
+                                    relay_route = value;
+                                }
+                            }
+                            if hit(FORGET_KEY, x, y) {
+                                relay_forget_key = !relay_forget_key;
+                                if relay_forget_key {
+                                    relay_key.zeroize();
+                                }
+                            }
+                            if hit(CANCEL_RELAY, x, y) {
+                                page = Page::Home;
+                                relay_key.zeroize();
+                            }
+                            if hit(SAVE_RELAY, x, y) {
+                                save_relay!();
+                            }
+                        }
                         Page::Add => {
                             if hit(NAME, x, y) {
                                 focused = 0;
@@ -703,6 +850,21 @@ pub fn run() -> Result<()> {
                             if hit(SIGN_IN, x, y) && child.is_none() && selected.is_some() {
                                 page = Page::Auth;
                                 secret.zeroize();
+                                focused = 0;
+                            }
+                            if hit(RELAY, x, y)
+                                && child.is_none()
+                                && let Some(profile) = &selected
+                            {
+                                let saved = profile.relay.as_ref();
+                                relay_url = saved.map_or_else(String::new, |r| r.url.clone());
+                                relay_pin = saved
+                                    .and_then(|r| r.fingerprint.clone())
+                                    .unwrap_or_default();
+                                relay_key.zeroize();
+                                relay_route = saved.map_or(crate::relay::Route::Auto, |r| r.route);
+                                relay_forget_key = false;
+                                page = Page::Relay;
                                 focused = 0;
                             }
                             if hit(SETTINGS, x, y) {
@@ -896,6 +1058,7 @@ pub fn run() -> Result<()> {
                             .arg("--dynamic-range")
                             .arg(if hdr { "hdr10" } else { "sdr" });
                         decoder.apply(&mut command);
+                        apply_relay(profile, &mut command)?;
                         if clipboard {
                             command.arg("--clipboard");
                         }
@@ -927,8 +1090,15 @@ pub fn run() -> Result<()> {
                                 for line in BufReader::new(output).lines().map_while(Result::ok) {
                                     println!("{line}");
                                     if line.contains("desktop connected") {
+                                        let relayed = line.contains("path=relay")
+                                            || line.contains("path=\"relay\"");
                                         let _ = sender.try_send(
-                                            "Connected. Your native desktop is ready.".to_owned(),
+                                            if relayed {
+                                                "Connected through the relay (end-to-end encrypted). Your native desktop is ready."
+                                            } else {
+                                                "Connected. Your native desktop is ready."
+                                            }
+                                            .to_owned(),
                                         );
                                     }
                                 }
@@ -986,7 +1156,13 @@ pub fn run() -> Result<()> {
                 ui.panel(Rect::new(rect.x(), rect.y() + 6, 3, 40), ACCENT)?;
             }
             ui.text(&font, profile.label(), 28, rect.y() + 6, 194, INK)?;
-            ui.text(&small_font, &profile.address, 28, rect.y() + 30, 194, MUTED)?;
+            ui.text(&small_font, &profile.address, 28, rect.y() + 30, 186, MUTED)?;
+            if presence_shown(profile) {
+                ui.presence(
+                    Rect::new(rect.x() + 210, rect.y() + 21, 10, 10),
+                    presence.state(&profile.address),
+                )?;
+            }
         }
         if profiles.is_empty() {
             ui.text(&font, "No desktops yet", 24, 160, 210, INK)?;
@@ -1045,6 +1221,98 @@ pub fn run() -> Result<()> {
             ui.button(REJECT, "Cancel", true, false)?;
         } else {
             match page {
+                Page::Relay => {
+                    ui.text(&title_font, "Relay", 304, 148, 688, INK)?;
+                    if let Some(profile) = &selected {
+                        ui.text(&small_font, profile.label(), 420, 162, 572, MUTED)?;
+                    }
+                    ui.text(&small_font, "RELAY URL", 304, 194, 688, MUTED)?;
+                    ui.field(
+                        RELAY_URL,
+                        &relay_url,
+                        "moqt://relay.example:4444 (empty: no relay)",
+                        focused == 0,
+                        select_all && focused == 0,
+                        caret,
+                    )?;
+                    ui.text(
+                        &small_font,
+                        "RELAY FINGERPRINT (SELF-HOSTED RELAYS)",
+                        304,
+                        274,
+                        688,
+                        MUTED,
+                    )?;
+                    ui.field(
+                        RELAY_PIN,
+                        &relay_pin,
+                        "Printed by teleport relay; empty for a provider relay",
+                        focused == 1,
+                        select_all && focused == 1,
+                        caret,
+                    )?;
+                    ui.text(&small_font, "RELAY KEY", 304, 354, 688, MUTED)?;
+                    let has_key = selected
+                        .as_ref()
+                        .and_then(|p| p.relay.as_ref())
+                        .is_some_and(|r| r.key_file.is_some());
+                    let masked = "*".repeat(relay_key.chars().count().min(256));
+                    ui.field(
+                        RELAY_KEY,
+                        &masked,
+                        if has_key && relay_forget_key {
+                            "Saved key will be removed"
+                        } else if has_key {
+                            "Saved key kept (type to replace)"
+                        } else {
+                            "Relay access key (if the relay has one)"
+                        },
+                        focused == 2,
+                        select_all && focused == 2,
+                        caret,
+                    )?;
+                    if has_key {
+                        ui.button(
+                            FORGET_KEY,
+                            if relay_forget_key {
+                                "Keep saved key"
+                            } else {
+                                "Forget saved key"
+                            },
+                            true,
+                            false,
+                        )?;
+                    }
+                    ui.text(&small_font, "CONNECT", 304, 434, 688, MUTED)?;
+                    for (index, (value, label)) in [
+                        (crate::relay::Route::Auto, "Direct, then relay"),
+                        (crate::relay::Route::Direct, "Direct only"),
+                        (crate::relay::Route::Relay, "Relay only"),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        ui.button(route_rect(index), label, true, relay_route == value)?;
+                    }
+                    ui.button(SAVE_RELAY, "Save relay settings", true, true)?;
+                    ui.button(CANCEL_RELAY, "Cancel", true, false)?;
+                    ui.text(
+                        &small_font,
+                        "Relayed sessions are end-to-end encrypted and verify this desktop's pinned identity.",
+                        304,
+                        584,
+                        688,
+                        MUTED,
+                    )?;
+                    ui.text(
+                        &small_font,
+                        "The key is saved in a private file. Clear the URL and save to remove the relay.",
+                        304,
+                        606,
+                        688,
+                        MUTED,
+                    )?;
+                }
                 Page::Add => {
                     ui.text(&title_font, "Add desktop", 304, 148, 688, INK)?;
                     ui.text(&small_font, "NAME", 304, 194, 688, MUTED)?;
@@ -1162,18 +1430,20 @@ pub fn run() -> Result<()> {
                         688,
                         INK,
                     )?;
-                    ui.text(
-                        &font,
-                        selected
-                            .as_ref()
-                            .map_or("Add your first desktop to get started.", |p| {
-                                p.address.as_str()
-                            }),
-                        304,
-                        212,
-                        688,
-                        MUTED,
-                    )?;
+                    let subtitle = match &selected {
+                        None => "Add your first desktop to get started.".to_owned(),
+                        Some(p) if presence_shown(p) => format!(
+                            "{}   ·   {}",
+                            p.address,
+                            match presence.state(&p.address) {
+                                crate::presence::State::Online => "Online via relay",
+                                crate::presence::State::Offline => "Offline",
+                                crate::presence::State::Unknown => "Status unknown",
+                            }
+                        ),
+                        Some(p) => p.address.clone(),
+                    };
+                    ui.text(&font, &subtitle, 304, 212, 688, MUTED)?;
                     ui.button(
                         CONNECT,
                         if child.is_some() {
@@ -1198,6 +1468,16 @@ pub fn run() -> Result<()> {
                     ui.button(
                         SIGN_IN,
                         "Sign in again",
+                        selected.is_some() && child.is_none(),
+                        false,
+                    )?;
+                    ui.button(
+                        RELAY,
+                        if selected.as_ref().is_some_and(|p| p.relay.is_some()) {
+                            "Relay: on"
+                        } else {
+                            "Relay"
+                        },
                         selected.is_some() && child.is_none(),
                         false,
                     )?;
@@ -1299,6 +1579,8 @@ pub fn run() -> Result<()> {
 const INK: Color = Color::RGB(231, 240, 246);
 const MUTED: Color = Color::RGB(146, 166, 185);
 const ACCENT: Color = Color::RGB(91, 223, 201);
+const ONLINE: Color = Color::RGB(98, 214, 120);
+const OFFLINE: Color = Color::RGB(96, 108, 124);
 
 fn hit(rect: Rect, x: i32, y: i32) -> bool {
     rect.contains_point((x, y))
@@ -1353,6 +1635,18 @@ impl Painter<'_, '_> {
                 Rect::new(x, y, surface.width(), surface.height()),
             )
             .map_err(anyhow::Error::msg)
+    }
+
+    /// Online: filled accent; offline: filled grey; unknown: outline only.
+    fn presence(&mut self, rect: Rect, state: crate::presence::State) -> Result<()> {
+        match state {
+            crate::presence::State::Online => self.panel(rect, ONLINE),
+            crate::presence::State::Offline => self.panel(rect, OFFLINE),
+            crate::presence::State::Unknown => {
+                self.canvas.set_draw_color(MUTED);
+                self.canvas.draw_rect(rect).map_err(anyhow::Error::msg)
+            }
+        }
     }
 
     fn button(&mut self, rect: Rect, text: &str, enabled: bool, primary: bool) -> Result<()> {
@@ -1490,6 +1784,79 @@ mod tests {
         let mut command = std::process::Command::new("teleport");
         preference.apply(&mut command);
         assert_eq!(command.get_args().count(), 0);
+    }
+
+    #[test]
+    fn relay_settings_reach_the_client_without_secrets_on_its_command_line() -> anyhow::Result<()> {
+        use std::ffi::OsStr;
+        let dir = tempfile::tempdir()?;
+        let key_file = dir.path().join("relay-key-test");
+        {
+            use std::io::Write;
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(&key_file)?.write_all(b"relay secret\n")?;
+        }
+        let mut profile = crate::profiles::Profile {
+            name: "Home".into(),
+            address: "home:4443".into(),
+            pairing_file: None,
+            fingerprint: Some("ab".repeat(32)),
+            relay: None,
+        };
+        // No relay: inherited relay variables never leak into the client.
+        let mut command = std::process::Command::new("teleport");
+        super::apply_relay(&profile, &mut command)?;
+        assert_eq!(command.get_args().count(), 0);
+        let removed: Vec<_> = command.get_envs().collect();
+        assert!(removed.contains(&(OsStr::new("TELEPORT_RELAY_URL"), None)));
+        assert!(removed.contains(&(OsStr::new("TELEPORT_RELAY_KEY"), None)));
+        assert!(super::presence_targets(std::slice::from_ref(&profile)).is_empty());
+
+        profile.relay = Some(crate::profiles::RelaySettings {
+            url: "moqt://relay.example:4444/?jwt=token".into(),
+            fingerprint: Some("cd".repeat(32)),
+            key_file: Some(key_file),
+            route: crate::relay::Route::Auto,
+        });
+        let mut command = std::process::Command::new("teleport");
+        super::apply_relay(&profile, &mut command)?;
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                OsStr::new("--relay-fingerprint"),
+                OsStr::new(&"cd".repeat(32)),
+                OsStr::new("--route"),
+                OsStr::new("auto")
+            ]
+        );
+        let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            envs[OsStr::new("TELEPORT_RELAY_URL")],
+            Some(OsStr::new("moqt://relay.example:4444/?jwt=token"))
+        );
+        assert_eq!(
+            envs[OsStr::new("TELEPORT_RELAY_KEY")],
+            Some(OsStr::new("relay secret"))
+        );
+        let targets = super::presence_targets(std::slice::from_ref(&profile));
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].fingerprint, "ab".repeat(32));
+        assert!(super::presence_shown(&profile));
+        // Direct-only desktops are never watched through the relay.
+        profile.relay.as_mut().unwrap().route = crate::relay::Route::Direct;
+        assert!(super::presence_targets(std::slice::from_ref(&profile)).is_empty());
+        assert!(!super::presence_shown(&profile));
+        // An invalid saved URL blocks the launch instead of being ignored.
+        profile.relay.as_mut().unwrap().url = "http://relay.example".into();
+        assert!(super::apply_relay(&profile, &mut std::process::Command::new("x")).is_err());
+        Ok(())
     }
 
     #[test]

@@ -609,6 +609,38 @@ impl PendingSession {
     }
 }
 
+/// Verify a `HostIdentity::sign_labeled` signature: `certificate` must be the
+/// one the client pins (SHA-256 of its DER equals `pinned_fingerprint`).
+pub fn verify_labeled(
+    certificate: &[u8],
+    pinned_fingerprint: &str,
+    label: &[u8],
+    message: &[u8],
+    signature_bytes: &[u8],
+) -> Result<()> {
+    ensure!(
+        !label.is_empty() && label != HOST_SIGNATURE_LABEL,
+        "signature label must be specific to its use"
+    );
+    let pinned = moq_native::tls::parse_fingerprint(pinned_fingerprint)
+        .map_err(|error| anyhow!("invalid pinned fingerprint: {error}"))?;
+    let actual = digest::digest(&digest::SHA256, certificate);
+    ensure!(
+        bool::from(actual.as_ref().ct_eq(pinned.as_ref())),
+        "host certificate does not match the approved fingerprint"
+    );
+    let (_, parsed) = x509_parser::parse_x509_certificate(certificate)
+        .map_err(|_| anyhow!("host certificate is not valid X.509"))?;
+    let mut signed = label.to_vec();
+    signed.extend_from_slice(message);
+    signature::UnparsedPublicKey::new(
+        &signature::ECDSA_P256_SHA256_ASN1,
+        &parsed.public_key().subject_public_key.data,
+    )
+    .verify(&signed, signature_bytes)
+    .map_err(|_| anyhow!("host signature is invalid"))
+}
+
 /// Host identity used to answer handshakes: the TLS certificate the client
 /// pins and its P-256 private key.
 #[cfg(target_os = "linux")]
@@ -634,6 +666,29 @@ impl HostIdentity {
             "host key does not match its certificate"
         );
         Ok(Self { certificate, key })
+    }
+
+    /// The certificate clients pin (DER).
+    pub fn certificate(&self) -> &[u8] {
+        &self.certificate
+    }
+
+    /// Sign `label ‖ message` with the host key, for statements other than
+    /// the handshake transcript (e.g. relay presence). Each use needs its own
+    /// label, distinct from the transcript's, so signatures never cross over.
+    pub fn sign_labeled(&self, label: &[u8], message: &[u8]) -> Result<Vec<u8>> {
+        ensure!(
+            !label.is_empty() && label != HOST_SIGNATURE_LABEL,
+            "signature label must be specific to its use"
+        );
+        let mut signed = label.to_vec();
+        signed.extend_from_slice(message);
+        Ok(self
+            .key
+            .sign(&SystemRandom::new(), &signed)
+            .map_err(|_| anyhow!("signing failed"))?
+            .as_ref()
+            .to_vec())
     }
 
     /// Return which candidate credential (by index) the hello names, if any.

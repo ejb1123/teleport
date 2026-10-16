@@ -244,7 +244,7 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
     };
     let relay_namespace = crate::relay::namespace(&pairing.fingerprint)?;
     // Connected relay, confirmed sessions from its intake task, and the tasks
-    // (session intake, enrollment).
+    // (session intake, presence, enrollment).
     let mut relay: Option<(
         crate::relay::Link,
         tokio::sync::mpsc::Receiver<crate::relay::Accepted>,
@@ -259,7 +259,13 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         {
             match crate::relay::connect(endpoint, &relay_namespace).await {
                 Ok(link) => {
-                    tracing::info!(relay = %endpoint.url, namespace = %relay_namespace, "connected to relay; accepting end-to-end encrypted sessions");
+                    tracing::info!(relay = %endpoint.display_url(), namespace = %relay_namespace, "connected to relay; accepting end-to-end encrypted sessions");
+                    // Signed "online" statements for launchers (see presence.rs).
+                    let presence = tokio::spawn(crate::presence::publish(
+                        link.outgoing.clone(),
+                        e2e.clone(),
+                        relay_namespace.clone(),
+                    ));
                     let (sender, receiver) = tokio::sync::mpsc::channel(4);
                     let intake = tokio::spawn(crate::relay::intake(
                         link.session.clone(),
@@ -270,7 +276,10 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
                         sender,
                         options.relay_require_device_key,
                     ));
-                    let mut tasks = vec![crate::relay::AbortOnDrop(intake)];
+                    let mut tasks = vec![
+                        crate::relay::AbortOnDrop(intake),
+                        crate::relay::AbortOnDrop(presence),
+                    ];
                     // Password and system-login enrollment through the relay.
                     if let Some((_, control)) = &admin {
                         tasks.push(crate::relay::AbortOnDrop(tokio::spawn(

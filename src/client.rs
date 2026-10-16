@@ -66,8 +66,14 @@ pub struct Options {
     pub embedded_cursor: bool,
     /// Reach the host through this MoQ relay with end-to-end encryption
     /// (e.g. moqt://relay.example:4444). The host must run with the same --relay.
-    #[arg(long)]
+    /// The environment form keeps a provider token out of the process list.
+    #[arg(long, env = "TELEPORT_RELAY_URL", hide_env_values = true)]
     pub relay: Option<url::Url>,
+    /// How to reach the host: `direct`, `relay`, or `auto` (direct with a
+    /// short timeout, then the relay). Default: `relay` with --relay, else
+    /// `direct`. Reconnects choose again.
+    #[arg(long, value_enum)]
+    pub route: Option<crate::relay::Route>,
     /// Pin a self-hosted relay's certificate (printed by `teleport relay`).
     #[arg(long, requires = "relay")]
     pub relay_fingerprint: Option<String>,
@@ -111,7 +117,74 @@ pub struct Options {
     pub dynamic_range: protocol::DynamicRange,
 }
 
+/// How long `--route auto` waits for the direct QUIC handshake before it
+/// tries the relay.
+const DIRECT_ATTEMPT: Duration = Duration::from_millis(2500);
+/// Overall bound for one connection attempt on a single path.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The path a session actually took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionPath {
+    Direct,
+    Relay,
+}
+
+impl SessionPath {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Relay => "relay",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Direct => "direct (pinned TLS)",
+            Self::Relay => "relay (end-to-end encrypted)",
+        }
+    }
+}
+
+/// The direct path could not be established at the transport level (no
+/// answer, refused, or a different certificate), so nothing reached a host
+/// that accepted our credential and the relay may be tried instead.
+#[derive(Debug)]
+struct DirectUnreachable;
+
+impl std::fmt::Display for DirectUnreachable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("direct path unavailable")
+    }
+}
+
+impl Options {
+    fn effective_route(&self) -> Result<crate::relay::Route> {
+        use crate::relay::Route;
+        let route = self.route.unwrap_or(if self.relay.is_some() {
+            Route::Relay
+        } else {
+            Route::Direct
+        });
+        ensure!(
+            route == Route::Direct || self.relay.is_some(),
+            "--route {} needs --relay",
+            route.as_str()
+        );
+        Ok(route)
+    }
+
+    /// Bound for a whole connection attempt, including a failed direct try.
+    fn connect_timeout(&self) -> Duration {
+        match self.effective_route() {
+            Ok(crate::relay::Route::Auto) => CONNECT_TIMEOUT + DIRECT_ATTEMPT,
+            _ => CONNECT_TIMEOUT,
+        }
+    }
+}
+
 struct Link {
+    path: SessionPath,
     /// Relay handshake and bridges; dropping it ends a relayed session.
     _relay: Option<crate::relay::ClientSession>,
     remote: moq_net::broadcast::Consumer,
@@ -127,7 +200,44 @@ struct Link {
     audio: Option<moq_net::track::Subscriber>,
 }
 
+/// Connect along the configured route. `auto` tries the direct address for
+/// [`DIRECT_ATTEMPT`], then the relay; it only falls back when the direct
+/// transport itself failed, never after a host answered. Both paths
+/// authenticate the host by its pinned certificate; the relay path always
+/// adds end-to-end encryption.
 async fn connect(options: &Options) -> Result<Link> {
+    let link = match options.effective_route()? {
+        crate::relay::Route::Direct => connect_via(options, SessionPath::Direct, None).await?,
+        crate::relay::Route::Relay => connect_via(options, SessionPath::Relay, None).await?,
+        crate::relay::Route::Auto => {
+            match connect_via(options, SessionPath::Direct, Some(DIRECT_ATTEMPT)).await {
+                Ok(link) => link,
+                Err(error) if error.downcast_ref::<DirectUnreachable>().is_some() => {
+                    tracing::info!(
+                        error = format!("{error:#}"),
+                        "direct path unavailable; trying the relay"
+                    );
+                    connect_via(options, SessionPath::Relay, None)
+                        .await
+                        .context("direct path unavailable and relay failed")?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    };
+    tracing::info!(
+        path = link.path.as_str(),
+        "connection path chosen: {}",
+        link.path.description()
+    );
+    Ok(link)
+}
+
+async fn connect_via(
+    options: &Options,
+    path: SessionPath,
+    direct_timeout: Option<Duration>,
+) -> Result<Link> {
     let agent_path = options
         .forward_ssh_agent
         .then(crate::ssh_agent::agent_path)
@@ -154,8 +264,8 @@ async fn connect(options: &Options) -> Result<Link> {
     config.quic.mtu_discovery = Some(protocol::QUIC_MTU_DISCOVERY);
     // Relay mode: authenticate the host end to end, then let the unchanged
     // session code below use plaintext origins that the bridge seals.
-    let relay = match &options.relay {
-        Some(relay) => Some(
+    let relay = match (&options.relay, path) {
+        (Some(relay), SessionPath::Relay) => Some(
             crate::relay::client(
                 &crate::relay::Endpoint {
                     url: relay.clone(),
@@ -167,7 +277,8 @@ async fn connect(options: &Options) -> Result<Link> {
             )
             .await?,
         ),
-        None => None,
+        (None, SessionPath::Relay) => anyhow::bail!("the relay path needs --relay"),
+        (_, SessionPath::Direct) => None,
     };
     config.tls.fingerprint = vec![pairing.fingerprint];
     let (outgoing, incoming) = match &relay {
@@ -209,10 +320,28 @@ async fn connect(options: &Options) -> Result<Link> {
                 .with_publisher(&outgoing)
                 .with_subscriber(incoming.clone());
             tracing::info!(address = %options.address, "connecting with pinned TLS certificate");
-            client
-                .connect(url)
-                .await
-                .context("QUIC connection failed; check address, pairing file and UDP firewall")?
+            let attempt = client.connect(url);
+            let result = match direct_timeout {
+                Some(limit) => match tokio::time::timeout(limit, attempt).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        return Err(anyhow::anyhow!("no answer within {limit:?}")
+                            .context(DirectUnreachable));
+                    }
+                },
+                None => attempt.await,
+            };
+            match result {
+                Ok(session) => session,
+                Err(error) if direct_timeout.is_some() => {
+                    return Err(anyhow::Error::from(error).context(DirectUnreachable));
+                }
+                Err(error) => {
+                    return Err(anyhow::Error::from(error).context(
+                        "QUIC connection failed; check address, pairing file and UDP firewall",
+                    ));
+                }
+            }
         }
     };
     let incoming_broadcasts = incoming.consume();
@@ -287,6 +416,7 @@ async fn connect(options: &Options) -> Result<Link> {
         None
     };
     Ok(Link {
+        path,
         _relay: relay,
         remote,
         ssh_agent,
@@ -393,6 +523,7 @@ pub fn run(options: Options, runtime: &Runtime) -> Result<()> {
             || cfg!(target_os = "macos"),
         "HDR presentation currently requires macOS; select an SDR stream on Linux"
     );
+    options.effective_route()?;
     media::prepare_decoder(
         options.software_decoder,
         media::VideoFormat {
@@ -406,7 +537,7 @@ pub fn run(options: Options, runtime: &Runtime) -> Result<()> {
             Some(
                 runtime
                     .block_on(async {
-                        tokio::time::timeout(Duration::from_secs(15), connect(&options)).await
+                        tokio::time::timeout(options.connect_timeout(), connect(&options)).await
                     })
                     .context("connection timed out")??,
             )
@@ -494,7 +625,7 @@ fn connect_window(
         if task.is_none() && Instant::now() >= retry_at {
             let options = options.clone();
             task = Some(runtime.spawn(async move {
-                tokio::time::timeout(Duration::from_secs(15), connect(&options))
+                tokio::time::timeout(options.connect_timeout(), connect(&options))
                     .await
                     .context("connection timed out; check UDP 4443 and host address")?
             }));
@@ -522,7 +653,15 @@ fn connect_window(
         canvas.set_draw_color(sdl2::pixels::Color::RGB(18, 23, 32));
         canvas.clear();
         for (row, text) in [
-            format!("Connecting to {}", options.address),
+            match options.effective_route() {
+                Ok(crate::relay::Route::Auto) => {
+                    format!("Connecting to {} (direct, then relay)", options.address)
+                }
+                Ok(crate::relay::Route::Relay) => {
+                    format!("Connecting to {} through the relay", options.address)
+                }
+                _ => format!("Connecting to {}", options.address),
+            },
             status.chars().take(85).collect(),
             if options.reconnect {
                 "Retries automatically. Close this window or press Esc to cancel.".into()
@@ -762,7 +901,8 @@ fn update_nv12(
 }
 
 fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool> {
-    tracing::info!(width = link.desktop.width, height = link.desktop.height, source = %link.desktop.source, "desktop connected; Ctrl+Alt+Q quits locally");
+    let session_path = link.path;
+    tracing::info!(path = session_path.as_str(), width = link.desktop.width, height = link.desktop.height, source = %link.desktop.source, "desktop connected; Ctrl+Alt+Q quits locally");
     // Choose the presentation format from the actual renderer, not the decoder
     // name. NV12 is useful only when SDL can convert it with its GPU renderer.
     let mut window_state = if options.headless_frames.is_none() {
@@ -1966,6 +2106,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     ),
                     desktop.bitrate as f64 / 1000.0
                 ),
+                format!("Path                  {}", session_path.description()),
                 format!("Control round trip    {latency}"),
                 format!("Host encoder          {host_encoder}"),
                 format!(
@@ -3131,5 +3272,47 @@ mod tests {
             Arguments::try_parse_from(base.into_iter().chain(["--codec", "h265"])).unwrap();
         assert_eq!(parsed.options.codec, protocol::VideoCodec::H265);
         assert!(Arguments::try_parse_from(base.into_iter().chain(["--codec", "av1"])).is_err());
+    }
+
+    #[test]
+    fn route_defaults_keep_existing_behaviour_and_relay_routes_need_a_relay() {
+        use crate::relay::Route;
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Arguments {
+            #[command(flatten)]
+            options: Options,
+        }
+        let parse = |extra: &[&str]| {
+            Arguments::try_parse_from(
+                ["test", "localhost:4443", "--pairing-file", "unused.json"]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            )
+            .unwrap()
+            .options
+        };
+        let relay = ["--relay", "moqt://relay.example:4444"];
+        // Skip if a developer's environment supplies a relay.
+        if std::env::var_os("TELEPORT_RELAY_URL").is_none() {
+            assert_eq!(parse(&[]).effective_route().unwrap(), Route::Direct);
+            assert!(parse(&["--route", "auto"]).effective_route().is_err());
+            assert!(parse(&["--route", "relay"]).effective_route().is_err());
+            assert_eq!(parse(&[]).connect_timeout(), CONNECT_TIMEOUT);
+        }
+        assert_eq!(parse(&relay).effective_route().unwrap(), Route::Relay);
+        let auto = parse(&[relay[0], relay[1], "--route", "auto"]);
+        assert_eq!(auto.effective_route().unwrap(), Route::Auto);
+        assert_eq!(auto.connect_timeout(), CONNECT_TIMEOUT + DIRECT_ATTEMPT);
+        let direct = parse(&[relay[0], relay[1], "--route", "direct"]);
+        assert_eq!(direct.effective_route().unwrap(), Route::Direct);
+        // Auto falls back only on the marked transport failure.
+        let unreachable = anyhow::anyhow!("timeout").context(DirectUnreachable);
+        assert!(unreachable.downcast_ref::<DirectUnreachable>().is_some());
+        assert!(
+            anyhow::anyhow!("host rejected")
+                .downcast_ref::<DirectUnreachable>()
+                .is_none()
+        );
     }
 }

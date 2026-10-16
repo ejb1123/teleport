@@ -1031,3 +1031,314 @@ fn native_toolbar_monitor_reconnect_disconnect_and_launcher() {
         .unwrap();
     wait_exit(&mut launcher);
 }
+
+/// Press one key by keysym (e.g. Tab 0xff09, Return 0xff0d).
+fn press_keysym(connection: &RustConnection, root: u32, keysym: u32) {
+    let setup = connection.setup();
+    let mapping = connection
+        .get_keyboard_mapping(setup.min_keycode, setup.max_keycode - setup.min_keycode + 1)
+        .unwrap()
+        .reply()
+        .unwrap();
+    let code = setup.min_keycode
+        + mapping
+            .keysyms
+            .chunks(usize::from(mapping.keysyms_per_keycode))
+            .position(|symbols| symbols[0] == keysym)
+            .expect("keysym is absent from Xvfb keymap") as u8;
+    for kind in [xproto::KEY_PRESS_EVENT, xproto::KEY_RELEASE_EVENT] {
+        connection
+            .xtest_fake_input(kind, code, 0, root, 0, 0, 0)
+            .unwrap()
+            .check()
+            .unwrap();
+    }
+    connection.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(60));
+}
+
+fn wait_profiles(
+    index: &std::path::Path,
+    ready: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(bytes) = std::fs::read(index)
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && ready(&value)
+        {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "profiles were not saved as expected"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// Relay settings are edited per desktop with the mouse and the keyboard,
+/// saved without the key in profiles.json, and the key kept in a private file.
+#[test]
+#[ignore = "requires Xvfb"]
+fn native_launcher_edits_relay_settings() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let config = temp.path().join("config");
+    let mut display = Process(
+        Command::new("Xvfb")
+            .args([
+                "-displayfd",
+                "1",
+                "-screen",
+                "0",
+                "1600x1000x24",
+                "-nolisten",
+                "tcp",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut number = String::new();
+    std::io::BufReader::new(display.0.stdout.take().unwrap())
+        .read_line(&mut number)
+        .unwrap();
+    let display_name = format!(":{}", number.trim());
+    let (connection, screen) = x11rb::connect(Some(&display_name)).unwrap();
+    let root = connection.setup().roots[screen].root;
+    let mut launcher = Process(
+        teleport(&display_name)
+            .arg("launcher")
+            .env("XDG_CONFIG_HOME", &config)
+            .env("SDL_RENDER_DRIVER", "software")
+            .env("SDL_IM_MODULE", "none")
+            .env("XMODIFIERS", "@im=none")
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let window = loop {
+        let window = desktop_window(&connection, root, &mut launcher, "Teleport", None);
+        if rendered_pixel(&connection, window, 1030, 820, 0x0c121b) {
+            break window;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "launcher did not draw its first frame"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    };
+    add_desktop(&connection, root, window, "Away", "away.example:4443");
+    let index = config.join("teleport/profiles.json");
+    wait_profiles(&index, |value| value[0]["name"] == "Away");
+
+    // Open the relay form; the URL field takes focus.
+    click(&connection, root, window, 880, 360);
+    wait_field_focus(&connection, window, 220);
+    type_ascii(&connection, root, window, "moqt://relay.example:4444");
+    click(&connection, root, window, 400, 320);
+    wait_field_focus(&connection, window, 300);
+    let pin = "AB".repeat(32);
+    type_ascii(&connection, root, window, &pin);
+    click(&connection, root, window, 400, 400);
+    wait_field_focus(&connection, window, 380);
+    type_ascii(&connection, root, window, "first-relay-key");
+    // "Relay only", then save.
+    click(&connection, root, window, 870, 475);
+    std::thread::sleep(Duration::from_millis(100));
+    click(&connection, root, window, 500, 540);
+    let saved = wait_profiles(&index, |value| !value[0]["relay"].is_null());
+    let relay = &saved[0]["relay"];
+    assert_eq!(relay["url"], "moqt://relay.example:4444");
+    assert_eq!(relay["fingerprint"], "ab".repeat(32));
+    assert_eq!(relay["route"], "relay");
+    let raw = std::fs::read_to_string(&index).unwrap();
+    assert!(!raw.contains("first-relay-key"), "key leaked: {raw}");
+    let first_key = std::path::PathBuf::from(relay["key_file"].as_str().unwrap());
+    assert!(first_key.starts_with(config.join("teleport")));
+    assert_eq!(
+        std::fs::read_to_string(&first_key).unwrap(),
+        "first-relay-key"
+    );
+    assert_eq!(
+        std::fs::metadata(&first_key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // Keyboard editing: reopen, Tab twice to the key, type, Enter saves.
+    click(&connection, root, window, 880, 360);
+    wait_field_focus(&connection, window, 220);
+    press_keysym(&connection, root, 0xff09);
+    wait_field_focus(&connection, window, 300);
+    press_keysym(&connection, root, 0xff09);
+    wait_field_focus(&connection, window, 380);
+    type_ascii(&connection, root, window, "second-relay-key");
+    press_keysym(&connection, root, 0xff0d);
+    let saved = wait_profiles(&index, |value| {
+        value[0]["relay"]["key_file"].as_str() != first_key.to_str()
+    });
+    let relay = &saved[0]["relay"];
+    assert_eq!(relay["url"], "moqt://relay.example:4444");
+    assert_eq!(relay["route"], "relay");
+    let second_key = std::path::PathBuf::from(relay["key_file"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&second_key).unwrap(),
+        "second-relay-key"
+    );
+    assert!(!first_key.exists(), "replaced key file was left behind");
+
+    // Clearing the URL removes the relay and its key.
+    click(&connection, root, window, 880, 360);
+    wait_field_focus(&connection, window, 220);
+    for _ in 0.."moqt://relay.example:4444".len() {
+        press_keysym(&connection, root, 0xff08);
+    }
+    click(&connection, root, window, 500, 540);
+    wait_profiles(&index, |value| value[0].get("relay").is_none());
+    assert!(!second_key.exists(), "removed relay kept its key file");
+    drop(launcher);
+}
+
+fn private_file(path: &std::path::Path, contents: &[u8]) {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap()
+        .write_all(contents)
+        .unwrap();
+}
+
+/// A saved desktop with relay settings shows the host's signed presence:
+/// online while the host is on the relay, offline once it stops.
+#[test]
+#[ignore = "requires Xvfb, local UDP sockets and GStreamer runtime plugins"]
+fn native_launcher_shows_relay_presence() {
+    use std::os::unix::fs::PermissionsExt;
+    const KEY: &str = "ui-presence-relay-key";
+    let temp = tempfile::tempdir_in("/tmp").unwrap();
+    let config = temp.path().join("config/teleport");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let identity = temp.path().join("identity");
+    let mut display = Process(
+        Command::new("Xvfb")
+            .args([
+                "-displayfd",
+                "1",
+                "-screen",
+                "0",
+                "1600x1000x24",
+                "-nolisten",
+                "tcp",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut number = String::new();
+    std::io::BufReader::new(display.0.stdout.take().unwrap())
+        .read_line(&mut number)
+        .unwrap();
+    let display_name = format!(":{}", number.trim());
+    let (connection, screen) = x11rb::connect(Some(&display_name)).unwrap();
+    let root = connection.setup().roots[screen].root;
+    let free_udp = || {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.local_addr().unwrap().to_string()
+    };
+    let relay_address = free_udp();
+    let mut relay = Process(
+        teleport(&display_name)
+            .args(["relay", "--listen", &relay_address, "--key", KEY])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut lines = std::io::BufReader::new(relay.0.stdout.take().unwrap()).lines();
+    let relay_fingerprint = lines
+        .by_ref()
+        .map_while(Result::ok)
+        .find_map(|line| line.strip_prefix("RELAY FINGERPRINT ").map(str::to_owned))
+        .expect("relay did not print its fingerprint");
+    std::thread::spawn(move || for _ in lines.map_while(Result::ok) {});
+    let relay_url = format!("moqt://{relay_address}");
+    let log = temp.path().join("host.log");
+    let mut host = Process(
+        teleport(&display_name)
+            .args(["host", "--source", "test", "--encoder", "software"])
+            .args(["--listen", &free_udp(), "--width", "640"])
+            .arg("--identity-dir")
+            .arg(&identity)
+            .args([
+                "--relay",
+                &relay_url,
+                "--relay-fingerprint",
+                &relay_fingerprint,
+            ])
+            .args(["--relay-key", KEY])
+            .stdout(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("connected to relay")
+    {
+        assert!(Instant::now() < deadline, "host did not connect to relay");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let pairing = std::fs::read(identity.join("pairing.json")).unwrap();
+    let fingerprint = serde_json::from_slice::<serde_json::Value>(&pairing).unwrap()["fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    private_file(&config.join("pairing-ui.json"), &pairing);
+    private_file(&config.join("relay-key-ui"), KEY.as_bytes());
+    private_file(
+        &config.join("profiles.json"),
+        &serde_json::to_vec(&serde_json::json!([{
+            "name": "Away desktop",
+            // Unreachable directly: presence comes only through the relay.
+            "address": "127.0.0.1:9",
+            "pairing_file": config.join("pairing-ui.json"),
+            "fingerprint": fingerprint,
+            "relay": {
+                "url": relay_url,
+                "fingerprint": relay_fingerprint,
+                "key_file": config.join("relay-key-ui"),
+                "route": "auto",
+            },
+        }]))
+        .unwrap(),
+    );
+    let mut launcher = Process(
+        teleport(&display_name)
+            .arg("launcher")
+            .env("XDG_CONFIG_HOME", temp.path().join("config"))
+            .env("SDL_RENDER_DRIVER", "software")
+            .spawn()
+            .unwrap(),
+    );
+    let window = desktop_window(&connection, root, &mut launcher, "Teleport", None);
+    // The presence dot of the first saved desktop.
+    let wait_dot = |rgb: u32, what: &str, limit: Duration| {
+        let deadline = Instant::now() + limit;
+        while !rendered_pixel(&connection, window, 231, 172, rgb) {
+            if Instant::now() >= deadline {
+                dump_window(&connection, window);
+            }
+            assert!(Instant::now() < deadline, "launcher never showed {what}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    wait_dot(0x62d678, "the desktop online", Duration::from_secs(20));
+    host.0.kill().unwrap();
+    host.0.wait().unwrap();
+    wait_dot(0x606c7c, "the desktop offline", Duration::from_secs(40));
+    drop(launcher);
+}

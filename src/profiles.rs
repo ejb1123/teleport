@@ -16,6 +16,99 @@ pub struct Profile {
     pub pairing_file: Option<PathBuf>,
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// Optional MoQ relay for reaching this desktop from anywhere. Absent in
+    /// profiles saved before relay support (and then never written).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelaySettings>,
+}
+
+/// How a saved desktop is reached through a relay. Saved by the launcher's
+/// relay form and meant to be filled in by pairing as well (`set_relay`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelaySettings {
+    /// `moqt://relay.example:4444` (self-hosted) or a provider's `https://`
+    /// WebTransport URL.
+    pub url: String,
+    /// Pin for a self-hosted relay's certificate (`teleport relay` prints it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    /// Private file (mode 0600, like pairing files) holding the relay access
+    /// key. The key itself is never written to profiles.json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_file: Option<PathBuf>,
+    /// Direct, relay, or direct first with automatic fallback to the relay.
+    #[serde(default)]
+    pub route: crate::relay::Route,
+}
+
+impl RelaySettings {
+    pub fn validate(&self) -> Result<()> {
+        validate_relay_url(&self.url)?;
+        if let Some(pin) = &self.fingerprint {
+            moq_native::tls::parse_fingerprint(pin)
+                .map_err(|error| anyhow::anyhow!("invalid relay fingerprint: {error}"))?;
+        }
+        Ok(())
+    }
+
+    /// The relay access key, read from its private file.
+    pub fn read_key(&self) -> Result<Option<zeroize::Zeroizing<String>>> {
+        let Some(path) = &self.key_file else {
+            return Ok(None);
+        };
+        check_private_file(path).context("relay key file")?;
+        let key = zeroize::Zeroizing::new(fs::read_to_string(path)?);
+        Ok(Some(zeroize::Zeroizing::new(key.trim().to_owned())))
+    }
+
+    /// Everything needed to connect to the relay, including the key.
+    pub fn endpoint(&self) -> Result<crate::relay::Endpoint> {
+        self.validate()?;
+        Ok(crate::relay::Endpoint {
+            url: self.url.parse()?,
+            fingerprint: self.fingerprint.clone(),
+            key: self.read_key()?.map(|key| key.to_string()),
+        })
+    }
+}
+
+pub fn validate_relay_url(url: &str) -> Result<()> {
+    let parsed: url::Url = url
+        .trim()
+        .parse()
+        .context("enter a relay URL, e.g. moqt://relay.example:4444")?;
+    ensure!(
+        matches!(parsed.scheme(), "moqt" | "moql" | "https"),
+        "relay URLs start with moqt:// (self-hosted) or https:// (provider)"
+    );
+    ensure!(
+        parsed.host_str().is_some_and(|host| !host.is_empty()),
+        "the relay URL needs a host"
+    );
+    ensure!(
+        parsed.username().is_empty() && parsed.password().is_none() && parsed.fragment().is_none(),
+        "the relay URL must not contain a user name, password or fragment"
+    );
+    ensure!(url.len() <= 2048, "the relay URL is too long");
+    Ok(())
+}
+
+/// A change to the saved relay access key.
+pub enum RelayKey {
+    /// Keep whatever key is saved (none stays none).
+    Keep,
+    /// Forget the saved key.
+    Clear,
+    /// Save this key (in a new private file).
+    Set(zeroize::Zeroizing<String>),
+}
+
+/// Relay settings to save for a desktop (see `set_relay`).
+pub struct RelayUpdate {
+    pub url: String,
+    pub fingerprint: Option<String>,
+    pub key: RelayKey,
+    pub route: crate::relay::Route,
 }
 
 impl Profile {
@@ -211,6 +304,7 @@ fn save_desktop_in(
         address: address.into(),
         pairing_file: None,
         fingerprint: None,
+        relay: None,
     };
     let mut updated = profiles.clone();
     updated.push(profile.clone());
@@ -299,6 +393,8 @@ fn save_pairing_in(
         address: address.to_owned(),
         pairing_file: Some(pairing_file),
         fingerprint: Some(pairing.fingerprint.to_ascii_lowercase()),
+        // Signing in again keeps how the desktop is reached.
+        relay: previous.and_then(|profile| profile.relay.clone()),
     };
     // Keep the previous trusted credential until the updated index has been saved.
     let mut updated = profiles.clone();
@@ -312,8 +408,287 @@ fn save_pairing_in(
     Ok(profile)
 }
 
+/// Save (or with `None`, remove) a desktop's relay settings. Host trust is
+/// untouched: the relay path authenticates the host with the same pin. Pairing
+/// that learns relay settings from the host can call this after
+/// `save_pairing`.
+pub fn set_relay(
+    address: &str,
+    update: Option<RelayUpdate>,
+    profiles: &mut Vec<Profile>,
+) -> Result<Profile> {
+    set_relay_in(address, update, profiles, &directory()?)
+}
+
+fn set_relay_in(
+    address: &str,
+    update: Option<RelayUpdate>,
+    profiles: &mut Vec<Profile>,
+    directory: &Path,
+) -> Result<Profile> {
+    let _lock = lock_and_reload(directory, profiles)?;
+    let mut updated = profiles.clone();
+    let profile = updated
+        .iter_mut()
+        .find(|profile| profile.address == address)
+        .context("save the desktop first")?;
+    let previous_key = profile
+        .relay
+        .as_ref()
+        .and_then(|relay| relay.key_file.clone());
+    let mut written_key = None;
+    let relay = match update {
+        None => None,
+        Some(update) => {
+            let fingerprint = update
+                .fingerprint
+                .map(|pin| pin.trim().to_ascii_lowercase())
+                .filter(|pin| !pin.is_empty());
+            let key_file = match update.key {
+                RelayKey::Keep => previous_key.clone(),
+                RelayKey::Clear => None,
+                RelayKey::Set(key) => {
+                    let key = key.trim();
+                    if key.is_empty() {
+                        None
+                    } else {
+                        ensure!(
+                            key.len() <= 512 && !key.chars().any(char::is_control),
+                            "the relay key must be at most 512 printable characters"
+                        );
+                        prepare_directory(directory)?;
+                        let path =
+                            directory.join(format!("relay-key-{:016x}", rand::random::<u64>()));
+                        private_write(&path, key.as_bytes())?;
+                        written_key = Some(path.clone());
+                        Some(path)
+                    }
+                }
+            };
+            let settings = RelaySettings {
+                url: update.url.trim().to_owned(),
+                fingerprint,
+                key_file,
+                route: update.route,
+            };
+            if let Err(error) = settings.validate() {
+                if let Some(path) = &written_key {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(error);
+            }
+            Some(settings)
+        }
+    };
+    profile.relay = relay;
+    let result = profile.clone();
+    let current_key = result
+        .relay
+        .as_ref()
+        .and_then(|relay| relay.key_file.clone());
+    if let Err(error) = private_write(
+        &directory.join("profiles.json"),
+        &serde_json::to_vec_pretty(&updated)?,
+    ) {
+        if let Some(path) = &written_key {
+            let _ = fs::remove_file(path);
+        }
+        return Err(error);
+    }
+    // Remove a replaced key, but only one this module created.
+    if let Some(old) = previous_key
+        && current_key.as_ref() != Some(&old)
+        && old.parent() == Some(directory)
+        && old
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("relay-key-"))
+    {
+        let _ = fs::remove_file(old);
+    }
+    *profiles = updated;
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relay_settings_round_trip_keep_trust_and_store_the_key_privately() -> anyhow::Result<()> {
+        use super::{RelayKey, RelayUpdate};
+        use crate::relay::Route;
+        let dir = tempfile::tempdir()?;
+        let mut profiles = Vec::new();
+        super::save_desktop_in("Home", "home:4443", &mut profiles, dir.path())?;
+        let pin = "ab".repeat(32);
+        super::approve_fingerprint_in("home:4443", &pin, &mut profiles, dir.path())?;
+        let update = |key| RelayUpdate {
+            url: " moqt://relay.example:4444 ".into(),
+            fingerprint: Some("CD".repeat(32)),
+            key,
+            route: Route::Auto,
+        };
+        let saved = super::set_relay_in(
+            "home:4443",
+            Some(update(RelayKey::Set("relay secret".to_owned().into()))),
+            &mut profiles,
+            dir.path(),
+        )?;
+        let relay = saved.relay.clone().unwrap();
+        assert_eq!(relay.url, "moqt://relay.example:4444");
+        assert_eq!(relay.fingerprint, Some("cd".repeat(32)));
+        let key_file = relay.key_file.clone().unwrap();
+        super::check_private_file(&key_file)?;
+        assert_eq!(relay.read_key()?.unwrap().as_str(), "relay secret");
+        let index = std::fs::read_to_string(dir.path().join("profiles.json"))?;
+        assert!(!index.contains("relay secret"), "key leaked into the index");
+        let endpoint = relay.endpoint()?;
+        assert_eq!(endpoint.key.as_deref(), Some("relay secret"));
+        assert!(!format!("{endpoint:?}").contains("relay secret"));
+        // Reloads equal, and trust is untouched.
+        let loaded = super::load_in(dir.path())?;
+        assert_eq!(loaded[0].relay.as_ref(), Some(&relay));
+        assert_eq!(
+            loaded[0].trusted_fingerprint()?.as_deref(),
+            Some(pin.as_str())
+        );
+
+        // Keep preserves the key; a new key replaces (and removes) the old file.
+        let kept = super::set_relay_in(
+            "home:4443",
+            Some(RelayUpdate {
+                route: Route::Relay,
+                ..update(RelayKey::Keep)
+            }),
+            &mut profiles,
+            dir.path(),
+        )?;
+        assert_eq!(
+            kept.relay.as_ref().unwrap().key_file.as_ref(),
+            Some(&key_file)
+        );
+        assert_eq!(kept.relay.as_ref().unwrap().route, Route::Relay);
+        let replaced = super::set_relay_in(
+            "home:4443",
+            Some(update(RelayKey::Set("second".to_owned().into()))),
+            &mut profiles,
+            dir.path(),
+        )?;
+        assert!(!key_file.exists());
+        let second = replaced.relay.unwrap().key_file.unwrap();
+        // Signing in again keeps the relay settings.
+        let pairing = crate::protocol::Pairing {
+            token: "aa".repeat(32),
+            fingerprint: pin.clone(),
+            device_key: None,
+        };
+        let paired = super::save_pairing_in("home:4443", &pairing, &mut profiles, dir.path())?;
+        assert_eq!(
+            paired.relay.as_ref().unwrap().key_file.as_ref(),
+            Some(&second)
+        );
+
+        // Invalid settings change nothing and leave no stray key file.
+        let before = std::fs::read(dir.path().join("profiles.json"))?;
+        for bad in [
+            "relay.example:4444",
+            "http://relay.example:4444",
+            "moqt://user:pw@relay.example:4444",
+            "",
+        ] {
+            let result = super::set_relay_in(
+                "home:4443",
+                Some(RelayUpdate {
+                    url: bad.into(),
+                    ..update(RelayKey::Set("third".to_owned().into()))
+                }),
+                &mut profiles,
+                dir.path(),
+            );
+            assert!(result.is_err(), "{bad}");
+        }
+        let bad_pin = super::set_relay_in(
+            "home:4443",
+            Some(RelayUpdate {
+                fingerprint: Some("not hex".into()),
+                ..update(RelayKey::Keep)
+            }),
+            &mut profiles,
+            dir.path(),
+        );
+        assert!(bad_pin.is_err());
+        assert_eq!(std::fs::read(dir.path().join("profiles.json"))?, before);
+        let keys = std::fs::read_dir(dir.path())?
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("relay-key-")
+            })
+            .count();
+        assert_eq!(keys, 1);
+
+        // Removing relay settings removes the key file too.
+        let removed = super::set_relay_in("home:4443", None, &mut profiles, dir.path())?;
+        assert!(removed.relay.is_none());
+        assert!(!second.exists());
+        assert!(!std::fs::read_to_string(dir.path().join("profiles.json"))?.contains("relay"));
+        assert!(super::set_relay_in("missing:4443", None, &mut profiles, dir.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn profiles_without_relay_fields_load_with_defaults() -> anyhow::Result<()> {
+        // Written by an older release: no relay fields at all.
+        let old: Vec<super::Profile> = serde_json::from_value(serde_json::json!([
+            { "name": "Old", "address": "old:4443", "fingerprint": "ab".repeat(32) },
+        ]))?;
+        assert!(old[0].relay.is_none());
+        // Relay settings with only a URL default to automatic routing.
+        let minimal: super::Profile = serde_json::from_value(serde_json::json!({
+            "address": "new:4443",
+            "relay": { "url": "moqt://relay.example:4444" }
+        }))?;
+        let relay = minimal.relay.unwrap();
+        assert_eq!(relay.route, crate::relay::Route::Auto);
+        assert!(relay.key_file.is_none() && relay.fingerprint.is_none());
+        assert!(relay.read_key()?.is_none());
+        let routes: Vec<crate::relay::Route> =
+            serde_json::from_str(r#"["auto","direct","relay"]"#)?;
+        assert_eq!(
+            routes,
+            [
+                crate::relay::Route::Auto,
+                crate::relay::Route::Direct,
+                crate::relay::Route::Relay
+            ]
+        );
+        // Profiles without a relay serialize exactly as before.
+        let json = serde_json::to_value(&old[0])?;
+        assert!(json.get("relay").is_none());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_public_relay_key_file_is_refused() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("relay-key-public");
+        super::private_write(&path, b"secret")?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        let settings = super::RelaySettings {
+            url: "moqt://relay.example:4444".into(),
+            fingerprint: None,
+            key_file: Some(path),
+            route: crate::relay::Route::Auto,
+        };
+        assert!(settings.read_key().is_err());
+        assert!(settings.endpoint().is_err());
+        Ok(())
+    }
+
     #[test]
     fn stale_instances_cannot_replace_pins_or_erase_other_desktops() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
