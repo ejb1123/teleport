@@ -44,6 +44,16 @@ in
       virtual gamepads for clients' game controllers: enables
       `hardware.uinput` and adds the allowed users to the `uinput` group
       (takes effect at their next login)'';
+    udpBuffers = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Raise `net.core.rmem_max` and `net.core.wmem_max` to 8 MiB (with
+        `lib.mkDefault`, so an explicit setting wins) so the QUIC socket gets
+        the buffers it requests; smaller buffers drop packets during keyframe
+        bursts on fast links.
+      '';
+    };
     preauthorizeRemoteDesktop = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -80,6 +90,10 @@ in
       })
     ];
     security.pam.services.teleport = lib.mkIf cfg.systemLogin { };
+    boot.kernel.sysctl = lib.mkIf cfg.udpBuffers {
+      "net.core.rmem_max" = lib.mkDefault 8388608;
+      "net.core.wmem_max" = lib.mkDefault 8388608;
+    };
     # The host advertises gamepads only when it can write /dev/uinput.
     hardware.uinput.enable = lib.mkIf cfg.gamepads true;
     users.users = lib.mkIf cfg.gamepads (
