@@ -22,6 +22,8 @@ const MAX_CONSECUTIVE_INPUT_FAILURES: u32 = 50;
 
 /// In-session portal recreations allowed per minute before giving up.
 const MAX_PORTAL_RECOVERIES_PER_MINUTE: usize = 3;
+/// One-second attempts to recreate a lost portal session (displays settling).
+const PORTAL_REOPEN_ATTEMPTS: u32 = 20;
 
 /// Minimum spacing between client-requested IDRs per stream.
 const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
@@ -273,6 +275,7 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
             }, if relay_endpoint.is_some() => {
                 match (accepted, &access, &relay) {
                     (Some(accepted), Some(access), Some((link, _, _))) => {
+                        restore_capture(capture).await;
                         let result = tokio::select! {
                             result = relayed(link, accepted, access, options, capture) => result,
                             _ = &mut shutdown => { capture.release_all().await; break; }
@@ -318,6 +321,7 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         } else {
             None
         };
+        restore_capture(capture).await;
         let result = tokio::select! {
             result = connection(request, options, capture) => result,
             _ = async { loop { tokio::time::sleep(Duration::from_secs(1)).await; if access.as_ref().is_some_and(|access| !access.authorized(&supplied)) { break; } } } => Err(anyhow::anyhow!("device access revoked")),
@@ -358,6 +362,28 @@ async fn relayed(
             capture,
         ) => result,
         _ = async { loop { tokio::time::sleep(Duration::from_secs(1)).await; if !access.authorized_hash(&hash) { break; } } } => Err(anyhow::anyhow!("device access revoked")),
+    }
+}
+
+/// Before a new session, recreate a portal session an earlier recovery could
+/// not (the displays may have been off). Failures are logged; the session then
+/// reports the capture error to the client.
+async fn restore_capture(capture: &mut Capture) {
+    for attempt in 1..=5 {
+        if !capture.is_lost() {
+            return;
+        }
+        match capture.reopen().await {
+            Ok(()) => tracing::info!("desktop portal session recreated before the next client"),
+            Err(error) => {
+                tracing::warn!(
+                    attempt,
+                    error = format!("{error:#}"),
+                    "desktop portal still unavailable"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
     }
 }
 
@@ -577,10 +603,27 @@ async fn run_session(
                     },
                 )?;
             }
-            capture
-                .reopen()
-                .await
-                .context("recreating the desktop portal session")?;
+            // Waking displays hotplug for a few seconds; until they are back the
+            // compositor has nothing to share, so keep retrying. Input heartbeats
+            // are buffered meanwhile and QUIC keep-alives run on other threads.
+            let mut attempt = 0;
+            loop {
+                attempt += 1;
+                match capture.reopen().await {
+                    Ok(()) => break,
+                    Err(error) if attempt < PORTAL_REOPEN_ATTEMPTS => {
+                        tracing::warn!(
+                            attempt,
+                            error = format!("{error:#}"),
+                            "desktop portal not ready yet; retrying"
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    Err(error) => {
+                        return Err(error.context("recreating the desktop portal session"));
+                    }
+                }
+            }
             video_start_group = video_barrier(&video)?;
             let info = desktop(options, capture, video_start_group)?;
             pipeline = media::encoder(

@@ -46,6 +46,8 @@ pub struct Capture {
     /// How this capture was opened, so a lost portal session can be recreated.
     source: String,
     restore_token_path: Option<std::path::PathBuf>,
+    /// The session was closed and not yet successfully recreated.
+    lost: bool,
 }
 
 enum Backend {
@@ -188,6 +190,7 @@ impl Capture {
             backend: Backend::Test,
             source: source.to_owned(),
             restore_token_path: restore_token_path.map(Path::to_path_buf),
+            lost: false,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
         };
@@ -613,6 +616,11 @@ impl Capture {
         }
     }
 
+    /// A previous recreation failed: the capture must be reopened before use.
+    pub fn is_lost(&self) -> bool {
+        self.lost
+    }
+
     /// Whether input and capture go through the desktop portal (Wayland).
     pub fn is_portal(&self) -> bool {
         matches!(self.backend, Backend::Portal { .. })
@@ -624,6 +632,7 @@ impl Capture {
     pub async fn reopen(&mut self) -> Result<()> {
         let monitor = self.active_monitor;
         self.close().await;
+        self.lost = true;
         let mut fresh = match Self::open_with_options(
             &self.source,
             self.restore_token_path.as_deref(),
