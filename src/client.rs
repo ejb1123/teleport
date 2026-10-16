@@ -58,6 +58,10 @@ pub struct Options {
     /// accepts datagrams (comparison and troubleshooting).
     #[arg(long, hide = true)]
     pub reliable_pointer: bool,
+    /// Keep the host pointer drawn into the video instead of drawing it
+    /// locally from cursor shapes (hosts that support it: X11).
+    #[arg(long)]
+    pub embedded_cursor: bool,
     /// Reach the host through this MoQ relay with end-to-end encryption
     /// (e.g. moqt://relay.example:4444). The host must run with the same --relay.
     #[arg(long)]
@@ -582,7 +586,8 @@ async fn receive_updates(
         .await
         .context("host update timed out")??
         .context("empty host update")?;
-        let update = serde_json::from_slice(&bytes)?;
+        let update: Update = serde_json::from_slice(&bytes)?;
+        update.validate()?;
         sender.send(update).await.context("session window closed")?;
     }
 }
@@ -881,12 +886,18 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             error = link.session.closed() => anyhow::bail!("connection closed: {error}"),
         }
     }));
+    // The host restarts its video without the pointer once we opt in. That
+    // extra `Update::Desktop` is not counted as an expected initial update
+    // (it may never come if the host cannot watch its cursor); readiness
+    // still waits for the requested monitor and video configuration.
+    let local_cursor = desktop.local_cursor && !options.embedded_cursor;
     if desktop.keyframe_requests {
         send(
             &events,
             Event::ClientFeatures {
                 keyframe_requests: true,
                 pointer_datagrams,
+                local_cursor,
             },
         )?;
     }
@@ -985,6 +996,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         }
                     }
                     Update::Notice { text } => tracing::info!(%text, "host notice"),
+                    Update::Cursor {
+                        cursor: Some(image),
+                    } => {
+                        tracing::info!("remote cursor {}x{}", image.width, image.height)
+                    }
+                    Update::Cursor { cursor: None } => tracing::info!("remote cursor hidden"),
                     _ => (),
                 }
             }
@@ -1218,6 +1235,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut keyboard_capture = crate::keyboard_capture::Capture::default();
     // Pointer lock for games; the guard releases it on every exit path.
     let mut pointer_lock = PointerLock::default();
+    // Host cursor shapes (X11 hosts); dropped before the video subsystem.
+    let mut remote_cursor = RemoteCursor::default();
     let mut shortcuts = crate::keyboard_capture::Shortcuts::default();
     let mut chrome = crate::fullscreen::Chrome::new();
     let mut placement: Option<crate::fullscreen::Placement> = None;
@@ -1238,11 +1257,19 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let mouse = event_pump.mouse_state();
         // SDL mouse coordinates are relative to its mouse-focus window, not
         // necessarily this primary display in a multi-window session.
-        let pointer_here = unsafe { sdl2::sys::SDL_GetMouseFocus() } == canvas.window().raw();
+        let mouse_focus = unsafe { sdl2::sys::SDL_GetMouseFocus() };
+        let pointer_here = mouse_focus == canvas.window().raw();
         redraw |= chrome.update(
             pointer_here.then_some((mouse.x(), mouse.y())),
             pointer_here && (mouse.left() || mouse.middle() || mouse.right()),
         );
+        // Auxiliary monitor windows are all video; the primary has a toolbar.
+        let over_video = !mouse_focus.is_null()
+            && (!pointer_here
+                || chrome
+                    .pointer(mouse.x(), mouse.y(), canvas.window().size(), size)
+                    .is_some());
+        remote_cursor.apply(over_video, pointer_lock.active());
         displays.draw(runtime, &mut session_fonts)?;
         first_draw = false;
         pipeline.error()?;
@@ -1346,6 +1373,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 Update::Notice { text } => {
                     notice = text.chars().take(160).collect();
                 }
+                Update::Cursor { cursor } => remote_cursor.set_shape(cursor.as_ref()),
                 _ => (),
             }
         }
@@ -2611,6 +2639,120 @@ impl Drop for PointerLock {
     fn drop(&mut self) {
         self.set(false);
     }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+enum CursorState {
+    /// SDL's default arrow (toolbar, letterbox, before any host shape).
+    #[default]
+    System,
+    Remote,
+    Hidden,
+}
+
+/// Host pointer drawn by the local window system from `Update::Cursor`, so it
+/// moves with no network or encode latency. Shown only over remote video;
+/// local UI keeps the default arrow. Pointer lock hides it independently.
+#[derive(Default)]
+struct RemoteCursor {
+    /// Latest host shape: `Some(None)` is a hidden host pointer.
+    shape: Option<Option<sdl2::mouse::Cursor>>,
+    applied: CursorState,
+    /// A new shape must be applied even if the state is unchanged.
+    stale: bool,
+}
+
+impl RemoteCursor {
+    fn set_shape(&mut self, image: Option<&protocol::CursorImage>) {
+        let cursor = match image.map(color_cursor).transpose() {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                // Better the local arrow than no pointer at all.
+                tracing::warn!(%error, "could not create the host cursor; using the local arrow");
+                self.shape = None;
+                self.stale = true;
+                return;
+            }
+        };
+        let previous = self.shape.replace(cursor);
+        self.stale = true;
+        // Swap a visible host cursor before freeing the old one, so SDL never
+        // falls back to its arrow in between.
+        if self.applied == CursorState::Remote {
+            self.apply(true, false);
+        }
+        drop(previous);
+    }
+
+    fn desired(&self, over_video: bool) -> CursorState {
+        match (over_video, &self.shape) {
+            (true, Some(Some(_))) => CursorState::Remote,
+            (true, Some(None)) => CursorState::Hidden,
+            _ => CursorState::System,
+        }
+    }
+
+    /// `over_video`: the pointer is over remote video in a session window.
+    fn apply(&mut self, over_video: bool, locked: bool) {
+        // Relative mode hides the pointer itself and restores it on release.
+        if locked {
+            return;
+        }
+        let desired = self.desired(over_video);
+        if desired == self.applied && !self.stale {
+            return;
+        }
+        self.stale = false;
+        self.applied = desired;
+        // Safety: plain SDL cursor calls on the thread that owns the video
+        // subsystem (the session event loop); cursors outlive their use.
+        unsafe {
+            match desired {
+                CursorState::Remote => {
+                    if let Some(Some(cursor)) = &self.shape {
+                        cursor.set();
+                    }
+                    sdl2::sys::SDL_ShowCursor(sdl2::sys::SDL_ENABLE as i32);
+                }
+                CursorState::Hidden => {
+                    sdl2::sys::SDL_ShowCursor(sdl2::sys::SDL_DISABLE as i32);
+                }
+                CursorState::System => {
+                    sdl2::sys::SDL_SetCursor(sdl2::sys::SDL_GetDefaultCursor());
+                    sdl2::sys::SDL_ShowCursor(sdl2::sys::SDL_ENABLE as i32);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RemoteCursor {
+    fn drop(&mut self) {
+        // Leave the launcher (or a reconnect) with a normal visible arrow
+        // before the host cursor is freed.
+        if self.applied != CursorState::System {
+            self.shape = None;
+            self.stale = true;
+            self.apply(false, false);
+        }
+    }
+}
+
+fn color_cursor(image: &protocol::CursorImage) -> Result<sdl2::mouse::Cursor> {
+    image.validate()?;
+    // SDL_CreateColorCursor copies the pixels; the surface is temporary.
+    let mut pixels = image.rgba.clone();
+    let width = u32::from(image.width);
+    let surface = sdl2::surface::Surface::from_data(
+        &mut pixels,
+        width,
+        u32::from(image.height),
+        width * 4,
+        sdl2::pixels::PixelFormatEnum::RGBA32,
+    )
+    .map_err(anyhow::Error::msg)?;
+    sdl2::mouse::Cursor::from_surface(&surface, image.hot_x.into(), image.hot_y.into())
+        .map_err(anyhow::Error::msg)
 }
 
 /// Send coalesced pointer-lock movement, split into protocol-sized steps.

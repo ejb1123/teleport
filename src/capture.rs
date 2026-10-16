@@ -48,6 +48,8 @@ pub struct Capture {
     restore_token_path: Option<std::path::PathBuf>,
     /// The session was closed and not yet successfully recreated.
     lost: bool,
+    /// The client draws the pointer itself; leave it out of X11 video.
+    pub local_cursor: bool,
 }
 
 enum Backend {
@@ -105,7 +107,8 @@ impl Capture {
                 );
                 let (x, y) = origins[index];
                 format!(
-                    "ximagesrc use-damage=false show-pointer=true startx={x} starty={y} endx={} endy={}",
+                    "ximagesrc use-damage=false show-pointer={} startx={x} starty={y} endx={} endy={}",
+                    !self.local_cursor,
                     u32::from(x as u16) + monitor.width - 1,
                     u32::from(y as u16) + monitor.height - 1
                 )
@@ -191,6 +194,7 @@ impl Capture {
             source: source.to_owned(),
             restore_token_path: restore_token_path.map(Path::to_path_buf),
             lost: false,
+            local_cursor: false,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
         };
@@ -357,7 +361,8 @@ impl Capture {
             Backend::X11 { origins, .. } => {
                 let (x, y) = origins[self.active_monitor];
                 format!(
-                    "ximagesrc use-damage=false show-pointer=true startx={x} starty={y} endx={} endy={}",
+                    "ximagesrc use-damage=false show-pointer={} startx={x} starty={y} endx={} endy={}",
+                    !self.local_cursor,
                     u32::from(x as u16) + self.width - 1,
                     u32::from(y as u16) + self.height - 1
                 )
@@ -627,6 +632,13 @@ impl Capture {
         matches!(self.backend, Backend::Portal { .. })
     }
 
+    /// Whether the pointer can be left out of the video and sent as shapes
+    /// instead. Only X11 so far: GStreamer's `pipewiresrc` does not expose
+    /// the portal's cursor metadata.
+    pub fn supports_local_cursor(&self) -> bool {
+        matches!(self.backend, Backend::X11 { .. })
+    }
+
     /// Replace a lost portal session with a new one, restored from the saved
     /// token (no local dialog when the compositor honours it). Keeps the
     /// active monitor when it still exists.
@@ -649,6 +661,7 @@ impl Capture {
             }
             Err(error) => return Err(error),
         };
+        fresh.local_cursor = self.local_cursor;
         std::mem::swap(self, &mut fresh);
         Ok(())
     }
