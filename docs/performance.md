@@ -20,6 +20,7 @@ heartbeats, and cache their selection for that client process.
 | Control RTT | Local monotonic time from queuing an authenticated probe until its matching reply is handled; includes host/client scheduling and ordered control queues |
 | Video Mbps | Encoded access-unit bytes received per interval, excluding QUIC/TLS/control/audio overhead |
 | Received / decoded / displayed FPS | Counts at each corresponding client stage; displaying a frame is not proof it scanned out |
+| Stream / local display | The host's current stream size and rate and how they were set (negotiated, requested from an older host, or host settings); this window's drawable size, its display's refresh rate as SDL reports it, and the presentation sync (adaptive vsync, immediate, or `--vsync`). A line appears when the display refreshes slower than the stream: the extra frames are decoded but never seen. Whether VRR is active is not visible to the client |
 | Host encoder time | Latest matched encoder sink/output PTS interval, including buffering inside that encoder; unavailable if timestamps do not match |
 | Receive to ready | Latest complete access unit entering appsrc until decoded pixels have been copied for the client frame slot; includes queue, decode, conversion and copy |
 | Compressed queue | That same frame's appsrc enqueue-to-output interval, before parsing |
@@ -52,8 +53,8 @@ An unchanged desktop may produce fewer captured frames; requested FPS is a cap,
 not a promise of unique frames. Values shown for the latest frame are samples,
 not percentiles. HDR codec diagnostics are separate from performance telemetry.
 
-Version 0.5.2 recovers when compressed input backlog exceeds 150 ms, 12 frames,
-or 8 MiB. A recovery is also reported as pressure to the host's bitrate controller,
+Version 0.5.2 recovers when compressed input backlog exceeds 150 ms, 12 frames
+(200 ms of frames above 60 FPS), or 8 MiB. A recovery is also reported as pressure to the host's bitrate controller,
 even though clearing the queue makes its next instantaneous measurement small.
 This prevents stale-input accumulation; it does not guarantee that an overloaded
 GPU/CPU can sustain the requested resolution or FPS. Repeated recoveries mean
