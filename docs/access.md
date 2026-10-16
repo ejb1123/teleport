@@ -103,7 +103,11 @@ delete or rotate identity files while relying on the only remote connection.
 Password enrollment uses OPAQUE (`opaque-ke` 4.0.1), Ristretto255/TripleDH/SHA-512
 and fixed Argon2id parameters (64 MiB, three passes, one lane). The authenticated
 exchange binds the host certificate fingerprint and enrollment metadata; the
-device credential is returned with authenticated encryption. The host persists
+device credential is returned with authenticated encryption. Current clients
+mark their hello with `device_key` (part of that binding) and send a fresh
+relay device key right after the password proof; the host stores it in the
+same record as the new credential and returns the credential bound to it, or
+issues nothing (see [device keys](relay.md#device-keys)). The host persists
 an OPAQUE registration record, not a plaintext password. Managed bearer tokens
 are stored as hashes on the host. The compatibility shared token remains in its
 existing private identity file.

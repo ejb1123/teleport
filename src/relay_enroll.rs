@@ -1,10 +1,10 @@
 //! Enrollment through a relay, so a host never needs a reachable port, not
 //! even for first-time pairing.
 //!
-//! The existing enrollment protocols run unchanged, byte for byte, over an
+//! The enrollment protocols run exactly as over TCP, byte for byte, over an
 //! ordered byte stream carried by a pair of relay tracks:
 //!
-//! * code pairing (`TPPAIR01`, SPAKE2) on a *rendezvous* namespace the host
+//! * code pairing (`TPPAIR02`, SPAKE2) on a *rendezvous* namespace the host
 //!   opens with the pairing code. The client learns it from the pairing link
 //!   (`teleport://relay/<rendezvous>/<code>`), since before pairing it does not
 //!   know the host fingerprint the normal namespace is derived from;
@@ -756,7 +756,7 @@ pub(crate) mod tests {
         let (mut client, host) = loopback(&origin, &"e".repeat(32));
         let host = host_attempt(host, &credential).await;
         let transcript = recorded.lock().unwrap().clone();
-        assert!(transcript.starts_with(b"TPPAIR01"));
+        assert!(transcript.starts_with(pairing::MAGIC));
         client.write_all(&transcript).await?;
         client.shutdown().await?;
         let mut answer = Vec::new();
@@ -764,6 +764,116 @@ pub(crate) mod tests {
         assert_eq!(host.await?, (false, false));
         // Only the host's fresh SPAKE2 message (length prefix + 33 bytes).
         assert_eq!(answer.len(), 2 + 33);
+        Ok(())
+    }
+
+    /// A relay that ends the client's request after `left` bytes.
+    #[cfg(target_os = "linux")]
+    struct Cut<S> {
+        inner: S,
+        left: usize,
+    }
+    #[cfg(target_os = "linux")]
+    impl<S: AsyncRead + Unpin> AsyncRead for Cut<S> {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            buffer: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            let mut chunk = vec![0; buffer.remaining().min(this.left)];
+            if chunk.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+            let mut limited = ReadBuf::new(&mut chunk);
+            let result = Pin::new(&mut this.inner).poll_read(context, &mut limited);
+            this.left -= limited.filled().len();
+            buffer.put_slice(limited.filled());
+            result
+        }
+    }
+    #[cfg(target_os = "linux")]
+    impl<S: AsyncWrite + Unpin> AsyncWrite for Cut<S> {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+            buffer: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.get_mut().inner).poll_write(context, buffer)
+        }
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_flush(context)
+        }
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            context: &mut TaskContext<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+        }
+    }
+
+    /// A relay that forwards a keyed client's code proof but not the device
+    /// key that follows: the host issues nothing and keeps the code, the
+    /// client saves nothing, and the same code then pairs, keyed.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn relayed_code_pairing_without_the_device_key_issues_nothing() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        // Magic, SPAKE2 message and key confirmation (length-prefixed).
+        const BEFORE_KEY: usize = 8 + 2 + 33 + 2 + 32;
+        let origin = origin();
+        let directory = tempfile::tempdir()?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let host_token = Pairing {
+            token: "c".repeat(64),
+            fingerprint: "d".repeat(64),
+            device_key: None,
+        };
+        let access = crate::access::ServerState::open(directory.path(), host_token.clone())?;
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        for (attempt, cut) in [("a", Some(BEFORE_KEY)), ("b", None)] {
+            let (client, host) = loopback(&origin, &attempt.repeat(32));
+            let mut used = false;
+            let accept = async {
+                // Dropped (closing the stream) as soon as the host is done.
+                let mut host = Cut {
+                    inner: host,
+                    left: cut.unwrap_or(usize::MAX),
+                };
+                pairing::accept_with_access(
+                    &mut host,
+                    "123456",
+                    &host_token,
+                    &mut used,
+                    tokio::time::Instant::now() + Duration::from_secs(10),
+                    Some(pairing::DeviceEnrollment {
+                        access: &access,
+                        epoch: &epoch,
+                        generation: 0,
+                    }),
+                )
+                .await
+            };
+            let (client, host) = tokio::join!(
+                tokio::time::timeout(PAIR_TIMEOUT, pairing::pair_over(client, "123-456", true)),
+                accept,
+            );
+            let client = client.map_err(anyhow::Error::from).flatten();
+            if cut.is_some() {
+                assert!(client.is_err() && host.is_err() && !used);
+                assert!(access.status().devices.is_empty());
+            } else {
+                let paired = client?;
+                host?;
+                assert!(used && paired.device_key.is_some());
+                assert!(access.relay_credentials().iter().all(|c| {
+                    c.hash == e2e::credential_hash(&host_token.token) || !c.hash_only()
+                }));
+            }
+        }
         Ok(())
     }
 }

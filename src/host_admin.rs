@@ -479,7 +479,7 @@ impl Control {
                 let config = self.system.as_ref().context("system login is disabled")?;
                 crate::system_login::handle(stream, source, config, self.access.clone()).await
             }
-            b"TPPAIR01" => {
+            b"TPPAIR01" | b"TPPAIR02" => {
                 let attempt = {
                     let mut network = self.network.lock().await;
                     let code = network.code.as_mut().context("pairing closed")?;
@@ -787,6 +787,27 @@ mod tests {
                 .is_err()
         );
         assert!(control.request(Request::Status).await?.pairing_open);
+        // A relay in front of the port that drops the device key (sent after
+        // the code proof) gets nothing issued, and the code stays usable.
+        let (client, mut relayed, meddler) =
+            crate::access::meddler::spawn(|up, index, _| match up && index == 3 {
+                true => crate::access::meddler::Action::HangUp,
+                false => crate::access::meddler::Action::Forward,
+            });
+        let mut tcp = tokio::net::TcpStream::connect(address).await?;
+        let bridge =
+            tokio::spawn(
+                async move { tokio::io::copy_bidirectional(&mut relayed, &mut tcp).await },
+            );
+        assert!(
+            crate::pairing::pair_over(client, response.code.as_deref().unwrap(), true)
+                .await
+                .is_err()
+        );
+        meddler.abort();
+        bridge.abort();
+        assert!(access.status().devices.is_empty());
+        assert!(control.request(Request::Status).await?.pairing_open);
         let device =
             crate::pairing::pair(&address.to_string(), response.code.as_deref().unwrap()).await?;
         assert_ne!(device.token, pairing.token);
@@ -925,6 +946,15 @@ mod tests {
         let paired = relay_enroll::pair(&endpoint, &invite).await?;
         assert!(access.authorized(&paired.token));
         assert_eq!(access.status().devices.len(), 2);
+        // Both enrolled with their device keys, through the relay.
+        assert!(device.device_key.is_some() && paired.device_key.is_some());
+        let host_hash = crate::e2e::credential_hash(&pairing.token);
+        assert!(
+            access
+                .relay_credentials()
+                .iter()
+                .all(|c| c.hash == host_hash || !c.hash_only())
+        );
         assert!(!control.request(Request::Status).await?.pairing_open);
         // Single use.
         assert!(relay_enroll::pair(&endpoint, &invite).await.is_err());
