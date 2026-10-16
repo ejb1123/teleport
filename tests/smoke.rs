@@ -1039,7 +1039,12 @@ fn x11_capture_input_and_native_window() {
             0,
             WindowClass::INPUT_OUTPUT,
             0,
-            &CreateWindowAux::new().event_mask(EventMask::KEY_PRESS | EventMask::KEY_RELEASE),
+            &CreateWindowAux::new().event_mask(
+                EventMask::KEY_PRESS
+                    | EventMask::KEY_RELEASE
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE,
+            ),
         )
         .unwrap()
         .check()
@@ -1114,12 +1119,15 @@ fn x11_capture_input_and_native_window() {
         "no local cursor shape received"
     );
     let mut transitions = Vec::new();
+    let mut buttons = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         while let Some(event) = connection.poll_for_event().unwrap() {
             match event {
                 x11rb::protocol::Event::KeyPress(e) => transitions.push((e.detail, true)),
                 x11rb::protocol::Event::KeyRelease(e) => transitions.push((e.detail, false)),
+                x11rb::protocol::Event::ButtonPress(e) => buttons.push((e.detail, true)),
+                x11rb::protocol::Event::ButtonRelease(e) => buttons.push((e.detail, false)),
                 _ => (),
             }
         }
@@ -1135,6 +1143,12 @@ fn x11_capture_input_and_native_window() {
     assert!(
         transitions.contains(&(38, true)) && transitions.contains(&(38, false)),
         "A press/release missing: {transitions:?}"
+    );
+    // Back and forward (SDL X1/X2) arrive as X11 buttons 8 and 9.
+    assert_eq!(
+        buttons,
+        [(8, true), (8, false), (9, true), (9, false)],
+        "side buttons"
     );
     assert!(
         connection

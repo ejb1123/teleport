@@ -1495,24 +1495,36 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     } else {
                         Vec::new()
                     };
-                    for event in [
-                        Event::Motion { x: 0.5, y: 0.5 },
-                        Event::Key {
-                            code: 30,
-                            down: true,
-                        },
-                        Event::Key {
-                            code: 30,
-                            down: false,
-                        },
-                        Event::Key {
-                            code: 29,
-                            down: true,
-                        },
-                    ]
-                    .into_iter()
-                    .chain(relative)
-                    .chain(gamepad)
+                    // Back and forward, pressed and released at the centre.
+                    let side_buttons = if desktop.extra_mouse_buttons {
+                        [protocol::BUTTON_BACK, protocol::BUTTON_FORWARD]
+                            .into_iter()
+                            .flat_map(|button| {
+                                [true, false].map(|down| Event::Button { button, down })
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+                    for event in [Event::Motion { x: 0.5, y: 0.5 }]
+                        .into_iter()
+                        .chain(side_buttons)
+                        .chain([
+                            Event::Key {
+                                code: 30,
+                                down: true,
+                            },
+                            Event::Key {
+                                code: 30,
+                                down: false,
+                            },
+                            Event::Key {
+                                code: 29,
+                                down: true,
+                            },
+                        ])
+                        .chain(relative)
+                        .chain(gamepad)
                     {
                         runtime.block_on(events.send(event))?;
                     }
@@ -1689,7 +1701,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut host_encode_us = 0;
     let mut host_bitrate = desktop.bitrate;
     let mut host_encoder = "Waiting / unavailable".to_owned();
-    let mut displays = multi_display::Displays::new(remote, options, session_codec, events.clone());
+    let mut displays = multi_display::Displays::new(remote, options, &desktop, events.clone());
     let mut keyboard_capture = crate::keyboard_capture::Capture::default();
     // Pointer lock for games; the guard releases it on every exit path.
     let mut pointer_lock = PointerLock::default();
@@ -2128,11 +2140,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 }
                 SdlEvent::MouseButtonDown { mouse_btn, .. } if pointer_lock.active() => {
                     flush_relative(&events, &mut relative)?;
-                    button(mouse_btn).map(|button| Event::Button { button, down: true })
+                    button(mouse_btn, desktop.extra_mouse_buttons)
+                        .map(|button| Event::Button { button, down: true })
                 }
                 SdlEvent::MouseButtonUp { mouse_btn, .. } if pointer_lock.active() => {
                     flush_relative(&events, &mut relative)?;
-                    button(mouse_btn).map(|button| Event::Button {
+                    button(mouse_btn, desktop.extra_mouse_buttons).map(|button| Event::Button {
                         button,
                         down: false,
                     })
@@ -2149,7 +2162,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     motion = None;
                     if let Some((x, y)) = chrome.pointer(x, y, canvas.window().size(), size) {
                         send(&events, Event::Motion { x, y })?;
-                        button(mouse_btn).map(|button| Event::Button { button, down: true })
+                        button(mouse_btn, desktop.extra_mouse_buttons)
+                            .map(|button| Event::Button { button, down: true })
                     } else {
                         None
                     }
@@ -2161,7 +2175,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     if let Some((x, y)) = chrome.pointer(x, y, canvas.window().size(), size) {
                         send(&events, Event::Motion { x, y })?;
                     }
-                    button(mouse_btn).map(|button| Event::Button {
+                    button(mouse_btn, desktop.extra_mouse_buttons).map(|button| Event::Button {
                         button,
                         down: false,
                     })
@@ -3493,11 +3507,15 @@ fn send(events: &mpsc::Sender<Event>, event: Event) -> Result<()> {
         )),
     }
 }
-fn button(button: MouseButton) -> Option<u8> {
+/// Wire number of a mouse button (X11 numbering). Back and forward only go
+/// to hosts advertising `Desktop::extra_mouse_buttons`.
+fn button(button: MouseButton, extra_buttons: bool) -> Option<u8> {
     match button {
         MouseButton::Left => Some(1),
         MouseButton::Middle => Some(2),
         MouseButton::Right => Some(3),
+        MouseButton::X1 if extra_buttons => Some(protocol::BUTTON_BACK),
+        MouseButton::X2 if extra_buttons => Some(protocol::BUTTON_FORWARD),
         _ => None,
     }
 }
@@ -3505,6 +3523,26 @@ fn button(button: MouseButton) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn side_mouse_buttons_only_go_to_hosts_that_take_them() {
+        assert_eq!(button(MouseButton::X1, true), Some(protocol::BUTTON_BACK));
+        assert_eq!(
+            button(MouseButton::X2, true),
+            Some(protocol::BUTTON_FORWARD)
+        );
+        assert_eq!(button(MouseButton::X1, false), None);
+        assert_eq!(button(MouseButton::X2, false), None);
+        assert_eq!(button(MouseButton::Right, false), Some(3));
+        assert_eq!(button(MouseButton::Unknown, true), None);
+        for extra in [false, true] {
+            for mouse in [MouseButton::Left, MouseButton::X1, MouseButton::X2] {
+                if let Some(button) = button(mouse, extra) {
+                    Event::Button { button, down: true }.validate().unwrap();
+                }
+            }
+        }
+    }
 
     #[test]
     fn large_pointer_lock_movement_is_split_without_loss() {

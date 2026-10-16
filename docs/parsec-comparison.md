@@ -439,8 +439,8 @@ What is on `main`/this branch, from README, docs and code:
   - Physical scancodes; Cmd→Super and Option→Alt (fixed). Keyboard capture
     with Ctrl+Alt+K. Mouse lock (relative) with Ctrl+Alt+M.
   - Disconnect with Ctrl+Alt+Q; hotkeys are fixed.
-  - **Mouse buttons left, middle, right only** (`src/client.rs:3191`):
-    back/forward are dropped. Precise wheel deltas are forwarded.
+  - Mouse buttons left, middle, right and (since 2026-10-16, G14)
+    back/forward. Precise wheel deltas are forwarded.
   - Gamepads: SDL to uinput Xbox 360, up to 4. No rumble, motion, touchpad or
     other pad types.
   - Local cursor on X11 hosts only; on Wayland the cursor stays in the video.
@@ -501,7 +501,7 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Keyboard capture | Immersive keyboard | Ctrl+Alt+K | Parity | |
 | Pointer confinement / relative | Immersive mouse, "Always Relative" | Ctrl+Alt+M relative lock | Parity | Auto-lock on hidden cursor missing |
 | Local cursor | Yes (inferred) | X11 only | Partial | Wayland hosts are the main target |
-| Extra mouse buttons | Yes (unverified) | No (L/M/R only) | Missing | S |
+| Extra mouse buttons | Yes (unverified) | Back/forward (2026-10-16) | Parity | G14 |
 | Configurable hotkeys / ignore hotkey | Yes | Fixed chords | Missing | S |
 | Cmd/Ctrl swap | Yes | Fixed Cmd→Super | Missing | S |
 | Gamepad (Xbox 360) | Yes (Windows host) | Yes (Linux host, 4 pads) | Parity | |
@@ -812,9 +812,11 @@ Effort M–L.**
 
 **G14. Extra mouse buttons and minor input parity. Effort S.**
 
-- **Mouse buttons:** map SDL `X1`/`X2` to evdev `BTN_SIDE`/`BTN_EXTRA` (portal
-  `NotifyPointerButton`) and XTest buttons 8/9. `src/client.rs:3191` currently
-  returns `None` for them. Back/forward buttons are bound in many games.
+- **Mouse buttons (done 2026-10-16, review tracker R10):** SDL `X1`/`X2` go
+  on the wire as buttons 8/9 to hosts advertising
+  `Desktop.extra_mouse_buttons`, which inject evdev `BTN_SIDE`/`BTN_EXTRA`
+  (portal `NotifyPointerButton`) or XTest buttons 8/9. Verified end to end on
+  an Xvfb X11 host; the portal mapping is unit-tested only.
 - **Hotkeys:** configurable hotkeys and an "ignore hotkey" list (Discord
   push-to-talk). Parsec has both (HK). Teleport's chords are hard-coded in
   `src/keyboard_capture.rs` and the client.

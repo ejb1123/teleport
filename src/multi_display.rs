@@ -39,21 +39,25 @@ pub(super) struct Displays {
     options: Options,
     /// The session codec; auxiliary monitors are encoded with it too.
     codec: protocol::VideoCodec,
+    /// The host takes back/forward (`Desktop::extra_mouse_buttons`).
+    extra_mouse_buttons: bool,
     events: mpsc::Sender<Event>,
 }
 
 impl Displays {
+    /// `desktop` is the session's (its codec is the one in use).
     pub fn new(
         remote: moq_net::broadcast::Consumer,
         options: &Options,
-        codec: protocol::VideoCodec,
+        desktop: &Desktop,
         events: mpsc::Sender<Event>,
     ) -> Self {
         Self {
             screens: Vec::new(),
             remote,
             options: options.clone(),
-            codec,
+            codec: desktop.codec,
+            extra_mouse_buttons: desktop.extra_mouse_buttons,
             events,
         }
     }
@@ -344,7 +348,7 @@ impl Displays {
             } => {
                 if let Some(event_motion) = motion(x, y) {
                     send(&self.events, event_motion)?;
-                    if let Some(button) = button(mouse_btn) {
+                    if let Some(button) = button(mouse_btn, self.extra_mouse_buttons) {
                         send(
                             &self.events,
                             Event::Button {

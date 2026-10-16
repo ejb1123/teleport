@@ -180,6 +180,10 @@ pub struct Desktop {
     /// Empty for older and software-only hosts.
     #[serde(default)]
     pub hardware_codecs: Vec<VideoCodec>,
+    /// Host injects the back and forward mouse buttons
+    /// ([`BUTTON_BACK`], [`BUTTON_FORWARD`]); older hosts reject them.
+    #[serde(default)]
+    pub extra_mouse_buttons: bool,
 }
 
 impl Desktop {
@@ -347,6 +351,10 @@ pub const POINTER_TRACK: &str = "pointer";
 /// Largest per-event pointer delta; clients split larger movements.
 pub const MAX_RELATIVE_MOTION: u32 = 4096;
 
+/// Side mouse buttons in X11 numbering (SDL X1/X2, evdev BTN_SIDE/BTN_EXTRA).
+pub const BUTTON_BACK: u8 = 8;
+pub const BUTTON_FORWARD: u8 = 9;
+
 /// Most gamepads one session may attach (Xbox-style player slots).
 pub const MAX_GAMEPADS: u8 = 4;
 /// SDL2 `SDL_GameControllerButton` values (A = 0 … TOUCHPAD = 20).
@@ -386,6 +394,9 @@ pub enum Event {
         x: f64,
         y: f64,
     },
+    /// X11 numbering: 1 left, 2 middle, 3 right; [`BUTTON_BACK`] and
+    /// [`BUTTON_FORWARD`] only to hosts advertising
+    /// `Desktop::extra_mouse_buttons` (older hosts reject them).
     Button {
         button: u8,
         down: bool,
@@ -588,7 +599,10 @@ impl Event {
                     && (0.0..=1.0).contains(y),
                 "invalid pointer coordinates"
             ),
-            Self::Button { button, .. } => ensure!((1..=3).contains(button), "unsupported button"),
+            Self::Button { button, .. } => ensure!(
+                matches!(*button, 1..=3 | BUTTON_BACK | BUTTON_FORWARD),
+                "unsupported button"
+            ),
             Self::Key { code, .. } => ensure!((1..=127).contains(code), "unsupported key"),
             Self::RelativeMotion { dx, dy } => ensure!(
                 dx.unsigned_abs() <= MAX_RELATIVE_MOTION
@@ -1189,6 +1203,25 @@ mod tests {
         assert_eq!(
             desktop.hardware_codecs,
             [VideoCodec::H264, VideoCodec::H265]
+        );
+    }
+    #[test]
+    fn side_mouse_buttons_are_valid_and_negotiated() {
+        let button = |button| Event::Button { button, down: true }.validate();
+        for valid in [1, 2, 3, BUTTON_BACK, BUTTON_FORWARD] {
+            assert!(button(valid).is_ok(), "{valid}");
+        }
+        // 4-7 are wheel steps in X11 numbering; they travel as Scroll.
+        for invalid in [0, 4, 5, 6, 7, 10, 255] {
+            assert!(button(invalid).is_err(), "{invalid}");
+        }
+        let old: Desktop = serde_json::from_value(serde_json::json!({ "version": 2, "width": 1,
+            "height": 1, "fps": 1, "source": "test", "monitors": [], "active_monitor": 0,
+            "audio": false, "clipboard": false }))
+        .unwrap();
+        assert!(
+            !old.extra_mouse_buttons,
+            "older hosts reject buttons 8 and 9"
         );
     }
     fn cursor(width: u16, height: u16) -> CursorImage {

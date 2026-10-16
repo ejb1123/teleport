@@ -1224,6 +1224,7 @@ fn desktop_for_monitor(
         display_negotiation: true,
         codec_selection: true,
         hardware_codecs: options.hardware_codecs.clone(),
+        extra_mouse_buttons: true,
     })
 }
 
