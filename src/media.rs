@@ -683,6 +683,21 @@ pub struct HdrImage {
 }
 pub type LatestImage = Arc<Mutex<Option<Image>>>;
 
+/// Called (from decoder threads) after a new frame is stored, so a client
+/// render loop can block until there is something to present instead of
+/// polling. Set once per process by the windowed client.
+static PRESENTER_WAKE: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+pub fn set_presenter_wake(wake: fn()) {
+    let _ = PRESENTER_WAKE.set(wake);
+}
+
+pub fn wake_presenter() {
+    if let Some(wake) = PRESENTER_WAKE.get() {
+        wake();
+    }
+}
+
 fn add_video_reference(buffer: &mut gst::BufferRef, key: u64) {
     static REFERENCE: std::sync::OnceLock<gst::Caps> = std::sync::OnceLock::new();
     let reference =
@@ -881,6 +896,8 @@ pub fn decoder_with_stats_presentation(
                     if video_group.is_some() {
                         stats.ready_frames.fetch_add(1, Ordering::Relaxed);
                     }
+                    drop(latest);
+                    wake_presenter();
                     return Ok(gst::FlowSuccess::Ok);
                 }
                 let frame = gstreamer_video::VideoFrameRef::from_buffer_ref_readable(
@@ -971,6 +988,8 @@ pub fn decoder_with_stats_presentation(
                 if video_group.is_some() {
                     stats.ready_frames.fetch_add(1, Ordering::Relaxed);
                 }
+                drop(latest);
+                wake_presenter();
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
@@ -1689,6 +1708,87 @@ pub fn doctor() -> Result<()> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    /// H7: a bitrate change the encoder cannot apply in place (x265; VA-API
+    /// with TELEPORT_TEST_HARDWARE=1) must neither block the caller (the
+    /// host's session task) nor stall frames. Prints the call time and the
+    /// longest gap between encoded frames around the change.
+    #[tokio::test]
+    #[ignore = "requires GStreamer and FFmpeg encoders; prints timings"]
+    async fn bitrate_reopen_keeps_frames_flowing() -> super::Result<()> {
+        use super::*;
+        gst::init()?;
+        let mut cases = vec![(EncoderKind::Software, VideoCodec::H265)];
+        if std::env::var_os("TELEPORT_TEST_HARDWARE").is_some() {
+            cases.push((EncoderKind::Vaapi, VideoCodec::H264));
+            cases.push((EncoderKind::Vaapi, VideoCodec::H265));
+        }
+        for (kind, codec) in cases {
+            if !crate::ffmpeg::enabled()? {
+                break;
+            }
+            let mut broadcast = moq_net::broadcast::Info::new().produce();
+            let track = broadcast.create_track(codec.track(), None)?;
+            let mut subscriber = track.subscribe(None);
+            let pipeline = encoder(
+                "videotestsrc is-live=true pattern=ball",
+                (1280, 720),
+                30,
+                4000,
+                track,
+                kind,
+                codec,
+            )?;
+            // Frame arrival times over 3 s; the change happens after 1 s.
+            let arrivals = tokio::spawn(async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                let mut times = Vec::new();
+                while let Ok(group) =
+                    tokio::time::timeout_at(deadline, subscriber.recv_group()).await
+                {
+                    let mut group = group?.context("track closed")?;
+                    while let Ok(frame) = tokio::time::timeout_at(
+                        deadline,
+                        crate::protocol::read_frame(&mut group, crate::protocol::MAX_FRAME),
+                    )
+                    .await
+                    {
+                        if frame?.is_none() {
+                            break;
+                        }
+                        times.push(Instant::now());
+                    }
+                }
+                anyhow::Ok(times)
+            });
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let changed_at = Instant::now();
+            pipeline.set_video_bitrate(2000)?;
+            let call = changed_at.elapsed();
+            let times = arrivals.await??;
+            let longest = |after: bool| {
+                times
+                    .windows(2)
+                    .filter(|pair| (pair[1] > changed_at) == after)
+                    .map(|pair| pair[1] - pair[0])
+                    .max()
+                    .unwrap_or_default()
+                    .as_secs_f64()
+                    * 1000.0
+            };
+            println!(
+                "REOPEN {kind:?} {codec:?}: set_video_bitrate {:.1} ms; longest frame gap {:.1} ms before, {:.1} ms after; {} frames",
+                call.as_secs_f64() * 1000.0,
+                longest(false),
+                longest(true),
+                times.len()
+            );
+            ensure!(pipeline.video_bitrate()? == 2000);
+            ensure!(times.len() >= 20, "too few frames: {}", times.len());
+            pipeline.error()?;
+        }
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn auto_encoding_prefers_nvidia_before_intel_and_vaapi() {

@@ -18,6 +18,24 @@ pub(super) struct State {
     key_interval: std::sync::atomic::AtomicU32,
     #[cfg(target_os = "linux")]
     pub metrics: Option<Arc<EncoderMetrics>>,
+    #[cfg(target_os = "linux")]
+    reopen: Reopen,
+}
+
+/// Bitrate changes the open encoder cannot apply in place (VA-API, QSV,
+/// x265): a replacement is opened on its own thread while the current encoder
+/// keeps producing frames, then swapped in before the next frame.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct Reopen {
+    replacement: Mutex<Option<Codec>>,
+    /// Bitrate requested last; 0 = the open encoder's own.
+    target_kbps: std::sync::atomic::AtomicU32,
+    /// Set by `set_bitrate`; consumed by the encoding thread.
+    pending: std::sync::atomic::AtomicBool,
+    running: std::sync::atomic::AtomicBool,
+    /// Why the last background reopen failed; reported by the next change.
+    error: Mutex<Option<String>>,
 }
 
 pub(super) fn state(pipeline: &gst::Pipeline) -> Option<Arc<State>> {
@@ -57,31 +75,96 @@ impl State {
     }
     #[cfg(target_os = "linux")]
     pub fn bitrate(&self) -> u32 {
-        self.codec.lock().unwrap().config.kbps
+        match self.reopen.target_kbps.load(Ordering::Acquire) {
+            0 => self.codec.lock().unwrap().config.kbps,
+            target => target,
+        }
     }
+    /// Never waits for the encoder: the change is applied by the encoding
+    /// thread before its next frame (whose encode may hold the codec for a
+    /// whole frame time), and a reopen happens on a thread of its own.
     #[cfg(target_os = "linux")]
     pub fn set_bitrate(&self, kbps: u32) -> Result<()> {
         ensure!((1..=100_000).contains(&kbps), "invalid video bitrate");
-        let mut codec = self.codec.lock().unwrap();
-        ensure!(codec.config.encoder, "not an encoder");
+        ensure!(self.metrics.is_some(), "not an encoder");
+        if let Some(error) = self.reopen.error.lock().unwrap().take() {
+            anyhow::bail!("encoder could not change bitrate: {error}");
+        }
+        self.reopen.target_kbps.store(kbps, Ordering::Release);
+        self.reopen.pending.store(true, Ordering::Release);
+        Ok(())
+    }
+    /// Encoding thread, before each frame: swap in a reopened encoder, then
+    /// apply a requested bitrate change.
+    #[cfg(target_os = "linux")]
+    fn apply_bitrate(self: &Arc<Self>, codec: &mut Codec) -> bool {
+        let mut replaced = false;
+        if let Some(replacement) = self.reopen.replacement.lock().unwrap().take() {
+            *codec = replacement;
+            replaced = true;
+        }
+        if !self.reopen.pending.swap(false, Ordering::AcqRel) {
+            return replaced;
+        }
+        let kbps = self.reopen.target_kbps.load(Ordering::Acquire);
+        if codec.config.kbps == kbps {
+            return replaced;
+        }
         // NVENC and libx264 reconfigure in place at the next frame: no new
         // hardware session, no forced IDR during the congestion that caused
         // this change. (Verified by the in-place bitrate codec test.)
-        if codec.set_bitrate_in_place(kbps)? {
-            return Ok(());
+        match codec.set_bitrate_in_place(kbps) {
+            Ok(true) => return replaced,
+            Ok(false) => (),
+            Err(error) => {
+                *self.reopen.error.lock().unwrap() = Some(format!("{error:#}"));
+                self.reopen.target_kbps.store(0, Ordering::Release);
+                return replaced;
+            }
         }
         // FFmpeg does not provide a universal mutable bitrate contract. Reopen
-        // transactionally and start a new IDR/GOP instead of claiming a change
-        // merely because AVCodecContext.bit_rate accepted an assignment.
-        let config = Config {
-            kbps,
-            ..codec.config.clone()
-        };
-        *codec = Codec::new(config)?;
-        if let Some(metrics) = &self.metrics {
-            metrics.pending.lock().unwrap().clear();
+        // (a new IDR/GOP) instead of claiming a change merely because
+        // AVCodecContext.bit_rate accepted an assignment, but beside the
+        // encoder, which keeps producing frames: opening a VA-API or x265
+        // encoder takes tens to hundreds of ms.
+        if !self.reopen.running.swap(true, Ordering::AcqRel) {
+            let (state, config) = (self.clone(), codec.config.clone());
+            if let Err(error) = std::thread::Builder::new()
+                .name("encoder-reopen".into())
+                .spawn(move || state.reopen(config))
+            {
+                *self.reopen.error.lock().unwrap() = Some(error.to_string());
+                self.reopen.target_kbps.store(0, Ordering::Release);
+                self.reopen.running.store(false, Ordering::Release);
+            }
         }
-        Ok(())
+        replaced
+    }
+    #[cfg(target_os = "linux")]
+    fn reopen(&self, config: Config) {
+        loop {
+            let kbps = self.reopen.target_kbps.load(Ordering::Acquire);
+            match Codec::new(Config {
+                kbps,
+                ..config.clone()
+            }) {
+                Ok(codec) => *self.reopen.replacement.lock().unwrap() = Some(codec),
+                Err(error) => {
+                    tracing::warn!(%error, kbps, "encoder reopen for a bitrate change failed; keeping the current encoder");
+                    *self.reopen.error.lock().unwrap() = Some(format!("{error:#}"));
+                    self.reopen.target_kbps.store(0, Ordering::Release);
+                    self.reopen.running.store(false, Ordering::Release);
+                    return;
+                }
+            }
+            self.reopen.running.store(false, Ordering::Release);
+            // A change made while this one opened found `running` set and
+            // left it here.
+            let target = self.reopen.target_kbps.load(Ordering::Acquire);
+            if target == kbps || target == 0 || self.reopen.running.swap(true, Ordering::AcqRel) {
+                return;
+            }
+        }
     }
 }
 
@@ -835,6 +918,8 @@ pub(super) fn decoder(
         key_interval: Default::default(),
         #[cfg(target_os = "linux")]
         metrics: None,
+        #[cfg(target_os = "linux")]
+        reopen: Default::default(),
     });
     *stats.decoder.lock().unwrap() = format!("ffmpeg:{}:{name}", format.codec.track());
     let pipeline = Pipeline(gst::parse::launch(&format!(
@@ -940,6 +1025,8 @@ pub(super) fn decoder(
                         if group.is_some() {
                             stats.ready_frames.fetch_add(1, Ordering::Relaxed);
                         }
+                        drop(latest);
+                        wake_presenter();
                     }
                     Ok(())
                 };
@@ -1269,6 +1356,7 @@ fn start(
         keyframe: Default::default(),
         key_interval: std::sync::atomic::AtomicU32::new((fps / 4).max(1)),
         metrics: Some(metrics.clone()),
+        reopen: Default::default(),
     });
     let pixel = if format.hdr() {
         "P010_10LE,colorimetry=bt2100-pq"
@@ -1392,6 +1480,10 @@ fn start(
                     let start = Instant::now();
                     let prepare_us = start.duration_since(pulled).as_micros() as u64;
                     let mut codec = state.codec.lock().unwrap();
+                    if state.apply_bitrate(&mut codec) {
+                        // Its first frame is an IDR, which starts a new group below.
+                        metrics.pending.lock().unwrap().clear();
+                    }
                     frame_id = frame_id
                         .checked_add(1)
                         .context("encoder timestamp exhausted")?;

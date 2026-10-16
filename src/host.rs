@@ -563,18 +563,16 @@ async fn run_session(
     };
     let mut video_start_group = 0;
     let info = desktop(options, capture, video_start_group)?;
-    let mut pipeline = media::encoder(
-        &capture.pipeline_source_for_range(options.dynamic_range)?,
+    let mut pipeline = start_encoder(
+        options,
+        capture.pipeline_source_for_range(options.dynamic_range)?,
         (info.width, info.height),
         options.fps,
         options.bitrate,
-        video.clone(),
-        options.encoder,
-        media::VideoFormat {
-            codec: options.codec,
-            dynamic_range: options.dynamic_range,
-        },
-    )?;
+        &video,
+    )
+    .await
+    .context("encoder start failed")??;
     let audio = match (options.audio_source.as_deref(), audio_track) {
         (Some(source), Some(track)) => Some(crate::audio::capture(source, track)?),
         _ => None,
@@ -589,15 +587,24 @@ async fn run_session(
         "native client connected"
     );
     let mut check = tokio::time::interval(Duration::from_millis(200));
-    let (sender, mut receiver) = tokio::sync::mpsc::channel(256);
+    let (sender, receiver) = tokio::sync::mpsc::channel(256);
+    let mut events = SessionEvents {
+        receiver,
+        deferred: Default::default(),
+    };
     // Highest pointer motion ID applied from either the ordered input track or
     // pointer datagrams; older or duplicate positions are dropped.
     let last_motion = Arc::new(AtomicU64::new(0));
     let controls = incoming.clone();
     let pointer_sender = sender.clone();
     let mut pointer_task: Option<AbortOnDrop> = None;
-    let incoming = receive_input(input, sender, last_motion.clone());
-    tokio::pin!(incoming);
+    // A task of its own, so input keeps arriving while the session loop waits
+    // for an encoder to start or stop (see while_starting).
+    let mut incoming = AbortOnDrop(tokio::spawn(receive_input(
+        input,
+        sender,
+        last_motion.clone(),
+    )));
     let mut adaptation = media::BitrateController::new(options.bitrate);
     let mut network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
     let mut adaptive = !options.fixed_bitrate;
@@ -634,7 +641,7 @@ async fn run_session(
             );
             capture.release_all().await;
             // Stop the dead PipeWire stream before opening the new session.
-            drop(pipeline);
+            while_starting(retire(pipeline), &mut events, capture, &mut updates).await?;
             for index in std::mem::take(&mut monitor_streams).into_keys() {
                 publish_update(
                     &mut updates,
@@ -668,18 +675,20 @@ async fn run_session(
             }
             video_start_group = video_barrier(&video)?;
             let info = desktop(options, capture, video_start_group)?;
-            pipeline = media::encoder(
-                &capture.pipeline_source_for_range(options.dynamic_range)?,
-                (info.width, info.height),
-                options.fps,
-                options.bitrate,
-                video.clone(),
-                options.encoder,
-                media::VideoFormat {
-                    codec: options.codec,
-                    dynamic_range: options.dynamic_range,
-                },
-            )?;
+            pipeline = while_starting(
+                start_encoder(
+                    options,
+                    capture.pipeline_source_for_range(options.dynamic_range)?,
+                    (info.width, info.height),
+                    options.fps,
+                    options.bitrate,
+                    &video,
+                ),
+                &mut events,
+                capture,
+                &mut updates,
+            )
+            .await?;
             if long_gop {
                 pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS));
             }
@@ -700,7 +709,7 @@ async fn run_session(
         }
         tokio::select! {
             result = crate::ssh_agent::closed(&mut ssh_agent) => return result,
-            result = &mut incoming => return result,
+            result = &mut incoming.0 => return result.context("input task failed")?,
             error = session.closed() => anyhow::bail!("{error}"),
             shape = async {
                 match cursor_watcher.as_mut() {
@@ -759,11 +768,11 @@ async fn run_session(
                     })?;
                 }
             },
-            event = receiver.recv() => {
+            event = events.next() => {
                 match event.context("input stream closed")? {
                     Event::MonitorStream { index, enabled } => {
                         if !enabled {
-                            monitor_streams.remove(&index);
+                            if let Some(stream) = monitor_streams.remove(&index) { while_starting(retire(stream), &mut events, capture, &mut updates).await?; }
                             capture.release_all().await;
                             publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: "Monitor stream disabled".into(), requested: true })?;
                             continue;
@@ -776,7 +785,7 @@ async fn run_session(
                             publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: "Monitor unavailable or four additional streams already active".into(), requested: false })?;
                             continue;
                         }
-                        match monitor_encoder(options, capture, index, &monitor_tracks[index]).await {
+                        match monitor_encoder(options, capture, index, &monitor_tracks[index], &mut events, &mut updates).await {
                             Ok(stream) => {
                                 publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
                                 if long_gop { stream.pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
@@ -817,16 +826,16 @@ async fn run_session(
                             };
                             // Restart capture without the pointer, as for a monitor switch.
                             capture.release_all().await;
-                            drop(pipeline);
+                            while_starting(retire(pipeline), &mut events, capture, &mut updates).await?;
                             capture.local_cursor = true;
                             video_start_group = video_barrier(&video)?;
                             let info = desktop(options, capture, video_start_group)?;
-                            pipeline = media::encoder(&capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, options.bitrate, video.clone(), options.encoder, media::VideoFormat { codec: options.codec, dynamic_range: options.dynamic_range })?;
+                            pipeline = while_starting(start_encoder(options, capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, options.bitrate, &video), &mut events, capture, &mut updates).await?;
                             if long_gop { pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
                             let active: Vec<_> = monitor_streams.keys().copied().collect();
-                            monitor_streams.clear();
+                            while_starting(retire(std::mem::take(&mut monitor_streams)), &mut events, capture, &mut updates).await?;
                             for index in active {
-                                match monitor_encoder(options, capture, index, &monitor_tracks[index]).await {
+                                match monitor_encoder(options, capture, index, &monitor_tracks[index], &mut events, &mut updates).await {
                                     Ok(stream) => {
                                         publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
                                         if long_gop { stream.pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
@@ -881,18 +890,30 @@ async fn run_session(
                             }
                         };
                         last_configure = Instant::now();
+                        // A bitrate-only change retargets the running encoder (in
+                        // place, or reopened in the background): no capture restart,
+                        // no gap. Auxiliary monitors keep their fixed bitrate.
+                        if width == options.width && fps == options.fps && pipeline.set_video_bitrate(bitrate).is_ok() {
+                            *options = requested;
+                            adaptation = media::BitrateController::new(bitrate);
+                            network_rate = media::NetworkRateController::new(bitrate, Instant::now());
+                            adaptive = !options.fixed_bitrate;
+                            last_feedback = Instant::now();
+                            publish_update(&mut updates, Update::Desktop { desktop: info })?;
+                            continue;
+                        }
                         capture.release_all().await;
-                        drop(pipeline);
+                        while_starting(retire(pipeline), &mut events, capture, &mut updates).await?;
                         video_start_group = video_barrier(&video)?;
                         info.video_start_group = video_start_group;
                         capture.select_monitor(capture.active_monitor).await?;
-                        pipeline = media::encoder(&capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), fps, bitrate, video.clone(), options.encoder, media::VideoFormat { codec: options.codec, dynamic_range: options.dynamic_range })?;
+                        pipeline = while_starting(start_encoder(options, capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), fps, bitrate, &video), &mut events, capture, &mut updates).await?;
                         if long_gop { pipeline.set_key_interval(fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
                         *options = requested;
                         let active: Vec<_> = monitor_streams.keys().copied().collect();
-                        monitor_streams.clear();
+                        while_starting(retire(std::mem::take(&mut monitor_streams)), &mut events, capture, &mut updates).await?;
                         for index in active {
-                            match monitor_encoder(options, capture, index, &monitor_tracks[index]).await {
+                            match monitor_encoder(options, capture, index, &monitor_tracks[index], &mut events, &mut updates).await {
                                 Ok(stream) => {
                                     publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
                                     if long_gop { stream.pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
@@ -916,11 +937,11 @@ async fn run_session(
                         last_switch = Instant::now();
                         capture.release_all().await;
                         // Stop the old source before opening another PipeWire node.
-                        drop(pipeline);
+                        while_starting(retire(pipeline), &mut events, capture, &mut updates).await?;
                         video_start_group = video_barrier(&video)?;
                         capture.select_monitor(index).await?;
                         let info = desktop(options, capture, video_start_group)?;
-                        pipeline = media::encoder(&capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, options.bitrate, video.clone(), options.encoder, media::VideoFormat { codec: options.codec, dynamic_range: options.dynamic_range })?;
+                        pipeline = while_starting(start_encoder(options, capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, options.bitrate, &video), &mut events, capture, &mut updates).await?;
                         if long_gop { pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
                         adaptation = media::BitrateController::new(options.bitrate);
                         network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
@@ -1045,29 +1066,132 @@ struct MonitorEncoder {
 
 async fn monitor_encoder(
     options: &Options,
-    capture: &Capture,
+    capture: &mut Capture,
     index: usize,
     track: &moq_net::track::Producer,
+    events: &mut SessionEvents,
+    updates: &mut moq_net::track::Producer,
 ) -> Result<MonitorEncoder> {
     let info = desktop_for_monitor(options, capture, index, video_barrier(track)?)?;
     let source = capture.monitor_source(index, options.dynamic_range).await?;
-    let pipeline = media::encoder(
-        &source.pipeline,
-        (info.width, info.height),
-        options.fps,
-        options.bitrate,
-        track.clone(),
-        options.encoder,
-        media::VideoFormat {
-            codec: options.codec,
-            dynamic_range: options.dynamic_range,
-        },
-    )?;
+    let pipeline = while_starting(
+        start_encoder(
+            options,
+            source.pipeline.clone(),
+            (info.width, info.height),
+            options.fps,
+            options.bitrate,
+            track,
+        ),
+        events,
+        capture,
+        updates,
+    )
+    .await?;
     Ok(MonitorEncoder {
         pipeline,
         _source: source,
         desktop: info,
     })
+}
+
+/// Input events from the client, plus control events set aside while an
+/// encoder was starting (handled first, in arrival order).
+struct SessionEvents {
+    receiver: tokio::sync::mpsc::Receiver<Event>,
+    deferred: std::collections::VecDeque<Event>,
+}
+
+impl SessionEvents {
+    async fn next(&mut self) -> Option<Event> {
+        match self.deferred.pop_front() {
+            Some(event) => Some(event),
+            None => self.receiver.recv().await,
+        }
+    }
+}
+
+/// Opens an encoder (hardware session, probing, capture start; NVENC takes
+/// ~0.5 s) on a blocking thread instead of the session task.
+fn start_encoder(
+    options: &Options,
+    source: String,
+    size: (u32, u32),
+    fps: u32,
+    bitrate: u32,
+    track: &moq_net::track::Producer,
+) -> tokio::task::JoinHandle<Result<media::Pipeline>> {
+    let (track, kind) = (track.clone(), options.encoder);
+    let format = media::VideoFormat {
+        codec: options.codec,
+        dynamic_range: options.dynamic_range,
+    };
+    tokio::task::spawn_blocking(move || {
+        media::encoder(&source, size, fps, bitrate, track, kind, format)
+    })
+}
+
+/// Stops pipelines on a blocking thread: closing an NVENC session takes about
+/// half a second, during which the session task would not read input.
+fn retire<T: Send + 'static>(old: T) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::task::spawn_blocking(move || {
+        drop(old);
+        Ok(())
+    })
+}
+
+/// Waits for `work` while still injecting input and answering probes, so a
+/// quality, monitor or cursor change does not freeze the remote pointer while
+/// an encoder stops or starts. Other events wait in `events.deferred` for the
+/// session loop. Rate feedback and keyframe requests do not hold up input;
+/// anything else (clipboard, monitor and video changes) does, to keep order.
+/// An input event that fails to inject is also left to the loop, which
+/// retries it with its error handling.
+async fn while_starting<T: Send + 'static>(
+    work: tokio::task::JoinHandle<Result<T>>,
+    events: &mut SessionEvents,
+    capture: &mut Capture,
+    updates: &mut moq_net::track::Producer,
+) -> Result<T> {
+    fn reorderable(event: &Event) -> bool {
+        matches!(
+            event,
+            Event::Feedback { .. } | Event::MonitorFeedback { .. } | Event::RequestKeyframe { .. }
+        )
+    }
+    let mut ordered = events.deferred.iter().any(|event| !reorderable(event));
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            result = &mut work => return result.context("encoder task failed")?,
+            event = events.receiver.recv(), if !ordered => {
+                let Some(event) = event else {
+                    // The session loop reports the closed stream.
+                    return work.await.context("encoder task failed")?;
+                };
+                match event {
+                    Event::Probe { id } => publish_update(updates, Update::Pong { id })?,
+                    event if reorderable(&event) => events.deferred.push_back(event),
+                    Event::MonitorStream { .. }
+                    | Event::MonitorMotion { .. }
+                    | Event::ClientFeatures { .. }
+                    | Event::ConfigureVideo { .. }
+                    | Event::SelectMonitor { .. }
+                    | Event::Clipboard { .. }
+                    | Event::ClipboardRequest => {
+                        ordered = true;
+                        events.deferred.push_back(event);
+                    }
+                    event => {
+                        if event.validate().is_err() || capture.input(event.clone()).await.is_err() {
+                            ordered = true;
+                            events.deferred.push_back(event);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn requested_format(

@@ -81,6 +81,16 @@ Restore tokens request that consent be remembered; the compositor/portal decides
 whether this is allowed and may prompt again after logout or permission changes.
 No service is enabled and no firewall is changed merely by building this project.
 
+The module raises `net.core.rmem_max`/`wmem_max` to 8 MiB (`udpBuffers`,
+default on, `lib.mkDefault` so your own value wins); with the kernel default
+the host logs `UDP receive/send buffer is smaller than requested` and can drop
+packets during keyframe bursts. Elsewhere, on host and client:
+
+```sh
+printf 'net.core.rmem_max = 8388608\nnet.core.wmem_max = 8388608\n' |
+  sudo tee /etc/sysctl.d/90-teleport.conf && sudo sysctl --system
+```
+
 The host registers the application ID `dev.teleport.Host` with the portal. On KDE,
 pre-authorize it once so lost or expired portal sessions are recreated
 without a local dialog, even while the screen is locked:

@@ -22,6 +22,8 @@ struct Profile {
     pattern: &'static str,
     /// Stream ~500 Hz pointer motion and time input-path probe round trips.
     input_latency: bool,
+    /// Ask the host to change the stream width every 1.5 s (encoder rebuilds).
+    reconfigure: bool,
     /// Stream width; height follows the 16:9 test source.
     width: u32,
 }
@@ -72,7 +74,7 @@ fn run(profile: &Profile) -> Outcome {
         r#"set -eu
 ip link set lo up
 tc qdisc add dev lo root netem {netem}
-TELEPORT_TEST_PATTERN={pattern} "$TELEPORT" host --source test --encoder software --listen 127.0.0.1:4443 \
+TELEPORT_TEST_PATTERN={pattern} "$TELEPORT" host --source test --encoder "${{TELEPORT_TEST_ENCODER:-software}}" --listen 127.0.0.1:4443 \
     --width {width} --fps {FPS} --bitrate {bitrate} --pairing-file "$DIR/pairing.json" \
     >"$DIR/host.log" 2>&1 &
 host=$!
@@ -85,7 +87,7 @@ done
 sleep 0.3
 {blackout}
 "$TELEPORT" client 127.0.0.1:4443 --pairing-file "$DIR/pairing.json" \
-    --headless-frames {FRAMES} --software-decoder --bitrate {bitrate} {input}
+    --headless-frames {FRAMES} --software-decoder --bitrate {bitrate} {input} {reconfigure}
 # Let the host notice the disconnect and log its encoder summary.
 sleep 0.5
 "#,
@@ -94,6 +96,11 @@ sleep 0.5
         width = profile.width,
         input = if profile.input_latency {
             "--smoke-input-latency"
+        } else {
+            ""
+        },
+        reconfigure = if profile.reconfigure {
+            "--smoke-reconfigure"
         } else {
             ""
         },
@@ -222,6 +229,7 @@ fn clean_link_streams_at_full_rate() {
         blackout: None,
         pattern: "ball",
         input_latency: false,
+        reconfigure: false,
         width: 640,
     });
     assert!(outcome.fps() >= 25.0, "{outcome:?}");
@@ -238,6 +246,7 @@ fn high_latency_link_keeps_full_rate() {
         blackout: None,
         pattern: "ball",
         input_latency: false,
+        reconfigure: false,
         width: 640,
     });
     assert!(outcome.fps() >= 25.0, "{outcome:?}");
@@ -253,6 +262,7 @@ fn one_percent_loss_survives_with_usable_rate() {
         blackout: None,
         pattern: "snow",
         input_latency: false,
+        reconfigure: false,
         width: 640,
     });
     assert!(outcome.fps() >= 20.0, "{outcome:?}");
@@ -268,6 +278,7 @@ fn five_percent_loss_survives() {
         blackout: None,
         pattern: "snow",
         input_latency: false,
+        reconfigure: false,
         width: 640,
     });
 }
@@ -282,6 +293,7 @@ fn jitter_and_reordering_survive() {
         blackout: None,
         pattern: "snow",
         input_latency: false,
+        reconfigure: false,
         width: 640,
     });
     assert!(outcome.fps() >= 20.0, "{outcome:?}");
@@ -298,6 +310,7 @@ fn bitrate_above_link_capacity_survives() {
         blackout: None,
         pattern: "snow",
         input_latency: false,
+        reconfigure: false,
         width: 640,
     });
 }
@@ -312,6 +325,7 @@ fn two_second_blackout_recovers_without_reconnect() {
         blackout: Some(2),
         pattern: "ball",
         input_latency: false,
+        reconfigure: false,
         width: 640,
     });
     // The stall must cover the outage, and video must resume promptly after.
@@ -323,6 +337,10 @@ fn two_second_blackout_recovers_without_reconnect() {
 /// share the ordered input path with key events, so their round trip is what
 /// a key press waits for (plus the return trip) when the mouse is moving.
 fn input_profile(name: &'static str, netem: &'static str) -> Outcome {
+    input_profile_with(name, netem, false)
+}
+
+fn input_profile_with(name: &'static str, netem: &'static str, reconfigure: bool) -> Outcome {
     let outcome = run(&Profile {
         name,
         netem,
@@ -330,6 +348,7 @@ fn input_profile(name: &'static str, netem: &'static str) -> Outcome {
         blackout: None,
         pattern: "ball",
         input_latency: true,
+        reconfigure,
         width: 640,
     });
     assert!(outcome.probes >= 50, "too few probe replies: {outcome:?}");
@@ -361,7 +380,17 @@ fn full_hd_clean_link_decode_path() {
         blackout: None,
         pattern: "snow",
         input_latency: false,
+        reconfigure: false,
         width: 1920,
     });
     assert!(outcome.fps() >= 25.0, "{outcome:?}");
+}
+
+#[test]
+#[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
+fn input_keeps_flowing_while_the_encoder_restarts() {
+    // H7: the host rebuilds its encoder for every width change. The probe
+    // tail shows how long input waits behind that. TELEPORT_TEST_ENCODER
+    // selects another encoder kind (e.g. nvidia, vaapi).
+    input_profile_with("reconfig", "delay 1ms", true);
 }
