@@ -20,7 +20,7 @@ teleport host-manager
 
 The native settings window manages the local host's Teleport account, one-time
 pairing window, and enrolled devices. Service start/stop controls target
-`teleport-desktop.service`; they do not install that service or edit NixOS config.
+`app-dev.teleport.Host.service`; they do not install that service or edit NixOS config.
 The default identity directory is `$HOME/.local/state/teleport/host`.
 
 From an already trusted SSH login to the host, use:

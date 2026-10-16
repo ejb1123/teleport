@@ -81,8 +81,12 @@ Restore tokens request that consent be remembered; the compositor/portal decides
 whether this is allowed and may prompt again after logout or permission changes.
 No service is enabled and no firewall is changed merely by building this project.
 
-Inspect with `systemctl --user status teleport-desktop` and
-`journalctl --user -u teleport-desktop`. Stop it with `systemctl --user stop teleport-desktop`.
+The unit name gives the host the application ID `dev.teleport.Host`. On KDE,
+pre-authorize it once so lost or expired portal sessions are recreated
+without a local dialog, even while the screen is locked:
+`flatpak permission-set kde-authorized remote-desktop dev.teleport.Host yes`.
+Inspect with `systemctl --user status app-dev.teleport.Host` and
+`journalctl --user -u app-dev.teleport.Host`. Stop it with `systemctl --user stop app-dev.teleport.Host`.
 Do not enable user lingering expecting desktop capture to work before login.
 
 ### Test the NixOS unit without rebooting or switching the system
@@ -92,11 +96,11 @@ unit (replace `nixos` with your configuration name):
 
 ```sh
 teleport_unit=$(nix build --no-link --print-out-paths \
-  '/etc/nixos#nixosConfigurations.nixos.config.systemd.user.units."teleport-desktop.service".unit')
-systemctl --user link --runtime "$teleport_unit/teleport-desktop.service"
+  '/etc/nixos#nixosConfigurations.nixos.config.systemd.user.units."app-dev.teleport.Host.service".unit')
+systemctl --user link --runtime "$teleport_unit/app-dev.teleport.Host.service"
 systemctl --user daemon-reload
 # Stop any manually launched Teleport host first, to release its port/capture.
-systemctl --user start teleport-desktop
+systemctl --user start app-dev.teleport.Host
 journalctl --user -u teleport-desktop -n 30 --no-pager
 ```
 

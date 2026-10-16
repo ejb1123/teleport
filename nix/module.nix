@@ -50,7 +50,12 @@ in
     ];
     environment.systemPackages = [ cfg.package ];
     security.pam.services.teleport = lib.mkIf cfg.systemLogin { };
-    systemd.user.services.teleport-desktop = {
+    # The unit name gives the host the application ID `dev.teleport.Host`
+    # (systemd `app-<AppID>.service` convention), which desktop portals use
+    # for permissions. KDE can then pre-authorize it, so a lost or expired
+    # portal session is recreated without a local dialog, even while locked:
+    #   flatpak permission-set kde-authorized remote-desktop dev.teleport.Host yes
+    systemd.user.services."app-dev.teleport.Host" = {
       description = "Teleport remote desktop host (graphical session)";
       wantedBy = [ "graphical-session.target" ];
       after = [ "graphical-session.target" ];
