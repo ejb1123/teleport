@@ -40,6 +40,19 @@ in
       description = "Additional host arguments. Clipboard and audio are opt-in.";
     };
     systemLogin = lib.mkEnableOption "existing Linux password login for allowed users' running desktops";
+    preauthorizeRemoteDesktop = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Pre-authorize the host (application ID `dev.teleport.Host`) for remote
+        desktop in the user's portal permission store each time it starts, so
+        KDE creates or recreates its screen and input session without the local
+        consent dialog -- including while the screen is locked, when that dialog
+        cannot appear. Intended for unattended hosts: anyone the host admits can
+        then control the desktop without local confirmation. Desktops other than
+        KDE ignore the entry.
+      '';
+    };
   };
   config = lib.mkIf cfg.enable {
     assertions = [
@@ -63,13 +76,12 @@ in
       })
     ];
     security.pam.services.teleport = lib.mkIf cfg.systemLogin { };
-    # The unit name gives the host the application ID `dev.teleport.Host`
-    # (systemd `app-<AppID>.service` convention), which desktop portals use
-    # for permissions (with the desktop entry above). KDE can then pre-authorize
-    # it, so a lost or expired portal session is recreated without a local
-    # dialog, even while locked:
-    #   flatpak permission-set kde-authorized remote-desktop dev.teleport.Host yes
-    systemd.user.services."app-dev.teleport.Host" = {
+    # The host registers the application ID `dev.teleport.Host` with the portal
+    # itself (host portal Registry; the desktop entry above is required). KDE
+    # can then pre-authorize it (see preauthorizeRemoteDesktop), so a lost or
+    # expired portal session is recreated without a local dialog, even while
+    # the screen is locked.
+    systemd.user.services.teleport-desktop = {
       description = "Teleport remote desktop host (graphical session)";
       wantedBy = [ "graphical-session.target" ];
       after = [ "graphical-session.target" ];
@@ -80,6 +92,10 @@ in
         Restart = "on-failure";
         RestartSec = 10;
         UMask = "0077";
+        # KDE's portal skips its consent dialog for apps marked "yes" here (the
+        # mechanism KRdp uses). "-": a missing permission store must not stop
+        # the host; it then falls back to the normal dialog.
+        ExecStartPre = lib.mkIf cfg.preauthorizeRemoteDesktop "-${pkgs.systemd}/bin/busctl --user call org.freedesktop.impl.portal.PermissionStore /org/freedesktop/impl/portal/PermissionStore org.freedesktop.impl.portal.PermissionStore SetPermission sbssas kde-authorized true remote-desktop dev.teleport.Host 1 yes";
       };
     };
   };

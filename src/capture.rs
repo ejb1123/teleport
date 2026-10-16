@@ -207,6 +207,7 @@ impl Capture {
         match source {
             "test" => (),
             "portal" => {
+                register_portal_app().await;
                 let proxy = RemoteDesktop::new().await.context(
                     "RemoteDesktop portal unavailable; run inside your graphical session",
                 )?;
@@ -778,6 +779,35 @@ fn write_restore_token(path: &Path, token: &str) -> Result<()> {
         let _ = std::fs::remove_file(&temporary);
     }
     result.context("saving portal restore token")
+}
+
+/// Application ID the host registers with desktop portals (needs a matching
+/// `dev.teleport.Host.desktop`, which the NixOS module installs). Lets KDE
+/// honour a pre-authorization instead of asking through a local dialog.
+pub const PORTAL_APP_ID: &str = "dev.teleport.Host";
+
+/// Register the host's application ID on the portal connection, once per
+/// process, before the first portal request. Optional: older portals lack the
+/// registry and the host then stays anonymous (local dialogs as before).
+async fn register_portal_app() {
+    static REGISTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if REGISTERED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let result = match PORTAL_APP_ID.parse() {
+        Ok(app_id) => ashpd::register_host_app(app_id)
+            .await
+            .map_err(anyhow::Error::from),
+        Err(error) => Err(anyhow::anyhow!("{error:?}")),
+    };
+    match result {
+        Ok(()) => tracing::info!(app_id = PORTAL_APP_ID, "registered with the desktop portal"),
+        Err(error) => tracing::warn!(
+            app_id = PORTAL_APP_ID,
+            error = format!("{error:#}"),
+            "portal app registration unavailable; local approval may be required"
+        ),
+    }
 }
 
 /// Whether a portal error means our RemoteDesktop session is gone or no
