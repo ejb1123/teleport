@@ -445,6 +445,8 @@ async fn run_session(
     negotiated.codec = requested.codec;
     negotiated.dynamic_range = requested.dynamic_range;
     let options = &mut negotiated;
+    // Each client opts in again; a new session starts with the pointer in video.
+    capture.local_cursor = false;
     capture.select_monitor(capture.active_monitor).await?;
     let mut broadcast = outgoing.create_broadcast(
         "desktop",
@@ -577,6 +579,9 @@ async fn run_session(
     // vanished while sleeping monitors woke). Recovered in place below.
     let mut portal_lost = false;
     let mut portal_recoveries: Vec<Instant> = Vec::new();
+    // XFixes cursor shapes for a client drawing the pointer locally (X11);
+    // dropping it at session end stops the watcher thread.
+    let mut cursor_watcher: Option<crate::x11_cursor::Watcher> = None;
     loop {
         if portal_lost {
             portal_lost = false;
@@ -660,6 +665,25 @@ async fn run_session(
             result = crate::ssh_agent::closed(&mut ssh_agent) => return result,
             result = &mut incoming => return result,
             error = session.closed() => anyhow::bail!("{error}"),
+            shape = async {
+                match cursor_watcher.as_mut() {
+                    Some(watcher) => watcher.shapes.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let shape = match (shape, cursor_watcher.as_mut()) {
+                    (Ok(()), Some(watcher)) => watcher.shapes.borrow_and_update().clone(),
+                    _ => {
+                        // The pointer stays out of the video; the client keeps its last shape.
+                        cursor_watcher = None;
+                        publish_update(&mut updates, Update::Notice { text: "Host cursor updates stopped".into() })?;
+                        None
+                    }
+                };
+                if let Some(cursor) = shape {
+                    publish_update(&mut updates, Update::Cursor { cursor })?;
+                }
+            },
             _ = check.tick() => {
                 if let Err(error) = pipeline.error() {
                     // On Wayland a capture failure is usually the portal stream
@@ -735,7 +759,7 @@ async fn run_session(
                     // Auxiliary streams currently use fixed bitrate. Their
                     // congestion must never adapt the independent primary.
                     Event::MonitorFeedback { .. } => {}
-                    Event::ClientFeatures { keyframe_requests , pointer_datagrams } => {
+                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor } => {
                         if pointer_datagrams && pointer_task.is_none() {
                             pointer_task = Some(AbortOnDrop(tokio::spawn(receive_pointer(controls.clone(), pointer_sender.clone(), last_motion.clone()))));
                         }
@@ -744,6 +768,47 @@ async fn run_session(
                             let frames = options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS);
                             pipeline.set_key_interval(frames);
                             for stream in monitor_streams.values() { stream.pipeline.set_key_interval(frames); }
+                        }
+                        if local_cursor && capture.supports_local_cursor() && cursor_watcher.is_none() {
+                            // Watch first: without shapes the client would have no pointer at all.
+                            let mut watcher = match crate::x11_cursor::watch() {
+                                Ok(watcher) => watcher,
+                                Err(error) => {
+                                    tracing::warn!(error = format!("{error:#}"), "local cursor unavailable; keeping the pointer in the video");
+                                    continue;
+                                }
+                            };
+                            // Restart capture without the pointer, as for a monitor switch.
+                            capture.release_all().await;
+                            drop(pipeline);
+                            capture.local_cursor = true;
+                            video_start_group = video_barrier(&video)?;
+                            let info = desktop(options, capture, video_start_group)?;
+                            pipeline = media::encoder(&capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, options.bitrate, video.clone(), options.encoder, media::VideoFormat { codec: options.codec, dynamic_range: options.dynamic_range })?;
+                            if long_gop { pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
+                            let active: Vec<_> = monitor_streams.keys().copied().collect();
+                            monitor_streams.clear();
+                            for index in active {
+                                match monitor_encoder(options, capture, index, &monitor_tracks[index]).await {
+                                    Ok(stream) => {
+                                        publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
+                                        if long_gop { stream.pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
+                                        monitor_streams.insert(index, stream);
+                                    }
+                                    Err(error) => publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor restart failed: {error}"), requested: false })?,
+                                }
+                            }
+                            adaptation = media::BitrateController::new(options.bitrate);
+                            network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
+                            encoder_metrics = pipeline.encoder_metrics()?;
+                            adaptive = !options.fixed_bitrate;
+                            last_feedback = Instant::now();
+                            publish_update(&mut updates, Update::Desktop { desktop: info })?;
+                            if let Some(cursor) = watcher.shapes.borrow_and_update().clone() {
+                                publish_update(&mut updates, Update::Cursor { cursor })?;
+                            }
+                            cursor_watcher = Some(watcher);
+                            tracing::info!("client draws the cursor locally");
                         }
                     }
                     Event::RequestKeyframe { monitor } => {
@@ -929,6 +994,7 @@ fn desktop_for_monitor(
         keyframe_requests: true,
         pointer_datagrams: true,
         relative_pointer: true,
+        local_cursor: capture.supports_local_cursor(),
     })
 }
 

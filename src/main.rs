@@ -33,6 +33,8 @@ mod system_login;
 #[cfg(target_os = "linux")]
 mod system_pam;
 mod windowing;
+#[cfg(target_os = "linux")]
+mod x11_cursor;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};

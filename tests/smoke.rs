@@ -478,11 +478,9 @@ fn persistent_identity_and_monitor_switch() {
     }
 }
 
-#[test]
-#[ignore = "requires Xvfb, local UDP sockets and GStreamer runtime plugins"]
-fn x11_capture_input_and_native_window() {
+/// A private 800x600 Xvfb display and its name (e.g. ":99").
+fn xvfb() -> (Process, String) {
     use std::io::BufRead;
-    use x11rb::{connection::Connection, protocol::xproto::ConnectionExt};
     let mut display = Process(
         Command::new("Xvfb")
             .args([
@@ -502,7 +500,244 @@ fn x11_capture_input_and_native_window() {
     std::io::BufReader::new(display.0.stdout.take().unwrap())
         .read_line(&mut number)
         .unwrap();
-    let display_name = format!(":{}", number.trim());
+    let name = format!(":{}", number.trim());
+    (display, name)
+}
+
+/// Starts an X11 host on `display_name` and waits for its pairing file.
+fn x11_host(display_name: &str, address: &str, pairing: &std::path::Path) -> Process {
+    let mut host = Process(
+        teleport()
+            .env_remove("WAYLAND_DISPLAY")
+            .env("XDG_SESSION_TYPE", "x11")
+            .env("DISPLAY", display_name)
+            .args([
+                "host",
+                "--source",
+                "x11",
+                "--listen",
+                address,
+                "--width",
+                "640",
+                "--fps",
+                "30",
+                "--pairing-file",
+            ])
+            .arg(pairing)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::read(pairing)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_none()
+    {
+        assert!(host.0.try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    host
+}
+
+/// X11 hosts leave the pointer out of the video for clients that draw it
+/// locally, and send every shape change (including a hidden cursor).
+#[test]
+#[ignore = "requires Xvfb, local UDP sockets and GStreamer runtime plugins"]
+fn x11_local_cursor_shapes() {
+    use std::io::BufRead;
+    use x11rb::{
+        connection::Connection,
+        protocol::xproto::{
+            ChangeWindowAttributesAux, ConnectionExt, CreateWindowAux, WindowClass,
+        },
+    };
+    let (_display, display_name) = xvfb();
+    let (connection, screen) = x11rb::connect(Some(&display_name)).unwrap();
+    let root = connection.setup().roots[screen].root;
+    let window = connection.generate_id().unwrap();
+    connection
+        .create_window(
+            0,
+            window,
+            root,
+            0,
+            0,
+            800,
+            600,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &CreateWindowAux::new(),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    connection.map_window(window).unwrap().check().unwrap();
+    connection
+        .warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, 400, 300)
+        .unwrap()
+        .check()
+        .unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let pairing = temp.path().join("pairing.json");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let _host = x11_host(&display_name, &address, &pairing);
+
+    // An opted-out client keeps the pointer in the video and gets no shapes.
+    let output = teleport()
+        .args([
+            "client",
+            &address,
+            "--headless-frames",
+            "20",
+            "--embedded-cursor",
+            "--pairing-file",
+        ])
+        .arg(&pairing)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "embedded-cursor client failed: {stdout}"
+    );
+    assert!(!stdout.contains("remote cursor"), "{stdout}");
+
+    let mut client = Process(
+        teleport()
+            .args([
+                "client",
+                &address,
+                "--headless-frames",
+                "100000",
+                "--pairing-file",
+            ])
+            .arg(&pairing)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let (lines, received) = std::sync::mpsc::channel();
+    let stdout = client.0.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let wait_for = |wanted: &dyn Fn(&str) -> bool, what: &str| -> String {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match received.recv_timeout(left) {
+                Ok(line) if wanted(&line) => return line,
+                Ok(_) => (),
+                Err(_) => panic!("client never logged {what}"),
+            }
+        }
+    };
+    // The initial shape (Xvfb's root "X" cursor) arrives on opt-in.
+    let initial = wait_for(
+        &|line| line.contains("remote cursor "),
+        "the initial cursor",
+    );
+    assert!(
+        initial.split_whitespace().any(|word| {
+            word.split_once('x')
+                .and_then(|(w, h)| Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?)))
+                .is_some_and(|(w, h)| (1..=256).contains(&w) && (1..=256).contains(&h))
+        }),
+        "no cursor size in {initial:?}"
+    );
+
+    // A window cursor under the pointer replaces the displayed cursor.
+    let font = connection.generate_id().unwrap();
+    connection
+        .open_font(font, b"cursor")
+        .unwrap()
+        .check()
+        .unwrap();
+    let arrow = connection.generate_id().unwrap();
+    connection
+        .create_glyph_cursor(arrow, font, font, 68, 69, 0, 0, 0, 0xffff, 0xffff, 0xffff)
+        .unwrap()
+        .check()
+        .unwrap();
+    connection
+        .change_window_attributes(window, &ChangeWindowAttributesAux::new().cursor(arrow))
+        .unwrap()
+        .check()
+        .unwrap();
+    wait_for(
+        &|line| line.contains("remote cursor ") && !line.contains("hidden"),
+        "the changed cursor",
+    );
+
+    // A fully transparent cursor (as games set) hides the local pointer.
+    let pixmap = connection.generate_id().unwrap();
+    connection
+        .create_pixmap(1, pixmap, root, 1, 1)
+        .unwrap()
+        .check()
+        .unwrap();
+    let gc = connection.generate_id().unwrap();
+    connection
+        .create_gc(
+            gc,
+            pixmap,
+            &x11rb::protocol::xproto::CreateGCAux::new().foreground(0),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    connection
+        .poly_fill_rectangle(
+            pixmap,
+            gc,
+            &[x11rb::protocol::xproto::Rectangle {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    let blank = connection.generate_id().unwrap();
+    connection
+        .create_cursor(blank, pixmap, pixmap, 0, 0, 0, 0, 0, 0, 0, 0)
+        .unwrap()
+        .check()
+        .unwrap();
+    connection
+        .change_window_attributes(window, &ChangeWindowAttributesAux::new().cursor(blank))
+        .unwrap()
+        .check()
+        .unwrap();
+    wait_for(
+        &|line| line.contains("remote cursor hidden"),
+        "a hidden cursor",
+    );
+    assert!(
+        client.0.try_wait().unwrap().is_none(),
+        "client exited early"
+    );
+}
+
+#[test]
+#[ignore = "requires Xvfb, local UDP sockets and GStreamer runtime plugins"]
+fn x11_capture_input_and_native_window() {
+    use x11rb::{connection::Connection, protocol::xproto::ConnectionExt};
+    let (_display, display_name) = xvfb();
     let (connection, screen) = x11rb::connect(Some(&display_name)).unwrap();
     let root = connection.setup().roots[screen].root;
     // Focus an isolated test window so we can observe XTest key transitions.
@@ -588,6 +823,11 @@ fn x11_capture_input_and_native_window() {
         "input client failed: {} {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
+    );
+    // X11 hosts draw the pointer on the client by default.
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("remote cursor "),
+        "no local cursor shape received"
     );
     let mut transitions = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);

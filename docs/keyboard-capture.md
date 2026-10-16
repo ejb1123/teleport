@@ -49,3 +49,9 @@ actual X11 keyboard grab and release via a competing X client. These are not
 physical Wayland/macOS global-shortcut acceptance tests. Test Alt+Tab, Super,
 Ctrl+Alt+K, both-monitor transitions, focus loss, and disconnect before relying
 on capture for unattended work.
+
+## Local cursor
+
+On X11 hosts the client draws the remote pointer locally (no video latency)
+and hides it when the host cursor is hidden, as games often do. Mouse lock
+still hides it. See [local cursor](cursor.md).

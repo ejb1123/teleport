@@ -132,6 +132,82 @@ pub struct Desktop {
     /// Host injects `Event::RelativeMotion` (pointer lock for games).
     #[serde(default)]
     pub relative_pointer: bool,
+    /// Host can leave the pointer out of the video and send its shape as
+    /// `Update::Cursor` once the client declares `ClientFeatures::local_cursor`.
+    #[serde(default)]
+    pub local_cursor: bool,
+}
+
+/// Largest cursor side accepted on the wire (cursors are usually 16-64 px;
+/// 256 covers large HiDPI themes).
+pub const MAX_CURSOR_SIZE: u16 = 256;
+
+/// Host cursor shape for a client that draws the pointer locally.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct CursorImage {
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    /// Straight (not premultiplied) RGBA, row-major, `width * height * 4` bytes.
+    #[serde(with = "base64_bytes")]
+    pub rgba: Vec<u8>,
+}
+
+impl std::fmt::Debug for CursorImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CursorImage")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("hot_x", &self.hot_x)
+            .field("hot_y", &self.hot_y)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CursorImage {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=MAX_CURSOR_SIZE).contains(&self.width)
+                && (1..=MAX_CURSOR_SIZE).contains(&self.height),
+            "cursor size out of range"
+        );
+        ensure!(
+            self.hot_x < self.width && self.hot_y < self.height,
+            "cursor hot spot outside the image"
+        );
+        ensure!(
+            self.rgba.len() == usize::from(self.width) * usize::from(self.height) * 4,
+            "cursor pixel data does not match its size"
+        );
+        Ok(())
+    }
+}
+
+/// Base64 keeps a 256x256 cursor (256 KiB) at ~350 KB of JSON, inside
+/// `MAX_CONTROL`; a JSON number array would need up to four times the bytes.
+mod base64_bytes {
+    use base64::Engine;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    const ENGINE: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
+    /// Encoded length of the largest valid image.
+    const LIMIT: usize =
+        (super::MAX_CURSOR_SIZE as usize * super::MAX_CURSOR_SIZE as usize * 4).div_ceil(3) * 4;
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&ENGINE.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        if text.len() > LIMIT {
+            return Err(serde::de::Error::custom("cursor image too large"));
+        }
+        ENGINE
+            .decode(text.as_bytes())
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -173,6 +249,26 @@ pub enum Update {
     Notice {
         text: String,
     },
+    /// New host cursor shape; `None` hides the pointer (e.g. a game set a
+    /// fully transparent cursor). Only sent after the client declared
+    /// `ClientFeatures::local_cursor` to a host advertising
+    /// `Desktop::local_cursor`.
+    Cursor {
+        cursor: Option<CursorImage>,
+    },
+}
+
+impl Update {
+    /// Rejects malformed host data before the client acts on it.
+    pub fn validate(&self) -> Result<()> {
+        if let Self::Cursor {
+            cursor: Some(image),
+        } = self
+        {
+            image.validate()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -277,6 +373,11 @@ pub enum Event {
         /// The client publishes pointer motion on [`POINTER_TRACK`] datagrams.
         #[serde(default)]
         pointer_datagrams: bool,
+        /// The client draws the pointer itself from `Update::Cursor`, so the
+        /// host leaves it out of the video. Only sent when
+        /// `Desktop::local_cursor`.
+        #[serde(default)]
+        local_cursor: bool,
     },
 }
 
@@ -581,6 +682,7 @@ mod tests {
             Event::ClientFeatures {
                 keyframe_requests: true,
                 pointer_datagrams: true,
+                local_cursor: true,
             },
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
@@ -628,6 +730,7 @@ mod tests {
             Event::ClientFeatures {
                 keyframe_requests: true,
                 pointer_datagrams: false,
+                local_cursor: false,
             }
         ));
         let primary: Event = serde_json::from_str(r#"{"type":"request_keyframe"}"#).unwrap();
@@ -646,11 +749,90 @@ mod tests {
         assert_eq!(desktop.codec, VideoCodec::H264);
         assert!(!desktop.configurable_video && !desktop.telemetry);
         assert!(!desktop.keyframe_requests);
+        assert!(!desktop.local_cursor);
         assert_eq!(desktop.video_start_group, 0);
         let mut invalid = old;
         invalid["codec"] = serde_json::json!("surprise");
         assert!(serde_json::from_value::<Desktop>(invalid).is_err());
     }
+    fn cursor(width: u16, height: u16) -> CursorImage {
+        CursorImage {
+            width,
+            height,
+            hot_x: 0,
+            hot_y: 0,
+            rgba: vec![0x80; usize::from(width) * usize::from(height) * 4],
+        }
+    }
+
+    #[test]
+    fn cursor_updates_roundtrip_compactly_and_reject_bad_images() {
+        for update in [
+            Update::Cursor {
+                cursor: Some(cursor(16, 24)),
+            },
+            Update::Cursor { cursor: None },
+        ] {
+            let wire = serde_json::to_vec(&update).unwrap();
+            let decoded: Update = serde_json::from_slice(&wire).unwrap();
+            decoded.validate().unwrap();
+            match (update, decoded) {
+                (Update::Cursor { cursor: a }, Update::Cursor { cursor: b }) => assert_eq!(a, b),
+                _ => unreachable!(),
+            }
+        }
+        // The largest cursor still fits a control frame.
+        let max = Update::Cursor {
+            cursor: Some(cursor(MAX_CURSOR_SIZE, MAX_CURSOR_SIZE)),
+        };
+        assert!(serde_json::to_vec(&max).unwrap().len() <= MAX_CONTROL);
+        max.validate().unwrap();
+
+        assert!(cursor(MAX_CURSOR_SIZE + 1, 1).validate().is_err());
+        assert!(cursor(0, 16).validate().is_err());
+        let mut short = cursor(16, 16);
+        short.rgba.pop();
+        assert!(short.validate().is_err());
+        let mut hot = cursor(16, 16);
+        hot.hot_x = 16;
+        assert!(hot.validate().is_err());
+        assert!(
+            Update::Cursor {
+                cursor: Some(hot.clone())
+            }
+            .validate()
+            .is_err()
+        );
+        // Oversized payloads are refused before decoding.
+        let huge = serde_json::json!({ "type": "cursor", "cursor": { "width": 1, "height": 1,
+            "hot_x": 0, "hot_y": 0, "rgba": "A".repeat(400_000) } });
+        assert!(serde_json::from_value::<Update>(huge).is_err());
+        let invalid = serde_json::json!({ "type": "cursor", "cursor": { "width": 1, "height": 1,
+            "hot_x": 0, "hot_y": 0, "rgba": "not base64!" } });
+        assert!(serde_json::from_value::<Update>(invalid).is_err());
+    }
+
+    #[test]
+    fn local_cursor_is_negotiated_by_both_ends() {
+        let features: Event = serde_json::from_str(
+            r#"{"type":"client_features","keyframe_requests":true,"local_cursor":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            features,
+            Event::ClientFeatures {
+                local_cursor: true,
+                ..
+            }
+        ));
+        assert!(!features.is_lossy());
+        let desktop: Desktop = serde_json::from_value(serde_json::json!({ "version": 2,
+            "width": 1, "height": 1, "fps": 1, "source": "X11", "monitors": [],
+            "active_monitor": 0, "audio": false, "clipboard": false, "local_cursor": true }))
+        .unwrap();
+        assert!(desktop.local_cursor);
+    }
+
     #[test]
     fn input_bounds() {
         assert!(
