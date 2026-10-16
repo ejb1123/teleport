@@ -229,11 +229,12 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         (None, _, _) => None,
     };
     let relay_namespace = crate::relay::namespace(&pairing.fingerprint)?;
-    // Connected relay, confirmed sessions from its intake task, and the task.
+    // Connected relay, confirmed sessions from its intake task, and the intake
+    // and presence tasks.
     let mut relay: Option<(
         crate::relay::Link,
         tokio::sync::mpsc::Receiver<crate::relay::Accepted>,
-        crate::relay::AbortOnDrop,
+        (crate::relay::AbortOnDrop, crate::relay::AbortOnDrop),
     )> = None;
     let mut relay_retry = Instant::now();
     loop {
@@ -244,7 +245,13 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         {
             match crate::relay::connect(endpoint, &relay_namespace).await {
                 Ok(link) => {
-                    tracing::info!(relay = %endpoint.url, namespace = %relay_namespace, "connected to relay; accepting end-to-end encrypted sessions");
+                    tracing::info!(relay = %endpoint.display_url(), namespace = %relay_namespace, "connected to relay; accepting end-to-end encrypted sessions");
+                    // Signed "online" statements for launchers (see presence.rs).
+                    let presence = tokio::spawn(crate::presence::publish(
+                        link.outgoing.clone(),
+                        e2e.clone(),
+                        relay_namespace.clone(),
+                    ));
                     let (sender, receiver) = tokio::sync::mpsc::channel(4);
                     let intake = tokio::spawn(crate::relay::intake(
                         link.session.clone(),
@@ -254,7 +261,14 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
                         e2e.clone(),
                         sender,
                     ));
-                    relay = Some((link, receiver, crate::relay::AbortOnDrop(intake)));
+                    relay = Some((
+                        link,
+                        receiver,
+                        (
+                            crate::relay::AbortOnDrop(intake),
+                            crate::relay::AbortOnDrop(presence),
+                        ),
+                    ));
                 }
                 Err(error) => {
                     tracing::warn!(%error, "relay unavailable; retrying in 5 s");

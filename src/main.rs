@@ -23,6 +23,7 @@ mod keyboard_capture;
 mod launcher;
 mod media;
 mod pairing;
+mod presence;
 mod profiles;
 mod protocol;
 mod relay;
@@ -89,6 +90,9 @@ enum Command {
     /// Run a minimal MoQ relay (self-hosted alternative to a provider relay).
     /// It forwards only end-to-end encrypted objects it cannot read.
     Relay(relay::Options),
+    /// Report whether a host is online through its relay (ONLINE, OFFLINE or
+    /// UNKNOWN), from statements the host signs with its pinned identity.
+    Presence(presence::Options),
     /// Check required media plugins without sharing the desktop.
     Doctor {
         /// Test synthetic HEVC Main 10 support; does not imply HDR desktop capture/display.
@@ -180,6 +184,7 @@ fn main() -> Result<()> {
         }
         Some(Command::Client(options)) => client::run(options, &runtime),
         Some(Command::Relay(options)) => runtime.block_on(relay::serve(options)),
+        Some(Command::Presence(options)) => runtime.block_on(presence::run(options)),
         Some(Command::Doctor { hdr }) => {
             media::doctor()?;
             if hdr {

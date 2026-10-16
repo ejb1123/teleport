@@ -2,7 +2,8 @@
 
 An experimental **native** remote desktop: Linux host, macOS/Linux client,
 Rust + SDL + direct FFmpeg video codecs, with Media over QUIC for video and input. No browser,
-Electron, WebRTC, external relay, or account is required.
+Electron, WebRTC, external relay, or account is required (an optional relay can
+reach hosts behind NAT; see [relay mode](docs/relay.md)).
 
 This is an experimental implementation, not a production Parsec replacement yet.
 It shares an existing graphical session, one client at a time. Start on a LAN
@@ -368,6 +369,13 @@ Missing events or gaps beyond the timeout/window end the connection and
 release input, rather than applying an incomplete key sequence. Pointer
 motion is coalesced at the window loop. Only one authenticated controller is
 served at a time. Private credentials are generated per host process.
+
+**Relay mode** (development): when the host's UDP port is not reachable, host and
+client can both connect out to a MoQ relay; every relayed session is end-to-end
+encrypted and authenticated against the pinned host identity. In the launcher,
+select a desktop and click **Relay** to save a relay URL, its fingerprint, key and a
+route (**Direct, then relay** by default). Desktops with a relay show signed
+online/offline presence. See [relay mode](docs/relay.md).
 
 ## Development and checks
 
