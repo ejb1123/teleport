@@ -130,7 +130,7 @@ same byte streams they use over TCP (`src/relay_enroll.rs`):
 
 | Enrollment | Relay namespace | Client command | End-to-end protection |
 | --- | --- | --- | --- |
-| One-time code (`TPPAIR01`, SPAKE2) | rendezvous from the pairing link | `teleport pair ADDRESS --relay ...` (link on stdin) | PAKE: the code never leaves either end |
+| One-time code (`TPPAIR02`, SPAKE2) | rendezvous from the pairing link | `teleport pair ADDRESS --relay ...` (link on stdin) | PAKE: the code never leaves either end |
 | Password (`TPAUTH01`, OPAQUE) | host namespace (`--relay-host`) | `teleport login ADDRESS --username U --relay-host ID --relay ...` | OPAQUE: authenticates the host fingerprint; the password never leaves the client |
 | Linux account (`TPSYS001`, PAM) | host namespace, from `--fingerprint` | `teleport login-system ADDRESS --username U --fingerprint F --relay ...` | TLS 1.3 pinned to the host certificate, inside the relay stream |
 
@@ -213,13 +213,26 @@ stores in `access.json`. On its own, the stored hash would let anyone who read
 the host's access record compute a valid hello, derive the session keys of a
 session it starts itself, and confirm them. Device keys close that gap:
 
-- **Enrollment.** After a password login (OPAQUE) or a code pairing (SPAKE2)
-  delivers the device token, the client generates an Ed25519 key, sends its
-  public half to the host sealed under a key derived from that enrollment's
-  shared secret, and keeps the private seed in its pairing file (0600, next to
-  the token, field `device_key`) only after the host's authenticated
-  acknowledgement. The host stores the public key with the device record
-  (`public_key`). A key, once registered, is never replaced.
+- **Enrollment.** The key is part of issuing the credential. The client
+  announces the capability inside the authenticated transcript (`device_key`
+  in the OPAQUE hello, which is in the OPAQUE context; the `TPPAIR02` magic,
+  which is in the SPAKE2 transcript), so a relay can neither strip nor add it.
+  Right after proving the password or code, and before anything is issued, it
+  generates an Ed25519 key and sends the public half sealed under a key
+  derived from that enrollment's shared secret and transcript. The host
+  writes the device record with `public_key` in the same update as its token
+  hash, then sends the credential sealed together with that public key. The
+  client saves the pairing (seed in field `device_key`, 0600, next to the
+  token) only if that answer names its own key. Any failure of these steps
+  fails the enrollment: no saved pairing, and no hash-only record on the host
+  (it never creates one for a capable client, and removes the device again if
+  it cannot send the credential). A missing or late key is never read as
+  "old client".
+  Message order: password — magic, hello, OPAQUE request, *response*, OPAQUE
+  finalization, sealed key, [*U2F challenge*, assertion], *sealed credential
+  with key*; code — `TPPAIR02`, SPAKE2 share, *share*, confirmation, sealed
+  key, *sealed credential with key* (host messages in italics). The code is
+  consumed only after the key arrived.
 - **Relayed sessions.** The client's confirmation carries a signature over the
   transcript hash (both ephemeral keys, credential identifier, request, host
   certificate), sealed so the relay cannot link it to a device. The host hands
@@ -227,12 +240,22 @@ session it starts itself, and confirm them. Device keys close that gap:
   public key, and leases a keyed device only for that verified key. A party
   holding only the stored hash gets the host's (non-secret) reply and nothing
   else; its own key, a signature from another session, or a tampered
-  signature are rejected.
+  signature are rejected. A relayed session stays leased only while the
+  device's stored key is still the one it proved (checked every second with
+  revocation), so no session outlives a key change.
 - **Compatibility.** Old pairing files (no `device_key`) and old
   `access.json` records (no `public_key`) load unchanged and stay
-  hash-authenticated. Old hosts ignore the extra confirmation object; old
-  clients close the connection after the token, which leaves a hash-only
-  device. Direct connections are unchanged: they present the token itself.
+  hash-authenticated. Old hosts ignore the extra confirmation object. Old
+  clients (no flag, `TPPAIR01`) still enroll, hash-only. A new client and a
+  host from before device keys do not enroll: the old host rejects
+  `TPPAIR02`, and answers a password login with its old credential format,
+  which the client refuses ("update Teleport on the host"; revoke the device
+  that host just listed). A relay cannot cause this against a current host,
+  whose answer to a flagged transcript is always bound to the key. Pairing
+  with a host that serves only its own pairing file (`--pair` without managed
+  devices) yields that shared token unkeyed, which the host states inside the
+  authenticated answer. Direct connections are unchanged: they present the
+  token itself.
 - **`--relay-require-device-key`** (host): relayed hellos for credentials the
   host's records alone would authenticate (the host pairing file's token and
   devices without a key) get no reply. System-login tickets stay allowed: they
@@ -272,9 +295,14 @@ for testing); report what you find.
   bytes read off the relay do not contain the plaintext; device keys: a
   stored-hash-only client, a foreign key, tampered, missing, swapped and
   transplanted signatures are all rejected, legacy devices still work.
-- `cargo test --bin teleport access:: protocol:: host_admin::` — key
-  registration in code pairing (and an old client that skips it), leases that
-  require the proven key, old `access.json` and pairing files loading.
+- `cargo test --bin teleport access:: pairing:: protocol:: host_admin::
+  relay_enroll::` — keyed enrollment through a meddling relay (device key
+  dropped, delayed or cut, credential undeliverable or dropped, capability
+  flag stripped or added): never a hash-only record for a capable client,
+  nothing saved on failure, the record removed when undeliverable, the code
+  kept when no key arrived; old clients still enroll hash-only; leases that
+  require the proven key and end when it changes; old `access.json` and
+  pairing files loading.
 - `cargo test --test relay -- --ignored` — real relay, host and client
   processes: video and input end to end, forged credential ignored, unpinned
   relay refused, and with `--relay-require-device-key` a code-paired device
@@ -309,10 +337,11 @@ for testing); report what you find.
   host's reply, but cannot confirm a session for a keyed device. Someone who
   can *write* the identity directory can replace public keys and is out of
   scope (as with any host compromise).
-- **A lost acknowledgement leaves a device unusable through the relay** if the
-  host stored the key but the client never saw the acknowledgement (the
-  connection dropped in between): the client then keeps no key. Re-enroll it;
-  direct connections are unaffected.
+- **A lost final message leaves an unused device record.** If the credential
+  reaches the host's side of the connection but never the client, the client
+  saves nothing and the host keeps a keyed record nobody holds the key for
+  (useless with `access.json` alone). Enroll again (a new pairing code, or
+  log in again) and revoke the stale entry in the device list.
 - Objects within one media group can be reordered by the relay (each is still
   authenticated); the decoder treats it like loss.
 - One relayed session at a time, as for direct sessions.

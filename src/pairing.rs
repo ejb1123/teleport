@@ -11,7 +11,11 @@ use tokio::{
     net::TcpStream,
 };
 
-const MAGIC: &[u8; 8] = b"TPPAIR01";
+/// Clients from before device keys.
+pub(crate) const MAGIC_V1: &[u8; 8] = b"TPPAIR01";
+/// Clients that offer a device key before the credential is issued. The magic
+/// is part of the SPAKE2 transcript, so a relay can neither strip nor add it.
+pub(crate) const MAGIC: &[u8; 8] = b"TPPAIR02";
 const CLIENT: &[u8] = b"teleport/pair/v1/client";
 const HOST: &[u8] = b"teleport/pair/v1/host";
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
@@ -55,12 +59,13 @@ struct Keys {
     confirmation: hmac::Key,
     encryption: aead::LessSafeKey,
     transcript: Vec<u8>,
-    /// Device-key registration after the credential (`crate::e2e`).
+    /// Device key and credential binding (`crate::e2e::Registration`),
+    /// used with [`MAGIC`].
     registration: crate::e2e::Registration,
 }
 impl Keys {
-    fn new(shared: &[u8], client: &[u8], host: &[u8]) -> Result<Self> {
-        let mut transcript = MAGIC.to_vec();
+    fn new(magic: &[u8; 8], shared: &[u8], client: &[u8], host: &[u8]) -> Result<Self> {
+        let mut transcript = magic.to_vec();
         transcript.extend_from_slice(client);
         transcript.extend_from_slice(host);
         let hash = digest::digest(&digest::SHA256, &transcript);
@@ -154,20 +159,20 @@ pub async fn pair(address: &str, code: &str) -> Result<Pairing> {
     pair_with(address, code, true).await
 }
 
-/// A client from before device keys: takes the credential and hangs up.
+/// A client from before device keys (`TPPAIR01`).
 #[cfg(test)]
 pub(crate) async fn pair_without_device_key(address: &str, code: &str) -> Result<Pairing> {
     pair_with(address, code, false).await
 }
 
-async fn pair_with(address: &str, code: &str, register_key: bool) -> Result<Pairing> {
+async fn pair_with(address: &str, code: &str, device_key: bool) -> Result<Pairing> {
     validate_address(address)?;
     let code = normalize(code)?;
     tokio::time::timeout(TIMEOUT, async {
         let stream = TcpStream::connect(address).await.context(
             "cannot reach pairing service; start host with --pair and allow TCP on its port",
         )?;
-        pair_over(stream, &code, register_key).await
+        pair_over(stream, &code, device_key).await
     })
     .await
     .context("pairing timed out; check host code and TCP firewall")?
@@ -175,43 +180,57 @@ async fn pair_with(address: &str, code: &str, register_key: bool) -> Result<Pair
 
 /// Client side of code pairing over any ordered byte stream: direct TCP, or a
 /// relay stream (`crate::relay_enroll`). The caller bounds the time.
-/// Client side of code pairing over any ordered byte stream (TCP or relay).
-/// `register_key`: create and register a device key after the credential
-/// (false only to emulate clients from before device keys).
+/// `device_key`: offer a device key, which the host stores with the issued
+/// credential ([`MAGIC`]); false only to emulate clients from before device
+/// keys ([`MAGIC_V1`]).
 pub(crate) async fn pair_over(
     mut stream: impl AsyncRead + AsyncWrite + Unpin,
     code: &str,
-    register_key: bool,
+    device_key: bool,
 ) -> Result<Pairing> {
     let code = normalize(code)?;
+    let magic = if device_key { MAGIC } else { MAGIC_V1 };
     let (state, message) = Spake2::<Ed25519Group>::start_a(
         &Password::new(code.as_bytes()),
         &Identity::new(CLIENT),
         &Identity::new(HOST),
     );
-    stream.write_all(MAGIC).await?;
+    stream.write_all(magic).await?;
     write_packet(&mut stream, &message).await?;
     stream.flush().await?;
-    let remote = read_packet(&mut stream, 128).await?;
+    // Hosts from before device keys close the connection on `TPPAIR02`.
+    let remote = read_packet(&mut stream, 128)
+        .await
+        .context("no pairing answer; the host may need a newer Teleport")?;
     let shared = state
         .finish(&remote)
         .map_err(|_| anyhow::anyhow!("invalid pairing exchange"))?;
-    let keys = Keys::new(&shared, &message, &remote)?;
+    let keys = Keys::new(magic, &shared, &message, &remote)?;
     let confirmation = hmac::sign(&keys.confirmation, &keys.transcript);
     write_packet(&mut stream, confirmation.as_ref()).await?;
+    // The device key goes before the credential exists (`crate::e2e::Registration`).
+    let offer = match device_key {
+        true => Some(crate::access::DeviceKeyOffer::new()?),
+        false => None,
+    };
+    if let Some(offer) = &offer {
+        write_packet(&mut stream, &offer.request(&keys.registration)).await?;
+    }
     stream.flush().await?;
     let packet = read_packet(&mut stream, 4096).await.context(
         "pairing rejected; code may be wrong, used, expired, or locked after five attempts",
     )?;
-    // Device keys are generated here, never accepted from the host.
-    let pairing = Pairing {
-        device_key: None,
-        ..keys.open(packet)?
-    };
-    if !register_key {
-        return Ok(pairing);
+    match offer {
+        // Keyed unless the host explicitly (and authenticated) sent its own
+        // pairing token, which has no device record.
+        Some(offer) => offer
+            .accept(&keys.registration, &packet)
+            .context("pairing authentication failed; check the code on the host"),
+        None => Ok(Pairing {
+            device_key: None,
+            ..keys.open(packet)?
+        }),
     }
-    Ok(crate::access::register_device_key(&mut stream, &keys.registration, pairing).await)
 }
 
 #[cfg(target_os = "linux")]
@@ -306,7 +325,11 @@ pub(crate) async fn accept_with_access(
 ) -> Result<()> {
     let mut magic = [0; 8];
     stream.read_exact(&mut magic).await?;
-    ensure!(&magic == MAGIC, "unsupported pairing protocol");
+    ensure!(
+        &magic == MAGIC || &magic == MAGIC_V1,
+        "unsupported pairing protocol"
+    );
+    let keyed = &magic == MAGIC;
     let client = read_packet(stream, 128).await?;
     let (state, host) = Spake2::<Ed25519Group>::start_b(
         &Password::new(code.as_bytes()),
@@ -316,12 +339,18 @@ pub(crate) async fn accept_with_access(
     let shared = state
         .finish(&client)
         .map_err(|_| anyhow::anyhow!("invalid pairing exchange"))?;
-    let keys = Keys::new(&shared, &client, &host)?;
+    let keys = Keys::new(&magic, &shared, &client, &host)?;
     write_packet(stream, &host).await?;
     stream.flush().await?;
     let proof = read_packet(stream, 32).await?;
     hmac::verify(&keys.confirmation, &keys.transcript, &proof)
         .map_err(|_| anyhow::anyhow!("pairing authentication failed"))?;
+    // A capable client's device key, before the code is consumed: without it
+    // nothing is issued and the code stays usable.
+    let device_key = match keyed {
+        true => Some(crate::access::read_device_key(stream, &keys.registration).await?),
+        false => None,
+    };
     ensure!(
         tokio::time::Instant::now() < deadline,
         "pairing code expired"
@@ -340,19 +369,25 @@ pub(crate) async fn accept_with_access(
             .map_err(|_| anyhow::anyhow!("pairing code closed or replaced"))?;
     }
     *used = true;
+    let seal =
+        |pairing: &Pairing, stored: Option<&[u8; crate::e2e::DEVICE_PUBLIC_KEY_LEN]>| match keyed {
+            true => Ok(keys
+                .registration
+                .seal_credential(stored, &serde_json::to_vec(pairing)?)),
+            false => keys.seal(pairing),
+        };
     let Some(access) = access else {
-        // The host's own pairing file: nothing to register a key against.
-        write_packet(stream, &keys.seal(pairing)?).await?;
+        // The host's own pairing file: no device record to store a key in,
+        // which the sealed answer says explicitly.
+        write_packet(stream, &seal(pairing, None)?).await?;
         stream.flush().await?;
         return Ok(());
     };
-    let device = access.access.enroll_device("Code-paired device")?;
-    write_packet(stream, &keys.seal(&device.pairing)?).await?;
-    stream.flush().await?;
-    access
+    let device = access
         .access
-        .accept_device_key(stream, &keys.registration, &device.id)
-        .await
+        .enroll_device("Code-paired device", device_key.as_ref())?;
+    let packet = seal(&device.pairing, device_key.as_ref())?;
+    access.access.deliver(stream, &device, &packet).await
 }
 
 #[cfg(test)]
@@ -382,8 +417,8 @@ mod tests {
             &Identity::new(CLIENT),
             &Identity::new(HOST),
         );
-        let ka = Keys::new(&a.finish(&msg_b).unwrap(), &msg_a, &msg_b)?;
-        let kb = Keys::new(&b.finish(&msg_a).unwrap(), &msg_a, &msg_b)?;
+        let ka = Keys::new(MAGIC, &a.finish(&msg_b).unwrap(), &msg_a, &msg_b)?;
+        let kb = Keys::new(MAGIC, &b.finish(&msg_a).unwrap(), &msg_a, &msg_b)?;
         hmac::verify(
             &kb.confirmation,
             &kb.transcript,
@@ -399,10 +434,176 @@ mod tests {
         assert_eq!(ka.open(encrypted.clone())?.token, pairing.token);
         encrypted[20] ^= 1;
         assert!(ka.open(encrypted).is_err());
-        let wrong = Keys::new(b"wrong key", &msg_a, &msg_b)?;
+        let wrong = Keys::new(MAGIC, b"wrong key", &msg_a, &msg_b)?;
         assert!(wrong.open(kb.seal(&pairing)?).is_err());
         Ok(())
     }
+    #[cfg(target_os = "linux")]
+    struct Meddled {
+        client: Result<Pairing>,
+        host: Result<()>,
+        used: bool,
+        /// A hash-only device record existed at some moment of the exchange.
+        hash_only_seen: bool,
+    }
+
+    /// Code pairing through a [`crate::access::meddler`] relay, against a
+    /// host with managed devices (`access`) or only its own pairing file.
+    #[cfg(target_os = "linux")]
+    async fn meddled_pair(
+        access: Option<(&crate::access::ServerState, &std::sync::atomic::AtomicU64)>,
+        device_key: bool,
+        decide: impl Fn(bool, usize, &[u8]) -> crate::access::meddler::Action + Send + Sync + 'static,
+    ) -> Meddled {
+        let host_token = Pairing {
+            token: "a".repeat(64),
+            fingerprint: "b".repeat(64),
+            device_key: None,
+        };
+        let (client, host, relay) = crate::access::meddler::spawn(decide);
+        let mut used = false;
+        let enrollment = access.map(|(access, epoch)| DeviceEnrollment {
+            access,
+            epoch,
+            generation: epoch.load(std::sync::atomic::Ordering::SeqCst),
+        });
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let accept = async {
+            // The host hangs up when done, as `serve` and `host_admin` do.
+            let mut host = host;
+            accept_with_access(
+                &mut host,
+                "123456",
+                &host_token,
+                &mut used,
+                deadline,
+                enrollment,
+            )
+            .await
+        };
+        let exchange = async { tokio::join!(pair_over(client, "123-456", device_key), accept) };
+        let hash_only = || {
+            access.is_some_and(|(access, _)| {
+                access.relay_credentials().iter().any(|c| {
+                    c.hash_only() && c.hash != crate::e2e::credential_hash(&host_token.token)
+                })
+            })
+        };
+        let mut hash_only_seen = false;
+        let watcher = async {
+            loop {
+                hash_only_seen |= hash_only();
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        let (client, host) = tokio::select! {
+            result = exchange => result,
+            _ = watcher => unreachable!(),
+        };
+        relay.abort();
+        Meddled {
+            client,
+            host,
+            used,
+            hash_only_seen: hash_only_seen || hash_only(),
+        }
+    }
+
+    /// The fix for a relay that dropped or delayed the device key around the
+    /// credential: a capable client's device is created with its key or not
+    /// at all, and the client keeps nothing unless the host bound its key.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn keyed_code_pairing_resists_a_meddling_relay() -> Result<()> {
+        use crate::access::meddler::Action;
+        use std::os::unix::fs::PermissionsExt;
+        // Towards the host: 0 magic, 1 SPAKE2, 2 confirmation, 3 device key.
+        // Towards the client: 0 SPAKE2, 1 credential.
+        const KEY: usize = 3;
+        let directory = tempfile::tempdir()?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let host_token = Pairing {
+            token: "a".repeat(64),
+            fingerprint: "b".repeat(64),
+            device_key: None,
+        };
+        let state = crate::access::ServerState::open(directory.path(), host_token.clone())?;
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let access = Some((&*state, &epoch));
+        let at_key = |action: fn() -> Action| {
+            move |up: bool, index: usize, _: &[u8]| match up && index == KEY {
+                true => action(),
+                false => Action::Forward,
+            }
+        };
+
+        // Device key dropped: nothing issued, the code is not even consumed.
+        let run = meddled_pair(access, true, at_key(|| Action::HangUp)).await;
+        assert!(run.client.is_err() && run.host.is_err() && !run.used && !run.hash_only_seen);
+        assert!(state.status().devices.is_empty());
+
+        // The host cannot deliver the credential: it removes the device.
+        let run = meddled_pair(access, true, at_key(|| Action::ForwardThenHangUp)).await;
+        assert!(run.client.is_err() && run.host.is_err() && run.used && !run.hash_only_seen);
+        assert!(state.status().devices.is_empty());
+
+        // Credential dropped after delivery: the client saves nothing; the
+        // host keeps a keyed record nobody holds the key for. Pairing again
+        // (with a new code) works.
+        let run = meddled_pair(access, true, |up, index, _| match !up && index == 1 {
+            true => Action::HangUp,
+            false => Action::Forward,
+        })
+        .await;
+        assert!(run.client.is_err() && run.host.is_ok() && run.used && !run.hash_only_seen);
+        assert_eq!(state.status().devices.len(), 1);
+
+        // Device key held back: no hash-only record at any point; keyed.
+        let run = meddled_pair(
+            access,
+            true,
+            at_key(|| Action::Delay(Duration::from_millis(300))),
+        )
+        .await;
+        let paired = run.client?;
+        run.host?;
+        assert!(!run.hash_only_seen);
+        let public =
+            crate::e2e::DeviceKey::from_hex(paired.device_key.as_deref().unwrap())?.public_key();
+        let hash = crate::e2e::credential_hash(&paired.token).to_vec();
+        assert!(state.begin_session_hash(hash.clone(), None).is_err());
+        drop(state.begin_session_hash(hash, Some(&public))?);
+
+        // The magic is in the SPAKE2 transcript: stripping the capability, or
+        // adding it to an old client's request, fails key confirmation.
+        let swap = |to: &'static [u8; 8]| {
+            move |up: bool, index: usize, _: &[u8]| match up && index == 0 {
+                true => Action::Replace(to.to_vec()),
+                false => Action::Forward,
+            }
+        };
+        let run = meddled_pair(access, true, swap(MAGIC_V1)).await;
+        assert!(run.client.is_err() && run.host.is_err() && !run.used);
+        let run = meddled_pair(access, false, swap(MAGIC)).await;
+        assert!(run.client.is_err() && run.host.is_err() && !run.used);
+        assert_eq!(state.status().devices.len(), 2);
+
+        // A client from before device keys still pairs, hash-only.
+        let run = meddled_pair(access, false, |_, _, _| Action::Forward).await;
+        let old = run.client?;
+        run.host?;
+        assert!(old.device_key.is_none() && run.hash_only_seen);
+        assert!(state.authorized(&old.token));
+
+        // A host pairing out its own token says so, authenticated: the
+        // client saves it unkeyed (there is no device record to key).
+        let run = meddled_pair(None, true, |_, _, _| Action::Forward).await;
+        let shared = run.client?;
+        run.host?;
+        assert!(shared.token == host_token.token && shared.device_key.is_none());
+        Ok(())
+    }
+
     #[tokio::test]
     #[cfg(target_os = "linux")]
     #[ignore = "requires local TCP sockets"]

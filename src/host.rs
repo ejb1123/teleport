@@ -383,7 +383,7 @@ async fn relayed(
     capture: &mut Capture,
 ) -> Result<()> {
     let hash = accepted.credential;
-    let _lease = access
+    let lease = access
         .begin_session_hash(hash.to_vec(), accepted.device_key.as_deref())
         .context("relayed credential not usable")?;
     let bridged = crate::relay::host(link, &accepted)?;
@@ -397,7 +397,8 @@ async fn relayed(
             options,
             capture,
         ) => result,
-        _ = async { loop { tokio::time::sleep(Duration::from_secs(1)).await; if !access.authorized_hash(&hash) { break; } } } => Err(anyhow::anyhow!("device access revoked")),
+        // Also ends if the device's stored key no longer is the one proven.
+        _ = async { loop { tokio::time::sleep(Duration::from_secs(1)).await; if !lease.authorized() { break; } } } => Err(anyhow::anyhow!("device access revoked")),
     }
 }
 

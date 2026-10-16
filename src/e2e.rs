@@ -148,29 +148,41 @@ fn device_signed(transcript: &[u8; 32]) -> Vec<u8> {
     signed
 }
 
-/// Device-key registration at enrollment, carried inside a channel that is
-/// already mutually authenticated (an OPAQUE login or a SPAKE2 code pairing)
-/// after the host has issued the device's token:
+/// Device-key binding at enrollment, carried inside a channel that is already
+/// mutually authenticated (an OPAQUE login or a SPAKE2 code pairing) whose
+/// transcript includes the client's device-key capability, so a relay can
+/// neither strip nor add it:
 ///
-/// 1. client → host: the device public key, sealed with a key derived from
-///    the enrollment secret and bound to the enrollment context;
-/// 2. host → client: the same public key, sealed in the other direction, once
-///    the host has stored it.
+/// 1. client → host, *before* any credential exists: the device public key,
+///    sealed with a key derived from the enrollment secret and bound to the
+///    enrollment context;
+/// 2. host → client: the issued credential, sealed in the other direction
+///    together with the public key the host stored in the same record update
+///    as the token hash (or an explicit "no device record" marker for the
+///    host's own pairing token).
 ///
-/// A client keeps its private key only after a valid acknowledgement, so it
-/// never believes itself keyed when the host is not. Older peers simply close
-/// the connection after the token, which leaves a hash-only (legacy) device.
+/// A keyed device therefore never exists hash-only on the host, and the client
+/// saves a pairing only after (2) names its own key: dropping, delaying or
+/// truncating either message fails the enrollment instead of downgrading it.
 pub struct Registration {
     to_host: aead::LessSafeKey,
     to_client: aead::LessSafeKey,
     context: Vec<u8>,
 }
 
+/// A credential opened by [`Registration::open_credential`].
+pub struct BoundCredential {
+    pub credential: Vec<u8>,
+    /// The host stored the client's key with the credential. `false` only for
+    /// the host's own pairing token, which has no device record to key.
+    pub keyed: bool,
+}
+
 impl Registration {
     /// `secret` is the enrollment's shared secret (or a key derived from it);
     /// `context` is its transcript, which both ends already agree on.
     pub fn new(secret: &[u8], context: &[u8]) -> Result<Self> {
-        let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, b"teleport device key registration v1")
+        let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, b"teleport device key enrollment v2")
             .extract(secret);
         let key = |label: &[u8]| -> Result<aead::LessSafeKey> {
             let raw: [u8; 32] = expand(&prk, &[label])?;
@@ -186,24 +198,23 @@ impl Registration {
         })
     }
 
-    fn seal(&self, key: &aead::LessSafeKey, public: &[u8; DEVICE_PUBLIC_KEY_LEN]) -> Vec<u8> {
+    fn seal(&self, key: &aead::LessSafeKey, mut body: Vec<u8>) -> Vec<u8> {
         let nonce = random::<12>();
-        let mut body = public.to_vec();
         key.seal_in_place_append_tag(
             aead::Nonce::assume_unique_for_key(nonce),
             aead::Aad::from(&self.context),
             &mut body,
         )
-        .expect("sealing a 32-byte message cannot fail");
+        .expect("sealing an enrollment message cannot fail");
         let mut packet = nonce.to_vec();
         packet.extend_from_slice(&body);
         packet
     }
 
-    fn open(&self, key: &aead::LessSafeKey, packet: &[u8]) -> Result<[u8; DEVICE_PUBLIC_KEY_LEN]> {
+    fn open(&self, key: &aead::LessSafeKey, packet: &[u8]) -> Result<Vec<u8>> {
         ensure!(
-            packet.len() == 12 + DEVICE_PUBLIC_KEY_LEN + aead::MAX_TAG_LEN,
-            "invalid device key registration"
+            packet.len() > 12 + aead::MAX_TAG_LEN,
+            "invalid device key enrollment message"
         );
         let mut body = packet[12..].to_vec();
         let opened = key
@@ -212,35 +223,61 @@ impl Registration {
                 aead::Aad::from(&self.context),
                 &mut body,
             )
-            .map_err(|_| anyhow!("device key registration failed authentication"))?;
-        Ok(opened.try_into().expect("length checked above"))
+            .map_err(|_| anyhow!("device key enrollment failed authentication"))?;
+        Ok(opened.to_vec())
     }
 
-    /// Client: the registration request.
+    /// Client: the sealed public key, sent before the host issues anything.
     pub fn request(&self, key: &DeviceKey) -> Vec<u8> {
-        self.seal(&self.to_host, &key.public_key())
+        self.seal(&self.to_host, key.public_key().to_vec())
     }
 
-    /// Host: the public key a registration request carries.
+    /// Host: the public key a request carries.
     #[cfg(target_os = "linux")]
     pub fn open_request(&self, packet: &[u8]) -> Result<[u8; DEVICE_PUBLIC_KEY_LEN]> {
-        self.open(&self.to_host, packet)
+        self.open(&self.to_host, packet)?
+            .try_into()
+            .map_err(|_| anyhow!("invalid device key enrollment message"))
     }
 
-    /// Host: acknowledge a stored public key.
+    /// Host: the issued credential, bound to the public key stored with it
+    /// (`None`: the host's own pairing token, which has no device record).
     #[cfg(target_os = "linux")]
-    pub fn acknowledge(&self, public: &[u8; DEVICE_PUBLIC_KEY_LEN]) -> Vec<u8> {
-        self.seal(&self.to_client, public)
+    pub fn seal_credential(
+        &self,
+        stored: Option<&[u8; DEVICE_PUBLIC_KEY_LEN]>,
+        credential: &[u8],
+    ) -> Vec<u8> {
+        let mut body = match stored {
+            Some(public) => [&[1u8][..], public].concat(),
+            None => vec![0],
+        };
+        body.extend_from_slice(credential);
+        self.seal(&self.to_client, body)
     }
 
-    /// Client: check that the host stored exactly this key.
-    pub fn verify_acknowledgement(&self, key: &DeviceKey, packet: &[u8]) -> Result<()> {
-        let stored = self.open(&self.to_client, packet)?;
-        ensure!(
-            bool::from(stored.ct_eq(&key.public_key())),
-            "host acknowledged a different device key"
-        );
-        Ok(())
+    /// Client: the credential, once the host has bound exactly `key` to it
+    /// (or said explicitly that it keeps no device record for it).
+    pub fn open_credential(&self, key: &DeviceKey, packet: &[u8]) -> Result<BoundCredential> {
+        let body = self.open(&self.to_client, packet)?;
+        match body.split_first() {
+            Some((1, rest)) if rest.len() > DEVICE_PUBLIC_KEY_LEN => {
+                let (stored, credential) = rest.split_at(DEVICE_PUBLIC_KEY_LEN);
+                ensure!(
+                    bool::from(stored.ct_eq(&key.public_key())),
+                    "host stored a different device key"
+                );
+                Ok(BoundCredential {
+                    credential: credential.to_vec(),
+                    keyed: true,
+                })
+            }
+            Some((0, credential)) if !credential.is_empty() => Ok(BoundCredential {
+                credential: credential.to_vec(),
+                keyed: false,
+            }),
+            _ => Err(anyhow!("invalid device key enrollment message")),
+        }
     }
 }
 
@@ -1055,33 +1092,48 @@ mod tests {
         );
         let public = host.open_request(&request).unwrap();
         assert_eq!(public, key.public_key());
-        let ack = host.acknowledge(&public);
-        client.verify_acknowledgement(&key, &ack).unwrap();
-        // Directions are distinct: a reflected request is not an ack.
-        assert!(client.verify_acknowledgement(&key, &request).is_err());
-        assert!(host.open_request(&ack).is_err());
-        // Another enrollment (secret or context) cannot inject or ack a key.
+        let issued = host.seal_credential(Some(&public), b"credential");
+        let opened = client.open_credential(&key, &issued).unwrap();
+        assert!(opened.keyed && opened.credential == b"credential");
+        // The host's own token: explicitly unkeyed, still authenticated.
+        let unkeyed = client
+            .open_credential(&key, &host.seal_credential(None, b"host token"))
+            .unwrap();
+        assert!(!unkeyed.keyed && unkeyed.credential == b"host token");
+        // Directions are distinct: a reflected request is not a credential.
+        assert!(client.open_credential(&key, &request).is_err());
+        assert!(host.open_request(&issued).is_err());
+        // Another enrollment (secret or context) cannot inject a key or a
+        // credential.
         for (secret, context) in [
             (&b"other secret"[..], &b"context"[..]),
             (b"enrollment secret", b"other"),
         ] {
             let other = Registration::new(secret, context).unwrap();
             assert!(other.open_request(&request).is_err());
-            assert!(
-                client
-                    .verify_acknowledgement(&key, &other.acknowledge(&public))
-                    .is_err()
-            );
+            for stored in [Some(&public), None] {
+                assert!(
+                    client
+                        .open_credential(&key, &other.seal_credential(stored, b"credential"))
+                        .is_err()
+                );
+            }
         }
-        // Tampering, truncation and an ack for a different key fail.
+        // Tampering, truncation and a credential bound to another key fail.
         let mut tampered = request.clone();
         tampered[20] ^= 1;
         assert!(host.open_request(&tampered).is_err());
         assert!(host.open_request(&request[..request.len() - 1]).is_err());
+        let mut tampered = issued.clone();
+        tampered[12] ^= 1;
+        assert!(client.open_credential(&key, &tampered).is_err());
         let (other_key, _) = DeviceKey::generate().unwrap();
         assert!(
             client
-                .verify_acknowledgement(&key, &host.acknowledge(&other_key.public_key()))
+                .open_credential(
+                    &key,
+                    &host.seal_credential(Some(&other_key.public_key()), b"credential")
+                )
                 .is_err()
         );
     }

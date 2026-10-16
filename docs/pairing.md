@@ -20,8 +20,17 @@ import workflow remains available. This does not change Wayland consent rules.
 - HKDF-SHA256 binds the exchange transcript and separates client-confirmation
   and credential-encryption keys. The host checks HMAC-SHA256 key confirmation
   before releasing a ChaCha20-Poly1305 authenticated/encrypted credential packet.
+- On a host with managed devices, the client's relay device key is part of
+  the issued credential: after key confirmation the client sends the public
+  half of a fresh Ed25519 key (sealed under the SPAKE2-derived keys), and the
+  host stores it in the same record as the new token before sealing the token
+  together with that key. Without the key nothing is issued and the code is
+  not consumed. The `TPPAIR02` magic that announces this is part of the
+  transcript; clients from before device keys send `TPPAIR01` and pair
+  hash-only. See [device keys](relay.md#device-keys).
 - The client authenticates/decrypts the host packet and validates the credential
-  before saving it in the existing 0700 profile directory and 0600 files.
+  (and, for `TPPAIR02`, that the host bound its key) before saving it in the
+  existing 0700 profile directory and 0600 files.
 - Subsequent MoQ connections still strictly pin the saved TLS certificate.
   Changed identities fail; there is no trust-all certificate verifier or automatic
   fallback. A fresh host code can renew credentials for the same identity, but
@@ -58,7 +67,7 @@ namespace `SHA-256("teleport-relay-pairing-v1" || rendezvous)[..16]` until the
 code is used, closed, replaced or expires. The link carries the rendezvous and
 the code; treat it exactly like the code.
 
-The exchange is the unchanged `TPPAIR01` SPAKE2 protocol, byte for byte, over
+The exchange is the same `TPPAIR02` SPAKE2 protocol as over TCP, byte for byte, over
 an ordered stream made of two relay tracks per attempt (`<attempt>/request`,
 `<attempt>/response`; see [relay enrollment](relay.md#enrollment-through-the-relay)).
 Limits are shared with TCP pairing: one code, five attempts in total across
