@@ -60,7 +60,10 @@ The host address is not contacted in relay mode. `--relay` may also come from
 
 `auto` falls back only when the direct *transport* fails (no answer, refused, or
 a different certificate at that address); once a host has answered on the direct
-or peer-to-peer path, its errors are reported, not retried through the relay.
+path, its errors are reported, not retried through the relay. (A peer-to-peer
+SETUP refusal, by contrast, comes from a host that already authenticated the
+credential during signalling, so it means a busy host or an expired ticket;
+the relay is still tried.)
 Every path authenticates the host by the same pinned fingerprint, and the relay
 path is always end-to-end encrypted, so no direction of fallback downgrades
 security. Every reconnect (`--reconnect`) chooses again. The chosen path is
@@ -303,7 +306,10 @@ detour (in the namespace test, 23 ms instead of 86 ms input round trip; see
    that socket's port (loopback, link-local and container/VM bridges left
    out); `srflx` — its public address as a STUN server saw it; `mapped` — with
    `--upnp`, a NAT-PMP mapping from the default gateway (Linux; deleted on
-   exit; UPnP-IGD and PCP are not implemented). The STUN server defaults to the
+   exit; UPnP-IGD and PCP are not implemented). STUN and the mapping run
+   concurrently; gathering waits at most 400 ms for the gateway, a failure is
+   remembered for 5 minutes, and the host maps (and renews) in the
+   background so answering never waits on it. The STUN server defaults to the
    self-hosted relay's responder (`moqt://` relay host, UDP 3478). Nothing is
    sent to a public STUN server unless named with `--stun HOST:PORT`
    (repeatable); `--no-stun` sends none. Provider (`https://`) relays get no
@@ -323,9 +329,11 @@ detour (in the namespace test, 23 ms instead of 86 ms input round trip; see
    answers with its own, each sealed (ChaCha20-Poly1305) under keys derived
    from that handshake's transcript and specific to direction and track.
    Signalling never leases the credential or captures anything.
-4. **Punching.** On a valid offer the host *arms* its peer-to-peer socket for
-   30 s, sends STUN Binding indications from it to each client candidate
-   (11 rounds over 3 s), then answers. Its NAT now expects the client. The
+4. **Punching.** On a valid offer the host issues a single-use *admission
+   ticket* (128 random bits, valid 30 s) bound to the credential hash and
+   device key the exchange proved, sends STUN Binding indications from its
+   socket to each client candidate (11 rounds over 3 s), then answers with
+   its candidates and the ticket, sealed. Its NAT now expects the client. The
    first six rounds (400 ms) carry an IP TTL of 2, set per datagram: they
    cross the host's own router but expire before the client's NAT. A
    conntrack NAT without an inbound firewall would otherwise record the
@@ -335,15 +343,20 @@ detour (in the namespace test, 23 ms instead of 86 ms input round trip; see
 5. **Connectivity.** The client dials every host candidate from its own
    socket (host candidates first, 30 ms apart) and keeps the first QUIC
    handshake whose certificate has the pinned SHA-256 fingerprint; the others
-   are dropped before any credential is sent. The MoQ session on top is an
-   ordinary direct session: the credential travels in the SETUP path inside
-   that pinned TLS connection, and the host authorizes, leases and revokes it
-   exactly as on `--listen`. Hole punching changes reachability, never
-   authentication.
+   are dropped before any credential is sent. The MoQ session on top is a
+   direct session whose SETUP path, inside that pinned TLS connection, is
+   `/teleport/<token>/<ticket>?<options>`. The host's socket refuses any
+   request without an outstanding ticket before it can queue, redeems the
+   ticket once, and the session loop then requires the token to be the
+   credential the signalling exchange proved and leases it with that
+   exchange's device-key proof (as for a relayed session, so
+   `--relay-require-device-key` and stored device keys still bind it); a
+   change of the stored key ends the session. Hole punching changes
+   reachability, never authentication.
 6. **Budget.** Signalling (relay connection, STUN, handshake, answer) must
-   finish within 2.5 s and a handshake within 1.5 s more. All of it runs
-   alongside the 2.5 s direct attempt; if both fail, the relay is used as
-   before.
+   finish within 2.5 s, the QUIC handshake within 1.5 s more and the MoQ
+   SETUP within another 1.5 s. All of it runs alongside the 2.5 s direct
+   attempt; if both fail, the relay is used as before.
 
 ### Compatibility
 
@@ -382,13 +395,18 @@ Peer-to-peer happens only when both ends support and allow it:
   they do, as with a direct connection. Use `--no-p2p` (either end) or
   `--route relay` to keep addresses private from the peer.
 - **Exposure.** The host's peer-to-peer socket listens on all interfaces by
-  default but ignores QUIC Initials unless an authenticated signalling
-  exchange armed it in the last 30 s, and then admits only what `--listen`
-  would. Punches go only to candidates of an authenticated client (at most
-  88 datagrams of 20 bytes per exchange).
+  default. It starts no QUIC connection unless an admission ticket is
+  outstanding (quinn still answers unknown QUIC versions and stray packets,
+  so a scanner can see a QUIC endpoint there), and admits only the holder of
+  a ticket, with the exact credential and device-key proof of the signalling
+  exchange that issued it: a stolen pairing file without the device key
+  gets no further here than through the relay. Punches go only to
+  candidates of an authenticated client (at most 88 datagrams of 20 bytes
+  per exchange).
 - **The relay's STUN responder** answers Binding requests only (no
-  attributes echoed), at most 2000 per second, so its use as a reflection
-  amplifier is small (a 20-byte request gets a 32- or 44-byte answer).
+  attributes echoed), at most 20 per second per source address and 2000 in
+  all, so its use as a reflection amplifier is small (a 20-byte request gets
+  a 32- or 44-byte answer).
 
 ### Measurements
 
@@ -484,7 +502,9 @@ for testing); report what you find.
   broadcast, reserved, link-local, port 0, too many); candidates sealed to
   their session, track and direction (another session, tampering, an
   unsealed list from the relay rejected); the domain-separated signalling
-  credential; STUN on the QUIC socket (spoofed answers ignored), a punch and
+  credential; admission tickets (sealed in the answer, single use, bounded,
+  carrying the proven credential and device key; SETUP paths without one
+  refused); STUN on the QUIC socket (spoofed answers ignored), a punch and
   a pinned QUIC handshake on the same socket (wrong pin refused), per-datagram
   TTL; NAT-PMP against a fake gateway.
 - `cargo test --test p2p -- --ignored` — unprivileged namespaces with two

@@ -733,7 +733,14 @@ pub async fn intake(
                 }
             };
             if let Some(p2p) = p2p.filter(|_| signalling) {
-                if let Err(error) = p2p.answer(&keys, &session_id, &incoming, &outgoing).await {
+                let grant = crate::p2p::Grant {
+                    credential,
+                    device_key,
+                };
+                if let Err(error) = p2p
+                    .answer(&keys, &session_id, &incoming, &outgoing, grant)
+                    .await
+                {
                     tracing::info!(
                         error = format!("{error:#}"),
                         "peer-to-peer signalling failed"

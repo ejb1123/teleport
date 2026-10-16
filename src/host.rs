@@ -256,6 +256,8 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         }
         _ => (None, None),
     };
+    // Closes the socket and any gateway mapping however serve() returns.
+    let _p2p_guard = p2p.clone().map(crate::p2p::CloseOnDrop);
     // Connected relay, confirmed sessions from its intake task, and the tasks
     // (session intake, presence, enrollment).
     let mut relay: Option<(
@@ -360,17 +362,29 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
             .strip_prefix("/teleport/")
             .unwrap_or("")
             .to_owned();
+        // A peer-to-peer request must present the very credential its
+        // signalling exchange authenticated (with its device key, if any).
+        let grant = request.grant().cloned();
         let authorized = access.as_ref().map_or_else(
             || bool::from(supplied.as_bytes().ct_eq(pairing.token.as_bytes())),
             |access| access.authorized(&supplied),
-        );
+        ) && grant.as_ref().is_none_or(|grant| {
+            bool::from(crate::e2e::credential_hash(&supplied).ct_eq(&grant.credential))
+        });
         if !authorized {
             request.close().await;
             tracing::warn!("rejected unauthorized client");
             continue;
         }
-        let _session_lease = if let Some(access) = &access {
-            match access.begin_session(&supplied) {
+        let session_lease = if let Some(access) = &access {
+            // Peer-to-peer: lease with the key proof of the signalling
+            // exchange, so stored device keys bind it as on the relay.
+            let lease = match &grant {
+                Some(grant) => access
+                    .begin_session_hash(grant.credential.to_vec(), grant.device_key.as_deref()),
+                None => access.begin_session(&supplied),
+            };
+            match lease {
                 Ok(lease) => Some(lease),
                 Err(_) => {
                     request.close().await;
@@ -383,16 +397,20 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         restore_capture(capture).await;
         let result = tokio::select! {
             result = connection(request, options, capture) => result,
-            _ = async { loop { tokio::time::sleep(Duration::from_secs(1)).await; if access.as_ref().is_some_and(|access| !access.authorized(&supplied)) { break; } } } => Err(anyhow::anyhow!("device access revoked")),
+            _ = async { loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let revoked = match (&session_lease, &grant) {
+                    (Some(lease), Some(_)) => !lease.authorized(),
+                    _ => access.as_ref().is_some_and(|access| !access.authorized(&supplied)),
+                };
+                if revoked { break; }
+            } } => Err(anyhow::anyhow!("device access revoked")),
             _ = &mut shutdown => { capture.end_session().await; break; }
         };
         capture.end_session().await;
         if let Err(error) = result {
             tracing::warn!(%error, "client disconnected");
         }
-    }
-    if let Some(p2p) = &p2p {
-        p2p.close();
     }
     server.close().await;
     Ok(())

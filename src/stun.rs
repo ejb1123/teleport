@@ -199,12 +199,19 @@ pub fn canonical(address: SocketAddr) -> SocketAddr {
 /// Answers per second the relay's responder sends before it starts dropping
 /// requests; bounds its use as a (small, ~2x) reflection amplifier.
 const RESPONSES_PER_SECOND: u32 = 2000;
+/// Answers per second to one source address (a client sends a handful).
+const RESPONSES_PER_SOURCE: u32 = 20;
+/// Distinct sources answered per second.
+const MAX_SOURCES: usize = 1024;
 
 /// Answer Binding requests on `socket` until it fails. Everything else is
 /// ignored. Each answer only tells the sender its own address.
 pub async fn serve(socket: tokio::net::UdpSocket) -> std::io::Result<()> {
     let mut buffer = [0u8; MAX_MESSAGE + 1];
     let mut window = (Instant::now(), 0u32);
+    // Answers per source address in the current second, so one busy (or
+    // spoofed) source cannot use up the budget for everyone.
+    let mut sources: std::collections::HashMap<IpAddr, u32> = std::collections::HashMap::new();
     loop {
         let (length, from) = socket.recv_from(&mut buffer).await?;
         let Some(message) = parse(&buffer[..length]) else {
@@ -216,10 +223,20 @@ pub async fn serve(socket: tokio::net::UdpSocket) -> std::io::Result<()> {
         let now = Instant::now();
         if now.duration_since(window.0) >= Duration::from_secs(1) {
             window = (now, 0);
+            sources.clear();
         }
         if window.1 >= RESPONSES_PER_SECOND {
             continue;
         }
+        let ip = canonical(from).ip();
+        if sources.len() >= MAX_SOURCES && !sources.contains_key(&ip) {
+            continue;
+        }
+        let count = sources.entry(ip).or_insert(0);
+        if *count >= RESPONSES_PER_SOURCE {
+            continue;
+        }
+        *count += 1;
         window.1 += 1;
         // A send error for one peer (e.g. unreachable) must not stop the
         // responder for everyone else.

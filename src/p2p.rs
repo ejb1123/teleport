@@ -19,15 +19,18 @@
 //!    its device signature) learns the host's addresses.
 //! 3. **Connectivity.** The host sends a few STUN indications from its QUIC
 //!    socket to the client's candidates, opening its NAT for them (the first
-//!    ones with a TTL too small to reach the client's NAT), then answers. The client dials every host candidate from its own QUIC socket
-//!    (staggered) and keeps the first QUIC handshake that verifies the pinned
-//!    certificate. The session on top is an ordinary direct session: the
-//!    credential rides the MoQ SETUP path and the host authorizes and leases
-//!    it exactly as for its main listener. Hole punching changes
-//!    reachability, never authentication.
+//!    ones with a TTL too small to reach the client's NAT), then answers with
+//!    its candidates and a single-use admission ticket. The client dials
+//!    every host candidate from its own QUIC socket (staggered) and keeps the
+//!    first QUIC handshake that verifies the pinned certificate. The session
+//!    on top is a direct session whose SETUP path carries the credential and
+//!    the ticket; the host requires the credential the signalling exchange
+//!    proved and leases it with that exchange's device-key proof. Hole
+//!    punching changes reachability, never authentication.
 //!
-//! The host's peer-to-peer socket ignores QUIC connection attempts unless a
-//! signalling exchange completed within the last [`ARM_WINDOW`].
+//! The host's peer-to-peer socket starts no QUIC connection unless a ticket
+//! is outstanding (each valid for [`ARM_WINDOW`]) and refuses requests that
+//! do not present one.
 //!
 //! Capability gating: a client signals only to hosts that run with a relay;
 //! a host that does not answer (older, or `--no-p2p`) costs the client at
@@ -57,11 +60,25 @@ use std::{
 pub const SIGNAL_TIMEOUT: Duration = Duration::from_millis(2500);
 /// QUIC dials to the host's candidates after the answer arrived.
 pub const DIAL_TIMEOUT: Duration = Duration::from_millis(1500);
+/// MoQ SETUP on the punched connection (the host answers it before any
+/// capture starts).
+const SETUP_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Upper bound of one peer-to-peer attempt (`--route auto` waits for it).
-pub const ATTEMPT_TIMEOUT: Duration =
-    Duration::from_millis(SIGNAL_TIMEOUT.as_millis() as u64 + DIAL_TIMEOUT.as_millis() as u64);
-/// Host: how long after a signalling exchange its socket accepts QUIC.
+pub const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(
+    SIGNAL_TIMEOUT.as_millis() as u64
+        + DIAL_TIMEOUT.as_millis() as u64
+        + SETUP_TIMEOUT.as_millis() as u64,
+);
+/// Host: how long an admission ticket (and so the armed socket) lasts.
 const ARM_WINDOW: Duration = Duration::from_secs(30);
+/// Host: outstanding admission tickets kept (oldest dropped first).
+#[cfg(target_os = "linux")]
+const MAX_TICKETS: usize = 16;
+/// Gateway mapping attempts inside candidate gathering; a slower gateway is
+/// left to a background attempt (host) or skipped (client).
+const MAPPING_WAIT: Duration = Duration::from_millis(400);
+/// After a failed NAT-PMP attempt, do not ask the gateway again for this long.
+const MAPPING_RETRY: Duration = Duration::from_secs(300);
 /// Host: wait for the client's sealed candidates after its confirmation.
 #[cfg(target_os = "linux")]
 const OFFER_TIMEOUT: Duration = Duration::from_secs(2);
@@ -201,6 +218,10 @@ pub struct Candidate {
 struct Candidates {
     version: u32,
     candidates: Vec<Candidate>,
+    /// Host → client only: the single-use admission ticket for the
+    /// peer-to-peer socket (hex), bound to this exchange's credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ticket: Option<String>,
 }
 
 /// Whether an address can be a peer's candidate at all: a unicast address
@@ -273,11 +294,22 @@ fn seal_candidates(
     track: &str,
     candidates: &[Candidate],
 ) -> Result<Vec<u8>> {
+    seal_message(keys, direction, track, candidates, None)
+}
+
+fn seal_message(
+    keys: &SessionKeys,
+    direction: Direction,
+    track: &str,
+    candidates: &[Candidate],
+    ticket: Option<String>,
+) -> Result<Vec<u8>> {
     keys.sealer(direction, track)?.seal(
         0,
         &serde_json::to_vec(&Candidates {
             version: 1,
             candidates: candidates.to_vec(),
+            ticket,
         })?,
     )
 }
@@ -288,6 +320,16 @@ fn open_candidates(
     track: &str,
     sealed: &[u8],
 ) -> Result<Vec<Candidate>> {
+    Ok(open_message(keys, direction, track, sealed)?.0)
+}
+
+/// Validated candidates and the ticket, if the message carries one.
+fn open_message(
+    keys: &SessionKeys,
+    direction: Direction,
+    track: &str,
+    sealed: &[u8],
+) -> Result<(Vec<Candidate>, Option<String>)> {
     let plain = keys
         .opener(direction, track, Order::Strict)?
         .open(0, sealed)
@@ -298,7 +340,7 @@ fn open_candidates(
         message.version == 1,
         "unsupported peer-to-peer candidates version"
     );
-    validate(message.candidates)
+    Ok((validate(message.candidates)?, message.ticket))
 }
 
 // ── Shared socket ───────────────────────────────────────────────────
@@ -520,6 +562,8 @@ pub struct Endpoint {
     socket: Arc<Demux>,
     /// Opt-in gateway mapping of this socket's port, deleted on drop.
     mapping: Mutex<Option<(Instant, crate::natpmp::Mapping)>>,
+    /// When the last gateway mapping attempt failed.
+    mapping_failed: Mutex<Option<Instant>>,
 }
 
 impl Endpoint {
@@ -562,6 +606,7 @@ impl Endpoint {
             quic,
             socket,
             mapping: Mutex::new(None),
+            mapping_failed: Mutex::new(None),
         })
     }
 
@@ -607,13 +652,33 @@ impl Endpoint {
     /// The gateway's public address for this socket (NAT-PMP), reusing a
     /// recent mapping. A renewed mapping of the same port replaces the old
     /// guard without deleting it.
-    async fn mapped(&self, port: u16) -> Option<SocketAddr> {
+    /// Waits at most `wait` for the gateway; a failure (or a gateway too slow
+    /// for that) is remembered for [`MAPPING_RETRY`].
+    async fn mapped(&self, port: u16, wait: Option<Duration>) -> Option<SocketAddr> {
         if let Some((created, mapping)) = &*self.mapping.lock().unwrap()
             && created.elapsed() < MAPPING_REUSE
         {
             return Some(mapping.external);
         }
-        match crate::natpmp::map(port).await {
+        if self
+            .mapping_failed
+            .lock()
+            .unwrap()
+            .is_some_and(|failed| failed.elapsed() < MAPPING_RETRY)
+        {
+            return None;
+        }
+        let attempt = crate::natpmp::map(port);
+        let result = match wait {
+            Some(wait) => tokio::time::timeout(wait, attempt)
+                .await
+                .unwrap_or_else(|_| Err(anyhow!("gateway did not answer within {wait:?}"))),
+            None => attempt.await,
+        };
+        if result.is_err() {
+            *self.mapping_failed.lock().unwrap() = Some(Instant::now());
+        }
+        match result {
             Ok(mapping) => {
                 let external = mapping.external;
                 if let Some((_, old)) = self
@@ -649,14 +714,26 @@ impl Endpoint {
                 address,
             })
             .collect();
-        let servers = stun_servers(args, relay).await;
-        let reflexive = futures_util::future::join_all(
-            servers
-                .iter()
-                .filter(|server| self.socket.destination(**server).is_some())
-                .map(|server| self.reflexive(*server)),
-        )
-        .await;
+        // STUN and the (opt-in) gateway mapping run concurrently; the
+        // mapping waits at most MAPPING_WAIT here.
+        let stun = async {
+            let servers = stun_servers(args, relay).await;
+            let reflexive = futures_util::future::join_all(
+                servers
+                    .iter()
+                    .filter(|server| self.socket.destination(**server).is_some())
+                    .map(|server| self.reflexive(*server)),
+            )
+            .await;
+            (servers, reflexive)
+        };
+        let mapping = async {
+            match args.upnp {
+                true => self.mapped(local.port(), Some(MAPPING_WAIT)).await,
+                false => None,
+            }
+        };
+        let ((servers, reflexive), mapped) = tokio::join!(stun, mapping);
         for address in reflexive.into_iter().flatten() {
             if valid_address(address) && !candidates.iter().any(|c| c.address == address) {
                 candidates.push(Candidate {
@@ -668,8 +745,7 @@ impl Endpoint {
         if servers.is_empty() && !args.no_stun {
             tracing::debug!("no STUN server configured for the peer-to-peer path");
         }
-        if args.upnp
-            && let Some(address) = self.mapped(local.port()).await
+        if let Some(address) = mapped
             && valid_address(address)
             && !candidates.iter().any(|c| c.address == address)
         {
@@ -952,7 +1028,7 @@ pub async fn connect(
     subscribe: moq_net::origin::Producer,
 ) -> Result<Connected> {
     let started = Instant::now();
-    let (endpoint, remote) = tokio::time::timeout(SIGNAL_TIMEOUT, async {
+    let (endpoint, (remote, ticket)) = tokio::time::timeout(SIGNAL_TIMEOUT, async {
         let endpoint = Endpoint::bind("[::]:0".parse().unwrap(), None)?;
         let remote = signal(&endpoint, args, relay, pairing).await?;
         Ok::<_, anyhow::Error>((endpoint, remote))
@@ -980,14 +1056,28 @@ pub async fn connect(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "peer-to-peer QUIC handshake verified the pinned certificate"
     );
-    let (session, driver) = moq_net::Client::new()
-        .with_versions(versions()?)
-        .with_publisher(publish)
-        .with_subscriber(subscribe)
-        .with_path(target)
-        .connect(web_transport_quinn::Session::raw(connection))
-        .await
-        .context("host rejected the peer-to-peer session")?;
+    // The ticket rides the SETUP path after the credential, inside the
+    // pinned TLS connection: `/teleport/<token>/<ticket>?<options>`.
+    let target = match target.split_once('?') {
+        Some((path, query)) => format!("{path}/{ticket}?{query}"),
+        None => format!("{target}/{ticket}"),
+    };
+    // The host authenticated this credential during signalling, so a refusal
+    // here is a busy host or an expired ticket, not a verdict on the
+    // credential: the relay, which authorizes on its own, is still tried.
+    let (session, driver) = tokio::time::timeout(
+        SETUP_TIMEOUT,
+        moq_net::Client::new()
+            .with_versions(versions()?)
+            .with_publisher(publish)
+            .with_subscriber(subscribe)
+            .with_path(target)
+            .connect(web_transport_quinn::Session::raw(connection)),
+    )
+    .await
+    .map_err(|_| anyhow!("no peer-to-peer session within {SETUP_TIMEOUT:?}"))
+    .and_then(|result| result.context("host refused the peer-to-peer session"))
+    .map_err(|error| error.context(Unavailable))?;
     tokio::spawn(driver);
     Ok(Connected {
         session,
@@ -1011,7 +1101,7 @@ async fn signal(
     args: &ClientArgs,
     relay_endpoint: &relay::Endpoint,
     pairing: &protocol::Pairing,
-) -> Result<Vec<Candidate>> {
+) -> Result<(Vec<Candidate>, String)> {
     let device = pairing
         .device_key
         .as_deref()
@@ -1081,12 +1171,20 @@ async fn signal(
         "signalling: candidates offered"
     );
     let answer = relay::read_announced(&link, &format!("{id}/{}", paths::ANSWER)).await?;
-    open_candidates(
+    let (candidates, ticket) = open_message(
         &established.keys,
         Direction::HostToClient,
         ANSWER_TRACK,
         &answer,
-    )
+    )?;
+    let ticket = ticket
+        .filter(|ticket| valid_ticket(ticket))
+        .context("the host's peer-to-peer answer carries no admission ticket")?;
+    Ok((candidates, ticket))
+}
+
+fn valid_ticket(ticket: &str) -> bool {
+    ticket.len() == 32 && ticket.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// Relay paths of one signalling exchange, below `<attempt>/`.
@@ -1169,6 +1267,34 @@ async fn dial(
 pub struct Request {
     inner: Box<moq_net::Request<web_transport_quinn::Session>>,
     pub remote: SocketAddr,
+    /// The SETUP path without the ticket (`/teleport/<token>`).
+    path: String,
+    query: Option<String>,
+    /// What the signalling exchange that issued this request's ticket proved.
+    pub grant: Grant,
+}
+
+/// The credential (and device key) a signalling exchange authenticated; a
+/// peer-to-peer session must present that credential and is leased with
+/// that key proof, as a relayed session would be.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug)]
+pub struct Grant {
+    /// `SHA-256(token)`.
+    pub credential: [u8; 32],
+    pub device_key: Option<Vec<u8>>,
+}
+
+/// Split `/teleport/<token>/<ticket>?<query>` into the session path, the
+/// ticket and the query.
+#[cfg(target_os = "linux")]
+fn split_setup(setup: &str) -> Option<(&str, &str, Option<&str>)> {
+    let (path, query) = match setup.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (setup, None),
+    };
+    let (path, ticket) = path.rsplit_once('/')?;
+    (path.starts_with("/teleport/") && valid_ticket(ticket)).then_some((path, ticket, query))
 }
 
 /// A direct session request from the main listener or the peer-to-peer
@@ -1185,11 +1311,15 @@ impl Incoming {
     pub fn path(&self) -> &str {
         match self {
             Self::Listener(request) => request.path(),
-            Self::P2p(request) => {
-                let setup = request.inner.path();
-                let path = setup.split_once('?').map_or(setup, |(path, _)| path);
-                if path == "/" { "" } else { path }
-            }
+            Self::P2p(request) => &request.path,
+        }
+    }
+
+    /// For a peer-to-peer request, what its signalling exchange proved.
+    pub fn grant(&self) -> Option<&Grant> {
+        match self {
+            Self::Listener(_) => None,
+            Self::P2p(request) => Some(&request.grant),
         }
     }
 
@@ -1197,7 +1327,7 @@ impl Incoming {
     pub fn query(&self) -> Option<&str> {
         match self {
             Self::Listener(request) => request.query(),
-            Self::P2p(request) => request.inner.path().split_once('?').map(|(_, query)| query),
+            Self::P2p(request) => request.query.as_deref(),
         }
     }
 
@@ -1238,13 +1368,26 @@ impl Incoming {
     }
 }
 
+/// Calls [`Host::close`] when dropped.
+#[cfg(target_os = "linux")]
+pub struct CloseOnDrop(pub Arc<Host>);
+
+#[cfg(target_os = "linux")]
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// The host's peer-to-peer socket and signalling responder.
 #[cfg(target_os = "linux")]
 pub struct Host {
     endpoint: Endpoint,
     gather: GatherArgs,
     relay: relay::Endpoint,
-    armed_until: Mutex<Option<Instant>>,
+    /// Outstanding admission tickets: (ticket, expiry, grant).
+    tickets: Mutex<std::collections::VecDeque<([u8; 16], Instant, Grant)>>,
+    closed: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(target_os = "linux")]
@@ -1283,38 +1426,80 @@ impl Host {
             endpoint,
             gather: args.gather.clone(),
             relay,
-            armed_until: Mutex::new(None),
+            tickets: Mutex::new(std::collections::VecDeque::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
         });
         tracing::info!(address = %host.endpoint.local_addr()?, "peer-to-peer socket ready (answers relay signalling)");
         let (sender, receiver) = tokio::sync::mpsc::channel(MAX_PENDING_ACCEPTS);
         tokio::spawn(host.clone().accept(sender));
+        if args.gather.upnp {
+            // Map in the background (and renew), so answering signalling
+            // never waits on the gateway.
+            let weak = Arc::downgrade(&host);
+            tokio::spawn(async move {
+                loop {
+                    let Some(host) = weak.upgrade() else { break };
+                    if host.closed.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Ok(local) = host.endpoint.local_addr() {
+                        host.endpoint.mapped(local.port(), None).await;
+                    }
+                    drop(host);
+                    tokio::time::sleep(MAPPING_RETRY + Duration::from_secs(1)).await;
+                }
+            });
+        }
         Ok((host, receiver))
     }
 
     /// Stop accepting and delete a gateway mapping (the accept task keeps
     /// this value alive, so dropping it at exit would not).
     pub fn close(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.endpoint
             .quic
             .close(quinn::VarInt::from_u32(0), b"host shutdown");
         drop(self.endpoint.mapping.lock().unwrap().take());
     }
 
+    /// Whether any admission ticket is outstanding.
     fn armed(&self) -> bool {
-        self.armed_until
-            .lock()
-            .unwrap()
-            .is_some_and(|until| Instant::now() < until)
+        let now = Instant::now();
+        let mut tickets = self.tickets.lock().unwrap();
+        tickets.retain(|(_, expires, _)| now < *expires);
+        !tickets.is_empty()
     }
 
-    fn arm(&self) {
-        *self.armed_until.lock().unwrap() = Some(Instant::now() + ARM_WINDOW);
+    /// Issue a single-use ticket for what a signalling exchange proved.
+    fn issue(&self, grant: Grant) -> String {
+        let ticket = e2e::random::<16>();
+        let mut tickets = self.tickets.lock().unwrap();
+        if tickets.len() >= MAX_TICKETS {
+            tickets.pop_front();
+        }
+        tickets.push_back((ticket, Instant::now() + ARM_WINDOW, grant));
+        relay::hex(&ticket)
+    }
+
+    /// Consume a ticket presented in a SETUP path.
+    fn redeem(&self, ticket: &str) -> Option<Grant> {
+        use subtle::ConstantTimeEq;
+        let now = Instant::now();
+        let mut tickets = self.tickets.lock().unwrap();
+        let index = tickets.iter().position(|(known, expires, _)| {
+            now < *expires && bool::from(relay::hex(known).as_bytes().ct_eq(ticket.as_bytes()))
+        })?;
+        tickets.remove(index).map(|(_, _, grant)| grant)
     }
 
     async fn accept(self: Arc<Self>, requests: tokio::sync::mpsc::Sender<Request>) {
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_ACCEPTS));
         while let Some(incoming) = self.endpoint.quic.accept().await {
-            // Unsolicited Initials get no answer at all.
+            // No connection starts without an outstanding ticket. (quinn
+            // still answers unknown versions and stray short headers, so
+            // the port is visible to a QUIC scanner.)
             if !self.armed() {
                 incoming.ignore();
                 continue;
@@ -1323,20 +1508,40 @@ impl Host {
                 incoming.ignore();
                 continue;
             };
-            let requests = requests.clone();
+            let (requests, host) = (requests.clone(), self.clone());
             tokio::spawn(async move {
                 let _permit = permit;
                 let remote = stun::canonical(incoming.remote_address());
                 match tokio::time::timeout(ACCEPT_TIMEOUT, accept_one(incoming)).await {
                     Ok(Ok(inner)) => {
-                        if requests
-                            .try_send(Request {
-                                inner: Box::new(inner),
-                                remote,
-                            })
-                            .is_err()
-                        {
-                            tracing::debug!(%remote, "peer-to-peer request dropped (host busy)");
+                        // Only the client of a completed signalling exchange
+                        // holds a ticket; anyone else is refused before the
+                        // request can queue for the session loop.
+                        let admitted =
+                            split_setup(inner.path()).and_then(|(path, ticket, query)| {
+                                host.redeem(ticket)
+                                    .map(|grant| (path.to_owned(), query.map(str::to_owned), grant))
+                            });
+                        let Some((path, query, grant)) = admitted else {
+                            tracing::debug!(%remote, "peer-to-peer request without a valid ticket");
+                            inner.close(moq_net::Error::Unauthorized);
+                            return;
+                        };
+                        if let Err(error) = requests.try_send(Request {
+                            inner: Box::new(inner),
+                            remote,
+                            path,
+                            query,
+                            grant,
+                        }) {
+                            tracing::debug!(%remote, "peer-to-peer request refused (host busy)");
+                            let request = match error {
+                                tokio::sync::mpsc::error::TrySendError::Full(request)
+                                | tokio::sync::mpsc::error::TrySendError::Closed(request) => {
+                                    request
+                                }
+                            };
+                            (*request.inner).close(moq_net::Error::App(503));
                         }
                     }
                     Ok(Err(error)) => {
@@ -1357,6 +1562,7 @@ impl Host {
         id: &str,
         incoming: &moq_net::origin::Producer,
         outgoing: &moq_net::origin::Producer,
+        grant: Grant,
     ) -> Result<()> {
         let offer = tokio::time::timeout(OFFER_TIMEOUT, async {
             let broadcast = incoming
@@ -1370,7 +1576,7 @@ impl Host {
         .context("peer-to-peer offer timed out")??;
         let remote = open_candidates(keys, Direction::ClientToHost, OFFER_TRACK, &offer)?;
         let local = self.endpoint.gather(&self.gather, Some(&self.relay)).await;
-        self.arm();
+        let ticket = self.issue(grant);
         tracing::info!(
             client = %describe(&remote),
             host = %describe(&local),
@@ -1380,7 +1586,13 @@ impl Host {
         let answer = relay::publish_one(
             outgoing,
             &format!("{id}/{}", paths::ANSWER),
-            seal_candidates(keys, Direction::HostToClient, ANSWER_TRACK, &local)?,
+            seal_message(
+                keys,
+                Direction::HostToClient,
+                ANSWER_TRACK,
+                &local,
+                Some(ticket),
+            )?,
         )
         .await?;
         tokio::spawn(async move {
@@ -1537,6 +1749,7 @@ mod tests {
         let forged = serde_json::to_vec(&Candidates {
             version: 1,
             candidates: vec![candidate(Kind::Host, "198.51.100.66:4443")],
+            ticket: Some("00".repeat(16)),
         })
         .unwrap();
         assert!(open_candidates(&host, Direction::ClientToHost, OFFER_TRACK, &forged).is_err());
@@ -1660,6 +1873,76 @@ mod tests {
         // A different pin fails the handshake.
         let wrong = "ab".repeat(32);
         assert!(dial(&client, &[candidate], &wrong).await.is_err());
+    }
+
+    /// The answer's ticket is sealed with the candidates; the host admits a
+    /// SETUP path only with an outstanding ticket, once, and hands the
+    /// session loop the credential and device key the exchange proved.
+    #[tokio::test]
+    async fn tickets_are_sealed_single_use_and_carry_the_grant() {
+        let (client, host_keys) = e2e::test_session();
+        let sealed = seal_message(
+            &host_keys,
+            Direction::HostToClient,
+            ANSWER_TRACK,
+            &[candidate(Kind::Srflx, "203.0.113.2:6000")],
+            Some("ab".repeat(16)),
+        )
+        .unwrap();
+        let (_, ticket) =
+            open_message(&client, Direction::HostToClient, ANSWER_TRACK, &sealed).unwrap();
+        assert_eq!(ticket.as_deref(), Some("ab".repeat(16).as_str()));
+        assert!(!String::from_utf8_lossy(&sealed).contains(&"ab".repeat(16)));
+
+        let token = "cd".repeat(32);
+        let ticket = "ef".repeat(16);
+        assert_eq!(
+            split_setup(&format!("/teleport/{token}/{ticket}?codec=h264")),
+            Some((
+                format!("/teleport/{token}").as_str(),
+                ticket.as_str(),
+                Some("codec=h264")
+            ))
+        );
+        assert_eq!(
+            split_setup(&format!("/teleport/{token}/{ticket}")),
+            Some((format!("/teleport/{token}").as_str(), ticket.as_str(), None))
+        );
+        // No ticket, a malformed one, or another path: refused.
+        assert!(split_setup(&format!("/teleport/{token}?codec=h264")).is_none());
+        assert!(split_setup(&format!("/teleport/{token}/xyz")).is_none());
+        assert!(split_setup(&format!("/other/{ticket}")).is_none());
+
+        let host = Host {
+            endpoint: Endpoint::bind("127.0.0.1:0".parse().unwrap(), None).unwrap(),
+            gather: GatherArgs::default(),
+            relay: relay::Endpoint {
+                url: "moqt://127.0.0.1:9".parse().unwrap(),
+                fingerprint: None,
+                key: None,
+            },
+            tickets: Mutex::new(std::collections::VecDeque::new()),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        };
+        assert!(!host.armed());
+        let issued = host.issue(Grant {
+            credential: e2e::credential_hash(&token),
+            device_key: Some(vec![7; 32]),
+        });
+        assert!(valid_ticket(&issued));
+        assert!(host.armed());
+        assert!(host.redeem(&"00".repeat(16)).is_none());
+        let grant = host.redeem(&issued).unwrap();
+        assert_eq!(grant.credential, e2e::credential_hash(&token));
+        assert_eq!(grant.device_key, Some(vec![7; 32]));
+        assert!(host.redeem(&issued).is_none(), "ticket reused");
+        assert!(!host.armed());
+        // The table is bounded: the oldest ticket is dropped first.
+        let first = host.issue(grant.clone());
+        for _ in 0..MAX_TICKETS {
+            host.issue(grant.clone());
+        }
+        assert!(host.redeem(&first).is_none());
     }
 
     /// Low-TTL punches carry the requested TTL (read back with IP_RECVTTL)
