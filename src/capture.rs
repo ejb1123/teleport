@@ -622,6 +622,7 @@ impl Capture {
             | Event::ClipboardRequest
             | Event::RequestKeyframe { .. }
             | Event::ClientFeatures { .. }
+            | Event::SelectCodec { .. }
             | Event::ClientDisplay(_) => (),
         }
         Ok(())

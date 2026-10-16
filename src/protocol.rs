@@ -170,6 +170,16 @@ pub struct Desktop {
     /// from it ([`negotiate`]); older hosts reject unknown events.
     #[serde(default)]
     pub display_negotiation: bool,
+    /// Host waits for `Event::SelectCodec` as the client's first input event
+    /// before it starts video, and encodes the codec chosen there. Older
+    /// hosts reject unknown events, so clients must check this first.
+    #[serde(default)]
+    pub codec_selection: bool,
+    /// Codecs the host encodes in hardware (its encoder probe), so a client
+    /// choosing automatically prefers H.265 only when it is cheap to encode.
+    /// Empty for older and software-only hosts.
+    #[serde(default)]
+    pub hardware_codecs: Vec<VideoCodec>,
 }
 
 impl Desktop {
@@ -461,6 +471,12 @@ pub enum Event {
         /// `Desktop::local_cursor`.
         #[serde(default)]
         local_cursor: bool,
+    },
+    /// The session's video codec. Sent as the very first input event to hosts
+    /// advertising `Desktop::codec_selection`, which wait for it before
+    /// starting video; it overrides the connection's `codec` parameter.
+    SelectCodec {
+        codec: VideoCodec,
     },
     /// The client's display and stream choices; the host picks the stream
     /// size, rate and bitrate from them ([`negotiate`]) and answers with
@@ -1146,10 +1162,34 @@ mod tests {
         assert!(!desktop.configurable_video && !desktop.telemetry);
         assert!(!desktop.keyframe_requests);
         assert!(!desktop.local_cursor);
+        assert!(!desktop.codec_selection && desktop.hardware_codecs.is_empty());
         assert_eq!(desktop.video_start_group, 0);
         let mut invalid = old;
         invalid["codec"] = serde_json::json!("surprise");
         assert!(serde_json::from_value::<Desktop>(invalid).is_err());
+    }
+    #[test]
+    fn codec_selection_roundtrips_and_is_never_dropped() {
+        let event: Event =
+            serde_json::from_str(r#"{"type":"select_codec","codec":"h265"}"#).unwrap();
+        assert!(matches!(
+            event,
+            Event::SelectCodec {
+                codec: VideoCodec::H265
+            }
+        ));
+        assert!(event.validate().is_ok() && !event.is_lossy());
+        assert!(serde_json::from_str::<Event>(r#"{"type":"select_codec","codec":"av1"}"#).is_err());
+        let desktop: Desktop = serde_json::from_value(serde_json::json!({ "version": 2,
+            "width": 1, "height": 1, "fps": 1, "source": "test", "monitors": [],
+            "active_monitor": 0, "audio": false, "clipboard": false,
+            "codec_selection": true, "hardware_codecs": ["h264", "h265"] }))
+        .unwrap();
+        assert!(desktop.codec_selection);
+        assert_eq!(
+            desktop.hardware_codecs,
+            [VideoCodec::H264, VideoCodec::H265]
+        );
     }
     fn cursor(width: u16, height: u16) -> CursorImage {
         CursorImage {

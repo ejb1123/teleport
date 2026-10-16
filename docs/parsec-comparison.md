@@ -412,9 +412,8 @@ What is on `main`/this branch, from README, docs and code:
   - The SDL canvas is created without `present_vsync`
     (`src/client.rs:765`, `src/multi_display.rs:156`); there is no VSync
     setting.
-- **Codecs:** H.264 or H.265, chosen explicitly (the launcher and client
-  default to H.264, `src/client.rs` `--codec`). There is no automatic HEVC
-  attempt or fallback. HDR10: HEVC Main10 on the experimental patched-KWin
+- **Codecs:** H.264 or H.265. (Since 2026-10-16, G5: `--codec auto`, the
+  default, picks H.265 when both ends have it in hardware.) HDR10: HEVC Main10 on the experimental patched-KWin
   path to a Mac Metal/EDR client (docs/hdr.md). No AV1, no 4:4:4.
 - **Rates:** host `--fps` 1..=120 (`src/host.rs:74`). The launcher offers
   30/60/120 FPS, 8/20/40 Mbps (CLI 0.5–100 Mbps), and native or scaled widths
@@ -478,7 +477,7 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | macOS client | Yes | Yes | Partial | Mac latency items M3/H10 unverified on hardware |
 | Linux client | Ubuntu 22.04, X11 | Any Nix Linux, X11 or Wayland | **Teleport ahead** | |
 | Android / iOS / web | Android experimental; no iOS; Chrome web | None | Missing | No iOS from Parsec is an opening |
-| H.264 / H.265 | Yes, HEVC tried by default with fallback | Yes, explicit choice, H.264 default | Partial | Needs auto-negotiation |
+| H.264 / H.265 | Yes, HEVC tried by default with fallback | Yes, auto: H.265 when both ends have hardware (2026-10-16) | Parity | G5 |
 | AV1 | No | No | Parity | Moonlight/Sunshine have it; an opening |
 | 4:4:4 | Warp, Windows host, NVIDIA/Intel | No | Missing | |
 | 10-bit SDR | Experimental | Main10 only for HDR | Partial | |
@@ -671,6 +670,16 @@ VRR itself is WIP.**
   `src/hdr_present.rs`.
 
 **G5. Automatic codec negotiation, HEVC by default. Effort S.**
+
+- **Status (2026-10-16): implemented** (review tracker R9). `--codec auto`
+  is the client and launcher default: H.265 when the host's encoder probe
+  (`Desktop.hardware_codecs`) and the client's decoder probe both find
+  hardware, otherwise H.264. The client sends `Event::SelectCodec` first to
+  hosts advertising `codec_selection`, which wait for it before starting
+  video, so there is no restart. Older hosts and clients keep H.264 unless
+  asked; HDR10 stays H.265; an explicit `--codec` wins. F8 and both logs
+  show the codec and why. Not done: a fallback when a probed hardware path
+  later fails mid-session (the existing decoder recovery applies), and AV1.
 
 - **Why:** Parsec tries H.265 by default and silently falls back (ADV, HW).
   Teleport defaults to H.264 and makes the user choose. HEVC is roughly half

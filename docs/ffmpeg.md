@@ -15,6 +15,14 @@ Backend names in logs and Stats start with `ffmpeg:`. Software uses libx264 /
 libx265 encoding and FFmpeg H.264 / HEVC decoding. The Nix flake links these
 libraries on Linux/macOS and enables oneVPL for Quick Sync on x86-64 Linux.
 
+The client's default `--codec auto` uses these probes: the host advertises
+the codecs its hardware encoders produce (probed once per process at 720p,
+`Desktop.hardware_codecs`) and the client picks H.265 only when it also has a
+hardware H.265 decoder. Zero-copy capture and presentation are codec-agnostic;
+the offscreen CUDA→GL and VA-API→EGL presentation tests and the DMA-BUF →
+NVENC/VA-API encode test cover H.265 as well as H.264. 10-bit output stays
+HDR10-only, which is always H.265.
+
 Encoders use closed, short GOPs without B-frames. NVENC also explicitly disables
 its output delay. Bitrate changes transactionally reopen the encoder and start
 a new keyframe group; accepted bitrate is the configured target, not measured

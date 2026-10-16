@@ -157,6 +157,9 @@ const QUALITIES: [(&str, &str); 5] = [
     ("40 Mbps cap", "40000"),
     ("80 Mbps cap", "80000"),
 ];
+/// Auto is H.265 when the host encodes and this client decodes it in
+/// hardware, otherwise H.264 (and always H.264 with older hosts).
+const CODECS: [(&str, &str); 3] = [("Auto codec", "auto"), ("H.264", "h264"), ("H.265", "h265")];
 
 #[derive(Default)]
 struct StreamPreferences {
@@ -976,15 +979,15 @@ pub fn run() -> Result<()> {
                                     stream.vsync = !stream.vsync;
                                 }
                                 if hit(pref_rect(3), x, y) {
-                                    codec = 1 - codec;
-                                    if codec == 0 {
+                                    codec = (codec + 1) % CODECS.len();
+                                    if CODECS[codec].1 != "h265" {
                                         hdr = false;
                                     }
                                 }
                                 if hit(pref_rect(4), x, y) && cfg!(target_os = "macos") {
                                     hdr = !hdr;
                                     if hdr {
-                                        codec = 1;
+                                        codec = 2;
                                     }
                                 }
                                 if hit(pref_rect(5), x, y) {
@@ -1124,7 +1127,7 @@ pub fn run() -> Result<()> {
                             .arg("--pairing-file")
                             .arg(credential)
                             .arg("--codec")
-                            .arg(["h264", "h265"][codec])
+                            .arg(CODECS[codec].1)
                             .arg("--dynamic-range")
                             .arg(if hdr { "hdr10" } else { "sdr" });
                         stream.apply(&mut command);
@@ -1559,7 +1562,7 @@ pub fn run() -> Result<()> {
                             resolution_label,
                             frame_rate_label,
                             quality_label,
-                            ["H.264", "H.265"][codec],
+                            CODECS[codec].0,
                             if hdr { "HDR preview" } else { "SDR" },
                             if clipboard {
                                 "Clipboard on"

@@ -37,6 +37,8 @@ pub(super) struct Displays {
     screens: Vec<Screen>,
     remote: moq_net::broadcast::Consumer,
     options: Options,
+    /// The session codec; auxiliary monitors are encoded with it too.
+    codec: protocol::VideoCodec,
     events: mpsc::Sender<Event>,
 }
 
@@ -44,12 +46,14 @@ impl Displays {
     pub fn new(
         remote: moq_net::broadcast::Consumer,
         options: &Options,
+        codec: protocol::VideoCodec,
         events: mpsc::Sender<Event>,
     ) -> Self {
         Self {
             screens: Vec::new(),
             remote,
             options: options.clone(),
+            codec,
             events,
         }
     }
@@ -189,7 +193,7 @@ impl Displays {
         protocol::validate_video_size(desktop.width, desktop.height)?;
         ensure!(
             desktop.version == protocol::VERSION
-                && desktop.codec == self.options.codec
+                && desktop.codec == self.codec
                 && desktop.dynamic_range == self.options.dynamic_range
                 && desktop.active_monitor == index,
             "invalid auxiliary stream metadata"

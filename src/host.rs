@@ -129,8 +129,14 @@ pub struct Options {
     /// Default codec for clients without an explicit selection. Prefer H.264 for compatibility.
     #[arg(long, value_enum, default_value_t = protocol::VideoCodec::H264)]
     pub codec: protocol::VideoCodec,
+    /// Tests: advertise these hardware codecs instead of probing encoders.
+    #[arg(long, hide = true, value_enum, value_delimiter = ',')]
+    pub smoke_hardware_codecs: Option<Vec<protocol::VideoCodec>>,
     #[arg(skip)]
     pub dynamic_range: protocol::DynamicRange,
+    /// Codecs `encoder` encodes in hardware here (`Desktop::hardware_codecs`).
+    #[arg(skip)]
+    pub hardware_codecs: Vec<protocol::VideoCodec>,
 }
 
 pub async fn run(options: Options) -> Result<()> {
@@ -162,6 +168,11 @@ pub async fn run(options: Options) -> Result<()> {
 }
 
 async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
+    // Warm the hardware encoder probe so the first client does not wait for it.
+    let kind = options.encoder;
+    if options.smoke_hardware_codecs.is_none() {
+        std::thread::spawn(move || media::hardware_codecs(kind));
+    }
     let mut config = moq_native::ServerConfig::default();
     config.bind = Some(options.listen.clone());
     config.version = vec![protocol::WIRE_VERSION.parse().map_err(anyhow::Error::msg)?];
@@ -552,16 +563,17 @@ async fn run_session(
         "desktop",
         moq_net::broadcast::Route::new().with_announce(true),
     )?;
-    let video = broadcast.create_track(
-        options.codec.track(),
-        moq_net::track::Info::default().with_latency_max(Duration::from_millis(500)),
-    )?;
-    let mut monitor_tracks = Vec::new();
-    for index in 0..capture.monitors.len().min(64) {
-        monitor_tracks.push(broadcast.create_track(
-            format!("monitor-{index}-{}", options.codec.track()),
-            moq_net::track::Info::default().with_latency_max(Duration::from_millis(500)),
-        )?);
+    // Both codecs' tracks exist until the client has chosen (SelectCodec):
+    // it subscribes to its choice right after sending it.
+    let mut video_tracks = Vec::new();
+    for codec in [protocol::VideoCodec::H264, protocol::VideoCodec::H265] {
+        video_tracks.push((
+            codec,
+            broadcast.create_track(
+                codec.track(),
+                moq_net::track::Info::default().with_latency_max(Duration::from_millis(500)),
+            )?,
+        ));
     }
     let mut monitor_streams: BTreeMap<usize, MonitorEncoder> = BTreeMap::new();
     let mut metadata = broadcast.create_track("desktop", None)?;
@@ -630,30 +642,20 @@ async fn run_session(
         options.bitrate =
             protocol::high_rate_bitrate(DEFAULT_BITRATE, size.width, size.height, options.fps);
     }
-    let info = desktop(options, capture, video_start_group)?;
-    let mut pipeline = start_encoder(
-        options,
-        capture.pipeline_source_for_range(options.dynamic_range)?,
-        (info.width, info.height),
-        options.fps,
-        options.bitrate,
-        &video,
-    )
-    .await
-    .context("encoder start failed")??;
-    let audio = match (options.audio_source.as_deref(), audio_track) {
-        (Some(source), Some(track)) => Some(crate::audio::capture(source, track)?),
-        _ => None,
+    // Probed once per process (src/ffmpeg_media.rs), off the async loop.
+    let kind = options.encoder;
+    options.hardware_codecs = match &options.smoke_hardware_codecs {
+        Some(codecs) => codecs.clone(),
+        None => tokio::task::spawn_blocking(move || media::hardware_codecs(kind))
+            .await
+            .context("hardware encoder probe failed")?,
     };
+    // The metadata goes out before video starts: a client that chooses the
+    // codec (Desktop::codec_selection) needs it to decide.
+    let info = desktop(options, capture, video_start_group)?;
     let mut group = metadata.append_group()?;
     group.write_frame(moq_net::Timestamp::now(), serde_json::to_vec(&info)?)?;
     group.finish()?;
-    tracing::info!(
-        width = info.width,
-        height = info.height,
-        fps = options.fps,
-        "native client connected"
-    );
     let mut check = tokio::time::interval(Duration::from_millis(200));
     let (sender, receiver) = tokio::sync::mpsc::channel(256);
     let mut events = SessionEvents {
@@ -673,6 +675,64 @@ async fn run_session(
         sender,
         last_motion.clone(),
     )));
+    // A client choosing the codec sends SelectCodec first. Older clients send
+    // something else (at least a heartbeat within INPUT_TIMEOUT) and get the
+    // codec from their connection request, as before.
+    let first = tokio::time::timeout(protocol::INPUT_TIMEOUT, events.receiver.recv()).await;
+    let chosen_by_client = match first {
+        Ok(Some(Event::SelectCodec { codec })) => {
+            ensure!(
+                options.dynamic_range != protocol::DynamicRange::Hdr10
+                    || codec == protocol::VideoCodec::H265,
+                "HDR10 requires H.265"
+            );
+            options.codec = codec;
+            true
+        }
+        Ok(Some(event)) => {
+            events.deferred.push_back(event);
+            false
+        }
+        // The input task reports a closed or silent input stream.
+        Ok(None) | Err(_) => false,
+    };
+    tracing::info!(
+        codec = options.codec.label(),
+        chosen_by_client,
+        hardware = ?options.hardware_codecs,
+        "session video codec"
+    );
+    let video = video_tracks
+        .into_iter()
+        .find_map(|(codec, track)| (codec == options.codec).then_some(track))
+        .context("no track for the session codec")?;
+    let mut monitor_tracks = Vec::new();
+    for index in 0..capture.monitors.len().min(64) {
+        monitor_tracks.push(broadcast.create_track(
+            format!("monitor-{index}-{}", options.codec.track()),
+            moq_net::track::Info::default().with_latency_max(Duration::from_millis(500)),
+        )?);
+    }
+    let mut pipeline = start_encoder(
+        options,
+        capture.pipeline_source_for_range(options.dynamic_range)?,
+        (info.width, info.height),
+        options.fps,
+        options.bitrate,
+        &video,
+    )
+    .await
+    .context("encoder start failed")??;
+    let audio = match (options.audio_source.as_deref(), audio_track) {
+        (Some(source), Some(track)) => Some(crate::audio::capture(source, track)?),
+        _ => None,
+    };
+    tracing::info!(
+        width = info.width,
+        height = info.height,
+        fps = options.fps,
+        "native client connected"
+    );
     let mut adaptation = media::BitrateController::new(options.bitrate);
     let mut network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
     let mut adaptive = !options.fixed_bitrate;
@@ -953,6 +1013,11 @@ async fn run_session(
                         client_display = Some(display);
                         display_pending = true;
                     }
+                    // Only the first event chooses (see above); video is running now.
+                    Event::SelectCodec { codec } => ensure!(
+                        codec == options.codec,
+                        "the video codec is chosen before video starts; reconnect to change it"
+                    ),
                     Event::RequestKeyframe { monitor } => {
                         // Bound IDR bursts: a lossy link must not turn every
                         // request into a full keyframe and deepen congestion.
@@ -1157,6 +1222,8 @@ fn desktop_for_monitor(
         gamepads: capture.gamepads_available(),
         max_fps: protocol::MAX_FPS,
         display_negotiation: true,
+        codec_selection: true,
+        hardware_codecs: options.hardware_codecs.clone(),
     })
 }
 
@@ -1280,6 +1347,7 @@ async fn while_starting<T: Send + 'static>(
                     | Event::ClientFeatures { .. }
                     | Event::ConfigureVideo { .. }
                     | Event::ClientDisplay(_)
+                    | Event::SelectCodec { .. }
                     | Event::SelectMonitor { .. }
                     | Event::Clipboard { .. }
                     | Event::ClipboardRequest => {

@@ -731,9 +731,9 @@ mod tests {
     }
 
     /// Four flat quadrants (limited-range NV12): grey, red-ish, green-ish,
-    /// blue-ish, encoded with libx264. Returns the config and packets.
+    /// blue-ish, encoded with libx264 (or libx265). Returns the config and packets.
     #[cfg(target_os = "linux")]
-    fn quadrant_stream(width: usize, height: usize) -> Result<(Config, Vec<Vec<u8>>)> {
+    fn quadrant_stream(width: usize, height: usize, hevc: bool) -> Result<(Config, Vec<Vec<u8>>)> {
         let quadrants = [
             (126_u8, 128_u8, 128_u8),
             (81, 90, 240),
@@ -760,7 +760,7 @@ mod tests {
             width: width as u32,
             height: height as u32,
             kbps: 4000,
-            ..software_config(false)
+            ..software_config(hevc)
         };
         let mut encoder = Codec::new(config.clone())?;
         let mut packets = Vec::new();
@@ -821,20 +821,26 @@ mod tests {
             return Ok(());
         }
         let (width, height) = (640_usize, 360_usize);
-        let (config, packets) = quadrant_stream(width, height)?;
-        let cpu = decode_last(&config, &packets, "software", 0)?; // RGB24 reference
-        let gpu = decode_last(&config, &packets, "cuda", 3)?;
-        let gpu = gpu
-            .gpu
-            .context("CUDA decoder did not keep the frame on the GPU")?;
-        let mut rgba = vec![0_u8; width * height * 4];
-        let result = unsafe { tp_cuda_gl_self_test(gpu.0.as_ptr(), rgba.as_mut_ptr()) };
-        if result == -libc::ENODEV {
-            eprintln!("SKIP: no NVIDIA EGL device");
-            return Ok(());
+        // H.264 and H.265 (the automatic choice with hardware on both ends).
+        for hevc in [false, true] {
+            let (config, packets) = quadrant_stream(width, height, hevc)?;
+            let cpu = decode_last(&config, &packets, "software", 0)?; // RGB24 reference
+            let gpu = decode_last(&config, &packets, "cuda", 3)?;
+            let gpu = gpu
+                .gpu
+                .context("CUDA decoder did not keep the frame on the GPU")?;
+            let mut rgba = vec![0_u8; width * height * 4];
+            let result = unsafe { tp_cuda_gl_self_test(gpu.0.as_ptr(), rgba.as_mut_ptr()) };
+            if result == -libc::ENODEV {
+                eprintln!("SKIP: no NVIDIA EGL device");
+                return Ok(());
+            }
+            check(result)?;
+            compare_quadrants(&cpu, &rgba, width, height)
+                .with_context(|| format!("hevc={hevc}"))?;
+            eprintln!("PASS cuda hevc={hevc}");
         }
-        check(result)?;
-        compare_quadrants(&cpu, &rgba, width, height)
+        Ok(())
     }
 
     /// VA-API zero-copy: decode on each DRM render node with a VA driver,
@@ -855,12 +861,13 @@ mod tests {
             .collect();
         nodes.sort();
         let mut passed = 0;
-        for (width, height, iterations) in [
-            (640_usize, 360_usize, 0),
-            (1920, 1080, 50),
-            (3840, 2160, 20),
+        for (width, height, iterations, hevc) in [
+            (640_usize, 360_usize, 0, false),
+            (640, 360, 0, true),
+            (1920, 1080, 50, false),
+            (3840, 2160, 20, false),
         ] {
-            let (config, packets) = quadrant_stream(width, height)?;
+            let (config, packets) = quadrant_stream(width, height, hevc)?;
             let cpu = decode_last(&config, &packets, "software", 0)?;
             for node in &nodes {
                 let name = format!("vaapi@{node}");
@@ -901,7 +908,7 @@ mod tests {
                         download_ns as f64 / 1e6
                     );
                 }
-                eprintln!("PASS {name} {width}x{height}");
+                eprintln!("PASS {name} {width}x{height} hevc={hevc}");
                 passed += 1;
             }
         }
@@ -1058,14 +1065,17 @@ mod tests {
             return Ok(());
         }
         let colors = [[200, 40, 40], [40, 180, 60], [50, 60, 210], [230, 230, 230]];
-        let mut targets = vec![("h264_nvenc", None)];
+        let mut targets = vec![("h264_nvenc", None), ("hevc_nvenc", None)];
         let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")?
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path().to_string_lossy().into_owned())
             .filter(|path| path.starts_with("/dev/dri/renderD"))
             .collect();
         nodes.sort();
-        targets.extend(nodes.into_iter().map(|node| ("h264_vaapi", Some(node))));
+        for node in nodes {
+            targets.push(("h264_vaapi", Some(node.clone())));
+            targets.push(("hevc_vaapi", Some(node)));
+        }
         let mut passed = 0;
         for (name, node) in targets {
             // Same size, 2x downscale, and a crop of the top-left quadrant.
@@ -1081,7 +1091,7 @@ mod tests {
                     height: size.1,
                     kbps: 4000,
                     gpu_input: true,
-                    ..software_config(false)
+                    ..software_config(name.starts_with("hevc"))
                 };
                 let mut encoder = match Codec::new(config.clone()) {
                     Ok(encoder) => encoder,

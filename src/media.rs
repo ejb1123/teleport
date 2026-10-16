@@ -762,6 +762,44 @@ pub fn prepare_decoder(force_software: bool, format: impl Into<VideoFormat>) -> 
     decoder::select(force_software, format.into()).map(|_| ())
 }
 
+/// This client's hardware decoder for `format` (probed and cached like
+/// `prepare_decoder`); `None` when only software decodes it here.
+pub fn hardware_decoder(format: impl Into<VideoFormat>) -> Result<Option<String>> {
+    let format = format.into();
+    let name = if crate::ffmpeg::enabled()? {
+        ffmpeg_media::select_decoder(false, format)?
+    } else {
+        decoder::select(false, format)?.to_owned()
+    };
+    Ok((name != "software" && !name.starts_with("avdec_")).then_some(name))
+}
+
+/// Codecs this host encodes in hardware with `kind` (8-bit; probed once per
+/// process). Blocks for up to a few seconds on the first call.
+pub fn hardware_codecs(kind: EncoderKind) -> Vec<VideoCodec> {
+    [VideoCodec::H264, VideoCodec::H265]
+        .into_iter()
+        .filter(|&codec| hardware_encoder(kind, codec))
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn hardware_encoder(kind: EncoderKind, codec: VideoCodec) -> bool {
+    match crate::ffmpeg::enabled() {
+        Ok(true) => ffmpeg_media::hardware_encoder(kind, codec).is_some(),
+        Ok(false) => matches!(
+            select_encoder(kind, 1280, 720, 60, 8000, codec),
+            Ok(EncoderKind::Nvidia | EncoderKind::Qsv | EncoderKind::Vaapi)
+        ),
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hardware_encoder(_: EncoderKind, _: VideoCodec) -> bool {
+    false
+}
+
 pub fn decoder_with_stats(
     force_software: bool,
     stats: Arc<crate::stats::StreamStats>,

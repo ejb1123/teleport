@@ -1295,6 +1295,84 @@ fn dmabuf_frame(sample: &gst::Sample) -> Result<crate::ffmpeg::Dmabuf> {
 }
 
 #[cfg(target_os = "linux")]
+fn encoder_name(kind: EncoderKind, codec: VideoCodec) -> String {
+    let prefix = if codec == VideoCodec::H265 {
+        "hevc"
+    } else {
+        "h264"
+    };
+    match kind {
+        EncoderKind::Nvidia => format!("{prefix}_nvenc"),
+        EncoderKind::Qsv => format!("{prefix}_qsv"),
+        EncoderKind::Vaapi => format!("{prefix}_vaapi"),
+        _ if codec == VideoCodec::H265 => "libx265".into(),
+        _ => "libx264".into(),
+    }
+}
+
+/// Opens `config` and requires a keyframe from three neutral frames.
+#[cfg(target_os = "linux")]
+fn probe_encoder(config: &Config) -> Result<()> {
+    let mut codec = Codec::new(config.clone())?;
+    let raw = neutral_frame(config.width, config.height, config.hdr);
+    let mut emitted = false;
+    for n in 0..3 {
+        codec.submit(&raw, n)?;
+        while let Some(packet) = codec.receive()? {
+            emitted |= packet.key;
+        }
+    }
+    ensure!(emitted, "encoder produced no independent keyframe");
+    Ok(())
+}
+
+/// The first hardware encoder for an 8-bit `codec` stream, in the order
+/// `encoder` tries them for `kind`, probed at a small size (720p). `None`
+/// when only software would encode it. Cached per process: hosts advertise
+/// this to clients choosing a codec automatically.
+#[cfg(target_os = "linux")]
+pub(super) fn hardware_encoder(kind: EncoderKind, codec: VideoCodec) -> Option<String> {
+    type Cache = BTreeMap<(String, bool), Option<String>>;
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Mutex::default).lock().unwrap();
+    let key = (format!("{kind:?}"), codec == VideoCodec::H265);
+    if let Some(found) = cache.get(&key) {
+        return found.clone();
+    }
+    let kinds: &[EncoderKind] = match kind {
+        EncoderKind::Auto => &[EncoderKind::Nvidia, EncoderKind::Qsv, EncoderKind::Vaapi],
+        EncoderKind::Software => &[],
+        _ => std::slice::from_ref(&kind),
+    };
+    let format = VideoFormat {
+        codec,
+        dynamic_range: crate::protocol::DynamicRange::Sdr,
+    };
+    let found = kinds.iter().find_map(|&choice| {
+        let config = Config {
+            encoder: true,
+            name: encoder_name(choice, codec),
+            width: 1280,
+            height: 720,
+            fps: 60,
+            kbps: 8000,
+            gop: 60,
+            ..config("", format, 1)
+        };
+        match probe_encoder(&config) {
+            Ok(()) => Some(config.name),
+            Err(error) => {
+                tracing::debug!(encoder = %config.name, %error, "no hardware encoder");
+                None
+            }
+        }
+    });
+    tracing::info!(?codec, encoder = ?found, "hardware encoder probe");
+    cache.insert(key, found.clone());
+    found
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn encoder(
     source: &str,
     size: (u32, u32),
@@ -1306,11 +1384,6 @@ pub(super) fn encoder(
 ) -> Result<Pipeline> {
     format.validate()?;
     crate::protocol::validate_video_size(size.0, size.1)?;
-    let prefix = if format.codec == VideoCodec::H265 {
-        "hevc"
-    } else {
-        "h264"
-    };
     // Zero-copy capture needs a DMA-BUF source, an 8-bit stream and an
     // encoder whose GPU can import (NVENC through CUDA, or VA-API).
     let zero_copy = dmabuf_source(source)
@@ -1346,17 +1419,7 @@ pub(super) fn encoder(
     let mut selected = None;
     let mut last = None;
     for choice in choices {
-        let name = match choice {
-            EncoderKind::Nvidia => format!("{prefix}_nvenc"),
-            EncoderKind::Qsv => format!("{prefix}_qsv"),
-            EncoderKind::Vaapi => format!("{prefix}_vaapi"),
-            _ => if format.codec == VideoCodec::H265 {
-                "libx265"
-            } else {
-                "libx264"
-            }
-            .into(),
-        };
+        let name = encoder_name(choice, format.codec);
         let config = Config {
             encoder: true,
             gpu_input: zero_copy.is_some()
@@ -1378,20 +1441,7 @@ pub(super) fn encoder(
             selected = Some(config);
             break;
         }
-        let probe = || -> Result<()> {
-            let mut codec = Codec::new(config.clone())?;
-            let raw = neutral_frame(size.0, size.1, format.hdr());
-            let mut emitted = false;
-            for n in 0..3 {
-                codec.submit(&raw, n)?;
-                while let Some(packet) = codec.receive()? {
-                    emitted |= packet.key;
-                }
-            }
-            ensure!(emitted, "encoder produced no independent keyframe");
-            Ok(())
-        };
-        match probe() {
+        match probe_encoder(&config) {
             Ok(()) => {
                 selected = Some(config);
                 break;
