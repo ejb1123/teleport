@@ -188,12 +188,14 @@ impl Capture {
                     name: "Test landscape".into(),
                     width: 1280,
                     height: 720,
+                    refresh_mhz: 0,
                 },
                 Monitor {
                     id: 1,
                     name: "Test portrait".into(),
                     width: 720,
                     height: 1280,
+                    refresh_mhz: 0,
                 },
             ],
             active_monitor: 0,
@@ -279,6 +281,8 @@ impl Capture {
                                 .unwrap_or_else(|| format!("Monitor {}", id + 1)),
                             width: width as u32,
                             height: height as u32,
+                            // The portal reports no refresh rate.
+                            refresh_mhz: 0,
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -617,7 +621,8 @@ impl Capture {
             | Event::Clipboard { .. }
             | Event::ClipboardRequest
             | Event::RequestKeyframe { .. }
-            | Event::ClientFeatures { .. } => (),
+            | Event::ClientFeatures { .. }
+            | Event::ClientDisplay(_) => (),
         }
         Ok(())
     }
@@ -714,6 +719,43 @@ fn state(down: bool) -> KeyState {
     }
 }
 
+/// Refresh rate of the first active output of a RandR monitor, in
+/// millihertz; 0 when unknown (Xvfb modes have no dot clock).
+fn x11_refresh_mhz(
+    connection: &x11rb::rust_connection::RustConnection,
+    outputs: &[x11rb::protocol::randr::Output],
+) -> u32 {
+    (|| -> Result<u32> {
+        for &output in outputs {
+            let info = connection
+                .randr_get_output_info(output, x11rb::CURRENT_TIME)?
+                .reply()?;
+            if info.crtc == 0 {
+                continue;
+            }
+            let crtc = connection
+                .randr_get_crtc_info(info.crtc, x11rb::CURRENT_TIME)?
+                .reply()?;
+            let resources = connection
+                .randr_get_screen_resources_current(connection.setup().roots[0].root)?
+                .reply()?;
+            if let Some(refresh) = resources
+                .modes
+                .iter()
+                .find(|mode| mode.id == crtc.mode)
+                .and_then(|mode| {
+                    (u64::from(mode.dot_clock) * 1000)
+                        .checked_div(u64::from(mode.htotal) * u64::from(mode.vtotal))
+                })
+            {
+                return Ok(refresh as u32);
+            }
+        }
+        Ok(0)
+    })()
+    .unwrap_or(0)
+}
+
 fn x11_monitors(
     connection: &x11rb::rust_connection::RustConnection,
     root: u32,
@@ -748,6 +790,7 @@ fn x11_monitors(
                 name: String::from_utf8_lossy(&atom.name).into_owned(),
                 width: item.width.into(),
                 height: item.height.into(),
+                refresh_mhz: x11_refresh_mhz(connection, &item.outputs),
             });
             origins.push((item.x, item.y));
         }
@@ -762,6 +805,7 @@ fn x11_monitors(
                 name: "X11 desktop".into(),
                 width,
                 height,
+                refresh_mhz: 0,
             }],
             vec![(0, 0)],
         )

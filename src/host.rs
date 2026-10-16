@@ -33,6 +33,26 @@ const KEYFRAME_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 /// still bounding recovery if a request itself is lost.
 const LONG_KEY_INTERVAL_SECONDS: u32 = 4;
 
+/// Session bitrate up to 60 FPS when `--bitrate` is left automatic (kbit/s).
+const DEFAULT_BITRATE: u32 = 8000;
+
+/// Minimum spacing of video reconfigurations (each may restart the encoder).
+const CONFIGURE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The stream for the client's display on the active monitor.
+fn negotiate_stream(
+    display: &protocol::ClientDisplay,
+    capture: &Capture,
+) -> protocol::StreamChoice {
+    let monitor = &capture.monitors[capture.active_monitor];
+    protocol::negotiate(
+        display,
+        (monitor.width, monitor.height),
+        monitor.refresh_mhz,
+        protocol::MAX_FPS,
+    )
+}
+
 #[derive(Args, Clone)]
 pub struct Options {
     /// Also accept end-to-end encrypted sessions through this MoQ relay, e.g.
@@ -71,10 +91,12 @@ pub struct Options {
     /// Stream width; 0 uses the selected monitor's reported native size.
     #[arg(long, default_value_t = 1280, value_parser = parse_width)]
     pub width: u32,
-    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=120))]
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u32).range(1..=240))]
     pub fps: u32,
-    /// Video bitrate in kilobits per second.
-    #[arg(long, default_value_t = 8000, value_parser = clap::value_parser!(u32).range(500..=100000))]
+    /// Video bitrate in kilobits per second. 0 (the default) picks one per
+    /// session: 8000 up to 60 fps, scaled for size and rate above
+    /// (`protocol::high_rate_bitrate`).
+    #[arg(long, default_value_t = 0, value_parser = parse_bitrate)]
     pub bitrate: u32,
     /// Persistent private identity directory; keeps paired clients valid across restarts.
     #[arg(long, conflicts_with = "pairing_file")]
@@ -562,6 +584,11 @@ async fn run_session(
         None
     };
     let mut video_start_group = 0;
+    if options.bitrate == 0 {
+        let size = desktop(options, capture, video_start_group)?;
+        options.bitrate =
+            protocol::high_rate_bitrate(DEFAULT_BITRATE, size.width, size.height, options.fps);
+    }
     let info = desktop(options, capture, video_start_group)?;
     let mut pipeline = start_encoder(
         options,
@@ -626,6 +653,10 @@ async fn run_session(
     // XFixes cursor shapes for a client drawing the pointer locally (X11);
     // dropping it at session end stops the watcher thread.
     let mut cursor_watcher: Option<crate::x11_cursor::Watcher> = None;
+    // The client's latest display (size, refresh, choices). Applied once the
+    // video-settings rate limit allows, coalescing bursts into the newest.
+    let mut client_display: Option<protocol::ClientDisplay> = None;
+    let mut display_pending = false;
     loop {
         if portal_lost {
             portal_lost = false;
@@ -728,6 +759,26 @@ async fn run_session(
                 };
                 if let Some(cursor) = shape {
                     publish_update(&mut updates, Update::Cursor { cursor })?;
+                }
+            },
+            _ = tokio::time::sleep_until((last_configure + CONFIGURE_INTERVAL).into()), if display_pending => {
+                display_pending = false;
+                if let Some(requested) = client_display {
+                    // The portal states no refresh rate, but the running
+                    // screencast does (KWin caps it at the monitor's).
+                    let active = capture.active_monitor;
+                    if capture.monitors[active].refresh_mhz == 0
+                        && let Some(refresh) = pipeline.source_refresh_mhz()
+                    {
+                        capture.monitors[active].refresh_mhz = refresh;
+                    }
+                    let choice = negotiate_stream(&requested, capture);
+                    tracing::info!(client = ?requested, ?choice, "negotiated stream for client display");
+                    // Through the ConfigureVideo path: a bitrate-only change
+                    // retargets the encoder in place, anything else restarts
+                    // it off the session loop; either way the client gets
+                    // `Update::Desktop`.
+                    events.deferred.push_back(Event::ConfigureVideo { width: choice.width, fps: choice.fps, bitrate: choice.bitrate });
                 }
             },
             _ = check.tick() => {
@@ -857,6 +908,10 @@ async fn run_session(
                             tracing::info!("client draws the cursor locally");
                         }
                     }
+                    Event::ClientDisplay(display) => {
+                        client_display = Some(display);
+                        display_pending = true;
+                    }
                     Event::RequestKeyframe { monitor } => {
                         // Bound IDR bursts: a lossy link must not turn every
                         // request into a full keyframe and deepen congestion.
@@ -874,7 +929,7 @@ async fn run_session(
                         }
                     }
                     Event::ConfigureVideo { width, fps, bitrate } => {
-                        if last_configure.elapsed() < Duration::from_millis(500) {
+                        if last_configure.elapsed() < CONFIGURE_INTERVAL {
                             publish_update(&mut updates, Update::Notice { text: "Video settings changed too quickly; try again".into() })?;
                             continue;
                         }
@@ -940,6 +995,11 @@ async fn run_session(
                         while_starting(retire(pipeline), &mut events, capture, &mut updates).await?;
                         video_start_group = video_barrier(&video)?;
                         capture.select_monitor(index).await?;
+                        if let Some(display) = &client_display {
+                            // Fit the new monitor's size and refresh rate.
+                            let choice = negotiate_stream(display, capture);
+                            (options.width, options.fps, options.bitrate) = (choice.width, choice.fps, choice.bitrate);
+                        }
                         let info = desktop(options, capture, video_start_group)?;
                         pipeline = while_starting(start_encoder(options, capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, options.bitrate, &video), &mut events, capture, &mut updates).await?;
                         if long_gop { pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
@@ -1054,6 +1114,8 @@ fn desktop_for_monitor(
         relative_pointer: true,
         local_cursor: capture.supports_local_cursor(),
         gamepads: capture.gamepads_available(),
+        max_fps: protocol::MAX_FPS,
+        display_negotiation: true,
     })
 }
 
@@ -1176,6 +1238,7 @@ async fn while_starting<T: Send + 'static>(
                     | Event::MonitorMotion { .. }
                     | Event::ClientFeatures { .. }
                     | Event::ConfigureVideo { .. }
+                    | Event::ClientDisplay(_)
                     | Event::SelectMonitor { .. }
                     | Event::Clipboard { .. }
                     | Event::ClipboardRequest => {
@@ -1256,6 +1319,17 @@ fn parse_width(value: &str) -> std::result::Result<u32, String> {
         Ok(width)
     } else {
         Err("width must be 0 (native), or 320–7680".into())
+    }
+}
+
+fn parse_bitrate(value: &str) -> std::result::Result<u32, String> {
+    let bitrate: u32 = value
+        .parse()
+        .map_err(|_| "bitrate must be a number".to_owned())?;
+    if bitrate == 0 || (500..=100_000).contains(&bitrate) {
+        Ok(bitrate)
+    } else {
+        Err("bitrate must be 0 (automatic), or 500–100000".into())
     }
 }
 

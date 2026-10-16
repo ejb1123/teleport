@@ -104,6 +104,106 @@ fn negotiated_resolution_and_native_portrait() {
     }
 }
 
+/// The client reports its display; the host picks size and rate from it and
+/// follows a change mid-session (as when the window moves to a 30 Hz
+/// display). Older hosts get a ConfigureVideo clamped to 120 FPS.
+#[test]
+#[ignore = "requires local UDP sockets and GStreamer runtime plugins"]
+fn display_negotiation_follows_the_client_and_old_hosts_are_clamped() {
+    let temp = tempfile::tempdir().unwrap();
+    let pairing = temp.path().join("pairing.json");
+    let log = temp.path().join("host.log");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let mut host = Process(
+        teleport()
+            .args([
+                "host",
+                "--source",
+                "test",
+                "--encoder",
+                "software",
+                "--listen",
+                &address,
+                "--width",
+                "640",
+                "--pairing-file",
+            ])
+            .arg(&pairing)
+            .stdout(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::read(&pairing)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_none()
+    {
+        assert!(host.0.try_wait().unwrap().is_none(), "test host exited");
+        assert!(Instant::now() < deadline, "test host did not become ready");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let client = |args: &[&str]| {
+        let output = teleport()
+            .args(["client", &address, "--pairing-file"])
+            .arg(&pairing)
+            .args(["--headless-frames", "90", "--software-decoder"])
+            .args(args)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success() && stdout.contains("SMOKE PASS"),
+            "client failed: {stdout} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    };
+    // A 960x540 window at 120 Hz on the 1280x720 test monitor, then 640x360
+    // at 30 Hz: the stream follows both, and video continues after the change.
+    let stdout = client(&[
+        "--width",
+        "match",
+        "--fps",
+        "match",
+        "--bitrate",
+        "auto",
+        "--smoke-display",
+        "960x540@120000",
+        "--smoke-display",
+        "640x360@30000",
+    ]);
+    let summary = stdout
+        .lines()
+        .find(|line| line.contains("SMOKE PASS"))
+        .unwrap();
+    for expected in ["width=640", "height=360", "fps=30", "bitrate=20000"] {
+        assert!(summary.contains(expected), "{expected} missing: {summary}");
+    }
+    assert!(
+        !summary.contains("frames_after_display_change=0"),
+        "{summary}"
+    );
+    let host_log = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        host_log
+            .matches("negotiated stream for client display")
+            .count(),
+        2,
+        "{host_log}"
+    );
+    // An explicit cap above the client's refresh rate: the display wins.
+    let stdout = client(&["--fps", "240", "--smoke-display", "1280x720@143856"]);
+    assert!(stdout.contains("fps=144"), "{stdout}");
+    // The same client against a host from before negotiation: 120 at most,
+    // with a notice, through ConfigureVideo.
+    let stdout = client(&["--fps", "180", "--smoke-legacy-host"]);
+    assert!(stdout.contains("fps=120"), "{stdout}");
+    assert!(stdout.contains("streams at most 120 fps"), "{stdout}");
+}
+
 #[test]
 #[ignore = "requires local UDP sockets and GStreamer runtime plugins"]
 fn test_host_advertises_and_accepts_gamepad_events() {
