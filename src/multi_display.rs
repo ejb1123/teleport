@@ -475,7 +475,7 @@ impl Screen {
             && !options.software_decoder
             && !options.software_renderer
             && desktop.dynamic_range == protocol::DynamicRange::Sdr;
-        let nv12 = cfg!(target_os = "linux") && supports_nv12(&self.canvas);
+        let nv12 = supports_nv12(&self.canvas);
         let (pipeline, source, image) = media::decoder_with_stats_presentation(
             options.software_decoder,
             self.stats.clone(),

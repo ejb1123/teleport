@@ -338,7 +338,7 @@ pub(super) fn decoder(
     let name = select_decoder(software, format)?;
     let output = if format.hdr() {
         2
-    } else if nv12 && cfg!(target_os = "linux") {
+    } else if nv12 {
         1
     } else {
         0

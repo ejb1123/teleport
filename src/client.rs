@@ -764,9 +764,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         None
     };
     let prefer_nv12 = if let Some((_, _, canvas)) = window_state.as_mut() {
-        let enabled = cfg!(target_os = "linux")
-            && link.desktop.dynamic_range == protocol::DynamicRange::Sdr
-            && supports_nv12(canvas);
+        // Any accelerated renderer that passes the NV12 probe (OpenGL on Linux,
+        // Metal on macOS) converts on the GPU; RGB24 would cost a CPU
+        // conversion of every frame (6-9 ms at 1080p).
+        let enabled =
+            link.desktop.dynamic_range == protocol::DynamicRange::Sdr && supports_nv12(canvas);
         tracing::info!(
             renderer = canvas.info().name,
             accelerated = renderer_accelerated(canvas),
@@ -775,8 +777,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         );
         enabled
     } else {
-        // Headless runs measure the path an accelerated Linux window uses.
-        cfg!(target_os = "linux") && link.desktop.dynamic_range == protocol::DynamicRange::Sdr
+        // Headless runs measure the path an accelerated window uses.
+        link.desktop.dynamic_range == protocol::DynamicRange::Sdr
     };
     let stream_stats = std::sync::Arc::new(crate::stats::StreamStats::default());
     let format = media::VideoFormat {
