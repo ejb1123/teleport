@@ -59,6 +59,9 @@
             pkgs.libxkbcommon
             pkgs.libdrm
             pkgs.libva
+            # Header-only: CUDA driver API declarations for zero-copy GL presentation
+            # (libcuda itself is loaded at runtime only when present).
+            pkgs.nv-codec-headers-12
             pkgs.libx11
             pkgs.libxext
             pkgs.libxdamage

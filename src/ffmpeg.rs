@@ -6,7 +6,6 @@ use std::{
 };
 
 #[repr(C)]
-#[derive(Default)]
 struct Output {
     data: *const u8,
     size: c_int,
@@ -14,6 +13,20 @@ struct Output {
     height: c_int,
     key: c_int,
     pts: i64,
+    gpu: *mut c_void,
+}
+impl Default for Output {
+    fn default() -> Self {
+        Self {
+            data: std::ptr::null(),
+            size: 0,
+            width: 0,
+            height: 0,
+            key: 0,
+            pts: 0,
+            gpu: std::ptr::null_mut(),
+        }
+    }
 }
 unsafe extern "C" {
     fn tp_codec_open(
@@ -41,6 +54,7 @@ unsafe extern "C" {
     fn tp_receive_packet(codec: *mut c_void, output: *mut Output) -> c_int;
     fn tp_receive_frame(codec: *mut c_void, output: *mut Output) -> c_int;
     fn tp_codec_flush(codec: *mut c_void);
+    fn tp_gpu_frame_free(frame: *mut c_void);
     fn tp_codec_set_bitrate(codec: *mut c_void, kbps: c_int) -> c_int;
     fn tp_codec_error(error: c_int, buffer: *mut c_char, length: c_int);
 }
@@ -95,6 +109,8 @@ pub struct Frame {
     pub height: u32,
     pub key: bool,
     pub pts: Option<u64>,
+    /// Output 3: the decoded CUDA frame itself (no download).
+    pub gpu: Option<GpuFrame>,
 }
 impl Codec {
     pub fn new(config: Config) -> Result<Self> {
@@ -155,6 +171,21 @@ impl Codec {
         if check(result)? == 0 {
             return Ok(None);
         }
+        if let Some(gpu) = NonNull::new(output.gpu) {
+            let gpu = GpuFrame(gpu);
+            crate::protocol::validate_video_size(
+                output.width.try_into()?,
+                output.height.try_into()?,
+            )?;
+            return Ok(Some(Frame {
+                bytes: Vec::new(),
+                width: output.width as u32,
+                height: output.height as u32,
+                key: false,
+                pts: output.pts.try_into().ok(),
+                gpu: Some(gpu),
+            }));
+        }
         ensure!(
             !output.data.is_null() && output.size > 0 && output.size <= 128 * 1024 * 1024,
             "invalid FFmpeg output allocation"
@@ -173,6 +204,7 @@ impl Codec {
             height: output.height as u32,
             key: output.key != 0,
             pts: output.pts.try_into().ok(),
+            gpu: None,
         }))
     }
     /// Change an open encoder's bitrate without reopening it. `Ok(false)` means
@@ -190,6 +222,83 @@ impl Codec {
         unsafe {
             tp_codec_flush(self.pointer.as_ptr());
         }
+    }
+}
+
+/// A reference to a decoded CUDA frame kept on the GPU (decoder output 3).
+/// Holding it keeps one decoder surface alive; dropping it releases it.
+pub struct GpuFrame(NonNull<c_void>);
+
+// Safety: an AVFrame reference is reference-counted and may be released or
+// read (with its CUDA context pushed) from any thread.
+unsafe impl Send for GpuFrame {}
+
+impl Drop for GpuFrame {
+    fn drop(&mut self) {
+        unsafe { tp_gpu_frame_free(self.0.as_ptr()) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn tp_cuda_gl_new(get: unsafe extern "C" fn(*const c_char) -> *mut c_void) -> *mut c_void;
+    fn tp_cuda_gl_draw(
+        presenter: *mut c_void,
+        frame: *const c_void,
+        x: c_int,
+        y: c_int,
+        width: c_int,
+        height: c_int,
+        framebuffer_height: c_int,
+    ) -> c_int;
+    fn tp_cuda_gl_free(presenter: *mut c_void);
+    #[cfg(test)]
+    fn tp_cuda_gl_self_test(frame: *const c_void, rgba: *mut u8) -> c_int;
+}
+
+/// Zero-copy presenter for [`GpuFrame`]s in the current OpenGL context:
+/// CUDA copies the planes into GL textures and a shader draws them, so the
+/// frame never leaves the GPU. Must be used on the thread that owns the GL
+/// context it was created in.
+#[cfg(target_os = "linux")]
+pub struct CudaGl(NonNull<c_void>);
+
+#[cfg(target_os = "linux")]
+impl CudaGl {
+    /// `None` when libcuda, GL 2.1 shaders or the needed GL entry points are
+    /// unavailable in the current context.
+    pub fn new(get: unsafe extern "C" fn(*const c_char) -> *mut c_void) -> Option<Self> {
+        NonNull::new(unsafe { tp_cuda_gl_new(get) }).map(Self)
+    }
+
+    /// Draw at `rect` (framebuffer pixels, top-left origin). GL state is
+    /// restored afterwards.
+    pub fn draw(
+        &mut self,
+        frame: &GpuFrame,
+        rect: (i32, i32, u32, u32),
+        framebuffer_height: u32,
+    ) -> Result<()> {
+        let result = unsafe {
+            tp_cuda_gl_draw(
+                self.0.as_ptr(),
+                frame.0.as_ptr(),
+                rect.0,
+                rect.1,
+                rect.2.try_into()?,
+                rect.3.try_into()?,
+                framebuffer_height.try_into()?,
+            )
+        };
+        check(result).context("zero-copy CUDA/GL presentation")?;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CudaGl {
+    fn drop(&mut self) {
+        unsafe { tp_cuda_gl_free(self.0.as_ptr()) }
     }
 }
 
@@ -386,6 +495,92 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "requires hardware encoder and at least one hardware decoder"]
+    fn zero_copy_cuda_gl_presentation_matches_cpu_decode() -> Result<()> {
+        if std::env::var("TELEPORT_TEST_HARDWARE").as_deref() != Ok("1") {
+            eprintln!("SKIP: set TELEPORT_TEST_HARDWARE=1 on a machine with NVIDIA CUDA and EGL");
+            return Ok(());
+        }
+        let (width, height) = (640_usize, 360_usize);
+        // Four flat quadrants (limited-range NV12): grey, red-ish, green-ish, blue-ish.
+        let quadrants = [
+            (126_u8, 128_u8, 128_u8),
+            (81, 90, 240),
+            (145, 54, 34),
+            (41, 240, 110),
+        ];
+        let quadrant = |x: usize, y: usize| {
+            quadrants[(y >= height / 2) as usize * 2 + (x >= width / 2) as usize]
+        };
+        let mut raw = vec![0_u8; width * height * 3 / 2];
+        for y in 0..height {
+            for x in 0..width {
+                raw[y * width + x] = quadrant(x, y).0;
+            }
+        }
+        for y in 0..height / 2 {
+            for x in 0..width / 2 {
+                let (_, u, v) = quadrant(x * 2, y * 2);
+                raw[width * height + y * width + x * 2] = u;
+                raw[width * height + y * width + x * 2 + 1] = v;
+            }
+        }
+        let config = Config {
+            width: width as u32,
+            height: height as u32,
+            kbps: 4000,
+            ..software_config(false)
+        };
+        let mut encoder = Codec::new(config.clone())?;
+        let mut packets = Vec::new();
+        for index in 0..3 {
+            encoder.submit(&raw, index)?;
+            while let Some(packet) = encoder.receive()? {
+                packets.push(packet.bytes);
+            }
+        }
+        let decode = |name: &str, output: i32| -> Result<Frame> {
+            let mut decoder = Codec::new(Config {
+                encoder: false,
+                name: name.into(),
+                output,
+                ..config.clone()
+            })?;
+            let mut last = None;
+            for (index, packet) in packets.iter().enumerate() {
+                decoder.submit(packet, index as u64)?;
+                while let Some(frame) = decoder.receive()? {
+                    last = Some(frame);
+                }
+            }
+            last.context("no decoded frame")
+        };
+        let cpu = decode("software", 0)?; // RGB24 reference
+        let gpu = decode("cuda", 3)?;
+        let gpu = gpu
+            .gpu
+            .context("CUDA decoder did not keep the frame on the GPU")?;
+        let mut rgba = vec![0_u8; width * height * 4];
+        let result = unsafe { tp_cuda_gl_self_test(gpu.0.as_ptr(), rgba.as_mut_ptr()) };
+        if result == -libc::ENODEV {
+            eprintln!("SKIP: no NVIDIA EGL device");
+            return Ok(());
+        }
+        check(result)?;
+        // Compare quadrant centres; glReadPixels rows are bottom-up.
+        for (cx, cy) in [(160, 90), (480, 90), (160, 270), (480, 270)] {
+            let expected = &cpu.bytes[(cy * width + cx) * 3..][..3];
+            let actual = &rgba[((height - 1 - cy) * width + cx) * 4..][..3];
+            for channel in 0..3 {
+                ensure!(
+                    (expected[channel] as i32 - actual[channel] as i32).abs() <= 4,
+                    "pixel ({cx},{cy}): GPU {actual:?} vs CPU {expected:?}"
+                );
+            }
+        }
+        Ok(())
+    }
     #[test]
     #[ignore = "requires hardware encoder and at least one hardware decoder"]
     fn direct_hardware_encode_decode_both_codecs() -> Result<()> {

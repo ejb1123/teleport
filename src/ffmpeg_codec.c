@@ -26,7 +26,12 @@ typedef struct {
     const uint8_t *data;
     int size, width, height, key;
     int64_t pts;
+    /* Output 3: a reference to the decoded CUDA frame (no download). The
+     * caller owns it and releases it with tp_gpu_frame_free. */
+    AVFrame *gpu;
 } TpOutput;
+
+void tp_gpu_frame_free(AVFrame *frame) { av_frame_free(&frame); }
 
 void tp_codec_free(TpCodec *codec) {
     if (!codec) return;
@@ -166,6 +171,8 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
         result = av_hwdevice_ctx_create(&codec->ctx->hw_device_ctx, type, NULL, NULL, 0);
         if (result < 0) goto fail;
         codec->ctx->get_format = choose_hw;
+        /* GPU presentation holds the newest frame until it is drawn. */
+        if (output == 3) codec->ctx->extra_hw_frames = 3;
     }
     result = avcodec_open2(codec->ctx, implementation, &opts);
     av_dict_free(&opts);
@@ -244,6 +251,13 @@ int tp_receive_frame(TpCodec *codec, TpOutput *output) {
     AVFrame *frame = codec->frame;
     if (!dimensions(frame->width, frame->height)) return AVERROR(EINVAL);
     int64_t pts = frame->pts;
+    if (codec->output_format == 3) {
+        if (frame->format != AV_PIX_FMT_CUDA) return AVERROR(EINVAL);
+        AVFrame *reference = av_frame_clone(frame);
+        if (!reference) return AVERROR(ENOMEM);
+        *output = (TpOutput){.width = frame->width, .height = frame->height, .pts = pts, .gpu = reference};
+        return 1;
+    }
     if (codec->hw_format != AV_PIX_FMT_NONE) {
         if (frame->format != codec->hw_format) return AVERROR(EINVAL);
         av_frame_unref(codec->download);

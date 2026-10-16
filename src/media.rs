@@ -623,6 +623,8 @@ pub struct Image {
     pub nv12: Option<Nv12Image>,
     /// Native decoder surface retained without mapping its video planes.
     pub surface: Option<gst::Sample>,
+    /// Decoded CUDA frame for zero-copy presentation (never downloaded).
+    pub gpu: Option<crate::ffmpeg::GpuFrame>,
 }
 
 /// CPU-mappable NV12 planes for an accelerated SDL YUV texture. This avoids
@@ -732,6 +734,22 @@ pub fn decoder_with_stats_output(
     decoder_with_stats_presentation(force_software, stats, format.into(), prefer_nv12, false)
 }
 
+/// Decoder whose CUDA output stays on the GPU for zero-copy presentation
+/// (`Image::gpu`). Falls back to NV12 frames when the selected decoder is not
+/// CUDA (or the stream is HDR), so callers must handle both.
+#[cfg(target_os = "linux")]
+pub fn decoder_with_gpu_frames(
+    stats: Arc<crate::stats::StreamStats>,
+    format: VideoFormat,
+) -> Result<(Pipeline, AppSrc, LatestImage)> {
+    format.validate()?;
+    ensure!(
+        crate::ffmpeg::enabled()?,
+        "GPU-resident frames need the direct FFmpeg backend"
+    );
+    ffmpeg_media::decoder(false, stats, format, true, false, true)
+}
+
 pub fn decoder_with_stats_presentation(
     force_software: bool,
     stats: Arc<crate::stats::StreamStats>,
@@ -741,7 +759,14 @@ pub fn decoder_with_stats_presentation(
 ) -> Result<(Pipeline, AppSrc, LatestImage)> {
     format.validate()?;
     if crate::ffmpeg::enabled()? {
-        return ffmpeg_media::decoder(force_software, stats, format, prefer_nv12, native_surface);
+        return ffmpeg_media::decoder(
+            force_software,
+            stats,
+            format,
+            prefer_nv12,
+            native_surface,
+            false,
+        );
     }
     ensure!(
         !native_surface || (cfg!(target_os = "macos") && !force_software && !format.hdr()),
@@ -845,6 +870,7 @@ pub fn decoder_with_stats_presentation(
                         hdr: None,
                         nv12: None,
                         surface: Some(sample),
+                        gpu: None,
                     });
                     if video_group.is_some() {
                         stats.ready_frames.fetch_add(1, Ordering::Relaxed);
@@ -925,6 +951,7 @@ pub fn decoder_with_stats_presentation(
                 }
                 *latest = Some(Image {
                     surface: None,
+                    gpu: None,
                     hdr,
                     nv12,
                     decoded_at: Instant::now(),
@@ -2771,7 +2798,7 @@ mod tests {
             bytes::Bytes::copy_from_slice(keyframe.buffer().unwrap().map_readable()?.as_slice());
         let stats = Arc::new(crate::stats::StreamStats::default());
         let (pipeline, input, image) =
-            ffmpeg_media::decoder(true, stats.clone(), codec.into(), false, false)?;
+            ffmpeg_media::decoder(true, stats.clone(), codec.into(), false, false, false)?;
 
         // A buffer the callback cannot process must be counted, not fatal.
         input.push_buffer(gst::Buffer::from_slice(keyframe.clone()))?;

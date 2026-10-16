@@ -42,8 +42,17 @@ only to the legacy backend.
 
 ## Important limits
 
-This is **not zero-copy**. Hardware-decoded frames are downloaded, normalized
-and copied into the existing SDL presentation path. Encoding likewise receives
+**Zero-copy on Linux with NVIDIA (2026-10-16):** when the session window uses
+SDL's OpenGL renderer on an NVIDIA GL context and the stream is SDR, CUDA-decoded
+frames stay on the GPU: CUDA copies the NV12 planes into GL textures and a
+shader converts and draws them under SDL's overlays (`src/cuda_gl.c`). Stats
+(F8) then shows `CUDA surface / OpenGL zero-copy`. `TELEPORT_ZERO_COPY=0`
+disables it; a presentation error switches the process to the CPU path and
+reconnects. Offscreen measurement on an RTX 3080: the GPU→CPU→GPU transfer
+alone drops from 0.67 to 0.22 ms at 1080p and 2.78 to 0.27 ms at 4K, before
+counting the removed conversion and copies. Other decoders (VA-API, Quick Sync,
+software) and macOS still download frames: everything else below applies to
+them. Encoding likewise receives
 CPU-addressable captured pixels and uploads when the hardware API requires it.
 Direct codecs provide explicit buffer ownership and timing; they do not prove
 that the reported Intel UHD 630 black flashes are fixed.

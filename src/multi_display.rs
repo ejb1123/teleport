@@ -835,6 +835,7 @@ mod tests {
             hdr: None,
             nv12: None,
             surface: None,
+            gpu: None,
         }
     }
     #[test]

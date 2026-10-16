@@ -205,7 +205,8 @@ mod tests {
                 "unexpected GStreamer encoder"
             );
             let stats = Arc::new(crate::stats::StreamStats::default());
-            let (decode, input, image) = decoder(true, stats.clone(), codec.into(), true, false)?;
+            let (decode, input, image) =
+                decoder(true, stats.clone(), codec.into(), true, false, false)?;
             ensure!(
                 decode.0.by_name("video_decoder").is_none(),
                 "unexpected GStreamer decoder"
@@ -329,6 +330,7 @@ pub(super) fn decoder(
     format: VideoFormat,
     nv12: bool,
     native: bool,
+    gpu: bool,
 ) -> Result<(Pipeline, AppSrc, LatestImage)> {
     format.validate()?;
     ensure!(
@@ -336,8 +338,11 @@ pub(super) fn decoder(
         "direct FFmpeg native-surface presentation is not integrated yet; unset TELEPORT_MAC_GPU_VIDEO or explicitly select TELEPORT_VIDEO_BACKEND=gstreamer"
     );
     let name = select_decoder(software, format)?;
+    // GPU-resident frames only for an 8-bit CUDA decode the caller can present.
     let output = if format.hdr() {
         2
+    } else if gpu && name == "cuda" {
+        3
     } else if nv12 {
         1
     } else {
@@ -401,6 +406,7 @@ pub(super) fn decoder(
                         let mut data = frame.bytes;
                         let mut nv12 = None;
                         let mut hdr = None;
+                        let gpu_frame = frame.gpu;
                         let stride = width as usize
                             * if output == 0 {
                                 3
@@ -409,7 +415,9 @@ pub(super) fn decoder(
                             } else {
                                 1
                             };
-                        if output != 0 {
+                        if output == 3 {
+                            ensure!(gpu_frame.is_some(), "decoder returned no GPU frame");
+                        } else if output != 0 {
                             ensure!(
                                 data.len() == stride * height as usize * 3 / 2,
                                 "invalid direct decoder plane size"
@@ -446,6 +454,7 @@ pub(super) fn decoder(
                             hdr,
                             nv12,
                             surface: None,
+                            gpu: gpu_frame,
                         });
                         if group.is_some() {
                             stats.ready_frames.fetch_add(1, Ordering::Relaxed);

@@ -785,6 +785,25 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         codec: link.desktop.codec,
         dynamic_range: link.desktop.dynamic_range,
     };
+    #[cfg(target_os = "linux")]
+    let mut zero_copy = match window_state.as_mut() {
+        Some((_, _, canvas))
+            if prefer_nv12
+                && !options.software_decoder
+                && canvas.info().name == "opengl"
+                && !ZERO_COPY_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+                && std::env::var("TELEPORT_ZERO_COPY").as_deref() != Ok("0") =>
+        {
+            ZeroCopy::new(canvas)
+        }
+        _ => None,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let zero_copy: Option<()> = None;
+    tracing::info!(
+        zero_copy = zero_copy.is_some(),
+        "GPU-resident video presentation"
+    );
     let native_surface = cfg!(target_os = "macos")
         && std::env::var("TELEPORT_MAC_GPU_VIDEO").as_deref() == Ok("1")
         && window_state.is_some()
@@ -794,6 +813,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let (pipeline, source, image) = if native_surface {
         tracing::info!("experimental GPU-resident VideoToolbox / Metal video enabled");
         media::decoder_with_stats_presentation(false, stream_stats.clone(), format, false, true)?
+    } else if zero_copy.is_some() {
+        #[cfg(target_os = "linux")]
+        {
+            media::decoder_with_gpu_frames(stream_stats.clone(), format)?
+        }
+        #[cfg(not(target_os = "linux"))]
+        unreachable!()
     } else if prefer_nv12 {
         media::decoder_with_stats_output(
             options.software_decoder,
@@ -1152,6 +1178,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut hdr_headroom: Option<f64> = None;
     let mut text_cache = std::collections::HashMap::new();
     let mut texture = None;
+    // Newest GPU-resident frame (zero-copy path), redrawn until replaced.
+    let mut gpu_frame: Option<crate::ffmpeg::GpuFrame> = None;
     let mut size = (0, 0);
     let mut event_pump = sdl.event_pump().map_err(anyhow::Error::msg)?;
     let mut last_frame = Instant::now();
@@ -1663,7 +1691,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             send(&events, event)?;
         }
         let next_frame = { image.lock().unwrap().take() };
-        if let Some(frame) = next_frame.filter(|frame| {
+        if let Some(mut frame) = next_frame.filter(|frame| {
             frame.decoder_recovery
                 == stream_stats
                     .decoder_recoveries
@@ -1674,54 +1702,73 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             new_frame = true;
             decoded_age = frame.decoded_at.elapsed();
             protocol::validate_video_size(frame.width, frame.height)?;
-            let native_frame = frame.hdr.is_some() || frame.surface.is_some();
-            if size != (frame.width, frame.height) && !native_frame {
-                size = (frame.width, frame.height);
-                if frame.nv12.is_some() {
-                    set_nv12_conversion();
+            'frame: {
+                if let Some(gpu) = frame.gpu.take() {
+                    // Zero-copy: keep the decoded surface; it is drawn on the GPU below.
+                    size = (frame.width, frame.height);
+                    texture = None;
+                    gpu_frame = Some(gpu);
+                    last_frame = Instant::now();
+                    if switch_ack && frame.width == desktop.width && frame.height == desktop.height
+                    {
+                        switching = false;
+                        awaiting_initial = false;
+                        switch_ack = false;
+                    }
+                    frames += 1;
+                    total_frames += 1;
+                    break 'frame;
                 }
-                texture = Some(creator.create_texture_streaming(
+                let native_frame = frame.hdr.is_some() || frame.surface.is_some();
+                if size != (frame.width, frame.height) && !native_frame {
+                    size = (frame.width, frame.height);
                     if frame.nv12.is_some() {
-                        PixelFormatEnum::NV12
-                    } else {
-                        PixelFormatEnum::RGB24
-                    },
-                    size.0,
-                    size.1,
-                )?);
-            }
-            if let Some(nv12) = &frame.nv12 {
-                update_nv12(
-                    texture.as_mut().context("missing NV12 texture")?,
-                    nv12,
-                    frame.width,
-                    frame.height,
-                )?;
-            } else if !native_frame {
-                texture.as_mut().context("missing SDR texture")?.update(
-                    None,
-                    &frame.data,
-                    frame.stride,
-                )?;
-            } else {
-                ensure!(
-                    hdr_presenter.is_some(),
-                    "received native video without a Metal presenter"
-                );
-                size = (frame.width, frame.height);
-            }
-            last_frame = Instant::now();
-            if native_frame {
-                hdr_frame = Some(frame);
-                hdr_frame_pending = true;
-            } else {
-                if switch_ack && frame.width == desktop.width && frame.height == desktop.height {
-                    switching = false;
-                    awaiting_initial = false;
-                    switch_ack = false;
+                        set_nv12_conversion();
+                    }
+                    texture = Some(creator.create_texture_streaming(
+                        if frame.nv12.is_some() {
+                            PixelFormatEnum::NV12
+                        } else {
+                            PixelFormatEnum::RGB24
+                        },
+                        size.0,
+                        size.1,
+                    )?);
                 }
-                frames += 1;
-                total_frames += 1;
+                if let Some(nv12) = &frame.nv12 {
+                    update_nv12(
+                        texture.as_mut().context("missing NV12 texture")?,
+                        nv12,
+                        frame.width,
+                        frame.height,
+                    )?;
+                } else if !native_frame {
+                    texture.as_mut().context("missing SDR texture")?.update(
+                        None,
+                        &frame.data,
+                        frame.stride,
+                    )?;
+                } else {
+                    ensure!(
+                        hdr_presenter.is_some(),
+                        "received native video without a Metal presenter"
+                    );
+                    size = (frame.width, frame.height);
+                }
+                last_frame = Instant::now();
+                if native_frame {
+                    hdr_frame = Some(frame);
+                    hdr_frame_pending = true;
+                } else {
+                    if switch_ack && frame.width == desktop.width && frame.height == desktop.height
+                    {
+                        switching = false;
+                        awaiting_initial = false;
+                        switch_ack = false;
+                    }
+                    frames += 1;
+                    total_frames += 1;
+                }
             }
         }
         ensure!(
@@ -1750,6 +1797,19 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             canvas
                 .copy(texture, None, chrome.rect(window_size, size))
                 .map_err(anyhow::Error::msg)?;
+        }
+        #[cfg(target_os = "linux")]
+        if let (Some(presenter), Some(frame)) = (zero_copy.as_mut(), gpu_frame.as_ref())
+            && let Err(error) = presenter.draw(&mut canvas, frame, chrome.rect(window_size, size))
+        {
+            // Never show a frozen or black picture: switch this process to the
+            // CPU NV12 path and reconnect.
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "zero-copy presentation failed; reconnecting with CPU presentation"
+            );
+            ZERO_COPY_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Ok(true);
         }
         if stats.elapsed() >= Duration::from_secs(1) || stats_lines.is_empty() {
             let snapshot = stream_stats.snapshot();
@@ -1839,6 +1899,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     "Pixel path            {}",
                     if native_surface {
                         "VideoToolbox surface / Metal (no video CPU copy)"
+                    } else if gpu_frame.is_some() {
+                        "CUDA surface / OpenGL zero-copy (no video CPU copy)"
                     } else if desktop.dynamic_range == protocol::DynamicRange::Hdr10 {
                         "P010 CPU copy / Metal upload"
                     } else if prefer_nv12 {
@@ -2438,6 +2500,81 @@ fn check_network(network: &mut Network, runtime: &Runtime) -> Result<()> {
         anyhow::bail!("network session ended");
     }
     Ok(())
+}
+
+/// Set when zero-copy presentation failed in this process; later sessions
+/// use the CPU NV12 path instead of retrying a broken driver path.
+#[cfg(target_os = "linux")]
+static ZERO_COPY_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Zero-copy CUDA→GL presenter bound to the session window's GL context.
+/// Other windows (monitor windows) create their own renderer contexts, so
+/// the session context is made current explicitly before every GL use.
+#[cfg(target_os = "linux")]
+struct ZeroCopy {
+    presenter: Option<crate::ffmpeg::CudaGl>,
+    window: *mut sdl2::sys::SDL_Window,
+    context: sdl2::sys::SDL_GLContext,
+}
+
+#[cfg(target_os = "linux")]
+impl ZeroCopy {
+    /// Must run right after the session renderer is created, while its GL
+    /// context is current.
+    fn new(canvas: &sdl2::render::Canvas<sdl2::video::Window>) -> Option<Self> {
+        let context = unsafe { sdl2::sys::SDL_GL_GetCurrentContext() };
+        if context.is_null() {
+            return None;
+        }
+        let presenter = crate::ffmpeg::CudaGl::new(sdl2::sys::SDL_GL_GetProcAddress)?;
+        Some(Self {
+            presenter: Some(presenter),
+            window: canvas.window().raw(),
+            context,
+        })
+    }
+
+    /// Draw `frame` at `rect` (logical pixels), after SDL has flushed what it
+    /// queued so far; SDL then draws the toolbar and overlays on top.
+    fn draw(
+        &mut self,
+        canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+        frame: &crate::ffmpeg::GpuFrame,
+        rect: Rect,
+    ) -> Result<()> {
+        let logical = canvas.window().size();
+        let output = canvas.output_size().map_err(anyhow::Error::msg)?;
+        let scale_x = output.0 as f64 / logical.0.max(1) as f64;
+        let scale_y = output.1 as f64 / logical.1.max(1) as f64;
+        unsafe {
+            sdl2::sys::SDL_RenderFlush(canvas.raw());
+            ensure!(
+                sdl2::sys::SDL_GL_MakeCurrent(self.window, self.context) == 0,
+                "session GL context unavailable"
+            );
+        }
+        self.presenter.as_mut().context("presenter released")?.draw(
+            frame,
+            (
+                (rect.x() as f64 * scale_x).round() as i32,
+                (rect.y() as f64 * scale_y).round() as i32,
+                (rect.width() as f64 * scale_x).round() as u32,
+                (rect.height() as f64 * scale_y).round() as u32,
+            ),
+            output.1,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ZeroCopy {
+    fn drop(&mut self) {
+        // Release GL objects in the context that owns them.
+        unsafe {
+            sdl2::sys::SDL_GL_MakeCurrent(self.window, self.context);
+        }
+        self.presenter.take();
+    }
 }
 
 /// SDL relative mouse mode (pointer lock) for games. Never traps the user:
