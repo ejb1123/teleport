@@ -101,11 +101,11 @@ systemctl --user link --runtime "$teleport_unit/app-dev.teleport.Host.service"
 systemctl --user daemon-reload
 # Stop any manually launched Teleport host first, to release its port/capture.
 systemctl --user start app-dev.teleport.Host
-journalctl --user -u teleport-desktop -n 30 --no-pager
+journalctl --user -u app-dev.teleport.Host -n 30 --no-pager
 ```
 
 Approve any local portal prompt, then test `systemctl --user restart
-teleport-desktop` and reconnect from an already paired client. A running process
+app-dev.teleport.Host` and reconnect from an already paired client. A running process
 alone is not proof of unattended access: check that capture actually resumes
 without local approval. Keep the same identity directory to preserve client trust.
 The service does not automatically open code enrollment on startup.

@@ -48,12 +48,26 @@ in
         message = "services.teleport-desktop.users must explicitly list the desktop users allowed to share their session.";
       }
     ];
-    environment.systemPackages = [ cfg.package ];
+    environment.systemPackages = [
+      cfg.package
+      # xdg-desktop-portal only accepts the unit-derived application ID when a
+      # matching desktop entry exists; without it the host is anonymous and
+      # cannot be pre-authorized.
+      (pkgs.makeDesktopItem {
+        name = "dev.teleport.Host";
+        desktopName = "Teleport Host";
+        comment = "Remote desktop host (identifies the Teleport host service to desktop portals)";
+        exec = "teleport host";
+        icon = "krfb";
+        noDisplay = true;
+      })
+    ];
     security.pam.services.teleport = lib.mkIf cfg.systemLogin { };
     # The unit name gives the host the application ID `dev.teleport.Host`
     # (systemd `app-<AppID>.service` convention), which desktop portals use
-    # for permissions. KDE can then pre-authorize it, so a lost or expired
-    # portal session is recreated without a local dialog, even while locked:
+    # for permissions (with the desktop entry above). KDE can then pre-authorize
+    # it, so a lost or expired portal session is recreated without a local
+    # dialog, even while locked:
     #   flatpak permission-set kde-authorized remote-desktop dev.teleport.Host yes
     systemd.user.services."app-dev.teleport.Host" = {
       description = "Teleport remote desktop host (graphical session)";
