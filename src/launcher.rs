@@ -127,6 +127,85 @@ impl DecoderPreference {
     }
 }
 
+/// Stream choices in Connection settings: (label, client argument). The
+/// first entry of each is the default. "Match" lets the client and host
+/// negotiate from the session window's size and display refresh rate; other
+/// sizes and rates are explicit (a rate is a cap: never above the refresh
+/// rate of either end). Hosts older than 240 FPS support stream at most 120.
+const RESOLUTIONS: [(&str, &str); 6] = [
+    ("Match client", "match"),
+    ("Native resolution", "0"),
+    ("1080p width", "1920"),
+    ("1440p width", "2560"),
+    ("720p width", "1280"),
+    ("4K width", "3840"),
+];
+const FRAME_RATES: [(&str, &str); 7] = [
+    ("Match display", "match"),
+    ("60 fps", "60"),
+    ("120 fps", "120"),
+    ("144 fps", "144"),
+    ("165 fps", "165"),
+    ("180 fps", "180"),
+    ("240 fps", "240"),
+];
+/// Auto is 20 Mbps up to 60 FPS (the earlier default) and more above.
+const QUALITIES: [(&str, &str); 5] = [
+    ("Auto bitrate", "auto"),
+    ("8 Mbps cap", "8000"),
+    ("20 Mbps cap", "20000"),
+    ("40 Mbps cap", "40000"),
+    ("80 Mbps cap", "80000"),
+];
+
+#[derive(Default)]
+struct StreamPreferences {
+    resolution: usize,
+    frame_rate: usize,
+    quality: usize,
+    vsync: bool,
+}
+
+impl StreamPreferences {
+    /// Advance setting `index` (0 size, 1 rate, 2 bitrate) to its next choice.
+    fn cycle(&mut self, index: usize) {
+        let (choice, count) = match index {
+            0 => (&mut self.resolution, RESOLUTIONS.len()),
+            1 => (&mut self.frame_rate, FRAME_RATES.len()),
+            _ => (&mut self.quality, QUALITIES.len()),
+        };
+        *choice = (*choice + 1) % count;
+    }
+
+    fn labels(&self) -> [&'static str; 3] {
+        [
+            RESOLUTIONS[self.resolution].0,
+            FRAME_RATES[self.frame_rate].0,
+            QUALITIES[self.quality].0,
+        ]
+    }
+
+    fn apply(&self, command: &mut Command) {
+        command
+            .arg("--width")
+            .arg(RESOLUTIONS[self.resolution].1)
+            .arg("--fps")
+            .arg(FRAME_RATES[self.frame_rate].1)
+            .arg("--bitrate")
+            .arg(QUALITIES[self.quality].1);
+        if self.vsync {
+            command.arg("--vsync");
+        }
+        tracing::info!(
+            "starting session with stream settings --width {} --fps {} --bitrate {}{}",
+            RESOLUTIONS[self.resolution].1,
+            FRAME_RATES[self.frame_rate].1,
+            QUALITIES[self.quality].1,
+            if self.vsync { " --vsync" } else { "" }
+        );
+    }
+}
+
 /// Pass a desktop's relay settings to the client process. The URL (which may
 /// carry a provider token) and the key travel in the child's environment,
 /// never on its command line, which other local users can read.
@@ -354,9 +433,7 @@ pub fn run() -> Result<()> {
     let mut connect_requested = false;
     let mut auth_requested = false;
     let mut settings = false;
-    let mut resolution = 0usize;
-    let mut frame_rate = 1usize;
-    let mut quality = 1usize;
+    let mut stream = StreamPreferences::default();
     let mut codec = 0usize;
     let mut hdr = false;
     let mut decoder = DecoderPreference::default();
@@ -890,14 +967,13 @@ pub fn run() -> Result<()> {
                                 status = "Disconnected.".into();
                             }
                             if settings && child.is_none() {
-                                if hit(pref_rect(0), x, y) {
-                                    resolution = (resolution + 1) % 5;
+                                for index in 0..3 {
+                                    if hit(pref_rect(index), x, y) {
+                                        stream.cycle(index);
+                                    }
                                 }
-                                if hit(pref_rect(1), x, y) {
-                                    frame_rate = (frame_rate + 1) % 3;
-                                }
-                                if hit(pref_rect(2), x, y) {
-                                    quality = (quality + 1) % 3;
+                                if hit(pref_rect(9), x, y) {
+                                    stream.vsync = !stream.vsync;
                                 }
                                 if hit(pref_rect(3), x, y) {
                                     codec = 1 - codec;
@@ -1047,16 +1123,11 @@ pub fn run() -> Result<()> {
                             .arg(&profile.address)
                             .arg("--pairing-file")
                             .arg(credential)
-                            .arg("--width")
-                            .arg([0, 1920, 2560, 1280, 3840][resolution].to_string())
-                            .arg("--fps")
-                            .arg([30, 60, 120][frame_rate].to_string())
-                            .arg("--bitrate")
-                            .arg([8000, 20000, 40000][quality].to_string())
                             .arg("--codec")
                             .arg(["h264", "h265"][codec])
                             .arg("--dynamic-range")
                             .arg(if hdr { "hdr10" } else { "sdr" });
+                        stream.apply(&mut command);
                         decoder.apply(&mut command);
                         apply_relay(profile, &mut command)?;
                         if clipboard {
@@ -1483,16 +1554,11 @@ pub fn run() -> Result<()> {
                     )?;
                     if settings {
                         ui.text(&small_font, "STREAM SETTINGS", 304, 420, 688, MUTED)?;
+                        let [resolution_label, frame_rate_label, quality_label] = stream.labels();
                         let labels = [
-                            [
-                                "Native resolution",
-                                "1080p width",
-                                "1440p width",
-                                "720p width",
-                                "4K width",
-                            ][resolution],
-                            ["30 fps", "60 fps", "120 fps"][frame_rate],
-                            ["8 Mbps cap", "20 Mbps cap", "40 Mbps cap"][quality],
+                            resolution_label,
+                            frame_rate_label,
+                            quality_label,
                             ["H.264", "H.265"][codec],
                             if hdr { "HDR preview" } else { "SDR" },
                             if clipboard {
@@ -1518,6 +1584,11 @@ pub fn run() -> Result<()> {
                                 "SSH agent off"
                             },
                             decoder.label(),
+                            if stream.vsync {
+                                "VSync on"
+                            } else {
+                                "VSync off (VRR)"
+                            },
                         ];
                         for (index, label) in labels.into_iter().enumerate() {
                             ui.button(
@@ -1529,9 +1600,9 @@ pub fn run() -> Result<()> {
                         }
                         ui.text(
                             &small_font,
-                            "Software decoding uses the CPU. Try it if hardware playback stalls.",
+                            "Match follows this window and display. VSync on stops tearing on fixed-refresh screens.",
                             304,
-                            626,
+                            676,
                             688,
                             MUTED,
                         )?;
@@ -1761,6 +1832,60 @@ fn append_code(code: &mut String, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn stream_settings_default_to_matching_and_reach_the_client() {
+        use crate::client::stream_settings::{Setting, parse_bitrate, parse_fps, parse_width};
+        let mut stream = super::StreamPreferences::default();
+        assert_eq!(
+            stream.labels(),
+            ["Match client", "Match display", "Auto bitrate"]
+        );
+        let args = |stream: &super::StreamPreferences| {
+            let mut command = std::process::Command::new("teleport");
+            stream.apply(&mut command);
+            command
+                .get_args()
+                .map(|arg| arg.to_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            args(&stream),
+            ["--width", "match", "--fps", "match", "--bitrate", "auto"]
+        );
+        // Every choice is one the client accepts, and cycling wraps around.
+        let mut rates = Vec::new();
+        for _ in 0..super::FRAME_RATES.len() {
+            let fps = args(&stream)[3].clone();
+            assert!(parse_fps(&fps).is_ok(), "{fps}");
+            rates.push(fps);
+            stream.cycle(1);
+        }
+        assert_eq!(rates, ["match", "60", "120", "144", "165", "180", "240"]);
+        assert_eq!(stream.frame_rate, 0);
+        for (_, width) in super::RESOLUTIONS {
+            assert!(parse_width(width).is_ok());
+        }
+        for (_, bitrate) in super::QUALITIES {
+            assert!(parse_bitrate(bitrate).is_ok());
+        }
+        assert_eq!(parse_fps(super::FRAME_RATES[5].1), Ok(Setting::Value(180)));
+        stream.cycle(0);
+        stream.cycle(2);
+        stream.vsync = true;
+        assert_eq!(
+            args(&stream),
+            [
+                "--width",
+                "0",
+                "--fps",
+                "match",
+                "--bitrate",
+                "8000",
+                "--vsync"
+            ]
+        );
+    }
+
     #[test]
     fn software_decoder_is_explicit_and_passed_to_client() {
         let mut preference = super::DecoderPreference::default();

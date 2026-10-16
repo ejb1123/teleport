@@ -541,9 +541,22 @@ fn launcher_authentication(password_mode: bool) {
             .env("SDL_RENDER_DRIVER", "software")
             .env("SDL_IM_MODULE", "none")
             .env("XMODIFIERS", "@im=none")
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap(),
     );
+    // The launcher and the client it starts log to this pipe.
+    let (log_sender, log) = std::sync::mpsc::channel::<String>();
+    let output = launcher.0.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(output)
+            .lines()
+            .map_while(Result::ok)
+        {
+            println!("{line}");
+            let _ = log_sender.send(line);
+        }
+    });
     let window = desktop_window(&connection, root, &mut launcher, "Teleport", None);
     let deadline = Instant::now() + Duration::from_secs(10);
     while !rendered_pixel(&connection, window, 304, 272, 0x5bdfc9) {
@@ -646,6 +659,19 @@ fn launcher_authentication(password_mode: bool) {
         None,
     );
     assert_ne!(desktop, window);
+    // New profiles match the client: the launcher asks for it, and the host
+    // answers the negotiation with a configuration.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (mut requested, mut acknowledged) = (false, false);
+    while !(requested && acknowledged) {
+        let line = log
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("launcher did not start a matching, negotiated session");
+        requested |= line.contains(
+            "starting session with stream settings --width match --fps match --bitrate auto",
+        );
+        acknowledged |= line.contains("host acknowledged video configuration");
+    }
     // The launcher's disconnect control owns and reaps the streaming child.
     connection
         .configure_window(
