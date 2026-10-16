@@ -57,6 +57,10 @@ pub struct Options {
     /// trips on the input path (network-condition tests).
     #[arg(long, hide = true, requires = "headless_frames")]
     pub smoke_input_latency: bool,
+    /// Change the stream width every 1.5 s, so the host rebuilds its encoder
+    /// mid-session (input stall measurements with --smoke-input-latency).
+    #[arg(long, hide = true, requires = "headless_frames")]
+    pub smoke_reconfigure: bool,
     /// Send pointer motion on the ordered input track even when the host
     /// accepts datagrams (comparison and troubleshooting).
     #[arg(long, hide = true)]
@@ -1111,6 +1115,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let mut next_probe = Instant::now();
         let mut probe_id = 0_u64;
         let mut motion_step = 0_u32;
+        let mut last_reconfigure = Instant::now();
         let mut initial_updates = expected_initial_updates;
         let mut initial_ready = expected_initial_updates == 0;
         const CLIPBOARD_SMOKE: &str = "Teleport clipboard smoke ✓\nline 2";
@@ -1276,6 +1281,20 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         runtime.block_on(events.send(event))?;
                     }
                 }
+            }
+            if options.smoke_reconfigure
+                && count > 0
+                && last_reconfigure.elapsed() >= Duration::from_millis(1500)
+            {
+                last_reconfigure = Instant::now();
+                send(
+                    &events,
+                    Event::ConfigureVideo {
+                        width: if desktop.width == 640 { 960 } else { 640 },
+                        fps: desktop.fps,
+                        bitrate: desktop.bitrate,
+                    },
+                )?;
             }
             if options.smoke_input_latency && count > 0 {
                 // ~500 Hz motion like a gaming mouse, plus a timed probe every
