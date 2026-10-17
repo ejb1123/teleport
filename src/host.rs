@@ -575,6 +575,19 @@ async fn run_session(
             )?,
         ));
     }
+    // Likewise for the per-monitor tracks, which clients may subscribe to
+    // before they send anything.
+    let mut monitor_codec_tracks = Vec::new();
+    for codec in [protocol::VideoCodec::H264, protocol::VideoCodec::H265] {
+        let mut tracks = Vec::new();
+        for index in 0..capture.monitors.len().min(64) {
+            tracks.push(broadcast.create_track(
+                format!("monitor-{index}-{}", codec.track()),
+                moq_net::track::Info::default().with_latency_max(Duration::from_millis(500)),
+            )?);
+        }
+        monitor_codec_tracks.push((codec, tracks));
+    }
     let mut monitor_streams: BTreeMap<usize, MonitorEncoder> = BTreeMap::new();
     let mut metadata = broadcast.create_track("desktop", None)?;
     let mut updates = broadcast.create_track(
@@ -706,13 +719,10 @@ async fn run_session(
         .into_iter()
         .find_map(|(codec, track)| (codec == options.codec).then_some(track))
         .context("no track for the session codec")?;
-    let mut monitor_tracks = Vec::new();
-    for index in 0..capture.monitors.len().min(64) {
-        monitor_tracks.push(broadcast.create_track(
-            format!("monitor-{index}-{}", options.codec.track()),
-            moq_net::track::Info::default().with_latency_max(Duration::from_millis(500)),
-        )?);
-    }
+    let monitor_tracks = monitor_codec_tracks
+        .into_iter()
+        .find_map(|(codec, tracks)| (codec == options.codec).then_some(tracks))
+        .context("no monitor tracks for the session codec")?;
     let mut pipeline = start_encoder(
         options,
         capture.pipeline_source_for_range(options.dynamic_range)?,
