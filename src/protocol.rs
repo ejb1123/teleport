@@ -426,6 +426,11 @@ pub struct Desktop {
     /// to locking its session, or to the unlock prompt when it is locked.
     #[serde(default)]
     pub secure_attention: bool,
+    /// Host injects `Event::ScrollSmooth` (trackpad pixel scrolling with a
+    /// gesture end); older hosts reject it, so clients keep whole-notch
+    /// `Scroll` events for them.
+    #[serde(default)]
+    pub smooth_scroll: bool,
 }
 
 /// What a host tells its paired clients about waking it and its power
@@ -917,6 +922,10 @@ pub const MICROPHONE_TRACK: &str = "microphone";
 /// Largest per-event pointer delta; clients split larger movements.
 pub const MAX_RELATIVE_MOTION: u32 = 4096;
 
+/// Largest per-axis `ScrollSmooth` delta in host pixels; clients split
+/// larger bursts.
+pub const MAX_SMOOTH_SCROLL: f64 = 4000.0;
+
 /// Side mouse buttons in X11 numbering (SDL X1/X2, evdev BTN_SIDE/BTN_EXTRA).
 pub const BUTTON_BACK: u8 = 8;
 pub const BUTTON_FORWARD: u8 = 9;
@@ -980,9 +989,19 @@ pub enum Event {
         code: u16,
         down: bool,
     },
+    /// Whole wheel notches, SDL signs: +y scrolls up, +x right.
     Scroll {
         x: i32,
         y: i32,
+    },
+    /// Trackpad scrolling in host logical pixels, with `Scroll`'s signs.
+    /// `finish` ends the gesture (host applications may then continue with
+    /// kinetic scrolling). Only to hosts advertising `Desktop::smooth_scroll`.
+    ScrollSmooth {
+        dx: f64,
+        dy: f64,
+        #[serde(default)]
+        finish: bool,
     },
     ReleaseAll,
     Ping,
@@ -1225,6 +1244,7 @@ impl Event {
             Self::Motion { .. }
                 | Self::MonitorMotion { .. }
                 | Self::Scroll { .. }
+                | Self::ScrollSmooth { .. }
                 | Self::Feedback { .. }
                 | Self::NetworkFeedback { .. }
                 | Self::MonitorFeedback { .. }
@@ -1286,6 +1306,13 @@ impl Event {
             Self::Scroll { x, y } => ensure!(
                 x.abs_diff(0) <= 20 && y.abs_diff(0) <= 20,
                 "scroll out of range"
+            ),
+            Self::ScrollSmooth { dx, dy, .. } => ensure!(
+                dx.is_finite()
+                    && dy.is_finite()
+                    && dx.abs() <= MAX_SMOOTH_SCROLL
+                    && dy.abs() <= MAX_SMOOTH_SCROLL,
+                "smooth scroll out of range"
             ),
             Self::SelectMonitor { index }
             | Self::RequestKeyframe {
@@ -2185,6 +2212,47 @@ mod tests {
             !old.extra_mouse_buttons,
             "older hosts reject buttons 8 and 9"
         );
+    }
+    #[test]
+    fn smooth_scroll_roundtrips_bounded_lossy_and_negotiated() {
+        let event = Event::ScrollSmooth {
+            dx: -1.5,
+            dy: 12.25,
+            finish: true,
+        };
+        let text = serde_json::to_string(&event).unwrap();
+        assert!(text.contains(r#""type":"scroll_smooth""#), "{text}");
+        let back: Event = serde_json::from_str(&text).unwrap();
+        assert!(matches!(
+            back,
+            Event::ScrollSmooth { dx, dy, finish: true } if dx == -1.5 && dy == 12.25
+        ));
+        assert!(back.validate().is_ok() && back.is_lossy());
+        // `finish` may be left out mid-gesture.
+        let back: Event =
+            serde_json::from_str(r#"{"type":"scroll_smooth","dx":0.0,"dy":3.0}"#).unwrap();
+        assert!(matches!(back, Event::ScrollSmooth { finish: false, .. }));
+        for (dx, dy) in [
+            (f64::NAN, 0.0),
+            (0.0, f64::INFINITY),
+            (MAX_SMOOTH_SCROLL + 1.0, 0.0),
+            (0.0, -MAX_SMOOTH_SCROLL - 1.0),
+        ] {
+            assert!(
+                Event::ScrollSmooth {
+                    dx,
+                    dy,
+                    finish: false
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        let old: Desktop = serde_json::from_value(serde_json::json!({ "version": 2, "width": 1,
+            "height": 1, "fps": 1, "source": "test", "monitors": [], "active_monitor": 0,
+            "audio": false, "clipboard": false }))
+        .unwrap();
+        assert!(!old.smooth_scroll, "older hosts reject ScrollSmooth");
     }
     fn cursor(width: u16, height: u16) -> CursorImage {
         CursorImage {

@@ -51,6 +51,8 @@ pub struct Capture {
     backend: Backend,
     keys: BTreeSet<u16>,
     buttons: BTreeSet<u8>,
+    /// X11: smooth scroll pixels not yet a whole wheel notch.
+    scroll_notches: crate::scroll::Notches,
     /// Virtual gamepads for this session (no-ops on the test backend).
     gamepads: crate::gamepad::Gamepads,
     /// How this capture was opened, so a lost portal session can be recreated.
@@ -600,6 +602,7 @@ impl Capture {
             cursor_metadata: false,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
+            scroll_notches: Default::default(),
             gamepads: crate::gamepad::Gamepads::new(false),
             virtual_mode,
             virtual_available: false,
@@ -859,6 +862,52 @@ impl Capture {
         Ok(())
     }
 
+    /// Host injects `Event::ScrollSmooth` as pixels (portal); X11 turns it
+    /// into whole notches, so clients keep their own notch path there.
+    pub fn smooth_scroll(&self) -> bool {
+        !matches!(self.backend, Backend::X11 { .. })
+    }
+
+    /// Whole wheel notches, SDL signs (+y up, +x right).
+    async fn scroll_notches(&self, x: i32, y: i32) -> Result<()> {
+        match &self.backend {
+            Backend::Portal { proxy, session, .. } => {
+                if y != 0 {
+                    proxy
+                        .notify_pointer_axis_discrete(session, Axis::Vertical, -y)
+                        .await?;
+                }
+                if x != 0 {
+                    proxy
+                        .notify_pointer_axis_discrete(session, Axis::Horizontal, x)
+                        .await?;
+                }
+            }
+            Backend::X11 {
+                connection, root, ..
+            } => {
+                for (count, button) in [
+                    (y.abs(), if y > 0 { 4 } else { 5 }),
+                    (x.abs(), if x > 0 { 7 } else { 6 }),
+                ] {
+                    for _ in 0..count {
+                        for kind in [xproto::BUTTON_PRESS_EVENT, xproto::BUTTON_RELEASE_EVENT] {
+                            connection
+                                .xtest_fake_input(kind, button, 0, *root, 0, 0, 0)?
+                                .check()?;
+                        }
+                    }
+                }
+            }
+            Backend::Test => {
+                if (x, y) != (0, 0) {
+                    tracing::info!(x, y, "test host scroll");
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn input(&mut self, event: Event) -> Result<()> {
         event.validate()?;
         match event {
@@ -939,53 +988,21 @@ impl Capture {
                 }
                 Backend::Test => (),
             },
-            Event::Scroll { x, y } => match &self.backend {
+            Event::Scroll { x, y } => self.scroll_notches(x, y).await?,
+            Event::ScrollSmooth { dx, dy, finish } => match &self.backend {
+                // Portal pixels: +dy scrolls down. `finish` ends the gesture
+                // (compositors that implement it start kinetic scrolling).
                 Backend::Portal { proxy, session, .. } => {
-                    if y != 0 {
-                        proxy
-                            .notify_pointer_axis_discrete(session, Axis::Vertical, -y)
-                            .await?;
-                    }
-                    if x != 0 {
-                        proxy
-                            .notify_pointer_axis_discrete(session, Axis::Horizontal, x)
-                            .await?;
-                    }
+                    proxy.notify_pointer_axis(session, dx, -dy, finish).await?
                 }
-                Backend::X11 {
-                    connection, root, ..
-                } => {
-                    for (count, button) in [
-                        (y.abs(), if y > 0 { 4 } else { 5 }),
-                        (x.abs(), if x > 0 { 7 } else { 6 }),
-                    ] {
-                        for _ in 0..count {
-                            connection
-                                .xtest_fake_input(
-                                    xproto::BUTTON_PRESS_EVENT,
-                                    button,
-                                    0,
-                                    *root,
-                                    0,
-                                    0,
-                                    0,
-                                )?
-                                .check()?;
-                            connection
-                                .xtest_fake_input(
-                                    xproto::BUTTON_RELEASE_EVENT,
-                                    button,
-                                    0,
-                                    *root,
-                                    0,
-                                    0,
-                                    0,
-                                )?
-                                .check()?;
-                        }
-                    }
+                // XTest has wheel buttons only: whole notches.
+                Backend::X11 { .. } => {
+                    let (x, y) = self.scroll_notches.add(dx, dy, finish);
+                    self.scroll_notches(x, y).await?;
                 }
-                Backend::Test => (),
+                Backend::Test => {
+                    tracing::info!(dx, dy, finish, "test host smooth scroll");
+                }
             },
             Event::ReleaseAll => self.release_all().await,
             Event::GamepadConnected { .. }

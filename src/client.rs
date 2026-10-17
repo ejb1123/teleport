@@ -98,6 +98,15 @@ pub struct Options {
     /// `never` only by Ctrl+Alt+M.
     #[arg(long, value_enum, default_value_t = RelativeMouse::Auto)]
     pub relative_mouse: RelativeMouse,
+    /// Trackpad scrolling speed (0.1-10): host pixels per local scroll unit
+    /// are ten times this. Mouse wheels always scroll whole notches.
+    #[arg(long, default_value_t = 1.0, value_parser = parse_scroll_speed)]
+    pub scroll_speed: f64,
+    /// Scroll direction on the host: `auto` scrolls like this computer's own
+    /// windows (its natural-scrolling setting included), `natural` and
+    /// `traditional` force one convention (docs/scrolling.md).
+    #[arg(long, value_enum, default_value_t = crate::scroll::Direction::Auto)]
+    pub scroll_direction: crate::scroll::Direction,
     /// Encoder speed/quality trade-off for this session: `latency`,
     /// `balanced` or `quality`. Default: the host's `--encoder-preset`.
     #[arg(long, value_enum)]
@@ -817,7 +826,10 @@ async fn send_input(
                 )?;
                 unconfirmed = Some((motion_id, event));
             }
-            Event::Button { .. } | Event::Scroll { .. } | Event::RelativeMotion { .. } => {
+            Event::Button { .. }
+            | Event::Scroll { .. }
+            | Event::ScrollSmooth { .. }
+            | Event::RelativeMotion { .. } => {
                 // Clicks and wheel steps land where the pointer was: repeat the
                 // latest position reliably, in order, right before them.
                 if let Some((id, motion)) = unconfirmed.take() {
@@ -2005,8 +2017,37 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     } else {
                         Vec::new()
                     };
+                    // A wheel notch, then a trackpad gesture (smooth pixels
+                    // to hosts that take them, else whole notches) and its end,
+                    // through the same translation as SDL wheel events.
+                    let scroll = {
+                        use crate::scroll::{Scroller, Target};
+                        let mut scroller = Scroller::new(
+                            desktop.smooth_scroll,
+                            options.scroll_speed,
+                            options.scroll_direction,
+                        );
+                        let start = Instant::now();
+                        let at = |ms| start + Duration::from_millis(ms);
+                        let centre = Target::Desktop(0.5, 0.5);
+                        let mut batch =
+                            scroller.wheel((0, 1), (0.0, 1.0), false, centre, None, start)?;
+                        for step in 0..12 {
+                            batch.extend(scroller.wheel(
+                                (0, 0),
+                                (0.0, -0.5),
+                                false,
+                                centre,
+                                None,
+                                at(200 + step * 10),
+                            )?);
+                        }
+                        batch.extend(scroller.poll(at(500)));
+                        batch
+                    };
                     for event in [Event::Motion { x: 0.5, y: 0.5 }]
                         .into_iter()
+                        .chain(scroll)
                         .chain(side_buttons)
                         .chain([
                             Event::Key {
@@ -2274,7 +2315,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut previous_bytes = 0;
     let mut previous_received = 0_u64;
     let mut previous_decoded = 0_u64;
-    let mut wheel = WheelAccumulator::default();
+    let mut wheel = crate::scroll::Scroller::new(
+        desktop.smooth_scroll,
+        options.scroll_speed,
+        options.scroll_direction,
+    );
+    // macOS trackpad phases (momentum, touch); none elsewhere.
+    let _scroll_phases = crate::scroll::platform::Monitor::install();
     let mut probe_id = 0_u64;
     let mut pending_probe: Option<(u64, Instant)> = None;
     let mut last_probe = Instant::now() - Duration::from_secs(1);
@@ -2506,7 +2553,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         fps = desktop.fps,
                         "host acknowledged video configuration"
                     );
-                    wheel = WheelAccumulator::default();
+                    send_all(&events, wheel.reset())?;
                     *image.lock().unwrap() = None;
                     pacer.clear();
                     hdr_frame = None;
@@ -2747,7 +2794,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 && chrome.blocks_pointer(y)
             {
                 motion = None;
-                wheel = WheelAccumulator::default();
+                send_all(&events, wheel.reset())?;
                 send(&events, Event::ReleaseAll)?;
                 if keyboard_capture_rect().contains_point((x, y)) {
                     notice = toggle_keyboard_capture(
@@ -2906,11 +2953,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     None
                 }
                 SdlEvent::MouseButtonDown { mouse_btn, .. } if pointer_lock.active() => {
+                    send_all(&events, wheel.flush(Instant::now()))?;
                     flush_relative(&events, &mut relative)?;
                     button(mouse_btn, desktop.extra_mouse_buttons)
                         .map(|button| Event::Button { button, down: true })
                 }
                 SdlEvent::MouseButtonUp { mouse_btn, .. } if pointer_lock.active() => {
+                    send_all(&events, wheel.flush(Instant::now()))?;
                     flush_relative(&events, &mut relative)?;
                     button(mouse_btn, desktop.extra_mouse_buttons).map(|button| Event::Button {
                         button,
@@ -2927,6 +2976,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     mouse_btn, x, y, ..
                 } => {
                     motion = None;
+                    send_all(&events, wheel.flush(Instant::now()))?;
                     if let Some((x, y)) = chrome.pointer(x, y, canvas.window().size(), size) {
                         send(&events, Event::Motion { x, y })?;
                         button(mouse_btn, desktop.extra_mouse_buttons)
@@ -2939,6 +2989,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     mouse_btn, x, y, ..
                 } => {
                     motion = None;
+                    send_all(&events, wheel.flush(Instant::now()))?;
                     if let Some((x, y)) = chrome.pointer(x, y, canvas.window().size(), size) {
                         send(&events, Event::Motion { x, y })?;
                     }
@@ -2960,15 +3011,33 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     // Use this event's cursor position, not the end-of-batch
                     // mouse state. Never let a coalesced motion follow a wheel
                     // event and rewind the remote pointer after scrolling.
-                    motion = None;
-                    for event in wheel.events(
-                        (x, y),
-                        (precise_x, precise_y),
-                        direction == sdl2::mouse::MouseWheelDirection::Flipped,
-                        chrome.pointer(mouse_x, mouse_y, canvas.window().size(), size),
-                    )? {
-                        send(&events, event)?;
+                    let now = Instant::now();
+                    let (markers, device) = crate::scroll::platform::take(true);
+                    for marker in markers {
+                        send_all(&events, wheel.marker(marker, now))?;
                     }
+                    let target = if pointer_lock.active() {
+                        flush_relative(&events, &mut relative)?;
+                        crate::scroll::Target::Locked
+                    } else {
+                        motion = None;
+                        chrome
+                            .pointer(mouse_x, mouse_y, canvas.window().size(), size)
+                            .map_or(crate::scroll::Target::Outside, |(x, y)| {
+                                crate::scroll::Target::Desktop(x, y)
+                            })
+                    };
+                    send_all(
+                        &events,
+                        wheel.wheel(
+                            (x, y),
+                            (precise_x, precise_y),
+                            direction == sdl2::mouse::MouseWheelDirection::Flipped,
+                            target,
+                            device,
+                            now,
+                        )?,
+                    )?;
                     None
                 }
                 SdlEvent::Window {
@@ -2976,7 +3045,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     ..
                 } => {
                     motion = None;
-                    wheel = WheelAccumulator::default();
+                    send_all(&events, wheel.reset())?;
                     None
                 }
                 SdlEvent::RenderTargetsReset { .. } | SdlEvent::RenderDeviceReset { .. } => {
@@ -2995,6 +3064,19 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 send(&events, event)?;
             }
         }
+        // Coalesced trackpad deltas and gesture ends. Pointer movement after
+        // the last wheel event in this batch must not overtake its deltas.
+        if motion.is_some() || relative != (0, 0) {
+            send_all(&events, wheel.flush(Instant::now()))?;
+        }
+        // Phases after the batch's last wheel event (a lift, a touch that
+        // stops coasting, momentum's end).
+        for marker in crate::scroll::platform::take(false).0 {
+            send_all(&events, wheel.marker(marker, Instant::now()))?;
+            displays.scroll_marker(marker, Instant::now())?;
+        }
+        send_all(&events, wheel.poll(Instant::now()))?;
+        displays.poll_scroll(Instant::now())?;
         flush_relative(&events, &mut relative)?;
         if let Some(event) = motion {
             send(&events, event)?;
@@ -3119,7 +3201,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             } else {
                 IDLE_WAIT
             }
-            .min(Duration::from_secs(1).saturating_sub(stats.elapsed()));
+            .min(Duration::from_secs(1).saturating_sub(stats.elapsed()))
+            // Coalesced trackpad deltas and the gesture's end are on time.
+            .min(wheel.deadline().map_or(Duration::MAX, |due| {
+                due.saturating_duration_since(Instant::now())
+            }));
             // A paced frame due within ~2 ms: sleep exactly instead of
             // SDL's millisecond wait, so the cadence stays even.
             if let Some(due) = pacer.next_due() {
@@ -3281,6 +3367,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     } else {
                         "host cannot lock"
                     }
+                ),
+                format!(
+                    "Scrolling             {}   |   direction {}",
+                    if desktop.smooth_scroll {
+                        format!("smooth pixels x{:.1}", options.scroll_speed)
+                    } else {
+                        "whole notches (host)".to_owned()
+                    },
+                    options.scroll_direction.label()
                 ),
                 format!(
                     "Keys                  Ctrl/Command {}   |   kept here: {}",
@@ -4269,63 +4364,6 @@ fn reveal_rect(width: u32) -> Rect {
     )
 }
 
-#[derive(Default)]
-struct WheelAccumulator {
-    remainder: [f64; 2],
-}
-
-impl WheelAccumulator {
-    fn events(
-        &mut self,
-        integer: (i32, i32),
-        precise: (f32, f32),
-        flipped: bool,
-        position: Option<(f64, f64)>,
-    ) -> Result<Vec<Event>> {
-        let Some((x, y)) = position else {
-            *self = Self::default();
-            return Ok(Vec::new());
-        };
-        let mut steps = [0_i32; 2];
-        for (index, (integer, precise)) in [(integer.0, precise.0), (integer.1, precise.1)]
-            .into_iter()
-            .enumerate()
-        {
-            // Precise deltas replace, not supplement, SDL's integer values.
-            // Older backends may supply only the integer field.
-            let delta = if precise.is_finite() && precise != 0.0 {
-                f64::from(precise)
-            } else {
-                f64::from(integer)
-            };
-            ensure!(
-                delta.abs() <= 200.0,
-                "wheel event exceeds bounded input budget"
-            );
-            let total = self.remainder[index] + if flipped { -delta } else { delta };
-            // SDL supplies f32 values: tolerate rounding at a whole-notch
-            // boundary without repeatedly discarding small touchpad deltas.
-            steps[index] = (total + total.signum() * 1e-6).trunc() as i32;
-            self.remainder[index] = total - f64::from(steps[index]);
-            if self.remainder[index].abs() < 1e-6 {
-                self.remainder[index] = 0.0;
-            }
-        }
-        if steps == [0, 0] {
-            return Ok(Vec::new());
-        }
-        let mut events = vec![Event::Motion { x, y }];
-        while steps != [0, 0] {
-            let x = steps[0].clamp(-20, 20);
-            let y = steps[1].clamp(-20, 20);
-            events.push(Event::Scroll { x, y });
-            steps[0] -= x;
-            steps[1] -= y;
-        }
-        Ok(events)
-    }
-}
-
 struct HdrOverlayPixels {
     rect: Rect,
     width: u32,
@@ -4906,6 +4944,17 @@ fn flush_relative(events: &mpsc::Sender<Event>, relative: &mut (i32, i32)) -> Re
     Ok(())
 }
 
+fn parse_scroll_speed(text: &str) -> Result<f64, String> {
+    match text.parse::<f64>() {
+        Ok(speed) if (0.1..=10.0).contains(&speed) => Ok(speed),
+        _ => Err("expected a number from 0.1 to 10".into()),
+    }
+}
+
+fn send_all(events: &mpsc::Sender<Event>, batch: Vec<Event>) -> Result<()> {
+    batch.into_iter().try_for_each(|event| send(events, event))
+}
+
 fn send(events: &mpsc::Sender<Event>, event: Event) -> Result<()> {
     event.validate()?;
     match events.try_send(event) {
@@ -5042,64 +5091,6 @@ mod tests {
             Rect::new(110, 20, 100, 20)
         );
         assert!(!keyboard_capture_rect().has_intersection(display_mode_rect()));
-    }
-
-    #[test]
-    fn wheel_notches_preserve_direction_amount_and_motion_order() -> Result<()> {
-        let mut wheel = WheelAccumulator::default();
-        for (integer, precise, flipped, expected) in [
-            ((0, 1), (0.0, 1.0), false, (0, 1)),
-            ((1, -1), (1.0, -1.0), true, (-1, 1)),
-            ((45, -23), (0.0, 0.0), false, (45, -23)),
-        ] {
-            let events = wheel.events(integer, precise, flipped, Some((0.3, 0.7)))?;
-            assert!(matches!(events[0], Event::Motion { x, y } if x == 0.3 && y == 0.7));
-            let mut total = (0, 0);
-            for event in &events[1..] {
-                event.validate()?;
-                if let Event::Scroll { x, y } = event {
-                    total.0 += x;
-                    total.1 += y;
-                } else {
-                    panic!("unexpected wheel translation");
-                }
-            }
-            assert_eq!(total, expected);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn wheel_fractions_accumulate_without_double_counting_and_reset_outside_desktop() -> Result<()>
-    {
-        let mut wheel = WheelAccumulator::default();
-        for _ in 0..3 {
-            // The integer field must not get counted in addition to precise.
-            assert!(
-                wheel
-                    .events((0, 1), (0.0, 0.25), false, Some((0.5, 0.5)))?
-                    .is_empty()
-            );
-        }
-        let events = wheel.events((0, 1), (0.0, 0.25), false, Some((0.5, 0.5)))?;
-        assert!(matches!(events[1], Event::Scroll { x: 0, y: 1 }));
-        assert!(
-            wheel
-                .events((0, 0), (0.0, 0.75), false, Some((0.5, 0.5)))?
-                .is_empty()
-        );
-        assert!(wheel.events((0, 1), (0.0, 1.0), false, None)?.is_empty());
-        assert!(
-            wheel
-                .events((0, 0), (0.0, 0.25), false, Some((0.5, 0.5)))?
-                .is_empty()
-        );
-        assert!(
-            wheel
-                .events((i32::MIN, 0), (0.0, 0.0), true, Some((0.5, 0.5)))
-                .is_err()
-        );
-        Ok(())
     }
 
     #[test]

@@ -404,7 +404,9 @@ to separate networking/decoding problems from portal/capture problems.
 ## Current scope and limitations
 
 - Native SDL window, resizable with letterboxing and correctly mapped pointer
-  coordinates; video, keyboard, three mouse buttons, and scrolling.
+  coordinates; video, keyboard, mouse buttons, and scrolling: wheels in
+  notches, trackpads as smooth pixels with macOS momentum on portal hosts
+  (`--scroll-speed`, `--scroll-direction`; docs/scrolling.md).
 - Host CLI defaults to 1280-pixel stream width, 60 fps (up to 240 with `--fps`),
   8 Mbps H.264 (scaled above 60 fps unless `--bitrate` is given); the launcher
   matches the client window and display. Tune with `--width`, `--fps`, and

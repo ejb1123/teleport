@@ -3814,6 +3814,7 @@ fn desktop_for_monitor(
         codec_selection: true,
         hardware_codecs: options.hardware_codecs.clone(),
         extra_mouse_buttons: true,
+        smooth_scroll: capture.smooth_scroll(),
         encoder_presets: true,
         encoder_preset: options.encoder_preset,
         // `TELEPORT_NETWORK_FEEDBACK=0`: the RTT-only controller, no step-down
