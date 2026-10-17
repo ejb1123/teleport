@@ -160,6 +160,8 @@
                   pkgs.lib.makeBinPath [
                     pkgs.wl-clipboard
                     pkgs.xclip
+                    # pw-cli: the host's virtual microphone (host --microphone)
+                    pkgs.pipewire
                   ]
                 }"''} \
                 --set TELEPORT_PACKAGED 1

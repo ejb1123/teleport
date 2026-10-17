@@ -188,6 +188,49 @@ const HOST_DISPLAY: [(&str, &str); 3] = [
     ("Host screen: private", "--privacy"),
     ("Host: + virtual monitor", "--virtual-monitor"),
 ];
+/// `--mic` (G20): send this computer's microphone to hosts that take it,
+/// optionally with echo cancellation (for speakers; off by default).
+const MICROPHONE: [(&str, &[&str]); 3] = [
+    ("Microphone off", &[]),
+    ("Microphone on", &["--mic"]),
+    ("Mic on, echo cancel", &["--mic", "--echo-cancel"]),
+];
+/// Desktop audio (G21): the host's choice, an Opus bitrate, or PCM.
+const AUDIO_QUALITY: [(&str, &[&str]); 8] = [
+    ("Audio: host default", &[]),
+    (
+        "Audio: Opus 64 kbps",
+        &["--audio-format", "opus", "--audio-bitrate", "64"],
+    ),
+    (
+        "Audio: Opus 96 kbps",
+        &["--audio-format", "opus", "--audio-bitrate", "96"],
+    ),
+    (
+        "Audio: Opus 128 kbps",
+        &["--audio-format", "opus", "--audio-bitrate", "128"],
+    ),
+    (
+        "Audio: Opus 192 kbps",
+        &["--audio-format", "opus", "--audio-bitrate", "192"],
+    ),
+    (
+        "Audio: Opus 256 kbps",
+        &["--audio-format", "opus", "--audio-bitrate", "256"],
+    ),
+    (
+        "Audio: Opus 510 kbps",
+        &["--audio-format", "opus", "--audio-bitrate", "510"],
+    ),
+    ("Audio: PCM 1.5 Mbps", &["--audio-format", "pcm"]),
+];
+/// `--keep-local`: a push-to-talk key that stays on this computer.
+const KEEP_LOCAL: [(&str, &[&str]); 4] = [
+    ("Keep local: none", &[]),
+    ("Keep local: F13", &["--keep-local", "F13"]),
+    ("Keep local: Scroll Lock", &["--keep-local", "ScrollLock"]),
+    ("Keep local: Pause", &["--keep-local", "Pause"]),
+];
 
 #[derive(Default)]
 struct StreamPreferences {
@@ -413,10 +456,11 @@ pub fn run() -> Result<()> {
     let REJECT = Rect::new(764, 560, 228, 44);
     debug_assert!(!APPROVE.has_intersection(AUTH));
     let mode_rect = |index: usize| Rect::new(304 + index as i32 * 174, 220, 166, 38);
+    // Six rows of three fit above the status panel (y 716).
     let pref_rect = |index: usize| {
         Rect::new(
             304 + (index % 3) as i32 * 232,
-            456 + (index / 3) as i32 * 44,
+            452 + (index / 3) as i32 * 44,
             220,
             36,
         )
@@ -470,6 +514,10 @@ pub fn run() -> Result<()> {
     let mut encoder_preset = 0usize;
     let mut host_display = 0usize;
     let mut gamepad_type = 0usize;
+    let mut microphone = 0usize;
+    let mut audio_quality = 0usize;
+    let mut swap_ctrl_cmd = false;
+    let mut keep_local = 0usize;
     let mut hdr = false;
     let mut decoder = DecoderPreference::default();
     let mut clipboard = false;
@@ -1032,6 +1080,18 @@ pub fn run() -> Result<()> {
                                 if hit(pref_rect(15), x, y) {
                                     gamepad_type = (gamepad_type + 1) % GAMEPAD_TYPES.len();
                                 }
+                                if hit(pref_rect(16), x, y) {
+                                    microphone = (microphone + 1) % MICROPHONE.len();
+                                }
+                                if hit(pref_rect(17), x, y) {
+                                    audio_quality = (audio_quality + 1) % AUDIO_QUALITY.len();
+                                }
+                                if hit(pref_rect(18), x, y) {
+                                    swap_ctrl_cmd = !swap_ctrl_cmd;
+                                }
+                                if hit(pref_rect(19), x, y) {
+                                    keep_local = (keep_local + 1) % KEEP_LOCAL.len();
+                                }
                                 if hit(pref_rect(3), x, y) {
                                     codec = (codec + 1) % CODECS.len();
                                     if CODECS[codec].1 != "h265" {
@@ -1198,6 +1258,12 @@ pub fn run() -> Result<()> {
                         command
                             .arg("--gamepad-type")
                             .arg(GAMEPAD_TYPES[gamepad_type].1);
+                        command.args(MICROPHONE[microphone].1);
+                        command.args(AUDIO_QUALITY[audio_quality].1);
+                        if swap_ctrl_cmd {
+                            command.arg("--swap-ctrl-cmd");
+                        }
+                        command.args(KEEP_LOCAL[keep_local].1);
                         decoder.apply(&mut command);
                         apply_relay(profile, &mut command)?;
                         if clipboard {
@@ -1686,6 +1752,14 @@ pub fn run() -> Result<()> {
                                 "Pacing: lowest latency"
                             },
                             GAMEPAD_TYPES[gamepad_type].0,
+                            MICROPHONE[microphone].0,
+                            AUDIO_QUALITY[audio_quality].0,
+                            if swap_ctrl_cmd {
+                                "Ctrl/Cmd swapped"
+                            } else {
+                                "Ctrl/Cmd as is"
+                            },
+                            KEEP_LOCAL[keep_local].0,
                         ];
                         for (index, label) in labels.into_iter().enumerate() {
                             ui.button(

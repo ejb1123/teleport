@@ -127,6 +127,43 @@ pub struct Options {
     /// Start with remote audio muted.
     #[arg(long)]
     pub mute: bool,
+    /// Keep this hotkey on this computer: never send it to the host, also
+    /// while keyboard capture is on (e.g. a voice chat push-to-talk key).
+    /// SDL key names with optional modifiers: `F13`, `ScrollLock`,
+    /// `Ctrl+Shift+M`. Repeat for more (docs/keyboard-capture.md).
+    #[arg(long, value_parser = crate::key_options::Hotkey::parse)]
+    pub keep_local: Vec<crate::key_options::Hotkey>,
+    /// Swap Ctrl and Command (Super) for the host: Command+C on a Mac
+    /// becomes Ctrl+C on a Linux host, and the other way around.
+    #[arg(long)]
+    pub swap_ctrl_cmd: bool,
+    /// Desktop audio encoding: `opus`, or `pcm` (uncompressed 48 kHz
+    /// stereo, ~1.5 Mbit/s, for fast, unconstrained links). Default: the
+    /// host's `--audio-format`.
+    #[arg(long, value_enum)]
+    pub audio_format: Option<protocol::AudioFormat>,
+    /// Opus bitrate in kbit/s: 64, 96, 128, 192, 256 or 510. Default: the
+    /// host's `--audio-bitrate` (128).
+    #[arg(long, value_parser = protocol::parse_audio_bitrate)]
+    pub audio_bitrate: Option<u32>,
+    /// Send this computer's microphone to the host, where applications can
+    /// record it as "Teleport Microphone" (hosts started with --microphone).
+    /// Ctrl+Alt+V mutes and unmutes it.
+    #[arg(long)]
+    pub mic: bool,
+    /// Start with the microphone muted (Ctrl+Alt+V unmutes).
+    #[arg(long, requires = "mic")]
+    pub mic_muted: bool,
+    /// Microphone to send on Linux: a PulseAudio/PipeWire source name
+    /// (`pactl list short sources`), or `test` for a tone. Default: the
+    /// system's default input (on macOS always).
+    #[arg(long, requires = "mic", value_parser = crate::audio::parse_mic_device)]
+    pub mic_device: Option<String>,
+    /// Cancel the host's audio, played on this computer's speakers, from the
+    /// microphone. Off by default: it also cuts much of your own speech while
+    /// host audio plays, and headphones need no cancellation.
+    #[arg(long, requires = "mic")]
+    pub echo_cancel: bool,
     /// Select this monitor on connection (zero-based).
     #[arg(long)]
     pub monitor: Option<usize>,
@@ -285,6 +322,10 @@ struct Link {
     input_sequence: u64,
     updates: moq_net::track::Subscriber,
     audio: Option<moq_net::track::Subscriber>,
+    /// The session's desktop audio (Opus 128 with older hosts).
+    audio_settings: protocol::AudioSettings,
+    /// `--mic`: the microphone track, sent only to hosts that take it.
+    microphone: Option<moq_net::track::Producer>,
 }
 
 /// Connect along the configured route. `auto` tries the direct address for
@@ -431,6 +472,16 @@ async fn connect_via(
         protocol::POINTER_TRACK,
         moq_net::track::Info::default().with_priority(255),
     )?;
+    // Between input (255) and the host's video under congestion.
+    let microphone = options
+        .mic
+        .then(|| {
+            broadcast.create_track(
+                protocol::MICROPHONE_TRACK,
+                moq_net::track::Info::default().with_priority(media::AUDIO_PRIORITY),
+            )
+        })
+        .transpose()?;
     let agent_responses = if options.forward_ssh_agent {
         Some(crate::ssh_agent::create_track(
             &mut broadcast,
@@ -549,6 +600,24 @@ async fn connect_via(
         &desktop,
         client_hevc_decoder(options).as_deref(),
     );
+    // Desktop audio: this client's choice over the host's defaults, with
+    // hosts that negotiate it; Opus 128 otherwise.
+    let audio_options = desktop.audio_options && desktop.codec_selection;
+    let audio_settings = if audio_options {
+        protocol::AudioSettings {
+            format: options
+                .audio_format
+                .unwrap_or(desktop.audio_settings.format),
+            bitrate: options
+                .audio_bitrate
+                .unwrap_or(desktop.audio_settings.bitrate),
+        }
+    } else {
+        if desktop.audio && (options.audio_format.is_some() || options.audio_bitrate.is_some()) {
+            tracing::warn!("this host does not offer audio options; playing Opus at 128 kbit/s");
+        }
+        protocol::AudioSettings::default()
+    };
     let mut input = input;
     let mut input_sequence = 0;
     if desktop.codec_selection {
@@ -561,6 +630,7 @@ async fn connect_via(
                 event: Event::SelectCodec {
                     codec: decision.codec,
                     encoder_preset: options.encoder_preset.filter(|_| desktop.encoder_presets),
+                    audio: audio_options.then_some(audio_settings),
                 },
                 motion: None,
             })?,
@@ -596,7 +666,7 @@ async fn connect_via(
     let audio = if desktop.audio {
         Some(
             remote
-                .track("opus")?
+                .track(audio_settings.format.track())?
                 .subscribe(media::audio_subscription())
                 .await?,
         )
@@ -620,6 +690,8 @@ async fn connect_via(
         input_sequence,
         updates,
         audio,
+        audio_settings,
+        microphone,
     })
 }
 
@@ -1284,13 +1356,20 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     );
     let (updates_sender, mut updates) = mpsc::channel(32);
     let mut decoded_audio = None;
+    // With a microphone, host audio coming out of the speakers can reach it:
+    // the player then feeds the microphone's echo canceller.
+    let echo_cancel = options.mic && options.echo_cancel && desktop.microphone;
     let mut audio = if link.audio.is_some() {
         if options.headless_frames.is_some() {
-            let (pipeline, source, counter) = crate::audio::decoder_for_headless()?;
+            let (pipeline, source, counter) =
+                crate::audio::decoder_for_headless(link.audio_settings.format)?;
             decoded_audio = Some(counter);
             Some((pipeline, source))
         } else {
-            Some(crate::audio::decoder()?)
+            Some(crate::audio::decoder(
+                echo_cancel,
+                link.audio_settings.format,
+            )?)
         }
     } else {
         None
@@ -1298,7 +1377,44 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     if let Some((pipeline, _)) = &audio {
         pipeline.set_audio_muted(options.mute)?;
     }
+    let mut link = link;
+    let mut microphone = match link.microphone.take() {
+        Some(track) if desktop.microphone => {
+            match crate::audio::Microphone::start(
+                options.mic_device.as_deref(),
+                echo_cancel && audio.is_some() && options.headless_frames.is_none(),
+                options.mic_muted,
+                track,
+            ) {
+                Ok(microphone) => {
+                    tracing::info!(
+                        echo_cancel = microphone.echo_cancel(),
+                        muted = microphone.muted(),
+                        "sending the microphone to the host"
+                    );
+                    Some(microphone)
+                }
+                Err(error) => {
+                    tracing::warn!(error = format!("{error:#}"), "microphone unavailable");
+                    let _ = updates_sender.try_send(Update::Notice {
+                        text: format!("Microphone unavailable: {error:#}"),
+                    });
+                    None
+                }
+            }
+        }
+        Some(_) => {
+            tracing::warn!("this host does not take a microphone (teleport host --microphone)");
+            let _ = updates_sender.try_send(Update::Notice {
+                text: "This host does not take a microphone (teleport host --microphone)".into(),
+            });
+            None
+        }
+        None => None,
+    };
     let audio_source = audio.as_ref().map(|(_, source)| source.clone());
+    let audio_settings = link.audio_settings;
+    let audio_format = audio_settings.format;
     let audio_notices = updates_sender.clone();
     let local_notices = updates_sender.clone();
     let network_stats = stream_stats.clone();
@@ -1334,7 +1450,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             result = receive_updates(link.updates, updates_sender, update_pongs) => result,
             result = async {
                 if let (Some(track), Some(source)) = (link.audio, audio_source)
-                    && let Err(error) = crate::audio::receive(track, source).await {
+                    && let Err(error) = crate::audio::receive(track, source, audio_format).await {
                         tracing::warn!(%error, "remote audio stopped; desktop remains connected");
                         let _ = audio_notices.send(Update::Notice { text: "Audio stopped; reconnect to retry audio".into() }).await;
                         media::wake_presenter();
@@ -1368,6 +1484,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 frame_timing,
                 privacy: options.privacy && desktop.privacy_mode,
                 virtual_monitor: options.virtual_monitor && desktop.virtual_monitor,
+                microphone: microphone.is_some(),
             },
         )?;
     }
@@ -1454,6 +1571,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             pipeline.error()?;
             if let Some((pipeline, _)) = &audio {
                 pipeline.error()?;
+            }
+            if let Some(microphone) = &microphone {
+                microphone.error()?;
             }
             check_network(&mut network, runtime)?;
             ensure!(
@@ -2000,6 +2120,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut auto_lock = AutoLock::new(options.relative_mouse);
     let mut host_pointer: Option<(usize, f64, f64)> = None;
     let mut shortcuts = crate::keyboard_capture::Shortcuts::default();
+    let mut key_options =
+        crate::key_options::KeyOptions::new(options.swap_ctrl_cmd, options.keep_local.clone());
     let mut chrome = crate::fullscreen::Chrome::new();
     let mut placement: Option<crate::fullscreen::Placement> = None;
     // Input-only redraws (pointer motion, hover) are capped so a 1000 Hz mouse
@@ -2101,6 +2223,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             tracing::warn!(%error, "audio output unavailable; desktop remains connected");
             notice = "Audio output unavailable; reconnect to retry".into();
             audio = None;
+        }
+        if let Some(Err(error)) = microphone.as_ref().map(crate::audio::Microphone::error) {
+            tracing::warn!(%error, "microphone stopped; desktop remains connected");
+            notice = "Microphone stopped; reconnect to retry".into();
+            microphone = None;
         }
         check_network(&mut network, runtime)?;
         ensure!(
@@ -2277,6 +2404,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 }
                 auto_lock.focus_lost();
                 shortcuts = crate::keyboard_capture::Shortcuts::default();
+                key_options.reset();
                 // Also centres and releases every host gamepad.
                 send(&events, Event::ReleaseAll)?;
             }
@@ -2310,12 +2438,31 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                             "Mouse lock unavailable on this display".into()
                         };
                     }
+                    Action::Microphone => {
+                        notice = match &microphone {
+                            Some(microphone) => {
+                                microphone.set_muted(!microphone.muted());
+                                if microphone.muted() {
+                                    "Microphone muted"
+                                } else {
+                                    "Microphone on"
+                                }
+                            }
+                            None if options.mic => "Microphone unavailable in this session",
+                            None => "Microphone off (start the client with --mic)",
+                        }
+                        .into();
+                    }
                     Action::Disconnect => break 'running,
                     Action::Stats => show_stats = !show_stats,
                     Action::Swallow => (),
                 }
                 continue;
             }
+            // Kept hotkeys stay here; Ctrl and Command may swap (all windows).
+            let Some(event) = key_options.filter(event) else {
+                continue;
+            };
             // Flush primary motion before an auxiliary event, preserving the
             // cross-monitor drag order instead of dropping its last position.
             if event
@@ -2887,6 +3034,62 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         auto_lock.state(pointer_lock.active())
                     } else {
                         "host cannot lock"
+                    }
+                ),
+                format!(
+                    "Keys                  Ctrl/Command {}   |   kept here: {}",
+                    if key_options.swap_ctrl_cmd() {
+                        "swapped"
+                    } else {
+                        "as is"
+                    },
+                    if key_options.local().is_empty() {
+                        "none".to_owned()
+                    } else {
+                        key_options
+                            .local()
+                            .iter()
+                            .map(crate::key_options::Hotkey::label)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                ),
+                format!(
+                    "Audio                 {}",
+                    if !desktop.audio {
+                        "host sends none".to_owned()
+                    } else {
+                        format!(
+                            "{}{}",
+                            audio_settings.label(),
+                            match (options.audio_format, options.audio_bitrate) {
+                                (None, None) if desktop.audio_options => "   |   host default",
+                                _ if !desktop.audio_options => "   |   older host: fixed",
+                                _ => "",
+                            }
+                        )
+                    }
+                ),
+                format!(
+                    "Microphone            {}",
+                    match &microphone {
+                        Some(microphone) => format!(
+                            "{}{}   |   Ctrl+Alt+V {}",
+                            if microphone.muted() { "muted" } else { "on" },
+                            if microphone.echo_cancel() {
+                                ", echo cancellation"
+                            } else {
+                                ""
+                            },
+                            if microphone.muted() {
+                                "unmutes"
+                            } else {
+                                "mutes"
+                            }
+                        ),
+                        None if !options.mic => "off".into(),
+                        None if !desktop.microphone => "host does not take one".into(),
+                        None => "unavailable".into(),
                     }
                 ),
                 format!("Presented             {fps:.1} fps"),

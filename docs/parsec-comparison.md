@@ -571,9 +571,11 @@ What is on `main`/this branch, from README, docs and code:
   enrollment. Per-device Ed25519 keys, revocation in Host settings, no cloud
   account.
 - **Input:**
-  - Physical scancodes; Cmd→Super and Option→Alt (fixed). Keyboard capture
-    with Ctrl+Alt+K. Mouse lock (relative) with Ctrl+Alt+M.
-  - Disconnect with Ctrl+Alt+Q; hotkeys are fixed.
+  - Physical scancodes; Cmd→Super and Option→Alt, or Ctrl and Cmd swapped
+    (`--swap-ctrl-cmd`, 2026-10-17). Keyboard capture with Ctrl+Alt+K.
+    Mouse lock (relative) with Ctrl+Alt+M.
+  - Disconnect with Ctrl+Alt+Q; the chords are fixed. Chosen hotkeys can
+    stay on the client (`--keep-local`, 2026-10-17).
   - Mouse buttons left, middle, right and (since 2026-10-16, G14)
     back/forward. Precise wheel deltas are forwarded.
   - Gamepads: SDL to uinput Xbox 360, up to 4, with rumble (since 2026-10-16,
@@ -581,7 +583,7 @@ What is on `main`/this branch, from README, docs and code:
   - Local cursor on X11 hosts only; on Wayland the cursor stays in the video.
 - **Audio:** desktop output only (an explicit `.monitor`). Opus stereo 128
   kbps with 10 ms frames, no in-band FEC (M8). The client queue is ≤100 ms,
-  leaky (`src/audio.rs`). No microphone.
+  leaky (`src/audio.rs`). Microphone passthrough since 2026-10-17 (G20).
 - **Displays:** select a monitor; multiple independent remote monitors map to
   up to 4 extra local fullscreen windows, each with its own stream. Virtual
   displays and privacy mode on KDE since 2026-10-17 (G17). No hotplug.
@@ -639,16 +641,16 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Pointer confinement / relative | Immersive mouse, "Always Relative" | Ctrl+Alt+M relative lock | Parity | Auto-lock on hidden cursor missing |
 | Local cursor | Yes (inferred) | X11 only | Partial | Wayland hosts are the main target |
 | Extra mouse buttons | Yes (unverified) | Back/forward (2026-10-16) | Parity | G14 |
-| Configurable hotkeys / ignore hotkey | Yes | Fixed chords | Missing | S |
+| Configurable hotkeys / ignore hotkey | Yes | Fixed chords; hotkeys kept on the client (`--keep-local`, 2026-10-17) | Partial | Chords not rebindable |
 | Cmd/Ctrl swap | Yes | Fixed Cmd→Super | Missing | S |
 | Gamepad (Xbox 360) | Yes (Windows host) | Yes (Linux host, 4 pads) | Parity | |
 | Rumble | Yes | Yes (2026-10-16) | Parity | G12 |
 | DS4 / DualSense emulation, touchpad, motion, haptics | Yes (Windows host) | DS4 and DualSense through uhid: touchpad, motion, LEDs, adaptive triggers (Linux host, 2026-10-17) | Mostly closed | G13; no DualSense haptics or audio |
 | Pad remapping UI | Yes | SDL database only | Missing | Low |
 | Pen / tablet | Warp | No | Missing | Low for gamers |
-| Mic passthrough | Windows host | No | Missing | Voice chat in games |
-| Multi-channel audio | 5.1/7.1 | Stereo | Missing | |
-| Audio bitrate / raw PCM | 128–512, raw option | Fixed 128k Opus | Partial | |
+| Mic passthrough | Windows host, echo cancellation | Linux (PipeWire) host "Teleport Microphone", any client, WebRTC echo cancellation (2026-10-17) | **Parity** | G20; owner = every paired client (no guest roles) |
+| Multi-channel audio | 5.1/7.1 | Stereo | Missing | G21: not built, see there |
+| Audio bitrate / raw PCM | 128–512, raw option | Opus 64–510 kbps or raw 48 kHz stereo PCM, host default + client choice (2026-10-17) | Parity | G21 |
 | Audio FEC / buffer tuning | 50–100 ms buffer | ≤100 ms leaky; tuning WIP | WIP | |
 | Multi-monitor | 3→5 screens (paid) | Up to 5 windows (1+4), free | **Parity / ahead (free)** | Per-screen settings partly |
 | Virtual displays / headless | VDD (paid), fallback (free) | Portal virtual outputs (KDE): headless fallback, `always`, extra monitor sized to the client (2026-10-17) | **Parity (free)** | G17; GNOME and a connector-less machine untested |
@@ -1159,6 +1161,22 @@ L.**
 
 **G20. Microphone passthrough. Effort M.**
 
+- **Status (2026-10-17): implemented** (review tracker R18, docs/audio.md).
+  Client `--mic` (launcher **Microphone on**, Ctrl+Alt+V mutes, F8 shows the
+  state) captures the default input (`pulsesrc`, `osxaudiosrc` on macOS),
+  encodes 10 ms voice Opus with in-band FEC and sends it on a `microphone`
+  track to hosts started with `--microphone` (`Desktop.microphone`,
+  `ClientFeatures.microphone`). The host plays it with the M8 playout timeline
+  and PLC into a PipeWire null sink whose monitor a loopback exposes as the
+  `Audio/Source` "Teleport Microphone"; a `pw-cli` child owns both, so they go
+  at session end, host exit and crash (parent-death signal), and a host start
+  removes any left by a dead host. Echo cancellation: `webrtcdsp` against a
+  `webrtcechoprobe` in the client's desktop-audio player, opt-in
+  (`--echo-cancel`; off by default because double talk is weak). Measured: mic → virtual source p50 73–90 ms, 0–2
+  dropouts, also with 2% loss; echo −42 to −67 dB, but most near-end ticks
+  are lost while far-end audio plays (double talk). Owner-only means every
+  paired client today.
+  Not verified: a real macOS microphone, Discord on the host.
 - **Why:** in-game and Discord voice on the host (MIC). Parsec gates it to
   owner connections; do the same, or use per-device consent.
 - **Steps:**
@@ -1175,6 +1193,21 @@ L.**
 **G21. Audio quality options: in-band FEC (M8), surround, bitrate. Effort S
 each.**
 
+- **Status (2026-10-17): bitrate and PCM implemented, surround not**
+  (review tracker R19, docs/audio.md). Host `--audio-bitrate
+  64|96|128|192|256|510` (default 128) and `--audio-format opus|pcm`
+  (default Opus) set what clients get by default (`Desktop.audio_options`,
+  `Desktop.audio_settings`); clients choose with `--audio-format` and
+  `--audio-bitrate`, the launcher's **Audio:** button, sent in
+  `SelectCodec.audio`; F8 shows the session's audio. PCM is 48 kHz stereo
+  S16LE, one 10 ms frame (1920 bytes) per group on a `pcm` track, through
+  the same sequence-timed playout (a lost frame becomes silence; there is no
+  PLC for PCM). Older clients get Opus at the host's bitrate. Measured: PCM
+  2–7 ms below Opus on a clean link, but 11–22 dropouts in 12 s at 2% loss
+  where Opus had none. Surround: not built; the capture follows the
+  monitored sink's channels, raw Opus packets would need multistream caps
+  (stream and coupled counts, mapping) on both ends, and the client output
+  must be 5.1 too, all of it untestable here without such hardware.
 - **FEC:** `inband-fec=true` plus a `packet-loss-percentage` hint from QUIC
   stats.
 - **Surround:** 5.1/7.1 via Opus multistream (channel-mapping family 1), when
@@ -1249,11 +1282,13 @@ mute on connect, camera passthrough (v4l2loopback), USB/YubiKey passthrough
 YubiKeys over libusb, 1.19), and display rotation.
 
 Found in Parsec's client (1.19), not in its manual:
-- **Uncompressed PCM audio option** for unconstrained links (S): an
-  alternative to Opus in `src/audio.rs`, capability-gated.
-- **Per-hotkey exclusions** (S): keep chosen hotkeys (push-to-talk) on the
-  client while keyboard capture is on (`docs/keyboard-capture.md`).
-- **Ctrl/Command swap** between macOS and other systems (S).
+- **Uncompressed PCM audio option** for unconstrained links (S): done
+  2026-10-17 (G21, `--audio-format pcm`).
+- **Per-hotkey exclusions** (S): done 2026-10-17, `--keep-local HOTKEY`
+  never sends chosen hotkeys (push-to-talk) to the host, also while keyboard
+  capture is on (review tracker R19, `docs/keyboard-capture.md`).
+- **Ctrl/Command swap** between macOS and other systems (S): done
+  2026-10-17, `--swap-ctrl-cmd` (R20).
 
 Where the inspection shows Teleport ahead on Linux: Parsec's Linux client is
 X11-only (XWayland on Wayland desktops) and decodes only through whatever

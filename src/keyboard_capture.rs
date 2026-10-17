@@ -63,6 +63,8 @@ pub enum Action {
     Toggle,
     /// Ctrl+Alt+M: lock/unlock the pointer for games (relative motion).
     PointerLock,
+    /// Ctrl+Alt+V: mute/unmute the microphone sent to the host.
+    Microphone,
     Disconnect,
     Stats,
     Swallow,
@@ -73,6 +75,7 @@ pub enum Action {
 pub struct Shortcuts {
     toggle_down: bool,
     lock_down: bool,
+    microphone_down: bool,
     stats_down: bool,
 }
 impl Shortcuts {
@@ -110,6 +113,15 @@ impl Shortcuts {
             self.lock_down = down;
             return Some(if first {
                 Action::PointerLock
+            } else {
+                Action::Swallow
+            });
+        }
+        if key == Keycode::V && (self.microphone_down || (down && chord)) {
+            let first = down && !repeat && !self.microphone_down;
+            self.microphone_down = down;
+            return Some(if first {
+                Action::Microphone
             } else {
                 Action::Swallow
             });
@@ -198,6 +210,31 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn microphone_chord_toggles_once_and_swallows_its_release() {
+        for captured in [false, true] {
+            let mut shortcuts = Shortcuts::default();
+            let chord = Mod::RCTRLMOD | Mod::LALTMOD;
+            assert_eq!(
+                shortcuts.event(&key(Keycode::V, true, chord, false), captured),
+                Some(Action::Microphone)
+            );
+            assert_eq!(
+                shortcuts.event(&key(Keycode::V, true, chord, true), captured),
+                Some(Action::Swallow)
+            );
+            assert_eq!(
+                shortcuts.event(&key(Keycode::V, false, Mod::NOMOD, false), captured),
+                Some(Action::Swallow)
+            );
+            // Ctrl+V (paste) still goes to the remote desktop.
+            assert_eq!(
+                shortcuts.event(&key(Keycode::V, true, Mod::LCTRLMOD, false), captured),
+                None
+            );
+        }
+    }
+
     #[test]
     fn captured_shortcuts_go_remote_except_emergency_controls() {
         let mut shortcuts = Shortcuts::default();

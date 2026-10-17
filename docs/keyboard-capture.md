@@ -5,6 +5,7 @@ any session window. On macOS this chord uses Control+Option, not Command.
 Capture is off by default and is not persisted across reconnects.
 
 - **Ctrl+Alt+K** toggles capture; **Ctrl+Alt+Q** always disconnects locally.
+  **Ctrl+Alt+V** mutes the microphone sent with `--mic` ([audio](audio.md)).
 - While bound, ordinary keys including Alt+Tab, Super and F8 are forwarded
   when the local OS delivers them. Use the **Stats** button for local statistics.
 - Keyboard capture follows focus between the session's monitor windows; it
@@ -14,6 +15,28 @@ Capture is off by default and is not persisted across reconnects.
   Release physical modifiers before starting the next shortcut.
 - Keypad, Num Lock, ISO backslash, application/menu and F13–F24 have physical
   key mappings. This does not synchronize lock-key LEDs or keyboard layouts.
+
+## Hotkeys kept local and Ctrl/Command swap
+
+`--keep-local HOTKEY` (repeatable; launcher **Keep local:** offers F13,
+Scroll Lock and Pause) keeps a hotkey on this computer: its press, repeats
+and release are never sent to the host, with or without keyboard capture.
+Use it for a voice chat push-to-talk key. Names are SDL key names with
+optional modifiers, matched exactly: `F13`, `ScrollLock`, `RCtrl`,
+`Ctrl+Shift+M` (Ctrl/Control, Alt/Option, Shift, Super/Cmd/Win). A
+modifier pressed before the key still reaches the host; prefer a single key.
+Whether another local application sees the key while capture is on depends
+on the OS and was not tested: the grab keeps ordinary key events from other
+windows; X11 tools that read raw input may still see them; Wayland
+compositor shortcuts stay inhibited. Teleport's own **Ctrl+Alt+V**
+microphone mute always works.
+
+`--swap-ctrl-cmd` (launcher **Ctrl/Cmd swapped**) swaps Ctrl and
+Command/Super on the way to the host, left and right separately: on a Mac
+client Command+C becomes Ctrl+C on a Linux host, and Control becomes Super.
+Teleport's own chords keep using the physical Ctrl (Control on macOS).
+
+F8 lists both under **Keys**.
 
 ## Mouse lock for games
 

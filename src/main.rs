@@ -25,6 +25,7 @@ mod host_ui;
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod identity;
+mod key_options;
 mod keyboard_capture;
 mod launcher;
 mod media;
@@ -51,6 +52,8 @@ mod system_login;
 mod system_pam;
 #[cfg(target_os = "linux")]
 mod virtual_display;
+#[cfg(target_os = "linux")]
+mod virtual_mic;
 mod windowing;
 #[cfg(target_os = "linux")]
 mod x11_cursor;

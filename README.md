@@ -249,13 +249,25 @@ Audio is off by default. List output monitors with `pactl list short sources`,
 then add `--audio-source YOUR_OUTPUT.monitor` to the host command. Never choose
 a microphone: only explicit `.monitor` names are accepted. Audio uses low-delay
 Opus and the client's audio output; use **Audio** or `--mute` to mute playback.
-This is output audio only, with no microphone forwarding and no tight A/V sync
-guarantee. `--audio-source test` generates a diagnostic tone.
+There is no tight A/V sync guarantee. `--audio-source test` generates a
+diagnostic tone. `--audio-bitrate` (64–510 kbit/s Opus, default 128) and
+`--audio-format pcm` (uncompressed, ~1.5 Mbit/s, for fast clean links) set
+the quality, on the host as a default and on the client (or the launcher's
+**Audio:** button) per session.
+
+Microphone passthrough is opt-in on both ends: start the host with
+`--microphone` (PipeWire) and the client with `--mic` (or the launcher's
+**Microphone on**). While the session lasts, applications on the host can
+record the client's microphone from the "Teleport Microphone" input; it is
+removed when the session ends. The client cancels the host audio's echo from
+its speakers; **Ctrl+Alt+V** mutes. See [audio](docs/audio.md).
 
 Keyboard shortcuts: **Bind keys** or **Ctrl+Alt+K** requests keyboard capture
 for Alt+Tab/Super and other shortcuts supported by the local OS. The same chord
 releases it; **Ctrl+Alt+Q** always disconnects locally. While bound, F8 goes
-remote; use the Stats button instead. See [keyboard capture and platform limits](docs/keyboard-capture.md)
+remote; use the Stats button instead. `--keep-local F13` keeps a hotkey (a
+push-to-talk key) on the client, and `--swap-ctrl-cmd` swaps Ctrl and
+Command for the host. See [keyboard capture and platform limits](docs/keyboard-capture.md)
 and the [remote-desktop feature audit](docs/remote-desktop-audit.md).
 
 The host defaults to `--encoder auto`: it probes NVIDIA, Intel Quick Sync (QSV),
