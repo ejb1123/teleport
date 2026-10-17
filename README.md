@@ -209,6 +209,17 @@ the desktop and collapses to the top edge; **Use one/all displays** controls the
 layout, and each window's display selector chooses its remote monitor. See
 [fullscreen mapping, limits and testing](docs/multi-monitor.md).
 
+On KDE Plasma 6 hosts the portal provides virtual displays. By default
+(`--virtual-display fallback`) a host with no monitor to share streams a
+virtual one sized to the client, and `teleport client --virtual-monitor`
+(launcher **Host: + virtual monitor**) adds one beside the real monitors for
+the session; `--virtual-display always` always streams one (exact resolution
+matching). Privacy mode turns the host's monitors off while you are connected:
+start the host with `--privacy-mode request` and connect with `--privacy`
+(launcher **Host screen: private**). The monitors come back on disconnect, and
+a guard process, `ExecStopPost` and `teleport privacy-restore` cover a host
+that dies. See [virtual displays and privacy mode](docs/virtual-display.md).
+
 Stats distinguish requested/accepted per-stream bitrate caps, the encoder's
 current target, control round-trip time, actual main-stream encoded-video payload bitrate,
 received/decoded/displayed FPS, skipped groups, superseded decoded frames,
@@ -385,7 +396,9 @@ to separate networking/decoding problems from portal/capture problems.
   changes that, Ctrl+Alt+M toggles the lock by hand.
 - Gamepads (with rumble) need a Linux host with `/dev/uinput` access;
   see [gamepads](docs/gamepad.md).
-- No file transfer, virtual display, IME, monitor hotplug or
+- Virtual displays and privacy mode need KDE Plasma 6 (GNOME untested);
+  see [virtual displays](docs/virtual-display.md).
+- No file transfer, IME, monitor hotplug or
   keychain-backed credentials yet. NAT traversal needs a relay for
   signalling; behind a symmetric NAT the session uses the relay itself
   (there is no other TURN-like fallback).
@@ -451,6 +464,8 @@ cargo test --locked
 cargo test --locked --test smoke -- --ignored --nocapture
 cargo test --locked --test ui -- --ignored --nocapture
 cargo test --locked --bin teleport -- --ignored --nocapture
+# KDE hosts: a private headless KWin with its own portal (never your session)
+cargo test --locked --test virtual_display -- --ignored --test-threads=1
 nix build
 TELEPORT_TEST_BINARY=./result/bin/teleport cargo test --locked --test smoke -- --ignored --nocapture
 nix flake check --all-systems
