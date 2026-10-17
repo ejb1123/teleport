@@ -88,7 +88,31 @@ teleport host-admin disable-password
 Treat an opened pairing code as secret. Codes expire after five minutes, have a
 bounded attempt count, and enroll one device. New code and password enrollments
 on persistent hosts get individual credentials. Revoking a managed device also
-disconnects its active session, normally within one second.
+disconnects its active session at once (within a second at most). Opening
+pairing is refused while a guest is connected: a code shown on the shared
+screen would let the guest enroll an owner device.
+
+## Owners and guests
+
+Devices enrolled by code, password or Linux login (and the host pairing
+file) are **owners**. Devices enrolled through an invite are **guests**:
+they get only the permissions the owner granted, wait for approval each
+time they connect, and several sessions share the desktop. See
+[guests and shared sessions](guests.md):
+
+```sh
+teleport host-admin create-invite --name Alice --uses 1 --minutes 60 --permissions view,gamepad
+teleport host-admin sessions          # connected sessions, waiting guests, open invites
+teleport host-admin approve ID        # or deny ID
+teleport host-admin set-guest DEVICE_ID --permissions view,gamepad,keyboard-mouse --trusted false
+teleport host-admin kick ID
+teleport host-admin take-control      # release-control gives guests the chance again
+teleport host-admin revoke-invite ID
+```
+
+`status` lists each device's source (`pairing`, `password`, `invite`) and,
+for guests, their permissions. **Revoke all managed** also closes every open
+invite.
 
 Changing or disabling the password revokes **password-enrolled** devices, not
 code-enrolled devices. **Revoke all devices** revokes all managed enrollments.

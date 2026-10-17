@@ -531,8 +531,9 @@ The installer holds the `parsecd.exe` launcher, the engine
 
 What is on `main`/this branch, from README, docs and code:
 
-- **Host:** Linux only (Wayland portal plus PipeWire, or X11). One client at a
-  time. Encoders: NVENC, QSV, VA-API (AMD/Intel), x264/x265 fallback, probed in
+- **Host:** Linux only (Wayland portal plus PipeWire, or X11). Up to eight
+  sessions share one encoder (owners and invited guests, G15/G16).
+  Encoders: NVENC, QSV, VA-API (AMD/Intel), x264/x265 fallback, probed in
   that order (`--encoder auto`).
   - NVENC preset `p1`/`ull`/CBR, zero-latency, no B-frames
     (`src/ffmpeg_codec.c:140-152`).
@@ -657,9 +658,9 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Wake-on-LAN | Not documented | No | Parity | An opening |
 | Clipboard | Automatic text sync | Explicit text, 64 KiB | Partial (by design) | |
 | File transfer | No | No | Parity | |
-| Multiple guests / co-op | Up to 20, per-guest permissions | One client | **Missing** | Parsec's signature feature |
-| Host approval prompt / share link | Yes | Pairing codes and links; no live approve | Partial | |
-| Guest permission levels | Pad, keyboard, mouse per guest | All or nothing | Missing | |
+| Multiple guests / co-op | Up to 20, per-guest permissions | Up to 8 sessions on one shared encoder, owners and guests, one keyboard/mouse holder (2026-10-17) | Parity | G15; one shared stream (no per-guest codec or size) |
+| Host approval prompt / share link | Yes | Invite links (N uses, expiry, direct or relay), live approval in host settings, host-admin or the owner's client; deny on timeout (2026-10-17) | Parity | G16; no "connect without approval" |
+| Guest permission levels | Pad, keyboard, mouse per guest | View, gamepad, keyboard-mouse, clipboard per guest, live (2026-10-17) | Parity | G15 |
 | Chat | Yes | No | Do not copy | |
 | Stats overlay | Rich, plus graph and warnings | Rich F8 with end-to-end stages, graph and warnings (2026-10-17) | Parity | G22 |
 | Published latency numbers | "7 ms LAN", "4–8 ms at 240 FPS" | Measured capture→present per stage in F8 (2026-10-17); no glass-to-glass number yet | Partial | G3 |
@@ -1065,6 +1066,25 @@ Effort M–L.**
 **G15. Multiple concurrent guests with per-guest permissions (co-op). Effort
 L.**
 
+- **Status (2026-10-17): implemented** (docs/guests.md, review tracker R18).
+  - One engine serves up to eight sessions: one capture and one encoder,
+    later sessions forward the first one's tracks.
+  - Roles: owners (the host's own devices) and guests (invite devices).
+    Per-guest permissions are view, gamepad (its own block of four pad
+    slots), keyboard-mouse and clipboard, live-editable; the default is view
+    plus gamepad.
+  - Keyboard and mouse go to one session at a time. Owners take control on
+    input or lock it; someone at the host takes it through settings or
+    `host-admin`.
+  - Policies: guests leave with the last owner, lock on last disconnect,
+    guest idle kick, total bandwidth cap split per session.
+  - The host settings window and admin socket list sessions, kick them and
+    change permissions; F8 shows each client its access.
+  - Adversarially reviewed; fixes are in the tracker.
+  - Open:
+    - physical host input does not take control;
+    - one shared stream (no per-guest codec or size);
+    - no "approved apps".
 - **Why:** this is Parsec's signature gaming feature. Friends join a game
   with their own pads. The host accepts each one; guests get gamepad-only by
   default; the host grants keyboard and mouse per guest (PERM, COOP).
@@ -1087,6 +1107,22 @@ L.**
 
 **G16. Invite links, guest credentials and a host approval prompt. Effort M.**
 
+- **Status (2026-10-17): implemented** (docs/guests.md, R18).
+  - Invite links are single- or N-use (up to 50) and time-limited (up to a
+    week). They work directly over TCP or through the relay on the host's
+    namespace.
+  - The SPAKE2 `TPINVT01` exchange uses the same device-key binding as code
+    pairing, so every guest device is keyed and revocable.
+  - Uses are spent atomically with the device record, so there is no
+    replay beyond the count.
+  - Live approval for each guest connection comes from:
+    - the host settings window;
+    - `host-admin approve|deny`;
+    - an owner's client (Ctrl+Alt+Y/N prompt over the video).
+  - A request is denied on timeout (30 s).
+  - Denied or kicked devices wait before asking again.
+  - The owner may mark a guest trusted; it still needs approval while no
+    owner is connected. There is no "connect without approval" mode.
 - **Why:** Parsec's flow is "click Share, send link, accept the request"
   (PERM). Teleport has pairing codes and relay pairing links that issue a
   permanent device credential.
