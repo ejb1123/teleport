@@ -72,6 +72,12 @@ pub struct Options {
     /// portal sends cursor metadata).
     #[arg(long)]
     pub embedded_cursor: bool,
+    /// Relative mouse (pointer lock) for games: `auto` locks while the host
+    /// hides its pointer (needs a local cursor; Ctrl+Alt+M releases until
+    /// the pointer reappears), `always` whenever a session window has focus,
+    /// `never` only by Ctrl+Alt+M.
+    #[arg(long, value_enum, default_value_t = RelativeMouse::Auto)]
+    pub relative_mouse: RelativeMouse,
     /// Reach the host through this MoQ relay with end-to-end encryption
     /// (e.g. moqt://relay.example:4444). The host must run with the same --relay.
     /// The environment form keeps a provider token out of the process list.
@@ -1721,6 +1727,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut pointer_lock = PointerLock::default();
     // Host cursor shapes (X11 hosts); dropped before the video subsystem.
     let mut remote_cursor = RemoteCursor::default();
+    // Automatic pointer lock (`--relative-mouse`) and where the host pointer
+    // is (`Update::CursorPosition`), to put the local one there on release.
+    let mut auto_lock = AutoLock::new(options.relative_mouse);
+    let mut host_pointer: Option<(usize, f64, f64)> = None;
     let mut shortcuts = crate::keyboard_capture::Shortcuts::default();
     let mut chrome = crate::fullscreen::Chrome::new();
     let mut placement: Option<crate::fullscreen::Placement> = None;
@@ -1764,6 +1774,43 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 || chrome
                     .pointer(mouse.x(), mouse.y(), canvas.window().size(), size)
                     .is_some());
+        if let Some(lock) = auto_lock.decide(
+            desktop.relative_pointer,
+            displays.owns_keyboard_focus(canvas.window()),
+            over_video,
+            pointer_lock.active(),
+        ) {
+            redraw = true;
+            if !lock {
+                pointer_lock.set(false);
+                // Continue from where the game left the host pointer.
+                if let Some((monitor, x, y)) = host_pointer
+                    && monitor == desktop.active_monitor
+                {
+                    let rect = chrome.rect(canvas.window().size(), size);
+                    // Safety: plain SDL call on the thread owning the window.
+                    unsafe {
+                        sdl2::sys::SDL_WarpMouseInWindow(
+                            canvas.window().raw(),
+                            rect.x() + (x * f64::from(rect.width())) as i32,
+                            rect.y() + (y * f64::from(rect.height())) as i32,
+                        );
+                    }
+                }
+                notice = "Mouse released: the host pointer is back".into();
+            } else if pointer_lock.set(true) {
+                notice = if options.relative_mouse == RelativeMouse::Always {
+                    "Relative mouse \u{2014} Ctrl+Alt+M releases"
+                } else {
+                    "Mouse locked: the host hid its pointer \u{2014} Ctrl+Alt+M releases"
+                }
+                .into();
+            } else {
+                // Do not retry every frame on a display without relative mode.
+                auto_lock.released_by_user();
+                notice = "Mouse lock unavailable on this display".into();
+            }
+        }
         remote_cursor.apply(over_video, pointer_lock.active());
         displays.draw(runtime, &mut session_fonts)?;
         first_draw = false;
@@ -1889,7 +1936,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 Update::Notice { text } => {
                     notice = text.chars().take(160).collect();
                 }
-                Update::Cursor { cursor } => remote_cursor.set_shape(cursor.as_ref()),
+                Update::Cursor { cursor } => {
+                    auto_lock.host_cursor(cursor.is_none());
+                    remote_cursor.set_shape(cursor.as_ref());
+                }
+                Update::CursorPosition { monitor, x, y } => host_pointer = Some((monitor, x, y)),
                 Update::Rumble {
                     pad,
                     low,
@@ -1923,6 +1974,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 if pointer_lock.set(false) {
                     notice = "Mouse released after leaving the session window".into();
                 }
+                auto_lock.focus_lost();
                 shortcuts = crate::keyboard_capture::Shortcuts::default();
                 // Also centres and releases every host gamepad.
                 send(&events, Event::ReleaseAll)?;
@@ -1947,6 +1999,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         motion = None;
                         notice = if pointer_lock.active() {
                             pointer_lock.set(false);
+                            auto_lock.released_by_user();
                             "Mouse released".into()
                         } else if !desktop.relative_pointer {
                             "Host does not support mouse lock; update the host".into()
@@ -2453,6 +2506,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 format!(
                     "Codec                 {}   |   {codec_reason}",
                     desktop.codec.label()
+                ),
+                format!(
+                    "Relative mouse        {}   |   {}",
+                    options.relative_mouse.label(),
+                    if desktop.relative_pointer {
+                        auto_lock.state(pointer_lock.active())
+                    } else {
+                        "host cannot lock"
+                    }
                 ),
                 format!("Presented             {fps:.1} fps"),
                 format!(
@@ -3379,6 +3441,122 @@ impl PointerLock {
     }
 }
 
+/// When to lock the pointer without being asked (`--relative-mouse`).
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RelativeMouse {
+    /// While the host hides its pointer (a game took the mouse).
+    #[default]
+    Auto,
+    /// Whenever a session window has focus (Parsec's "Always Relative").
+    Always,
+    /// Only by Ctrl+Alt+M.
+    Never,
+}
+
+impl RelativeMouse {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+}
+
+/// Automatic pointer lock. Pure decisions; the session loop applies them
+/// with [`PointerLock`], whose never-trap rules (focus loss, Ctrl+Alt+M,
+/// drop) still hold.
+#[derive(Debug)]
+struct AutoLock {
+    mode: RelativeMouse,
+    /// The host pointer is hidden (`Update::Cursor { cursor: None }`).
+    host_hidden: bool,
+    /// The user released an automatic lock: stay unlocked until the host
+    /// pointer reappears (auto) or focus leaves and returns (always).
+    suppressed: bool,
+    /// The current lock was taken automatically (a manual one is left alone).
+    engaged: bool,
+}
+
+impl AutoLock {
+    fn new(mode: RelativeMouse) -> Self {
+        Self {
+            mode,
+            host_hidden: false,
+            suppressed: false,
+            engaged: false,
+        }
+    }
+
+    fn host_cursor(&mut self, hidden: bool) {
+        if self.host_hidden && !hidden && self.mode == RelativeMouse::Auto {
+            self.suppressed = false;
+        }
+        self.host_hidden = hidden;
+    }
+
+    fn focus_lost(&mut self) {
+        self.engaged = false;
+        if self.mode == RelativeMouse::Always {
+            self.suppressed = false;
+        }
+    }
+
+    /// Ctrl+Alt+M while locked: an automatic lock stays off until the next
+    /// trigger.
+    fn released_by_user(&mut self) {
+        if self.engaged {
+            self.suppressed = true;
+        }
+        self.engaged = false;
+    }
+
+    fn wanted(&self, supported: bool, focused: bool) -> bool {
+        supported
+            && focused
+            && !self.suppressed
+            && match self.mode {
+                RelativeMouse::Auto => self.host_hidden,
+                RelativeMouse::Always => true,
+                RelativeMouse::Never => false,
+            }
+    }
+
+    /// `Some(true)` to lock, `Some(false)` to release an automatic lock.
+    /// Locks only with the pointer over remote video.
+    fn decide(
+        &mut self,
+        supported: bool,
+        focused: bool,
+        over_video: bool,
+        locked: bool,
+    ) -> Option<bool> {
+        let wanted = self.wanted(supported, focused);
+        if wanted && !locked && over_video {
+            self.engaged = true;
+            return Some(true);
+        }
+        if !wanted && locked && self.engaged {
+            self.engaged = false;
+            return Some(false);
+        }
+        None
+    }
+
+    fn state(&self, locked: bool) -> &'static str {
+        match (locked, self.engaged, self.suppressed) {
+            (true, true, _) if self.mode == RelativeMouse::Always => "locked (always)",
+            (true, true, _) => "locked (host pointer hidden)",
+            (true, false, _) => "locked (Ctrl+Alt+M)",
+            (false, _, true) => "released by user",
+            (false, _, false) if self.mode == RelativeMouse::Auto && self.host_hidden => {
+                "waiting (focus video)"
+            }
+            _ => "unlocked",
+        }
+    }
+}
+
 impl Drop for PointerLock {
     fn drop(&mut self) {
         self.set(false);
@@ -3562,6 +3740,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn auto_lock_follows_the_host_pointer_and_never_traps() {
+        let mut lock = AutoLock::new(RelativeMouse::Auto);
+        // Visible pointer: nothing happens.
+        assert_eq!(lock.decide(true, true, true, false), None);
+        // A game hides it: lock, but only over video and with focus.
+        lock.host_cursor(true);
+        assert_eq!(lock.decide(true, true, false, false), None);
+        assert_eq!(lock.decide(true, false, true, false), None);
+        assert_eq!(lock.decide(false, true, true, false), None);
+        assert_eq!(lock.decide(true, true, true, false), Some(true));
+        assert_eq!(lock.decide(true, true, false, true), None);
+        // The pointer reappears (a menu): release.
+        lock.host_cursor(false);
+        assert_eq!(lock.decide(true, true, true, true), Some(false));
+        // Hidden again, then the user releases with the hotkey: stays off
+        // until the pointer reappears and hides again.
+        lock.host_cursor(true);
+        assert_eq!(lock.decide(true, true, true, false), Some(true));
+        lock.released_by_user();
+        assert_eq!(lock.decide(true, true, true, false), None);
+        assert_eq!(lock.state(false), "released by user");
+        lock.host_cursor(false);
+        lock.host_cursor(true);
+        assert_eq!(lock.decide(true, true, true, false), Some(true));
+        // Focus loss: the loop releases; returning to the window re-locks.
+        lock.focus_lost();
+        assert_eq!(lock.decide(true, true, true, false), Some(true));
+        // A manual lock is never released automatically.
+        let mut manual = AutoLock::new(RelativeMouse::Auto);
+        assert_eq!(manual.decide(true, true, true, true), None);
+        assert_eq!(manual.state(true), "locked (Ctrl+Alt+M)");
+    }
+
+    #[test]
+    fn always_and_never_relative_modes() {
+        let mut always = AutoLock::new(RelativeMouse::Always);
+        assert_eq!(always.decide(true, true, true, false), Some(true));
+        always.released_by_user();
+        assert_eq!(always.decide(true, true, true, false), None);
+        // Leaving and returning to the window re-arms it.
+        always.focus_lost();
+        assert_eq!(always.decide(true, true, true, false), Some(true));
+        let mut never = AutoLock::new(RelativeMouse::Never);
+        never.host_cursor(true);
+        assert_eq!(never.decide(true, true, true, false), None);
     }
 
     #[test]

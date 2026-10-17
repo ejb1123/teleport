@@ -365,6 +365,9 @@ to separate networking/decoding problems from portal/capture problems.
   and Wayland hosts whose portal sends cursor metadata (KDE Plasma 6);
   `--embedded-cursor` on either end keeps it in the video. See
   [local cursor](docs/cursor.md).
+- Games: the client locks the mouse (relative mode) while the host hides
+  its pointer; `--relative-mouse always|never` (launcher **Mouse** button)
+  changes that, Ctrl+Alt+M toggles the lock by hand.
 - Gamepads (with rumble) need a Linux host with `/dev/uinput` access;
   see [gamepads](docs/gamepad.md).
 - No file transfer, virtual display, IME, monitor hotplug or

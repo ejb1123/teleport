@@ -1457,3 +1457,248 @@ fn windowed_presentation_latency() {
     assert!(!summary.contains(" frames=0 "), "no frames presented");
     drop(host);
 }
+
+fn xvfb(size: &str) -> (Process, String) {
+    let mut display = Process(
+        Command::new("Xvfb")
+            .args(["-displayfd", "1", "-screen", "0", size, "-nolisten", "tcp"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut number = String::new();
+    std::io::BufReader::new(display.0.stdout.take().unwrap())
+        .read_line(&mut number)
+        .unwrap();
+    (display, format!(":{}", number.trim()))
+}
+
+/// Whether some client holds the pointer grab on this display (SDL's
+/// relative mode grabs it).
+fn pointer_grabbed(connection: &RustConnection, root: u32) -> bool {
+    let reply = connection
+        .grab_pointer(
+            false,
+            root,
+            xproto::EventMask::NO_EVENT,
+            xproto::GrabMode::ASYNC,
+            xproto::GrabMode::ASYNC,
+            x11rb::NONE,
+            x11rb::NONE,
+            x11rb::CURRENT_TIME,
+        )
+        .unwrap()
+        .reply()
+        .unwrap();
+    if reply.status == xproto::GrabStatus::SUCCESS {
+        connection
+            .ungrab_pointer(x11rb::CURRENT_TIME)
+            .unwrap()
+            .check()
+            .unwrap();
+        return false;
+    }
+    reply.status == xproto::GrabStatus::ALREADY_GRABBED
+}
+
+/// G11b: a host app hiding its pointer locks the client's mouse (SDL
+/// relative mode), and showing it again releases it. The host is an X11
+/// host on one Xvfb (its own window sets a blank cursor, as games do), the
+/// windowed client on another.
+#[test]
+#[ignore = "requires Xvfb, UDP and GStreamer runtime plugins"]
+fn hidden_host_pointer_locks_the_client_mouse() {
+    let temp = tempfile::tempdir().unwrap();
+    let (_host_display, host_name) = xvfb("800x600x24");
+    let (host_x, host_screen) = x11rb::connect(Some(&host_name)).unwrap();
+    let host_root = host_x.setup().roots[host_screen].root;
+    let game = host_x.generate_id().unwrap();
+    host_x
+        .create_window(
+            0,
+            game,
+            host_root,
+            0,
+            0,
+            800,
+            600,
+            0,
+            xproto::WindowClass::INPUT_OUTPUT,
+            0,
+            &xproto::CreateWindowAux::new(),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    host_x.map_window(game).unwrap().check().unwrap();
+    host_x
+        .warp_pointer(x11rb::NONE, host_root, 0, 0, 0, 0, 400, 300)
+        .unwrap()
+        .check()
+        .unwrap();
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let pairing = temp.path().join("pairing.json");
+    let mut host = Process(
+        teleport(&host_name)
+            .env("XDG_SESSION_TYPE", "x11")
+            .args([
+                "host",
+                "--source",
+                "x11",
+                "--encoder",
+                "software",
+                "--width",
+                "640",
+                "--fps",
+                "30",
+                "--listen",
+                &address,
+                "--pairing-file",
+            ])
+            .arg(&pairing)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::read(&pairing)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_none()
+    {
+        assert!(host.0.try_wait().unwrap().is_none(), "host exited");
+        assert!(Instant::now() < deadline, "host never published pairing");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let (_client_display, client_name) = xvfb("1600x1000x24");
+    let (connection, screen) = x11rb::connect(Some(&client_name)).unwrap();
+    let root = connection.setup().roots[screen].root;
+    let mut client = Process(
+        teleport(&client_name)
+            .args(["client", &address, "--software-decoder", "--pairing-file"])
+            .arg(&pairing)
+            .spawn()
+            .unwrap(),
+    );
+    let window = desktop_window(
+        &connection,
+        root,
+        &mut client,
+        "Teleport - Remote Desktop",
+        None,
+    );
+    connection
+        .set_input_focus(xproto::InputFocus::PARENT, window, x11rb::CURRENT_TIME)
+        .unwrap()
+        .check()
+        .unwrap();
+    let geometry = connection.get_geometry(window).unwrap().reply().unwrap();
+    let over_video = |connection: &RustConnection| {
+        let position = connection
+            .translate_coordinates(
+                window,
+                root,
+                geometry.width as i16 / 2,
+                geometry.height as i16 / 2 + 40,
+            )
+            .unwrap()
+            .reply()
+            .unwrap();
+        connection
+            .xtest_fake_input(
+                xproto::MOTION_NOTIFY_EVENT,
+                0,
+                0,
+                root,
+                position.dst_x,
+                position.dst_y,
+                0,
+            )
+            .unwrap()
+            .check()
+            .unwrap();
+    };
+    over_video(&connection);
+    // Visible host pointer: no lock.
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!pointer_grabbed(&connection, root), "locked too early");
+
+    // The "game" hides its pointer.
+    let pixmap = host_x.generate_id().unwrap();
+    host_x
+        .create_pixmap(1, pixmap, host_root, 1, 1)
+        .unwrap()
+        .check()
+        .unwrap();
+    let gc = host_x.generate_id().unwrap();
+    host_x
+        .create_gc(gc, pixmap, &xproto::CreateGCAux::new().foreground(0))
+        .unwrap()
+        .check()
+        .unwrap();
+    host_x
+        .poly_fill_rectangle(
+            pixmap,
+            gc,
+            &[xproto::Rectangle {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            }],
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    let blank = host_x.generate_id().unwrap();
+    host_x
+        .create_cursor(blank, pixmap, pixmap, 0, 0, 0, 0, 0, 0, 0, 0)
+        .unwrap()
+        .check()
+        .unwrap();
+    host_x
+        .change_window_attributes(
+            game,
+            &xproto::ChangeWindowAttributesAux::new().cursor(blank),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !pointer_grabbed(&connection, root) {
+        assert!(client.0.try_wait().unwrap().is_none(), "client exited");
+        assert!(
+            Instant::now() < deadline,
+            "client did not lock the mouse for a hidden host pointer"
+        );
+        over_video(&connection);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // A menu shows the pointer again: released.
+    let font = host_x.generate_id().unwrap();
+    host_x.open_font(font, b"cursor").unwrap().check().unwrap();
+    let arrow = host_x.generate_id().unwrap();
+    host_x
+        .create_glyph_cursor(arrow, font, font, 68, 69, 0, 0, 0, 0xffff, 0xffff, 0xffff)
+        .unwrap()
+        .check()
+        .unwrap();
+    host_x
+        .change_window_attributes(
+            game,
+            &xproto::ChangeWindowAttributesAux::new().cursor(arrow),
+        )
+        .unwrap()
+        .check()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while pointer_grabbed(&connection, root) {
+        assert!(
+            Instant::now() < deadline,
+            "client kept the mouse locked after the host pointer returned"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

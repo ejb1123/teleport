@@ -771,6 +771,12 @@ refresh. Effort M.**
   switched back to an embedded pointer for clients that do not opt in.
   Verified on KDE Plasma 6.7.5. Gap: with DMA-BUF capture KWin's first
   bitmap is lost, so the shape arrives with its first change.
+- **Status (2026-10-16): step 3 implemented** (G11b, tracker R3):
+  `--relative-mouse auto|always|never` (launcher button, F8 line). Auto locks
+  while the host hides its pointer and a session window has focus with the
+  pointer over video (keyboard capture is not required); Ctrl+Alt+M or the
+  pointer reappearing releases it. Verified in an Xvfb UI test, not with a
+  real game. Step 4 (scaling the cursor) is open.
 
 - **Why:** local cursor only works on X11 hosts (docs/cursor.md), and KDE
   Wayland is the primary host. On Wayland the pointer has a full

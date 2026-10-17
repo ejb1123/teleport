@@ -65,6 +65,30 @@ GNOME's portal offers it too, untested).
   sends `Update::CursorPosition { monitor, x, y }` (normalised, latest wins, at
   most ~30/s). The client uses it to place its pointer when relative mode ends.
 
+## Automatic pointer lock (relative mouse)
+
+Games hide the pointer and read relative motion. With a local cursor the
+client sees that as `Update::Cursor { cursor: None }` and, by default
+(`--relative-mouse auto`, launcher **Mouse: auto lock**), switches to SDL
+relative mode (the same pointer lock as Ctrl+Alt+M, `Event::RelativeMotion`):
+
+- It locks only while a session window has focus and the pointer is over
+  the video, and releases when the host pointer reappears (a menu). On
+  release the local pointer is warped to the host pointer's last
+  `Update::CursorPosition` (Wayland hosts), so it continues where the game
+  left it.
+- Ctrl+Alt+M releases an automatic lock until the host pointer reappears and
+  hides again. Focus loss releases it as before; returning re-locks while
+  the pointer is still hidden.
+- `--relative-mouse always` (**Mouse: always relative**) locks whenever a
+  session window has focus; Ctrl+Alt+M releases it until focus leaves and
+  returns. `never` (**Mouse: lock by hotkey**) only locks on Ctrl+Alt+M.
+- F8 shows the mode and state (`locked (host pointer hidden)`, `released by
+  user`, ...). Hosts without relative input (`Desktop.relative_pointer`)
+  never lock. Clients with `--embedded-cursor` get no shapes, so auto never
+  triggers. Pointer-constraint signals (Wayland locked-pointer) are not
+  available through the portal; the hidden pointer is the only signal.
+
 `teleport client --embedded-cursor` keeps the old behaviour (pointer in the
 video), e.g. to compare or if a host theme's cursor renders poorly.
 
@@ -84,7 +108,9 @@ video), e.g. to compare or if a host theme's cursor renders poorly.
 - Animated cursors are sent frame by frame (X11: each frame has its own
   serial; KWin: each frame invalidates the bitmap).
 - The pointer position is the client's. Host-side warps (an app moving the
-  pointer) are not shown until the local mouse moves.
+  pointer) are not shown until the local mouse moves, except that ending an
+  automatic lock warps to the host position.
+- Automatic pointer lock was not verified with a real game on a KDE host.
 - The pipewiresrc probe depends on its private pool data layout (stable since
   PipeWire 0.3, checked at runtime). If the check fails, no shapes arrive and
   the client keeps its arrow; `--embedded-cursor` on either end avoids it.
@@ -115,6 +141,11 @@ video), e.g. to compare or if a host theme's cursor renders poorly.
   metadata session; an `--embedded-cursor` client switched the host to an
   embedded session and the next opted-in client back, each switch about
   0.4 s (portal session plus NVENC restart), with no dialog.
+- `cargo test --test ui -- --ignored hidden_host_pointer_locks_the_client_mouse`
+  runs an X11 host on one Xvfb and a windowed client on another: the host
+  window's blank cursor makes the client grab the pointer (SDL relative
+  mode), its arrow cursor releases it. `client::tests` cover the lock policy
+  (auto, always, never, hotkey suppression, focus).
 - Not tested: the SDL cursor on a real display (toolbar arrow, hide over
   video, auxiliary windows) and a shape change on Wayland (it needs the local
   pointer to move). Check these by hand.
