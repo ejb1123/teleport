@@ -163,6 +163,12 @@ pub struct Options {
     /// degrades (they are still logged).
     #[arg(long)]
     pub no_warnings: bool,
+    /// Which pad the host emulates for each local controller: `auto` (a
+    /// DualShock 4 or DualSense for PlayStation controllers, otherwise an
+    /// Xbox 360 pad), `xbox`, `ds4` or `dualsense`. Hosts without
+    /// PlayStation pads create Xbox pads.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub gamepad_type: controllers::GamepadChoice,
     /// Session video codec. `auto` uses H.265 when the host encodes and this
     /// client decodes it in hardware, otherwise H.264 (always H.264 with
     /// hosts that cannot negotiate). An explicit codec is always used.
@@ -1340,6 +1346,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 local_cursor,
                 // Played on the local controller (headless runs log it).
                 rumble: desktop.gamepads,
+                // PlayStation pads' lightbar, player LEDs and trigger effects.
+                gamepad_lights: desktop.gamepad_offer().ds4 || desktop.gamepad_offer().dualsense,
                 // Where to put the pointer when relative mode ends.
                 cursor_positions: local_cursor,
                 frame_timing,
@@ -1495,6 +1503,16 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         high,
                         duration_ms,
                     } => tracing::info!(pad, low, high, duration_ms, "host rumble"),
+                    Update::GamepadLights {
+                        pad,
+                        red,
+                        green,
+                        blue,
+                        player,
+                    } => tracing::info!(pad, red, green, blue, player, "host gamepad lights"),
+                    Update::GamepadTriggers { pad, right, left } => {
+                        tracing::info!(pad, ?right, ?left, "host gamepad triggers")
+                    }
                     _ => (),
                 }
             }
@@ -1594,10 +1612,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     // create a system-wide uinput pad (visible to the host
                     // user's games), so smoke runs never press one there.
                     let gamepad = if desktop.gamepads && desktop.source == "test" {
-                        vec![
+                        let mut events = vec![
                             Event::GamepadConnected {
                                 pad: 0,
                                 name: "Smoke pad".into(),
+                                kind: crate::protocol::GamepadType::Xbox,
                             },
                             Event::GamepadButton {
                                 pad: 0,
@@ -1615,7 +1634,48 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                                 down: false,
                             },
                             Event::GamepadDisconnected { pad: 0 },
-                        ]
+                        ];
+                        // A DualSense (hosts offering it) with touch and motion.
+                        if desktop.gamepad_offer().dualsense {
+                            events.extend([
+                                Event::GamepadConnected {
+                                    pad: 1,
+                                    name: "Smoke DualSense".into(),
+                                    kind: protocol::GamepadType::DualSense,
+                                },
+                                Event::GamepadTouch {
+                                    pad: 1,
+                                    finger: 0,
+                                    down: true,
+                                    x: 0.5,
+                                    y: 0.25,
+                                },
+                                Event::GamepadMotion {
+                                    pad: 1,
+                                    gyro: [0.5, 0.0, -0.5],
+                                    accel: [0.0, 9.8, 0.0],
+                                },
+                                Event::GamepadButton {
+                                    pad: 1,
+                                    button: 20,
+                                    down: true,
+                                },
+                                Event::GamepadButton {
+                                    pad: 1,
+                                    button: 20,
+                                    down: false,
+                                },
+                                Event::GamepadTouch {
+                                    pad: 1,
+                                    finger: 0,
+                                    down: false,
+                                    x: 0.5,
+                                    y: 0.25,
+                                },
+                                Event::GamepadDisconnected { pad: 1 },
+                            ]);
+                        }
+                        events
                     } else {
                         Vec::new()
                     };
@@ -1823,7 +1883,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let presentation = configure_presentation(&video, &canvas, options.vsync);
     tracing::info!(presentation, "session presentation sync");
     // Dropped with the session: the host removes its pads when it ends.
-    let mut controllers = controllers::Controllers::new(&sdl);
+    let mut controllers = controllers::Controllers::new(&sdl, options.gamepad_type);
     let mut graphics_name =
         graphics_renderer(&video).unwrap_or_else(|| "Not exposed by this backend".into());
     tracing::info!(graphics = %graphics_name, "local graphics device");
@@ -2137,6 +2197,16 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     high,
                     duration_ms,
                 } => controllers.rumble(pad, low, high, duration_ms),
+                Update::GamepadLights {
+                    pad,
+                    red,
+                    green,
+                    blue,
+                    player,
+                } => controllers.lights(pad, [red, green, blue], player),
+                Update::GamepadTriggers { pad, right, left } => {
+                    controllers.triggers(pad, &right, &left)
+                }
                 _ => (),
             }
         }
@@ -2171,7 +2241,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             }
             // SDL delivers controller input only while a session window has
             // focus (SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS is off by default).
-            if controllers.event(&event, &events, desktop.gamepads)? {
+            if controllers.event(&event, &events, desktop.gamepad_offer())? {
                 continue;
             }
             if let Some(action) = shortcuts.event(&event, keyboard_capture.active()) {
@@ -2495,7 +2565,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         if let Some(event) = motion {
             send(&events, event)?;
         }
-        controllers.flush(&events, desktop.gamepads)?;
+        controllers.flush(&events, desktop.gamepad_offer())?;
         if let Some(text) = controllers.take_notice() {
             notice = text;
             redraw = true;

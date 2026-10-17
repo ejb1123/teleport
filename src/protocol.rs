@@ -58,6 +58,70 @@ impl EncoderPreset {
     }
 }
 
+/// The controller a host pad emulates (docs/gamepad.md). `Xbox` is a uinput
+/// Xbox 360 pad; the PlayStation types are `/dev/uhid` HID devices with
+/// Sony's report descriptors, driven by the kernel's `hid-playstation`.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum GamepadType {
+    #[default]
+    Xbox,
+    /// DualShock 4 (`054c:05c4`): touchpad, motion, lightbar.
+    Ds4,
+    /// DualSense (`054c:0ce6`): touchpad, motion, lightbar, player LEDs,
+    /// adaptive triggers.
+    #[serde(rename = "dualsense")]
+    #[value(name = "dualsense")]
+    DualSense,
+}
+
+impl GamepadType {
+    pub fn is_xbox(&self) -> bool {
+        *self == Self::Xbox
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Xbox => "Xbox 360",
+            Self::Ds4 => "DualShock 4",
+            Self::DualSense => "DualSense",
+        }
+    }
+}
+
+/// Which pad types a host creates (`Desktop::gamepads` and
+/// `Desktop::gamepad_types`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GamepadOffer {
+    pub xbox: bool,
+    pub ds4: bool,
+    pub dualsense: bool,
+}
+
+impl GamepadOffer {
+    pub fn any(self) -> bool {
+        self.xbox || self.ds4 || self.dualsense
+    }
+
+    pub fn offers(self, kind: GamepadType) -> bool {
+        match kind {
+            GamepadType::Xbox => self.xbox,
+            GamepadType::Ds4 => self.ds4,
+            GamepadType::DualSense => self.dualsense,
+        }
+    }
+
+    /// What a pad that wants `kind` becomes: the Xbox pad when the host does
+    /// not offer it.
+    pub fn resolve(self, kind: GamepadType) -> GamepadType {
+        if self.offers(kind) {
+            kind
+        } else {
+            GamepadType::Xbox
+        }
+    }
+}
+
 /// HDR10 here specifies PQ/BT.2020 limited-range 10-bit video, not mastering metadata.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -193,6 +257,11 @@ pub struct Desktop {
     /// Older hosts reject unknown events, so clients must check this first.
     #[serde(default)]
     pub gamepads: bool,
+    /// Pad types `GamepadConnected::kind` may ask for, with `gamepads`.
+    /// Hosts listing a PlayStation type also accept `GamepadTouch` and
+    /// `GamepadMotion`. Empty for older hosts: Xbox pads only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gamepad_types: Vec<GamepadType>,
     /// Highest frame rate `ConfigureVideo` accepts; zero for hosts that
     /// predate the field, which reject anything above [`LEGACY_MAX_FPS`].
     #[serde(default)]
@@ -264,6 +333,18 @@ impl Desktop {
             LEGACY_MAX_FPS
         } else {
             self.max_fps.min(MAX_FPS)
+        }
+    }
+
+    /// The pad types this host creates; nothing without `gamepads`.
+    pub fn gamepad_offer(&self) -> GamepadOffer {
+        if !self.gamepads {
+            return GamepadOffer::default();
+        }
+        GamepadOffer {
+            xbox: true,
+            ds4: self.gamepad_types.contains(&GamepadType::Ds4),
+            dualsense: self.gamepad_types.contains(&GamepadType::DualSense),
         }
     }
 }
@@ -418,6 +499,45 @@ pub enum Update {
         high: u16,
         duration_ms: u32,
     },
+    /// The lightbar colour and player LEDs a game (or the host kernel) set
+    /// on PlayStation pad `pad`. `player` is the DualSense's five player
+    /// LEDs, left to right in bits 0..=4 (0 for a DualShock 4). Only sent
+    /// after the client declared `ClientFeatures::gamepad_lights`.
+    GamepadLights {
+        pad: u8,
+        red: u8,
+        green: u8,
+        blue: u8,
+        #[serde(default)]
+        player: u8,
+    },
+    /// DualSense adaptive-trigger effects for pad `pad`: the 11-byte effect
+    /// blocks of the right and left trigger exactly as in the controller's
+    /// output report (mode byte first). Only sent after the client declared
+    /// `ClientFeatures::gamepad_lights`.
+    GamepadTriggers {
+        pad: u8,
+        right: [u8; TRIGGER_EFFECT_LEN],
+        left: [u8; TRIGGER_EFFECT_LEN],
+    },
+}
+
+/// Bytes of one DualSense adaptive-trigger effect.
+pub const TRIGGER_EFFECT_LEN: usize = 11;
+
+/// The DualSense effects block (`DS5EffectsState_t` in SDL, the output
+/// report's common part) that plays `right` and `left` trigger effects and
+/// nothing else; `SDL_GameControllerSendEffect` takes it for a PS5 pad.
+pub fn dualsense_trigger_effect(
+    right: &[u8; TRIGGER_EFFECT_LEN],
+    left: &[u8; TRIGGER_EFFECT_LEN],
+) -> [u8; 47] {
+    let mut effect = [0u8; 47];
+    // Right and left trigger effects valid.
+    effect[0] = 0x04 | 0x08;
+    effect[10..21].copy_from_slice(right);
+    effect[21..32].copy_from_slice(left);
+    effect
 }
 
 /// Longest `Update::Rumble` (SDL's `SDL_GameControllerRumble` limit); hosts
@@ -441,6 +561,13 @@ impl Update {
                 *pad < MAX_GAMEPADS && *duration_ms <= MAX_RUMBLE_MS,
                 "invalid rumble"
             ),
+            Self::GamepadLights { pad, player, .. } => ensure!(
+                *pad < MAX_GAMEPADS && *player < 0x20,
+                "invalid gamepad lights"
+            ),
+            Self::GamepadTriggers { pad, .. } => {
+                ensure!(*pad < MAX_GAMEPADS, "invalid gamepad triggers")
+            }
             _ => (),
         }
         Ok(())
@@ -478,6 +605,11 @@ pub const GAMEPAD_AXES: u8 = 6;
 pub const GAMEPAD_FIRST_TRIGGER: u8 = 4;
 /// Longest controller name forwarded for host logs.
 pub const MAX_GAMEPAD_NAME: usize = 128;
+/// Simultaneous touchpad contacts a PlayStation pad reports.
+pub const TOUCHPAD_FINGERS: u8 = 2;
+/// Bound for `GamepadMotion` values (SDL units: rad/s and m/s²); real pads
+/// saturate far below it (about 35 rad/s and 39 m/s²).
+pub const MAX_MOTION: f32 = 1000.0;
 
 /// One pointer datagram. Only `Motion` and `MonitorMotion` are accepted.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -563,6 +695,10 @@ pub enum Event {
     GamepadConnected {
         pad: u8,
         name: String,
+        /// The pad to emulate; only a type in `Desktop::gamepad_types` (older
+        /// hosts ignore the field and create an Xbox pad).
+        #[serde(default, skip_serializing_if = "GamepadType::is_xbox")]
+        kind: GamepadType,
     },
     /// The controller in slot `pad` went away; the host destroys its pad.
     GamepadDisconnected {
@@ -579,6 +715,26 @@ pub enum Event {
         pad: u8,
         axis: u8,
         value: i16,
+    },
+    /// Finger `finger` (< [`TOUCHPAD_FINGERS`]) on a PlayStation pad's
+    /// touchpad, normalised like SDL (0..=1, origin top left); `down: false`
+    /// lifts it. Coalesced and retried like `GamepadAxis`. Only for pads
+    /// connected with a PlayStation `kind`.
+    GamepadTouch {
+        pad: u8,
+        finger: u8,
+        down: bool,
+        x: f32,
+        y: f32,
+    },
+    /// A PlayStation pad's motion sensors in SDL's units and axes: `gyro`
+    /// in rad/s (pitch, yaw, roll), `accel` in m/s². Latest wins (the client
+    /// averages the gyro since its last send). Only for pads connected with
+    /// a PlayStation `kind`.
+    GamepadMotion {
+        pad: u8,
+        gyro: [f32; 3],
+        accel: [f32; 3],
     },
     /// Client capabilities the host may rely on for this session. Only sent to
     /// hosts advertising `Desktop::keyframe_requests`.
@@ -618,6 +774,11 @@ pub enum Event {
         /// an extra monitor. Only sent when `Desktop::virtual_monitor`.
         #[serde(default)]
         virtual_monitor: bool,
+        /// The client plays `Update::GamepadLights` and
+        /// `Update::GamepadTriggers` for PlayStation pads. Older hosts ignore
+        /// the field; older clients never declare it.
+        #[serde(default)]
+        gamepad_lights: bool,
     },
     /// The session's video codec. Sent as the very first input event to hosts
     /// advertising `Desktop::codec_selection`, which wait for it before
@@ -710,6 +871,8 @@ impl Event {
                 | Self::Ping
                 | Self::RequestKeyframe { .. }
                 | Self::GamepadAxis { .. }
+                | Self::GamepadTouch { .. }
+                | Self::GamepadMotion { .. }
         )
     }
 
@@ -785,7 +948,24 @@ impl Event {
                 delay_ms.is_none_or(|delay| delay <= 60_000) && *received_kbps <= 10_000_000,
                 "invalid network feedback"
             ),
-            Self::GamepadConnected { pad, name } => ensure!(
+            Self::GamepadTouch {
+                pad, finger, x, y, ..
+            } => ensure!(
+                *pad < MAX_GAMEPADS
+                    && *finger < TOUCHPAD_FINGERS
+                    && (0.0..=1.0).contains(x)
+                    && (0.0..=1.0).contains(y),
+                "invalid gamepad touch"
+            ),
+            Self::GamepadMotion { pad, gyro, accel } => ensure!(
+                *pad < MAX_GAMEPADS
+                    && gyro
+                        .iter()
+                        .chain(accel)
+                        .all(|value| value.is_finite() && value.abs() <= MAX_MOTION),
+                "invalid gamepad motion"
+            ),
+            Self::GamepadConnected { pad, name, .. } => ensure!(
                 *pad < MAX_GAMEPADS
                     && name.len() <= MAX_GAMEPAD_NAME
                     && !name.chars().any(char::is_control),
@@ -1300,6 +1480,7 @@ mod tests {
                 frame_timing: true,
                 privacy: true,
                 virtual_monitor: true,
+                gamepad_lights: true,
             },
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
@@ -1341,6 +1522,7 @@ mod tests {
             Event::GamepadConnected {
                 pad: MAX_GAMEPADS - 1,
                 name: "Xbox Series X Controller".into(),
+                kind: crate::protocol::GamepadType::Xbox,
             },
             Event::GamepadDisconnected { pad: 0 },
             Event::GamepadButton {
@@ -1368,14 +1550,17 @@ mod tests {
             Event::GamepadConnected {
                 pad: MAX_GAMEPADS,
                 name: String::new(),
+                kind: crate::protocol::GamepadType::Xbox,
             },
             Event::GamepadConnected {
                 pad: 0,
                 name: "x".repeat(MAX_GAMEPAD_NAME + 1),
+                kind: crate::protocol::GamepadType::Xbox,
             },
             Event::GamepadConnected {
                 pad: 0,
                 name: "pad\n".into(),
+                kind: crate::protocol::GamepadType::Xbox,
             },
             Event::GamepadDisconnected { pad: MAX_GAMEPADS },
             Event::GamepadButton {
@@ -1421,6 +1606,7 @@ mod tests {
             Event::GamepadConnected {
                 pad: 0,
                 name: String::new(),
+                kind: crate::protocol::GamepadType::Xbox,
             },
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
@@ -1455,6 +1641,7 @@ mod tests {
                 frame_timing: false,
                 privacy: false,
                 virtual_monitor: false,
+                gamepad_lights: false,
             }
         ));
         let primary: Event = serde_json::from_str(r#"{"type":"request_keyframe"}"#).unwrap();

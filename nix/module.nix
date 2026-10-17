@@ -45,6 +45,18 @@ in
       virtual gamepads for clients' game controllers: enables
       `hardware.uinput` and adds the allowed users to the `uinput` group
       (takes effect at their next login)'';
+    playstationGamepads = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        With `gamepads`: also let the allowed users create DualShock 4 and
+        DualSense pads through `/dev/uhid` (group `uinput`, the `uhid`
+        module loaded at boot), so PlayStation controllers on clients
+        appear as PlayStation pads with touchpad, motion sensors and LEDs.
+        Without it the host offers only the Xbox 360 pad. Like uinput, uhid
+        lets its users create any input device. See docs/gamepad.md.
+      '';
+    };
     udpBuffers = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -135,6 +147,11 @@ in
         extraGroups = [ "uinput" ];
       })
     );
+    # PlayStation pads (docs/gamepad.md): /dev/uhid for the same group.
+    boot.kernelModules = lib.mkIf (cfg.gamepads && cfg.playstationGamepads) [ "uhid" ];
+    services.udev.extraRules = lib.mkIf (cfg.gamepads && cfg.playstationGamepads) ''
+      KERNEL=="uhid", SUBSYSTEM=="misc", GROUP="uinput", MODE="0660", OPTIONS+="static_node=uhid"
+    '';
     # The host registers the application ID `dev.teleport.Host` with the portal
     # itself (host portal Registry; the desktop entry above is required). KDE
     # can then pre-authorize it (see preauthorizeRemoteDesktop), so a lost or

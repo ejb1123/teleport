@@ -174,6 +174,13 @@ const ENCODER_PRESETS: [(&str, &str); 4] = [
     ("Encoder: balanced", "balanced"),
     ("Encoder: best quality", "quality"),
 ];
+/// Which pad the host emulates for local controllers (`--gamepad-type`).
+const GAMEPAD_TYPES: [(&str, &str); 4] = [
+    ("Gamepad: auto", "auto"),
+    ("Gamepad: Xbox", "xbox"),
+    ("Gamepad: DualShock 4", "ds4"),
+    ("Gamepad: DualSense", "dualsense"),
+];
 /// Host monitors for this session: as they are, off (privacy mode, on hosts
 /// that allow it) or plus a virtual monitor.
 const HOST_DISPLAY: [(&str, &str); 3] = [
@@ -409,9 +416,9 @@ pub fn run() -> Result<()> {
     let pref_rect = |index: usize| {
         Rect::new(
             304 + (index % 3) as i32 * 232,
-            456 + (index / 3) as i32 * 50,
+            456 + (index / 3) as i32 * 44,
             220,
-            38,
+            36,
         )
     };
     let (sdl, video) = crate::windowing::init()?;
@@ -462,6 +469,7 @@ pub fn run() -> Result<()> {
     let mut relative_mouse = 0usize;
     let mut encoder_preset = 0usize;
     let mut host_display = 0usize;
+    let mut gamepad_type = 0usize;
     let mut hdr = false;
     let mut decoder = DecoderPreference::default();
     let mut clipboard = false;
@@ -1016,6 +1024,9 @@ pub fn run() -> Result<()> {
                                 if hit(pref_rect(13), x, y) {
                                     host_display = (host_display + 1) % HOST_DISPLAY.len();
                                 }
+                                if hit(pref_rect(14), x, y) {
+                                    gamepad_type = (gamepad_type + 1) % GAMEPAD_TYPES.len();
+                                }
                                 if hit(pref_rect(3), x, y) {
                                     codec = (codec + 1) % CODECS.len();
                                     if CODECS[codec].1 != "h265" {
@@ -1179,6 +1190,9 @@ pub fn run() -> Result<()> {
                         if !HOST_DISPLAY[host_display].1.is_empty() {
                             command.arg(HOST_DISPLAY[host_display].1);
                         }
+                        command
+                            .arg("--gamepad-type")
+                            .arg(GAMEPAD_TYPES[gamepad_type].1);
                         decoder.apply(&mut command);
                         apply_relay(profile, &mut command)?;
                         if clipboard {
@@ -1658,6 +1672,7 @@ pub fn run() -> Result<()> {
                                 "Warnings off"
                             },
                             HOST_DISPLAY[host_display].0,
+                            GAMEPAD_TYPES[gamepad_type].0,
                         ];
                         for (index, label) in labels.into_iter().enumerate() {
                             ui.button(
@@ -1667,14 +1682,6 @@ pub fn run() -> Result<()> {
                                 false,
                             )?;
                         }
-                        ui.text(
-                            &small_font,
-                            "Match follows this window and display. VSync on stops tearing on fixed-refresh screens.",
-                            304,
-                            700,
-                            688,
-                            MUTED,
-                        )?;
                     } else {
                         ui.text(
                             &font,

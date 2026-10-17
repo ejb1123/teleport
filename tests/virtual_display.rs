@@ -263,6 +263,7 @@ impl Client {
             frame_timing: false,
             privacy,
             virtual_monitor,
+            gamepad_lights: false,
         })
     }
 

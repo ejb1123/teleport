@@ -959,8 +959,10 @@ async fn run_session(
     // video-settings rate limit allows, coalescing bursts into the newest.
     let mut client_display: Option<protocol::ClientDisplay> = None;
     let mut display_pending = false;
-    // Force feedback from the virtual pads, once the client plays rumble.
-    let mut rumble: Option<tokio::sync::mpsc::UnboundedReceiver<crate::gamepad::Rumble>> = None;
+    // Feedback from the virtual pads (rumble, PlayStation lights and trigger
+    // effects), once the client plays it.
+    let mut rumble: Option<tokio::sync::mpsc::UnboundedReceiver<crate::gamepad::PadFeedback>> =
+        None;
     // Privacy mode for this session: dropping it (however the session ends)
     // turns the monitors back on while the virtual output still exists.
     let mut privacy: Option<crate::privacy::Privacy> = None;
@@ -1223,7 +1225,7 @@ async fn run_session(
                     None => std::future::pending().await,
                 }
             } => match effect {
-                Some(crate::gamepad::Rumble { pad, motors }) => publish_update(&mut updates, Update::Rumble { pad, low: motors.low, high: motors.high, duration_ms: motors.duration_ms })?,
+                Some(feedback) => publish_update(&mut updates, pad_feedback_update(feedback))?,
                 None => rumble = None,
             },
             error = session.closed() => anyhow::bail!("{error}"),
@@ -1455,7 +1457,7 @@ async fn run_session(
                     // Auxiliary streams currently use fixed bitrate. Their
                     // congestion must never adapt the independent primary.
                     Event::MonitorFeedback { .. } => {}
-                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble, cursor_positions: wants_positions, frame_timing, privacy: wants_privacy, virtual_monitor: wants_virtual } => {
+                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble, cursor_positions: wants_positions, frame_timing, privacy: wants_privacy, virtual_monitor: wants_virtual, gamepad_lights } => {
                         if frame_timing && !options.frame_timing {
                             // Encoders started later inherit it from options.
                             options.frame_timing = true;
@@ -1478,9 +1480,9 @@ async fn run_session(
                                 publish_update(&mut updates, Update::Notice { text: "This host cannot add a virtual monitor".into() })?;
                             }
                         }
-                        if plays_rumble && rumble.is_none() {
+                        if (plays_rumble || gamepad_lights) && rumble.is_none() {
                             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-                            capture.enable_rumble(sender);
+                            capture.enable_pad_feedback(sender, plays_rumble, gamepad_lights);
                             rumble = Some(receiver);
                         }
                         if pointer_datagrams && pointer_task.is_none() {
@@ -1881,6 +1883,7 @@ fn desktop_for_monitor(
         relative_pointer: true,
         local_cursor: capture.supports_local_cursor(),
         gamepads: capture.gamepads_available(),
+        gamepad_types: capture.gamepad_types(),
         max_fps: protocol::MAX_FPS,
         display_negotiation: true,
         codec_selection: true,
@@ -2140,6 +2143,33 @@ fn parse_bitrate(value: &str) -> std::result::Result<u32, String> {
         Ok(bitrate)
     } else {
         Err("bitrate must be 0 (automatic), or 500–100000".into())
+    }
+}
+
+/// The updates-track message for a virtual pad's feedback.
+fn pad_feedback_update(feedback: crate::gamepad::PadFeedback) -> Update {
+    use crate::gamepad::PadFeedback;
+    match feedback {
+        PadFeedback::Rumble(crate::gamepad::Rumble { pad, motors }) => Update::Rumble {
+            pad,
+            low: motors.low,
+            high: motors.high,
+            duration_ms: motors.duration_ms,
+        },
+        PadFeedback::Lights {
+            pad,
+            red,
+            green,
+            blue,
+            player,
+        } => Update::GamepadLights {
+            pad,
+            red,
+            green,
+            blue,
+            player,
+        },
+        PadFeedback::Triggers { pad, right, left } => Update::GamepadTriggers { pad, right, left },
     }
 }
 
