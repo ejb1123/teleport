@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>dev.teleport.Teleport</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <name>Teleport</name>
+  <summary>Native remote desktop over Media over QUIC</summary>
+  <description>
+    <p>
+      Teleport streams a Linux desktop to macOS and Linux clients with
+      hardware video encoding and decoding, low-latency input, audio,
+      clipboard sharing, gamepads and end-to-end encrypted relays.
+    </p>
+  </description>
+  <launchable type="desktop-id">dev.teleport.Teleport.desktop</launchable>
+  <url type="homepage">https://github.com/ejb1123/teleport</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.5.4" date="2026-10-17"/>
+  </releases>
+</component>

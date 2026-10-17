@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Teleport Host
+Comment=Remote desktop host (identifies the Teleport host service to desktop portals)
+Exec=teleport host
+Icon=dev.teleport.Teleport
+NoDisplay=true

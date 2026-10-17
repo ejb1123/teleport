@@ -106,9 +106,7 @@
         let
           pkgs = import nixpkgs { inherit system; };
           deps = environment pkgs;
-        in
-        {
-          default = pkgs.rustPlatform.buildRustPackage {
+          teleport = pkgs.rustPlatform.buildRustPackage {
             pname = "teleport";
             version = "0.5.4";
             src = pkgs.lib.fileset.toSource {
@@ -119,7 +117,12 @@
                 ./build.rs
                 ./src
                 ./tests
-                ./packaging
+                # Not packaging/linux: the relocatable bundle's scripts must
+                # not rebuild the application.
+                ./packaging/pam
+                ./packaging/icons
+                ./packaging/teleport.desktop
+                ./packaging/Info.plist
                 ./nix/mesa-runtime.sh
               ];
             };
@@ -171,6 +174,7 @@
             + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
               install -Dm644 packaging/teleport.desktop $out/share/applications/teleport.desktop
               substituteInPlace $out/share/applications/teleport.desktop --replace-fail 'Exec=teleport' "Exec=$out/bin/teleport"
+              install -Dm644 packaging/icons/dev.teleport.Teleport.svg $out/share/icons/hicolor/scalable/apps/dev.teleport.Teleport.svg
             ''
             + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
               mkdir -p $out/Applications/Teleport.app/Contents/MacOS
@@ -178,6 +182,26 @@
               makeWrapper $out/bin/teleport $out/Applications/Teleport.app/Contents/MacOS/teleport
             '';
             meta.mainProgram = "teleport";
+          };
+          # Relocatable Linux bundle and its packages (docs/distribution.md).
+          bundle = import ./nix/bundle.nix {
+            inherit pkgs teleport;
+            inherit (deps) media;
+          };
+        in
+        {
+          default = teleport;
+        }
+        // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          inherit bundle;
+          appimage = import ./nix/appimage.nix { inherit pkgs bundle; };
+          deb = import ./nix/linux-packages.nix {
+            inherit pkgs bundle;
+            format = "deb";
+          };
+          rpm = import ./nix/linux-packages.nix {
+            inherit pkgs bundle;
+            format = "rpm";
           };
         }
       );

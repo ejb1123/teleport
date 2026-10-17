@@ -51,6 +51,21 @@ HDR path and Mac Metal/EDR renderer are available; see [HDR status](docs/hdr.md)
 `nix run . -- doctor --hdr` tests synthetic codecs. A passing codec probe is not HDR
 desktop support.
 
+## Installing without Nix
+
+The flake also builds packages that run without Nix
+([installation and distribution](docs/distribution.md)):
+
+```sh
+nix build .#appimage   # Teleport-VERSION-ARCH.AppImage: host and client, any glibc Linux
+nix build .#deb        # .deb with the systemd user unit and udev rules
+nix build .#rpm        # .rpm, the same
+tools/macos-app.sh     # on a Mac: self-contained, signed and notarised Teleport.app
+```
+
+`packaging/flatpak/` builds a client-only Flatpak. GPU drivers come from the
+installed system. The quick start below uses Nix directly.
+
 ## Quick start: Linux → Mac
 
 Clone this repository on both machines and install Nix with flakes enabled.
@@ -432,8 +447,9 @@ to separate networking/decoding problems from portal/capture problems.
   causes skipped video groups. Severe control loss/reordering disconnects the
   session instead of silently dropping keyboard/button events.
 - Windows is a future client target, not an implemented or tested platform.
-- A signed/notarized standalone Mac installer is not implemented. Nix provides
-  a native `.app` launcher that still depends on its Nix store closure; see
+- Installers without Nix (AppImage, .deb/.rpm, client Flatpak, signed and
+  notarised Mac `.app`) are built from the flake but not published yet, and
+  the Mac app has not been built on a Mac; see
   [installation and distribution](docs/distribution.md).
 
 ## Transport

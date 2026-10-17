@@ -1252,10 +1252,7 @@ pub fn run() -> Result<()> {
                                 }
                             }
                             if hit(HOST_SETTINGS, x, y) && cfg!(target_os = "linux") {
-                                match Command::new(std::env::current_exe()?)
-                                    .arg("host-manager")
-                                    .spawn()
-                                {
+                                match Command::new(crate::self_exe()?).arg("host-manager").spawn() {
                                     Ok(mut process) => {
                                         std::thread::spawn(move || {
                                             let _ = process.wait();
@@ -1361,7 +1358,7 @@ pub fn run() -> Result<()> {
                             .trusted_fingerprint()?
                             .context("host identity is not approved")?;
                         crate::profiles::check_private_file(credential)?;
-                        let mut command = Command::new(std::env::current_exe()?);
+                        let mut command = Command::new(crate::self_exe()?);
                         command
                             .arg("client")
                             .arg(&profile.address)
