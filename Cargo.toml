@@ -55,3 +55,14 @@ objc2-foundation = "0.3.2"
 objc2-metal = "0.3.2"
 objc2-quartz-core = "0.3.2"
 objc2-core-graphics = "0.3.2"
+
+# moq-net 0.2.20 plus three patches for relays without namespace discovery
+# (Cloudflare's), branch teleport/moq-net-0.2.20 of the fork; see
+# docs/relay.md, "Provider relays (Cloudflare)". moq-native uses it too.
+[patch.crates-io]
+moq-net = { git = "https://github.com/ejb1123/moq", rev = "a9f1502854b60c2ee3b8cdf62a80cab1e4eceec8" }
+
+# The fork's workspace would bring its own kio; keep the crates.io one that
+# everything else shares.
+[patch."https://github.com/ejb1123/moq"]
+kio = "0.5.9"

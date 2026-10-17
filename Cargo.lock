@@ -2062,8 +2062,7 @@ dependencies = [
 [[package]]
 name = "moq-net"
 version = "0.2.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78123e01ace212c4dd73c8dbe642b2bc0e52cb1a8f8f71947ab416dd7534a921"
+source = "git+https://github.com/ejb1123/moq?rev=a9f1502854b60c2ee3b8cdf62a80cab1e4eceec8#a9f1502854b60c2ee3b8cdf62a80cab1e4eceec8"
 dependencies = [
  "arrayvec",
  "bytes",

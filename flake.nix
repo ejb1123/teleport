@@ -126,7 +126,11 @@
                 ./nix/mesa-runtime.sh
               ];
             };
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              # moq-net from the fork in Cargo.toml's [patch.crates-io].
+              outputHashes."moq-net-0.2.20" = "sha256-QZOxhfXR1qr7gxGUTmUtltm/Zntt/hDn6o2HsBu2s48=";
+            };
             nativeBuildInputs = [
               pkgs.pkg-config
               pkgs.cmake

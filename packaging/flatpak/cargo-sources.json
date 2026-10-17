@@ -1,5 +1,11 @@
 [
     {
+        "type": "git",
+        "url": "https://github.com/ejb1123/moq",
+        "commit": "a9f1502854b60c2ee3b8cdf62a80cab1e4eceec8",
+        "dest": "flatpak-cargo/git/moq-a9f1502"
+    },
+    {
         "type": "archive",
         "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/aead/aead-0.5.2.crate",
@@ -2626,16 +2632,21 @@
         "dest-filename": ".cargo-checksum.json"
     },
     {
-        "type": "archive",
-        "archive-type": "tar-gzip",
-        "url": "https://static.crates.io/crates/moq-net/moq-net-0.2.20.crate",
-        "sha256": "78123e01ace212c4dd73c8dbe642b2bc0e52cb1a8f8f71947ab416dd7534a921",
-        "dest": "cargo/vendor/moq-net-0.2.20"
+        "type": "shell",
+        "commands": [
+            "cp -r --reflink=auto \"flatpak-cargo/git/moq-a9f1502/rs/moq-net\" \"cargo/vendor/moq-net\""
+        ]
     },
     {
         "type": "inline",
-        "contents": "{\"package\": \"78123e01ace212c4dd73c8dbe642b2bc0e52cb1a8f8f71947ab416dd7534a921\", \"files\": {}}",
-        "dest": "cargo/vendor/moq-net-0.2.20",
+        "contents": "[package]\nname = \"moq-net\"\ndescription = \"The networking layer for Media over QUIC: real-time pub/sub with built-in caching, fan-out, and prioritization.\"\nauthors = [\"Luke Curley\"]\nrepository = \"https://github.com/moq-dev/moq\"\nlicense = \"MIT OR Apache-2.0\"\nversion = \"0.2.20\"\nedition = \"2024\"\nrust-version = \"1.91\"\nkeywords = [\"quic\", \"http3\", \"webtransport\", \"media\", \"live\"]\ncategories = [\"multimedia\", \"network-programming\", \"web-programming\"]\n\n[package.metadata.cargo-shear]\nignored = [\"getrandom\"]\n\n[features]\nfuzz = []\n\n[dependencies]\narrayvec = \"0.7\"\nbytes = \"1\"\nfutures = \"0.3\"\nnum_enum = \"0.7\"\nrand = \"0.10.1\"\nslab = \"0.4.12\"\nthiserror = \"2\"\ntracing = \"0.1\"\nweb-transport-trait = \"0.4.0\"\n\n[dependencies.kio]\nfeatures = [\"time\"]\nversion = \"0.5.8\"\n\n[dependencies.serde]\nversion = \"1\"\nfeatures = [\"derive\"]\n\n[dependencies.web-async]\nversion = \"0.1.5\"\nfeatures = [\"tracing\"]\n\n[dev-dependencies]\ncriterion = \"0.8\"\nserde_json = \"1\"\n\n[dev-dependencies.tokio]\nfeatures = [\"macros\", \"io-util\", \"sync\", \"test-util\", \"time\", \"rt\"]\nversion = \"1.48\"\n\n[target.\"cfg(loom)\".dev-dependencies.loom]\nversion = \"0.7.2\"\nfeatures = [\"futures\"]\n\n[target.\"cfg(target_family = \\\"wasm\\\")\".dev-dependencies]\nwasm-bindgen-test = \"=0.3.71\"\n\n[target.\"cfg(target_family = \\\"wasm\\\")\".dev-dependencies.getrandom]\nversion = \"0.4\"\nfeatures = [\"wasm_js\"]\n\n[lints.rust.unexpected_cfgs]\nlevel = \"warn\"\ncheck-cfg = [\"cfg(loom)\"]\n\n[[example]]\nname = \"fuzz-seeds\"\npath = \"examples/fuzz-seeds.rs\"\nrequired-features = [\"fuzz\"]\n\n[[bench]]\nname = \"group\"\nharness = false\n\n[[bench]]\nname = \"track\"\nharness = false\n",
+        "dest": "cargo/vendor/moq-net",
+        "dest-filename": "Cargo.toml"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": null, \"files\": {}}",
+        "dest": "cargo/vendor/moq-net",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -5903,7 +5914,7 @@
     },
     {
         "type": "inline",
-        "contents": "[source.vendored-sources]\ndirectory = \"cargo/vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n",
+        "contents": "[source.vendored-sources]\ndirectory = \"cargo/vendor\"\n\n[source.crates-io]\nreplace-with = \"vendored-sources\"\n\n[source.\"https://github.com/ejb1123/moq\"]\ngit = \"https://github.com/ejb1123/moq\"\nreplace-with = \"vendored-sources\"\nrev = \"a9f1502854b60c2ee3b8cdf62a80cab1e4eceec8\"\n",
         "dest": "cargo",
         "dest-filename": "config"
     }

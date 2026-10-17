@@ -12,7 +12,9 @@
 #
 # After changing Cargo.lock, regenerate cargo-sources.json with
 # flatpak-builder-tools' cargo/flatpak-cargo-generator.py Cargo.lock
-# -o packaging/flatpak/cargo-sources.json.
+# -o packaging/flatpak/cargo-sources.json, then drop `path = "rs/kio"` from
+# the generated moq-net Cargo.toml (the git dependency's workspace path; kio
+# comes from crates.io, see [patch] in Cargo.toml).
 id: dev.teleport.Teleport
 runtime: org.freedesktop.Platform
 runtime-version: '26.08'
