@@ -93,10 +93,19 @@ trap cleanup EXIT
 
 pipewire >"$logs/pipewire.log" 2>&1 &
 pids+=($!)
+# WirePlumber exits at once ("Failed to connect to PipeWire") if it starts
+# before PipeWire listens; screencasts would then never be linked and every
+# pipewiresrc would wait for a format until it times out.
+for _ in $(seq 100); do
+    [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] && [ -S "$XDG_RUNTIME_DIR/pipewire-0-manager" ] && break
+    sleep 0.1
+done
+[ -S "$XDG_RUNTIME_DIR/pipewire-0-manager" ] || { echo "nested-kwin: PipeWire did not start" >&2; exit 1; }
 # Links a consumer (pipewiresrc) to the screencast node. The `policy`
 # profile has no hardware monitors: no ALSA, Bluetooth or cameras of the
 # real machine are touched.
 wireplumber --profile policy >"$logs/wireplumber.log" 2>&1 &
+wireplumber=$!
 pids+=($!)
 "$kwin" --virtual --socket teleport-test --no-lockscreen --width 1280 --height 720 \
     --output-count "$outputs" >"$logs/kwin.log" 2>&1 &
@@ -138,5 +147,9 @@ for _ in $(seq 50); do
         org.freedesktop.portal.ScreenCast AvailableSourceTypes >/dev/null 2>&1 && break
     sleep 0.1
 done
+kill -0 "$wireplumber" 2>/dev/null || {
+    echo "nested-kwin: WirePlumber exited: $(cat "$logs/wireplumber.log")" >&2
+    exit 1
+}
 
 "$@"

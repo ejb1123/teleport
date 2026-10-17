@@ -47,6 +47,26 @@ impl VideoFormat {
 }
 impl Drop for Pipeline {
     fn drop(&mut self) {
+        // A pipewiresrc stopped just after reaching PLAYING, before its
+        // streaming thread first entered `create`, can deadlock the state
+        // change: the thread then runs the `unlock_stop` that GstBaseSrc
+        // deferred from PAUSED->PLAYING (`pending_unlock_stop`), clearing the
+        // `flushing` flag our stop had just set, and waits in `create` for a
+        // frame that never comes (going to PAUSED made the stream inactive)
+        // while `set_state(Null)` waits for its stream lock. A capture
+        // restart right after a session starts (privacy mode, a cursor or
+        // monitor change) hits this when the host is busy. EOS is a flag
+        // `unlock_stop` leaves alone, so `create` returns either way.
+        // pipewiresrc only has a stream (and takes EOS) from READY on.
+        for source in self.0.iterate_recurse().into_iter().flatten() {
+            if source
+                .factory()
+                .is_some_and(|factory| factory.name() == "pipewiresrc")
+                && source.current_state() != gst::State::Null
+            {
+                source.send_event(gst::event::Eos::new());
+            }
+        }
         let _ = self.0.set_state(gst::State::Null);
     }
 }
