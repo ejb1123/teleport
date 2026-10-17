@@ -167,7 +167,7 @@ aspect ratio that fits the window (never upscaled). Moving the window to another
 display, a mode change, fullscreen or a resize renegotiates once it has settled
 for a second, and only if the stream would change (a resize by 10% or more).
 Explicit choices remain: native, 1080p-, 1440p-, 720p- or 4K-width; 60, 120,
-144, 165, 180 or 240 FPS (a cap); 8/20/40/80 Mbps; H.264/H.265. Auto bitrate is
+144, 165, 180 or 240 FPS (a cap); 8/20/40/80 Mbps; H.264/H.265/AV1. Auto bitrate is
 20 Mbps up to 60 FPS and scales above (34.6 Mbps at 1440p180). Hosts from
 before 240 FPS support stream at most 120 FPS; the client says so and clamps.
 Scaling preserves the selected monitor's aspect ratio; it does not change the
@@ -187,10 +187,16 @@ nix run . -- client LINUX_IP:4443 --pairing-file pairing.json \
   --width 0 --fps 60 --bitrate 20000 --codec h265 --stats
 ```
 
-`--codec auto` (the default; launcher **Auto codec**) streams H.265 when the host
-encodes it in hardware and the client decodes it in hardware, and H.264 otherwise
-or with hosts from before automatic choice. An explicit `--codec h264|h265` always
-wins. Stats (F8) shows the codec and why it was chosen.
+`--codec auto` (the default; launcher **Auto codec**) streams AV1, else H.265,
+when the host encodes it in hardware and the client decodes it in hardware, and
+H.264 otherwise or with hosts from before automatic choice. An explicit
+`--codec h264|h265|av1` always wins (AV1 needs a host that offers it; a software
+host encodes it with SVT-AV1, which is slow). Two quality options, off by
+default: `--chroma-444 auto|on` (launcher **4:4:4 colour**) keeps full-resolution
+colour for sharp coloured text (H.265 4:4:4 on NVIDIA in hardware), and
+`--ten-bit auto|on` (launcher **10-bit**) encodes Main 10 against banding in
+dithered gradients. Stats (F8) shows the codec, 4:2:0/4:4:4, 10-bit and why
+([AV1, 4:4:4 and 10-bit](docs/ffmpeg.md#av1)).
 `--encoder-preset latency|balanced|quality` (host default, or per session from
 the client; launcher **Encoder:**) trades host encode time for quality without
 adding frame delay; `latency` is the default. See

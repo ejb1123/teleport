@@ -273,6 +273,58 @@ fn ten_bit_sdr_keeps_precision_and_dithers_to_eight_bits() -> Result<()> {
     Ok(())
 }
 
+/// AV1 decoders after a lost frame (what intra refresh would rely on, as
+/// with H.264): dav1d, and NVDEC with `TELEPORT_TEST_HARDWARE=1`. Prints
+/// how many later frames each decodes and their mean luma error.
+#[test]
+#[ignore = "measurement; TELEPORT_TEST_HARDWARE=1 adds NVDEC"]
+fn av1_decoding_past_a_lost_frame() -> Result<()> {
+    let (width, height) = (320, 240);
+    let config = encoder_config("libsvtav1", VideoCodec::Av1, width, height);
+    let mut encoder = Codec::new(config.clone())?;
+    let mut packets = Vec::new();
+    for frame in 0..30_usize {
+        encoder.submit(&stripes(width, height, frame), frame as u64)?;
+        while let Some(packet) = encoder.receive()? {
+            packets.push((packet.pts.unwrap_or_default(), packet.bytes));
+        }
+    }
+    let mut decoders = vec!["software"];
+    if hardware() {
+        decoders.push("cuda");
+    }
+    for name in decoders {
+        let mut decoder = decoder(&config, name, 1)?;
+        let (mut decoded, mut errors, mut error) = (0, 0, 0_u64);
+        for (pts, packet) in &packets {
+            if *pts == 10 {
+                continue; // lost
+            }
+            if decoder.submit(packet, *pts).is_err() {
+                errors += 1;
+                continue;
+            }
+            while let Ok(Some(frame)) = decoder.receive() {
+                let at = frame.pts.unwrap_or_default() as usize;
+                if at > 10 {
+                    decoded += 1;
+                    error += frame.bytes[..width * height]
+                        .iter()
+                        .zip(&stripes(width, height, at))
+                        .map(|(a, b)| u64::from(a.abs_diff(*b)))
+                        .sum::<u64>()
+                        / (width * height) as u64;
+                }
+            }
+        }
+        eprintln!(
+            "AV1 LOSS {name}: {decoded} of 19 later frames decoded, {errors} errors, mean luma error {}",
+            error / decoded.max(1)
+        );
+    }
+    Ok(())
+}
+
 // ---- Measurements ----
 
 fn load() -> String {
