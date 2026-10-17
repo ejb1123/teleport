@@ -185,6 +185,42 @@ const RELATIVE_MOUSE: [(&str, &str); 3] = [
     ("Mouse: always relative", "always"),
     ("Mouse: lock by hotkey", "never"),
 ];
+/// `--scroll-direction` (docs/scrolling.md).
+const SCROLL_DIRECTION: [(&str, &str); 3] = [
+    ("Scroll: as this computer", "auto"),
+    ("Scroll: natural", "natural"),
+    ("Scroll: traditional", "traditional"),
+];
+/// `--scroll-speed` for trackpads.
+const SCROLL_SPEED: [(&str, &str); 3] = [
+    ("Scroll speed: normal", "1"),
+    ("Scroll speed: fast", "1.6"),
+    ("Scroll speed: slow", "0.6"),
+];
+/// Connection settings tabs and the setting buttons on each (indices of
+/// the button labels, in their grid order). Every setting is on one tab.
+const SETTINGS_TABS: [(&str, &[usize]); 4] = [
+    ("Display", &[0, 1, 2, 4, 9, 14, 20, 21]),
+    ("Input", &[10, 18, 19, 15, 22, 23]),
+    ("Audio & sharing", &[6, 17, 16, 5, 7]),
+    ("Advanced", &[3, 8, 11, 13, 12]),
+];
+
+/// A setting button's place on its tab: three per row under the tabs;
+/// `None` on other tabs.
+fn setting_rect(tab: usize, index: usize) -> Option<Rect> {
+    let slot = SETTINGS_TABS[tab].1.iter().position(|&i| i == index)?;
+    Some(Rect::new(
+        304 + (slot % 3) as i32 * 232,
+        500 + (slot / 3) as i32 * 44,
+        220,
+        36,
+    ))
+}
+
+fn settings_tab_rect(tab: usize) -> Rect {
+    Rect::new(304 + tab as i32 * 174, 452, 166, 36)
+}
 /// `--encoder-preset`; the first keeps the host's choice.
 const ENCODER_PRESETS: [(&str, &str); 4] = [
     ("Encoder: host default", ""),
@@ -373,23 +409,11 @@ fn approval_confirm_rect() -> Rect {
 }
 
 /// Connection settings buttons shown (the rest of the grid stays empty).
-const PREF_BUTTONS: usize = 22;
+const PREF_BUTTONS: usize = 24;
 /// The settings caption's top; the grid starts below it.
 const PREF_CAPTION_Y: i32 = 390;
 /// Top of the status panel, which the grid must stay above.
 const STATUS_Y: i32 = 716;
-
-/// Connection settings button `index`: eight rows of three between the
-/// caption (below the session buttons; the power row is hidden with
-/// settings shown) and the status panel.
-fn pref_rect(index: usize) -> Rect {
-    Rect::new(
-        304 + (index % 3) as i32 * 232,
-        414 + (index / 3) as i32 * 38,
-        220,
-        32,
-    )
-}
 
 #[derive(Default)]
 struct AgentConsent {
@@ -505,6 +529,10 @@ pub fn run() -> Result<()> {
     let REJECT = Rect::new(764, 560, 228, 44);
     debug_assert!(!APPROVE.has_intersection(AUTH));
     let mode_rect = |index: usize| Rect::new(304 + index as i32 * 174, 220, 166, 38);
+    // Settings on the current tab; the others are off-screen (never hit).
+    let pref_rect = |tab: usize, index: usize| {
+        setting_rect(tab, index).unwrap_or(Rect::new(-1000, -1000, 1, 1))
+    };
     let (sdl, video) = crate::windowing::init()?;
     let ttf = sdl2::ttf::init().map_err(anyhow::Error::msg)?;
     let font = ttf
@@ -553,6 +581,9 @@ pub fn run() -> Result<()> {
     let mut chroma_444 = 0usize;
     let mut ten_bit = 0usize;
     let mut relative_mouse = 0usize;
+    let mut settings_tab = 0usize;
+    let mut scroll_direction = 0usize;
+    let mut scroll_speed = 0usize;
     let mut encoder_preset = 0usize;
     let mut host_display = 0usize;
     let mut gamepad_type = 0usize;
@@ -1210,72 +1241,86 @@ pub fn run() -> Result<()> {
                                 status = "Disconnected.".into();
                             }
                             if settings && child.is_none() {
+                                for tab in 0..SETTINGS_TABS.len() {
+                                    if hit(settings_tab_rect(tab), x, y) {
+                                        settings_tab = tab;
+                                    }
+                                }
                                 for index in 0..3 {
-                                    if hit(pref_rect(index), x, y) {
+                                    if hit(pref_rect(settings_tab, index), x, y) {
                                         stream.cycle(index);
                                     }
                                 }
-                                if hit(pref_rect(9), x, y) {
+                                if hit(pref_rect(settings_tab, 22), x, y) {
+                                    scroll_direction =
+                                        (scroll_direction + 1) % SCROLL_DIRECTION.len();
+                                }
+                                if hit(pref_rect(settings_tab, 23), x, y) {
+                                    scroll_speed = (scroll_speed + 1) % SCROLL_SPEED.len();
+                                }
+                                if hit(pref_rect(settings_tab, 9), x, y) {
                                     stream.vsync = !stream.vsync;
                                 }
-                                if hit(pref_rect(10), x, y) {
+                                if hit(pref_rect(settings_tab, 10), x, y) {
                                     relative_mouse = (relative_mouse + 1) % RELATIVE_MOUSE.len();
                                 }
-                                if hit(pref_rect(11), x, y) {
+                                if hit(pref_rect(settings_tab, 11), x, y) {
                                     encoder_preset = (encoder_preset + 1) % ENCODER_PRESETS.len();
                                 }
-                                if hit(pref_rect(12), x, y) {
+                                if hit(pref_rect(settings_tab, 12), x, y) {
                                     overlay_warnings = !overlay_warnings;
                                 }
-                                if hit(pref_rect(13), x, y) {
+                                if hit(pref_rect(settings_tab, 13), x, y) {
                                     host_display = (host_display + 1) % HOST_DISPLAY.len();
                                 }
-                                if hit(pref_rect(14), x, y) {
+                                if hit(pref_rect(settings_tab, 14), x, y) {
                                     smooth_pacing = !smooth_pacing;
                                 }
-                                if hit(pref_rect(15), x, y) {
+                                if hit(pref_rect(settings_tab, 15), x, y) {
                                     gamepad_type = (gamepad_type + 1) % GAMEPAD_TYPES.len();
                                 }
-                                if hit(pref_rect(16), x, y) {
+                                if hit(pref_rect(settings_tab, 16), x, y) {
                                     microphone = (microphone + 1) % MICROPHONE.len();
                                 }
-                                if hit(pref_rect(17), x, y) {
+                                if hit(pref_rect(settings_tab, 17), x, y) {
                                     audio_quality = (audio_quality + 1) % AUDIO_QUALITY.len();
                                 }
-                                if hit(pref_rect(18), x, y) {
+                                if hit(pref_rect(settings_tab, 18), x, y) {
                                     swap_ctrl_cmd = !swap_ctrl_cmd;
                                 }
-                                if hit(pref_rect(19), x, y) {
+                                if hit(pref_rect(settings_tab, 19), x, y) {
                                     keep_local = (keep_local + 1) % KEEP_LOCAL.len();
                                 }
-                                if hit(pref_rect(20), x, y) {
+                                if hit(pref_rect(settings_tab, 20), x, y) {
                                     chroma_444 = (chroma_444 + 1) % CHROMA_444.len();
                                 }
-                                if hit(pref_rect(21), x, y) {
+                                if hit(pref_rect(settings_tab, 21), x, y) {
                                     ten_bit = (ten_bit + 1) % TEN_BIT.len();
                                 }
-                                if hit(pref_rect(3), x, y) {
+                                if hit(pref_rect(settings_tab, 3), x, y) {
                                     codec = (codec + 1) % CODECS.len();
                                     if CODECS[codec].1 != "h265" {
                                         hdr = false;
                                     }
                                 }
-                                if hit(pref_rect(4), x, y) && cfg!(target_os = "macos") {
+                                if hit(pref_rect(settings_tab, 4), x, y)
+                                    && cfg!(target_os = "macos")
+                                {
                                     hdr = !hdr;
                                     if hdr {
                                         codec = 2;
                                     }
                                 }
-                                if hit(pref_rect(5), x, y) {
+                                if hit(pref_rect(settings_tab, 5), x, y) {
                                     clipboard = !clipboard;
                                 }
-                                if hit(pref_rect(6), x, y) {
+                                if hit(pref_rect(settings_tab, 6), x, y) {
                                     mute = !mute;
                                 }
-                                if hit(pref_rect(8), x, y) {
+                                if hit(pref_rect(settings_tab, 8), x, y) {
                                     decoder.toggle();
                                 }
-                                if hit(pref_rect(7), x, y) {
+                                if hit(pref_rect(settings_tab, 7), x, y) {
                                     let target = selected
                                         .as_ref()
                                         .map_or("", |profile| profile.address.as_str());
@@ -1407,6 +1452,10 @@ pub fn run() -> Result<()> {
                             .arg(TEN_BIT[ten_bit].1)
                             .arg("--relative-mouse")
                             .arg(RELATIVE_MOUSE[relative_mouse].1)
+                            .arg("--scroll-direction")
+                            .arg(SCROLL_DIRECTION[scroll_direction].1)
+                            .arg("--scroll-speed")
+                            .arg(SCROLL_SPEED[scroll_speed].1)
                             .arg("--dynamic-range")
                             .arg(if hdr { "hdr10" } else { "sdr" });
                         stream.apply(&mut command);
@@ -1428,6 +1477,10 @@ pub fn run() -> Result<()> {
                         }
                         command.args(KEEP_LOCAL[keep_local].1);
                         decoder.apply(&mut command);
+                        // The session window is titled after the desktop.
+                        if !profile.name.trim().is_empty() {
+                            command.arg("--title").arg(profile.name.trim());
+                        }
                         apply_relay(profile, &mut command)?;
                         if clipboard {
                             command.arg("--clipboard");
@@ -1945,14 +1998,26 @@ pub fn run() -> Result<()> {
                             KEEP_LOCAL[keep_local].0,
                             CHROMA_444[chroma_444].0,
                             TEN_BIT[ten_bit].0,
+                            SCROLL_DIRECTION[scroll_direction].0,
+                            SCROLL_SPEED[scroll_speed].0,
                         ];
-                        for (index, label) in labels.into_iter().enumerate() {
+                        for (tab, (name, _)) in SETTINGS_TABS.iter().enumerate() {
                             ui.button(
-                                pref_rect(index),
-                                label,
-                                child.is_none() && (index != 4 || cfg!(target_os = "macos")),
-                                false,
+                                settings_tab_rect(tab),
+                                name,
+                                child.is_none(),
+                                tab == settings_tab,
                             )?;
+                        }
+                        for (index, label) in labels.into_iter().enumerate() {
+                            if let Some(rect) = setting_rect(settings_tab, index) {
+                                ui.button(
+                                    rect,
+                                    label,
+                                    child.is_none() && (index != 4 || cfg!(target_os = "macos")),
+                                    false,
+                                )?;
+                            }
                         }
                     } else {
                         ui.text(
@@ -2183,26 +2248,6 @@ mod tests {
     /// Every connection setting has its own button inside the settings area:
     /// below the session buttons and caption, above the status panel, inside
     /// the window, overlapping nothing.
-    #[test]
-    fn settings_buttons_fit_between_the_caption_and_the_status_panel() {
-        use super::{PREF_BUTTONS, PREF_CAPTION_Y, STATUS_Y, pref_rect};
-        let session_buttons = sdl2::rect::Rect::new(304, 342, 688, 36);
-        assert!(session_buttons.bottom() < PREF_CAPTION_Y);
-        for index in 0..PREF_BUTTONS {
-            let rect = pref_rect(index);
-            assert!(rect.top() >= PREF_CAPTION_Y + 20, "{index}: {rect:?}");
-            assert!(rect.bottom() <= STATUS_Y, "{index}: {rect:?}");
-            assert!(
-                rect.left() >= 280 && rect.right() <= 1016,
-                "{index}: {rect:?}"
-            );
-            assert!(rect.height() >= 28, "{index}: {rect:?}");
-            for other in index + 1..PREF_BUTTONS {
-                assert!(!rect.has_intersection(pref_rect(other)), "{index} {other}");
-            }
-        }
-    }
-
     #[test]
     fn stream_settings_default_to_matching_and_reach_the_client() {
         use crate::client::stream_settings::{Setting, parse_bitrate, parse_fps, parse_width};
@@ -2435,6 +2480,30 @@ mod tests {
         assert!(!path.exists());
         Ok(())
     }
+    #[test]
+    fn every_setting_is_on_one_tab_above_the_status_panel() {
+        use super::{SETTINGS_TABS, setting_rect, settings_tab_rect};
+        let mut seen = vec![0; 22];
+        for (tab, (_, settings)) in SETTINGS_TABS.iter().enumerate() {
+            assert!(settings.len() <= 6, "tab {tab} is crowded");
+            let tab_rect = settings_tab_rect(tab);
+            assert!(tab_rect.right() <= 1016);
+            for &index in *settings {
+                seen[index] += 1;
+                let rect = setting_rect(tab, index).unwrap();
+                // Below the tabs, above the status panel (y 716), on screen.
+                assert!(rect.y() > tab_rect.bottom() && rect.bottom() < 716);
+                assert!(rect.right() <= 1016);
+                for &other in *settings {
+                    if other != index {
+                        assert!(!rect.has_intersection(setting_rect(tab, other).unwrap()));
+                    }
+                }
+            }
+        }
+        assert!(seen.iter().all(|&count| count == 1), "{seen:?}");
+    }
+
     #[test]
     fn hit_testing_excludes_margins_and_adjacent_controls() {
         let button = sdl2::rect::Rect::new(304, 272, 448, 44);

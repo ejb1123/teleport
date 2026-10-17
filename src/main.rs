@@ -31,6 +31,8 @@ mod identity;
 mod key_options;
 mod keyboard_capture;
 mod launcher;
+#[cfg(target_os = "macos")]
+mod mac_scroll;
 mod media;
 mod natpmp;
 mod overlay;
@@ -46,6 +48,7 @@ mod protocol;
 mod pw_cursor;
 mod relay;
 mod relay_enroll;
+mod scroll;
 mod security_key;
 #[cfg(target_os = "linux")]
 mod session_lock;

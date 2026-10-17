@@ -296,6 +296,23 @@ fn test_host_advertises_and_accepts_gamepad_events() {
                 !text.contains("could not be injected"),
                 "pad event rejected: {text}"
             );
+            // Scrolling (src/scroll.rs): a wheel notch stays discrete; the
+            // trackpad gesture arrives as smooth pixels (5 px per half unit)
+            // and ends with `finish`.
+            assert!(
+                text.contains("test host scroll x=0 y=1"),
+                "no wheel notch: {text}"
+            );
+            assert_eq!(
+                text.matches("test host smooth scroll dx=0.0 dy=-5.0 finish=false")
+                    .count(),
+                12,
+                "smooth deltas: {text}"
+            );
+            assert!(
+                text.contains("test host smooth scroll dx=0.0 dy=0.0 finish=true"),
+                "no gesture end: {text}"
+            );
             break;
         }
         assert!(
@@ -1226,11 +1243,23 @@ fn x11_capture_input_and_native_window() {
         transitions.contains(&(38, true)) && transitions.contains(&(38, false)),
         "A press/release missing: {transitions:?}"
     );
+    // Scrolling (src/scroll.rs): X11 hosts take whole notches only. The
+    // wheel notch up is button 4; the trackpad gesture (12 x 5 px down)
+    // becomes one 50 px notch down, button 5.
     // Back and forward (SDL X1/X2) arrive as X11 buttons 8 and 9.
     assert_eq!(
         buttons,
-        [(8, true), (8, false), (9, true), (9, false)],
-        "side buttons"
+        [
+            (4, true),
+            (4, false),
+            (5, true),
+            (5, false),
+            (8, true),
+            (8, false),
+            (9, true),
+            (9, false)
+        ],
+        "wheel and side buttons"
     );
     assert!(
         connection

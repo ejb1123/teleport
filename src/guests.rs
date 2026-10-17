@@ -99,7 +99,8 @@ pub fn need(event: &Event) -> Need {
         | Event::RelativeMotion { .. }
         | Event::Button { .. }
         | Event::Key { .. }
-        | Event::Scroll { .. } => Need::KeyboardMouse,
+        | Event::Scroll { .. }
+        | Event::ScrollSmooth { .. } => Need::KeyboardMouse,
         Event::GamepadConnected { .. }
         | Event::GamepadDisconnected { .. }
         | Event::GamepadButton { .. }

@@ -35,6 +35,10 @@ pub struct Options {
     /// Private pairing file copied from the host.
     #[arg(long)]
     pub pairing_file: PathBuf,
+    /// Desktop name for the window title (the launcher passes its saved
+    /// name); default: the address.
+    #[arg(long, hide = true)]
+    pub title: Option<String>,
     /// Decode this many frames without opening a window (smoke testing).
     #[arg(long, hide = true)]
     pub headless_frames: Option<u32>,
@@ -98,6 +102,15 @@ pub struct Options {
     /// `never` only by Ctrl+Alt+M.
     #[arg(long, value_enum, default_value_t = RelativeMouse::Auto)]
     pub relative_mouse: RelativeMouse,
+    /// Trackpad scrolling speed (0.1-10): host pixels per local scroll unit
+    /// are ten times this. Mouse wheels always scroll whole notches.
+    #[arg(long, default_value_t = 1.0, value_parser = parse_scroll_speed)]
+    pub scroll_speed: f64,
+    /// Scroll direction on the host: `auto` scrolls like this computer's own
+    /// windows (its natural-scrolling setting included), `natural` and
+    /// `traditional` force one convention (docs/scrolling.md).
+    #[arg(long, value_enum, default_value_t = crate::scroll::Direction::Auto)]
+    pub scroll_direction: crate::scroll::Direction,
     /// Encoder speed/quality trade-off for this session: `latency`,
     /// `balanced` or `quality`. Default: the host's `--encoder-preset`.
     #[arg(long, value_enum)]
@@ -885,7 +898,10 @@ async fn send_input(
                 )?;
                 unconfirmed = Some((motion_id, event));
             }
-            Event::Button { .. } | Event::Scroll { .. } | Event::RelativeMotion { .. } => {
+            Event::Button { .. }
+            | Event::Scroll { .. }
+            | Event::ScrollSmooth { .. }
+            | Event::RelativeMotion { .. } => {
                 // Clicks and wheel steps land where the pointer was: repeat the
                 // latest position reliably, in order, right before them.
                 if let Some((id, motion)) = unconfirmed.take() {
@@ -1210,11 +1226,24 @@ type SessionWindow = (
     sdl2::render::Canvas<sdl2::video::Window>,
 );
 
+/// "<desktop> - Teleport - Remote Desktop": the desktop first, so Mission
+/// Control, Cmd+Tab and task bars tell sessions apart.
+fn window_title(options: &Options) -> String {
+    let label = options
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&options.address);
+    let label: String = label.chars().filter(|c| !c.is_control()).take(80).collect();
+    format!("{label} - Teleport - Remote Desktop")
+}
+
 fn session_window(options: &Options) -> Result<SessionWindow> {
     let (sdl, video) = crate::windowing::init()?;
     let make_window = || -> Result<sdl2::video::Window> {
         let mut window = video
-            .window("Teleport - Remote Desktop", 1280, 720)
+            .window(&window_title(options), 1280, 720)
             .position_centered()
             .resizable()
             .allow_highdpi()
@@ -2104,8 +2133,37 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     } else {
                         Vec::new()
                     };
+                    // A wheel notch, then a trackpad gesture (smooth pixels
+                    // to hosts that take them, else whole notches) and its end,
+                    // through the same translation as SDL wheel events.
+                    let scroll = {
+                        use crate::scroll::{Scroller, Target};
+                        let mut scroller = Scroller::new(
+                            desktop.smooth_scroll,
+                            options.scroll_speed,
+                            options.scroll_direction,
+                        );
+                        let start = Instant::now();
+                        let at = |ms| start + Duration::from_millis(ms);
+                        let centre = Target::Desktop(0.5, 0.5);
+                        let mut batch =
+                            scroller.wheel((0, 1), (0.0, 1.0), false, centre, None, start)?;
+                        for step in 0..12 {
+                            batch.extend(scroller.wheel(
+                                (0, 0),
+                                (0.0, -0.5),
+                                false,
+                                centre,
+                                None,
+                                at(200 + step * 10),
+                            )?);
+                        }
+                        batch.extend(scroller.poll(at(500)));
+                        batch
+                    };
                     for event in [Event::Motion { x: 0.5, y: 0.5 }]
                         .into_iter()
+                        .chain(scroll)
                         .chain(side_buttons)
                         .chain([
                             Event::Key {
@@ -2367,13 +2425,29 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let initial_settings_started = Instant::now();
     let mut switch_ack = false;
     let mut first_draw = true;
-    let mut show_stats = options.stats;
+    // F8: 0 hidden, 1 summary, 2 details.
+    let mut stats_page: u8 = u8::from(options.stats);
+    // Ctrl+Alt+S: images of the window and of the next decoded frame.
+    let mut snapshot_request = Snapshot::default();
+    // Test hook: open F8 and take the Ctrl+Alt+S snapshots once this many
+    // frames are shown (rendering checks without key injection).
+    let mut snapshot_after: Option<u64> = std::env::var("TELEPORT_SNAPSHOT_AFTER_FRAMES")
+        .ok()
+        .and_then(|frames| frames.parse().ok());
+    // Overlay layers drawn in the last presented frame (F8 diagnostics).
+    let mut last_layers = String::new();
     let mut fps = 0.0;
     let mut mbps = 0.0;
     let mut previous_bytes = 0;
     let mut previous_received = 0_u64;
     let mut previous_decoded = 0_u64;
-    let mut wheel = WheelAccumulator::default();
+    let mut wheel = crate::scroll::Scroller::new(
+        desktop.smooth_scroll,
+        options.scroll_speed,
+        options.scroll_direction,
+    );
+    // macOS trackpad phases (momentum, touch); none elsewhere.
+    let _scroll_phases = crate::scroll::platform::Monitor::install();
     let mut probe_id = 0_u64;
     let mut pending_probe: Option<(u64, Instant)> = None;
     let mut last_probe = Instant::now() - Duration::from_secs(1);
@@ -2424,6 +2498,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     // How long the frame drawn next waited in the pacer.
     let mut frame_held = Duration::ZERO;
     'running: loop {
+        if snapshot_after.is_some_and(|after| total_frames as u64 >= after) {
+            snapshot_after = None;
+            snapshot_request = Snapshot::requested();
+            stats_page = 2;
+        }
         present_timer.iterations += 1;
         WAKE_QUEUED.store(false, Ordering::Release);
         let mut redraw = first_draw || deferred_redraw;
@@ -2605,7 +2684,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         fps = desktop.fps,
                         "host acknowledged video configuration"
                     );
-                    wheel = WheelAccumulator::default();
+                    send_all(&events, wheel.reset())?;
                     *image.lock().unwrap() = None;
                     pacer.clear();
                     hdr_frame = None;
@@ -2761,7 +2840,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         }
                     }
                     Action::Disconnect => break 'running,
-                    Action::Stats => show_stats = !show_stats,
+                    Action::Stats => {
+                        stats_page = (stats_page + 1) % (crate::overlay::STATS_PAGES + 1)
+                    }
                     Action::AllowGuest | Action::DenyGuest => {
                         let allow = action == Action::AllowGuest;
                         notice = match guest_panel.first(Instant::now()) {
@@ -2800,6 +2881,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                             .into()
                         };
                         guest_panel.notice(notice.clone(), Instant::now());
+                    }
+                    Action::Snapshot => {
+                        snapshot_request = Snapshot::requested();
+                        notice = "Saving snapshots (window now, video at the next frame)…".into();
                     }
                     Action::Swallow => (),
                 }
@@ -2847,7 +2932,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 && chrome.blocks_pointer(y)
             {
                 motion = None;
-                wheel = WheelAccumulator::default();
+                send_all(&events, wheel.reset())?;
                 send(&events, Event::ReleaseAll)?;
                 if keyboard_capture_rect().contains_point((x, y)) {
                     notice = toggle_keyboard_capture(
@@ -2962,7 +3047,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         break 'running;
                     }
                     Some(6) => break 'running,
-                    Some(7) => show_stats = !show_stats,
+                    Some(7) => stats_page = (stats_page + 1) % (crate::overlay::STATS_PAGES + 1),
                     _ => (),
                 }
                 continue;
@@ -3006,11 +3091,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     None
                 }
                 SdlEvent::MouseButtonDown { mouse_btn, .. } if pointer_lock.active() => {
+                    send_all(&events, wheel.flush(Instant::now()))?;
                     flush_relative(&events, &mut relative)?;
                     button(mouse_btn, desktop.extra_mouse_buttons)
                         .map(|button| Event::Button { button, down: true })
                 }
                 SdlEvent::MouseButtonUp { mouse_btn, .. } if pointer_lock.active() => {
+                    send_all(&events, wheel.flush(Instant::now()))?;
                     flush_relative(&events, &mut relative)?;
                     button(mouse_btn, desktop.extra_mouse_buttons).map(|button| Event::Button {
                         button,
@@ -3027,6 +3114,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     mouse_btn, x, y, ..
                 } => {
                     motion = None;
+                    send_all(&events, wheel.flush(Instant::now()))?;
                     if let Some((x, y)) = chrome.pointer(x, y, canvas.window().size(), size) {
                         send(&events, Event::Motion { x, y })?;
                         button(mouse_btn, desktop.extra_mouse_buttons)
@@ -3039,6 +3127,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     mouse_btn, x, y, ..
                 } => {
                     motion = None;
+                    send_all(&events, wheel.flush(Instant::now()))?;
                     if let Some((x, y)) = chrome.pointer(x, y, canvas.window().size(), size) {
                         send(&events, Event::Motion { x, y })?;
                     }
@@ -3060,15 +3149,33 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     // Use this event's cursor position, not the end-of-batch
                     // mouse state. Never let a coalesced motion follow a wheel
                     // event and rewind the remote pointer after scrolling.
-                    motion = None;
-                    for event in wheel.events(
-                        (x, y),
-                        (precise_x, precise_y),
-                        direction == sdl2::mouse::MouseWheelDirection::Flipped,
-                        chrome.pointer(mouse_x, mouse_y, canvas.window().size(), size),
-                    )? {
-                        send(&events, event)?;
+                    let now = Instant::now();
+                    let (markers, device) = crate::scroll::platform::take(true);
+                    for marker in markers {
+                        send_all(&events, wheel.marker(marker, now))?;
                     }
+                    let target = if pointer_lock.active() {
+                        flush_relative(&events, &mut relative)?;
+                        crate::scroll::Target::Locked
+                    } else {
+                        motion = None;
+                        chrome
+                            .pointer(mouse_x, mouse_y, canvas.window().size(), size)
+                            .map_or(crate::scroll::Target::Outside, |(x, y)| {
+                                crate::scroll::Target::Desktop(x, y)
+                            })
+                    };
+                    send_all(
+                        &events,
+                        wheel.wheel(
+                            (x, y),
+                            (precise_x, precise_y),
+                            direction == sdl2::mouse::MouseWheelDirection::Flipped,
+                            target,
+                            device,
+                            now,
+                        )?,
+                    )?;
                     None
                 }
                 SdlEvent::Window {
@@ -3076,7 +3183,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     ..
                 } => {
                     motion = None;
-                    wheel = WheelAccumulator::default();
+                    send_all(&events, wheel.reset())?;
                     None
                 }
                 SdlEvent::RenderTargetsReset { .. } | SdlEvent::RenderDeviceReset { .. } => {
@@ -3095,6 +3202,19 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 send(&events, event)?;
             }
         }
+        // Coalesced trackpad deltas and gesture ends. Pointer movement after
+        // the last wheel event in this batch must not overtake its deltas.
+        if motion.is_some() || relative != (0, 0) {
+            send_all(&events, wheel.flush(Instant::now()))?;
+        }
+        // Phases after the batch's last wheel event (a lift, a touch that
+        // stops coasting, momentum's end).
+        for marker in crate::scroll::platform::take(false).0 {
+            send_all(&events, wheel.marker(marker, Instant::now()))?;
+            displays.scroll_marker(marker, Instant::now())?;
+        }
+        send_all(&events, wheel.poll(Instant::now()))?;
+        displays.poll_scroll(Instant::now())?;
         flush_relative(&events, &mut relative)?;
         if let Some(event) = motion {
             send(&events, event)?;
@@ -3129,6 +3249,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             frame_latency = frame.latency;
             present_timer.picked_up(frame.decoded_at);
             protocol::validate_video_size(frame.width, frame.height)?;
+            if snapshot_request.video {
+                snapshot_request.video = false;
+                notice = match save_video_snapshot(&frame) {
+                    Ok(Some(path)) => format!("Video frame saved: {}", path.display()),
+                    Ok(None) => "Video stays on the GPU here; only the window was saved".into(),
+                    Err(error) => format!("Video snapshot failed: {error:#}"),
+                };
+                tracing::info!(%notice, "snapshot");
+            }
             'frame: {
                 if let Some(gpu) = frame.gpu.take() {
                     // Zero-copy: keep the decoded surface; it is drawn on the GPU below.
@@ -3219,7 +3348,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             } else {
                 IDLE_WAIT
             }
-            .min(Duration::from_secs(1).saturating_sub(stats.elapsed()));
+            .min(Duration::from_secs(1).saturating_sub(stats.elapsed()))
+            // Coalesced trackpad deltas and the gesture's end are on time.
+            .min(wheel.deadline().map_or(Duration::MAX, |due| {
+                due.saturating_duration_since(Instant::now())
+            }));
             // A paced frame due within ~2 ms: sleep exactly instead of
             // SDL's millisecond wait, so the cadence stays even.
             if let Some(due) = pacer.next_due() {
@@ -3243,6 +3376,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             continue;
         }
         deferred_redraw = false;
+        let mut layers: Vec<&str> = Vec::new();
         let window_size = canvas.window().size();
         canvas.set_logical_size(window_size.0.max(1), window_size.1.max(TOOLBAR_HEIGHT + 1))?;
         canvas.set_draw_color(sdl2::pixels::Color::RGB(12, 15, 20));
@@ -3251,6 +3385,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             canvas
                 .copy(texture, None, chrome.rect(window_size, size))
                 .map_err(anyhow::Error::msg)?;
+            layers.push("video (SDL texture)");
         }
         #[cfg(target_os = "linux")]
         if let (Some(presenter), Some(frame)) = (zero_copy.as_mut(), gpu_frame.as_ref())
@@ -3264,6 +3399,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             );
             ZERO_COPY_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
             return Ok(true);
+        }
+        #[cfg(target_os = "linux")]
+        if zero_copy.is_some() && gpu_frame.is_some() {
+            layers.push("video (zero-copy GL)");
+        }
+        if hdr_presenter.is_some() && hdr_frame.is_some() {
+            layers.push("video (Metal layer; UI composited on it)");
         }
         if stats.elapsed() >= Duration::from_secs(1) || stats_lines.is_empty() {
             let snapshot = stream_stats.snapshot();
@@ -3389,6 +3531,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     }
                 ),
                 format!(
+                    "Scrolling             {}   |   direction {}",
+                    if desktop.smooth_scroll {
+                        format!("smooth pixels x{:.1}", options.scroll_speed)
+                    } else {
+                        "whole notches (host)".to_owned()
+                    },
+                    options.scroll_direction.label()
+                ),
+                format!(
                     "Keys                  Ctrl/Command {}   |   kept here: {}",
                     if key_options.swap_ctrl_cmd() {
                         "swapped"
@@ -3475,6 +3626,30 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     match local_display.refresh_mhz {
                         0 => "unknown refresh".to_owned(),
                         mhz => format!("{} Hz", protocol::refresh_hz(mhz)),
+                    }
+                ),
+                {
+                    // HiDPI diagnostics: points, GL drawable, renderer output.
+                    let window = canvas.window().size();
+                    let drawable = canvas.window().drawable_size();
+                    let output = canvas.output_size().unwrap_or((0, 0));
+                    format!(
+                        "Window                {}x{} pt | drawable {}x{} | output {}x{} ({:.2}x)",
+                        window.0,
+                        window.1,
+                        drawable.0,
+                        drawable.1,
+                        output.0,
+                        output.1,
+                        f64::from(output.0) / f64::from(window.0.max(1))
+                    )
+                },
+                format!(
+                    "Layers (last frame)   {}",
+                    if last_layers.is_empty() {
+                        "none"
+                    } else {
+                        &last_layers
                     }
                 ),
                 {
@@ -3612,7 +3787,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             frames = 0;
         }
         use sdl2::pixels::Color;
+        // Notices show for five seconds: in the toolbar, or as a toast when
+        // it is hidden (fullscreen).
+        if previous_notice != notice {
+            previous_notice.clone_from(&notice);
+            notice_at = Instant::now();
+        }
+        let notice_fresh = !notice.is_empty() && notice_at.elapsed() < Duration::from_secs(5);
         if chrome.visible() {
+            layers.push("toolbar");
             canvas.set_draw_color(Color::RGB(21, 27, 38));
             canvas
                 .fill_rect(Rect::new(0, 0, window_size.0, TOOLBAR_HEIGHT))
@@ -3651,7 +3834,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 };
                 let active = (index == 1 && audio.is_some() && !muted)
                     || (index == 4 && fullscreen)
-                    || (index == 7 && show_stats);
+                    || (index == 7 && stats_page != 0);
                 canvas.set_draw_color(if hover == Some(index) && enabled {
                     if index == 6 {
                         Color::RGB(114, 47, 59)
@@ -3697,13 +3880,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 Some(7) => "Stats for nerds · measured streaming performance (F8)",
                 _ => "",
             };
-            if previous_notice != notice {
-                previous_notice.clone_from(&notice);
-                notice_at = Instant::now();
-            }
             let status = if !hint.is_empty() {
                 hint.into()
-            } else if !notice.is_empty() && notice_at.elapsed() < Duration::from_secs(5) {
+            } else if notice_fresh {
                 notice.clone()
             } else {
                 format!(
@@ -3772,63 +3951,156 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             )?;
         } else {
             canvas.set_draw_color(Color::RGB(99, 218, 193));
+            layers.push("reveal strip");
             canvas
                 .fill_rect(reveal_rect(window_size.0))
                 .map_err(anyhow::Error::msg)?;
         }
-        let mut stats_panel = None;
-        if show_stats {
-            let panel_width = 520.min(window_size.0.saturating_sub(24));
-            let panel = Rect::new(
-                window_size.0 as i32 - panel_width as i32 - 12,
-                if chrome.visible() {
-                    TOOLBAR_HEIGHT as i32 + 12
-                } else {
-                    12
-                },
-                panel_width,
-                stats_lines.len() as u32 * 24 + 28 + GRAPH_HEIGHT,
-            );
-            stats_panel = Some(panel);
+        // Overlays, laid out so none covers another (src/overlay.rs).
+        let shown = warnings.visible(Instant::now());
+        let guest_lines = guest_panel.lines(Instant::now());
+        let page_lines = if stats_page == 0 {
+            Vec::new()
+        } else {
+            crate::overlay::stats_page(&stats_lines, stats_page, keyboard_capture.active())
+        };
+        let toast = !chrome.visible() && notice_fresh;
+        let placed = crate::overlay::layout(
+            window_size,
+            chrome.rect(window_size, size),
+            if chrome.visible() { TOOLBAR_HEIGHT } else { 0 },
+            &crate::overlay::Overlays {
+                toast,
+                guest_lines: guest_lines.len(),
+                stats_lines: page_lines.len(),
+                stats_extra: if stats_page == 1 { GRAPH_HEIGHT } else { 0 },
+                warning_lines: shown.len(),
+            },
+        );
+        let line_height = crate::overlay::PANEL_LINE as i32;
+        let mut text_panel = |canvas: &mut sdl2::render::Canvas<sdl2::video::Window>,
+                              panel: Rect,
+                              fill: Color,
+                              border: Color,
+                              ink: Color,
+                              lines: &[&str]|
+         -> Result<()> {
+            canvas.set_draw_color(fill);
+            canvas.fill_rect(panel).map_err(anyhow::Error::msg)?;
+            canvas.set_draw_color(border);
+            canvas.draw_rect(panel).map_err(anyhow::Error::msg)?;
+            for (index, text) in lines.iter().enumerate() {
+                session_text(
+                    canvas,
+                    &creator,
+                    &mut session_fonts,
+                    &mut text_cache,
+                    text,
+                    Rect::new(
+                        panel.x() + 10,
+                        panel.y() + 6 + index as i32 * line_height,
+                        panel.width().saturating_sub(20),
+                        20,
+                    ),
+                    ink,
+                )?;
+            }
+            Ok(())
+        };
+        // Notices while the toolbar is hidden.
+        if let Some(panel) = placed.toast {
+            layers.push("notice toast");
+            text_panel(
+                &mut canvas,
+                panel,
+                Color::RGB(21, 27, 38),
+                Color::RGB(71, 196, 172),
+                Color::RGB(223, 233, 243),
+                &[notice.as_str()],
+            )?;
+        }
+        // G22: concise warnings over the top left of the video.
+        if let Some(panel) = placed.warnings {
+            layers.push("warnings");
+            text_panel(
+                &mut canvas,
+                panel,
+                Color::RGB(48, 26, 18),
+                Color::RGB(214, 128, 60),
+                Color::RGB(255, 196, 120),
+                &shown,
+            )?;
+        }
+        // Shared sessions: approval prompts and access changes, top right.
+        if let Some(panel) = placed.guests {
+            layers.push("guest/notice panel");
+            let lines: Vec<&str> = guest_lines.iter().map(String::as_str).collect();
+            text_panel(
+                &mut canvas,
+                panel,
+                Color::RGB(16, 30, 50),
+                Color::RGB(88, 160, 232),
+                Color::RGB(196, 224, 255),
+                &lines,
+            )?;
+        }
+        if let Some(panel) = placed.stats {
+            layers.push("F8 stats");
+            let panel_width = panel.width();
             canvas.set_draw_color(Color::RGB(16, 23, 33));
             canvas.fill_rect(panel).map_err(anyhow::Error::msg)?;
             canvas.set_draw_color(Color::RGB(67, 103, 114));
             canvas.draw_rect(panel).map_err(anyhow::Error::msg)?;
-            // Rolling graph under the title: frame time, latency, bitrate.
-            let series = [
-                (&graph.frame_ms, 20.0, Color::RGB(99, 218, 193)),
-                (&graph.latency_ms, 20.0, Color::RGB(240, 190, 90)),
-                (&graph.mbps, 5.0, Color::RGB(130, 170, 250)),
-            ];
-            for (row, ((values, floor, color), label)) in
-                series.into_iter().zip(&graph_labels).enumerate()
-            {
-                let top = panel.y() + 40 + row as i32 * GRAPH_ROW;
-                session_text(
-                    &mut canvas,
-                    &creator,
-                    &mut session_fonts,
-                    &mut text_cache,
-                    label,
-                    Rect::new(panel.x() + 14, top + 8, 200, 20),
-                    color,
-                )?;
-                let area = Rect::new(
-                    panel.x() + 220,
-                    top,
-                    panel_width.saturating_sub(234).max(1),
-                    GRAPH_ROW as u32 - 6,
-                );
-                canvas.set_draw_color(Color::RGB(28, 38, 52));
-                canvas.fill_rect(area).map_err(anyhow::Error::msg)?;
-                let (points, _) = crate::overlay::Graph::points(values, area, floor);
-                if points.len() > 1 {
-                    canvas.set_draw_color(color);
-                    canvas.draw_lines(&points[..]).map_err(anyhow::Error::msg)?;
+            let graph_height = if stats_page == 1 && placed.stats_graph {
+                // Rolling graph under the title: frame time, latency, bitrate.
+                let series = [
+                    (&graph.frame_ms, 20.0, Color::RGB(99, 218, 193)),
+                    (&graph.latency_ms, 20.0, Color::RGB(240, 190, 90)),
+                    (&graph.mbps, 5.0, Color::RGB(130, 170, 250)),
+                ];
+                for (row, ((values, floor, color), label)) in
+                    series.into_iter().zip(&graph_labels).enumerate()
+                {
+                    let top = panel.y() + 40 + row as i32 * GRAPH_ROW;
+                    session_text(
+                        &mut canvas,
+                        &creator,
+                        &mut session_fonts,
+                        &mut text_cache,
+                        label,
+                        Rect::new(panel.x() + 14, top + 8, 200, 20),
+                        color,
+                    )?;
+                    let area = Rect::new(
+                        panel.x() + 220,
+                        top,
+                        panel_width.saturating_sub(234).max(1),
+                        GRAPH_ROW as u32 - 6,
+                    );
+                    canvas.set_draw_color(Color::RGB(28, 38, 52));
+                    canvas.fill_rect(area).map_err(anyhow::Error::msg)?;
+                    let (points, _) = crate::overlay::Graph::points(values, area, floor);
+                    if points.len() > 1 {
+                        canvas.set_draw_color(color);
+                        canvas.draw_lines(&points[..]).map_err(anyhow::Error::msg)?;
+                    }
                 }
-            }
-            for (index, line) in stats_lines.iter().enumerate() {
-                let graph_offset = if index == 0 { 0 } else { GRAPH_HEIGHT as i32 };
+                GRAPH_HEIGHT as i32
+            } else {
+                0
+            };
+            // Lines cut by a short window say so on the last one shown.
+            let fit = placed.stats_lines;
+            let cut = page_lines.len() - fit;
+            for (index, line) in page_lines.iter().take(fit).enumerate() {
+                let more;
+                let line = if cut > 0 && index + 1 == fit && index > 0 {
+                    more = format!("… {} more lines: enlarge the window", cut + 1);
+                    &more
+                } else {
+                    line
+                };
+                let offset = if index == 0 { 0 } else { graph_height };
                 session_text(
                     &mut canvas,
                     &creator,
@@ -3837,8 +4109,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     line,
                     Rect::new(
                         panel.x() + 14,
-                        panel.y() + 14 + index as i32 * 24 + graph_offset,
-                        panel_width - 28,
+                        panel.y() + 14 + index as i32 * crate::overlay::STATS_LINE as i32 + offset,
+                        panel_width.saturating_sub(28),
                         20,
                     ),
                     if index == 0 {
@@ -3849,83 +4121,24 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 )?;
             }
         }
-        // G22: concise warnings over the top-left of the video.
-        let mut warning_panel = None;
-        let shown = warnings.visible(Instant::now());
-        if !shown.is_empty() {
-            let video = chrome.rect(window_size, size);
-            let top = video.y().max(if chrome.visible() {
-                TOOLBAR_HEIGHT as i32
-            } else {
-                0
-            });
-            let panel = Rect::new(
-                video.x() + 12,
-                top + 12,
-                460.min(window_size.0.saturating_sub(24)).max(1),
-                shown.len() as u32 * 26 + 8,
-            );
-            warning_panel = Some(panel);
-            canvas.set_draw_color(Color::RGB(48, 26, 18));
-            canvas.fill_rect(panel).map_err(anyhow::Error::msg)?;
-            canvas.set_draw_color(Color::RGB(214, 128, 60));
-            canvas.draw_rect(panel).map_err(anyhow::Error::msg)?;
-            for (index, text) in shown.iter().enumerate() {
-                session_text(
-                    &mut canvas,
-                    &creator,
-                    &mut session_fonts,
-                    &mut text_cache,
-                    text,
-                    Rect::new(
-                        panel.x() + 10,
-                        panel.y() + 6 + index as i32 * 26,
-                        panel.width().saturating_sub(20),
-                        20,
-                    ),
-                    Color::RGB(255, 196, 120),
-                )?;
-            }
+        let (stats_panel, warning_panel, guest_rect, toast_rect) =
+            (placed.stats, placed.warnings, placed.guests, placed.toast);
+        if snapshot_request.window {
+            snapshot_request.window = false;
+            notice = match save_window_snapshot(&mut canvas) {
+                Ok(path) => format!(
+                    "Window saved ({}x{} pt, {}x{} px): {}",
+                    window_size.0,
+                    window_size.1,
+                    canvas.output_size().unwrap_or_default().0,
+                    canvas.output_size().unwrap_or_default().1,
+                    path.display()
+                ),
+                Err(error) => format!("Window snapshot failed: {error:#}"),
+            };
+            tracing::info!(%notice, "snapshot");
         }
-        // Shared sessions: approval prompts and access changes, top right.
-        let mut guest_rect = None;
-        let guest_lines = guest_panel.lines(Instant::now());
-        if !guest_lines.is_empty() {
-            let video = chrome.rect(window_size, size);
-            let top = video.y().max(if chrome.visible() {
-                TOOLBAR_HEIGHT as i32
-            } else {
-                0
-            });
-            let width = 640.min(window_size.0.saturating_sub(24)).max(1);
-            let panel = Rect::new(
-                (video.x() + video.width() as i32 - width as i32 - 12).max(0),
-                top + 12,
-                width,
-                guest_lines.len() as u32 * 26 + 8,
-            );
-            guest_rect = Some(panel);
-            canvas.set_draw_color(Color::RGB(16, 30, 50));
-            canvas.fill_rect(panel).map_err(anyhow::Error::msg)?;
-            canvas.set_draw_color(Color::RGB(88, 160, 232));
-            canvas.draw_rect(panel).map_err(anyhow::Error::msg)?;
-            for (index, text) in guest_lines.iter().enumerate() {
-                session_text(
-                    &mut canvas,
-                    &creator,
-                    &mut session_fonts,
-                    &mut text_cache,
-                    text,
-                    Rect::new(
-                        panel.x() + 10,
-                        panel.y() + 6 + index as i32 * 26,
-                        panel.width().saturating_sub(20),
-                        20,
-                    ),
-                    Color::RGB(196, 224, 255),
-                )?;
-            }
-        }
+        last_layers = layers.join(", ");
         if let (Some(presenter), Some(frame)) = (&mut hdr_presenter, &hdr_frame) {
             let mut ui = vec![read_hdr_overlay(
                 &mut canvas,
@@ -3936,7 +4149,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 },
                 window_size,
             )?];
-            for panel in [stats_panel, warning_panel, guest_rect]
+            for panel in [stats_panel, warning_panel, guest_rect, toast_rect]
                 .into_iter()
                 .flatten()
             {
@@ -4375,61 +4588,87 @@ fn reveal_rect(width: u32) -> Rect {
     )
 }
 
+/// Ctrl+Alt+S: what to save next (docs/ux-audit.md, "Double overlapping
+/// text"). Comparing the window with the unscaled decoded frame tells a
+/// host/encoder artefact from a client presentation one.
 #[derive(Default)]
-struct WheelAccumulator {
-    remainder: [f64; 2],
+struct Snapshot {
+    window: bool,
+    video: bool,
 }
 
-impl WheelAccumulator {
-    fn events(
-        &mut self,
-        integer: (i32, i32),
-        precise: (f32, f32),
-        flipped: bool,
-        position: Option<(f64, f64)>,
-    ) -> Result<Vec<Event>> {
-        let Some((x, y)) = position else {
-            *self = Self::default();
-            return Ok(Vec::new());
-        };
-        let mut steps = [0_i32; 2];
-        for (index, (integer, precise)) in [(integer.0, precise.0), (integer.1, precise.1)]
-            .into_iter()
-            .enumerate()
-        {
-            // Precise deltas replace, not supplement, SDL's integer values.
-            // Older backends may supply only the integer field.
-            let delta = if precise.is_finite() && precise != 0.0 {
-                f64::from(precise)
-            } else {
-                f64::from(integer)
-            };
-            ensure!(
-                delta.abs() <= 200.0,
-                "wheel event exceeds bounded input budget"
-            );
-            let total = self.remainder[index] + if flipped { -delta } else { delta };
-            // SDL supplies f32 values: tolerate rounding at a whole-notch
-            // boundary without repeatedly discarding small touchpad deltas.
-            steps[index] = (total + total.signum() * 1e-6).trunc() as i32;
-            self.remainder[index] = total - f64::from(steps[index]);
-            if self.remainder[index].abs() < 1e-6 {
-                self.remainder[index] = 0.0;
+impl Snapshot {
+    fn requested() -> Self {
+        Self {
+            window: true,
+            video: true,
+        }
+    }
+}
+
+/// `~/Downloads/teleport-<time>-<kind>.bmp`, else the temporary directory.
+fn snapshot_path(kind: &str) -> PathBuf {
+    let directory = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Downloads"))
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.as_millis());
+    directory.join(format!("teleport-{stamp}-{kind}.bmp"))
+}
+
+fn save_bmp(path: &std::path::Path, width: u32, height: u32, rgb: &mut [u8]) -> Result<()> {
+    let surface =
+        sdl2::surface::Surface::from_data(rgb, width, height, width * 3, PixelFormatEnum::RGB24)
+            .map_err(anyhow::Error::msg)?;
+    surface.save_bmp(path).map_err(anyhow::Error::msg)
+}
+
+/// The decoded frame before any scaling; `None` when it never reaches the
+/// CPU (zero-copy, native Mac surfaces, HDR planes).
+fn save_video_snapshot(frame: &media::Image) -> Result<Option<PathBuf>> {
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    let mut rgb = vec![0_u8; width * height * 3];
+    if let Some(nv12) = &frame.nv12 {
+        // Luma only: enough to see doubled edges.
+        for row in 0..height {
+            let line = &nv12.y[row * nv12.y_stride..][..width];
+            for (pixel, &luma) in rgb[row * width * 3..][..width * 3]
+                .chunks_exact_mut(3)
+                .zip(line)
+            {
+                pixel.fill(luma);
             }
         }
-        if steps == [0, 0] {
-            return Ok(Vec::new());
+    } else if frame.gpu.is_none()
+        && frame.hdr.is_none()
+        && frame.surface.is_none()
+        && frame.data.len() >= frame.stride * height.saturating_sub(1) + width * 3
+    {
+        for row in 0..height {
+            rgb[row * width * 3..][..width * 3]
+                .copy_from_slice(&frame.data[row * frame.stride..][..width * 3]);
         }
-        let mut events = vec![Event::Motion { x, y }];
-        while steps != [0, 0] {
-            let x = steps[0].clamp(-20, 20);
-            let y = steps[1].clamp(-20, 20);
-            events.push(Event::Scroll { x, y });
-            steps[0] -= x;
-            steps[1] -= y;
-        }
-        Ok(events)
+    } else {
+        return Ok(None);
     }
+    let path = snapshot_path("video");
+    save_bmp(&path, frame.width, frame.height, &mut rgb)?;
+    Ok(Some(path))
+}
+
+/// Everything the SDL renderer drew this frame, at drawable resolution.
+fn save_window_snapshot(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>) -> Result<PathBuf> {
+    let logical = canvas.logical_size();
+    canvas.set_logical_size(0, 0)?;
+    let (width, height) = canvas.output_size().map_err(anyhow::Error::msg)?;
+    let pixels = canvas.read_pixels(None, PixelFormatEnum::RGB24);
+    canvas.set_logical_size(logical.0, logical.1)?;
+    let mut pixels = pixels.map_err(anyhow::Error::msg)?;
+    let path = snapshot_path("window");
+    save_bmp(&path, width, height, &mut pixels)?;
+    Ok(path)
 }
 
 struct HdrOverlayPixels {
@@ -5012,6 +5251,17 @@ fn flush_relative(events: &mpsc::Sender<Event>, relative: &mut (i32, i32)) -> Re
     Ok(())
 }
 
+fn parse_scroll_speed(text: &str) -> Result<f64, String> {
+    match text.parse::<f64>() {
+        Ok(speed) if (0.1..=10.0).contains(&speed) => Ok(speed),
+        _ => Err("expected a number from 0.1 to 10".into()),
+    }
+}
+
+fn send_all(events: &mpsc::Sender<Event>, batch: Vec<Event>) -> Result<()> {
+    batch.into_iter().try_for_each(|event| send(events, event))
+}
+
 fn send(events: &mpsc::Sender<Event>, event: Event) -> Result<()> {
     event.validate()?;
     match events.try_send(event) {
@@ -5148,64 +5398,6 @@ mod tests {
             Rect::new(110, 20, 100, 20)
         );
         assert!(!keyboard_capture_rect().has_intersection(display_mode_rect()));
-    }
-
-    #[test]
-    fn wheel_notches_preserve_direction_amount_and_motion_order() -> Result<()> {
-        let mut wheel = WheelAccumulator::default();
-        for (integer, precise, flipped, expected) in [
-            ((0, 1), (0.0, 1.0), false, (0, 1)),
-            ((1, -1), (1.0, -1.0), true, (-1, 1)),
-            ((45, -23), (0.0, 0.0), false, (45, -23)),
-        ] {
-            let events = wheel.events(integer, precise, flipped, Some((0.3, 0.7)))?;
-            assert!(matches!(events[0], Event::Motion { x, y } if x == 0.3 && y == 0.7));
-            let mut total = (0, 0);
-            for event in &events[1..] {
-                event.validate()?;
-                if let Event::Scroll { x, y } = event {
-                    total.0 += x;
-                    total.1 += y;
-                } else {
-                    panic!("unexpected wheel translation");
-                }
-            }
-            assert_eq!(total, expected);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn wheel_fractions_accumulate_without_double_counting_and_reset_outside_desktop() -> Result<()>
-    {
-        let mut wheel = WheelAccumulator::default();
-        for _ in 0..3 {
-            // The integer field must not get counted in addition to precise.
-            assert!(
-                wheel
-                    .events((0, 1), (0.0, 0.25), false, Some((0.5, 0.5)))?
-                    .is_empty()
-            );
-        }
-        let events = wheel.events((0, 1), (0.0, 0.25), false, Some((0.5, 0.5)))?;
-        assert!(matches!(events[1], Event::Scroll { x: 0, y: 1 }));
-        assert!(
-            wheel
-                .events((0, 0), (0.0, 0.75), false, Some((0.5, 0.5)))?
-                .is_empty()
-        );
-        assert!(wheel.events((0, 1), (0.0, 1.0), false, None)?.is_empty());
-        assert!(
-            wheel
-                .events((0, 0), (0.0, 0.25), false, Some((0.5, 0.5)))?
-                .is_empty()
-        );
-        assert!(
-            wheel
-                .events((i32::MIN, 0), (0.0, 0.0), true, Some((0.5, 0.5)))
-                .is_err()
-        );
-        Ok(())
     }
 
     #[test]

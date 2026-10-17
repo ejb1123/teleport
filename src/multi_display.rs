@@ -18,7 +18,7 @@ struct Screen {
     remote: usize,
     desktop: Option<Desktop>,
     chrome: crate::fullscreen::Chrome,
-    wheel: WheelAccumulator,
+    wheel: crate::scroll::Scroller,
     pipeline: Option<media::Pipeline>,
     worker: Option<Network>,
     image: Option<media::LatestImage>,
@@ -41,6 +41,8 @@ pub(super) struct Displays {
     codec: protocol::VideoCodec,
     /// The host takes back/forward (`Desktop::extra_mouse_buttons`).
     extra_mouse_buttons: bool,
+    /// The host takes `Event::ScrollSmooth` (`Desktop::smooth_scroll`).
+    smooth_scroll: bool,
     events: mpsc::Sender<Event>,
 }
 
@@ -58,6 +60,7 @@ impl Displays {
             options: options.clone(),
             codec: desktop.codec,
             extra_mouse_buttons: desktop.extra_mouse_buttons,
+            smooth_scroll: desktop.smooth_scroll,
             events,
         }
     }
@@ -124,6 +127,24 @@ impl Displays {
             }
         }
     }
+    /// Coalesced trackpad deltas and gesture ends of every monitor window.
+    pub fn poll_scroll(&mut self, now: Instant) -> Result<()> {
+        for screen in &mut self.screens {
+            send_scroll(&self.events, screen.remote, screen.wheel.poll(now))?;
+        }
+        Ok(())
+    }
+    /// A platform gesture phase (macOS) after the batch's last wheel event.
+    pub fn scroll_marker(&mut self, marker: crate::scroll::Marker, now: Instant) -> Result<()> {
+        for screen in &mut self.screens {
+            send_scroll(
+                &self.events,
+                screen.remote,
+                screen.wheel.marker(marker, now),
+            )?;
+        }
+        Ok(())
+    }
     pub fn stop(&mut self) {
         let _ = self.events.try_send(Event::ReleaseAll);
         for screen in self.screens.drain(..) {
@@ -174,7 +195,11 @@ impl Displays {
                 remote,
                 desktop: None,
                 chrome,
-                wheel: WheelAccumulator::default(),
+                wheel: crate::scroll::Scroller::new(
+                    self.smooth_scroll,
+                    self.options.scroll_speed,
+                    self.options.scroll_direction,
+                ),
                 pipeline: None,
                 worker: None,
                 image: None,
@@ -209,7 +234,7 @@ impl Displays {
                 screen.dirty = true;
                 screen.frame = None;
                 screen.texture = None;
-                screen.wheel = WheelAccumulator::default();
+                send_scroll(&self.events, screen.remote, screen.wheel.reset())?;
             }
         }
         Ok(())
@@ -261,7 +286,7 @@ impl Displays {
             } => {
                 screen.pointer = None;
                 screen.buttons = 0;
-                screen.wheel = WheelAccumulator::default();
+                send_scroll(&self.events, screen.remote, screen.wheel.reset())?;
             }
             SdlEvent::Window {
                 win_event: WindowEvent::Leave,
@@ -334,6 +359,19 @@ impl Displays {
                     y,
                 })
         };
+        // Pointer movement and clicks never overtake coalesced scrolling.
+        if matches!(
+            event,
+            SdlEvent::MouseMotion { .. }
+                | SdlEvent::MouseButtonDown { .. }
+                | SdlEvent::MouseButtonUp { .. }
+        ) {
+            send_scroll(
+                &self.events,
+                screen.remote,
+                screen.wheel.flush(Instant::now()),
+            )?;
+        }
         match *event {
             SdlEvent::MouseMotion { x, y, .. } => {
                 if let Some(event) = motion(x, y) {
@@ -366,30 +404,35 @@ impl Displays {
                 y,
                 precise_x,
                 precise_y,
-                direction,
                 mouse_x,
                 mouse_y,
+                direction,
                 ..
             } => {
-                let point = screen.chrome.pointer(mouse_x, mouse_y, window, screen.size);
-                for event in screen.wheel.events(
+                let now = Instant::now();
+                let (markers, device) = crate::scroll::platform::take(true);
+                for marker in markers {
+                    send_scroll(
+                        &self.events,
+                        screen.remote,
+                        screen.wheel.marker(marker, now),
+                    )?;
+                }
+                let target = screen
+                    .chrome
+                    .pointer(mouse_x, mouse_y, window, screen.size)
+                    .map_or(crate::scroll::Target::Outside, |(x, y)| {
+                        crate::scroll::Target::Desktop(x, y)
+                    });
+                let batch = screen.wheel.wheel(
                     (x, y),
                     (precise_x, precise_y),
                     direction == sdl2::mouse::MouseWheelDirection::Flipped,
-                    point,
-                )? {
-                    send(
-                        &self.events,
-                        match event {
-                            Event::Motion { x, y } => Event::MonitorMotion {
-                                index: screen.remote,
-                                x,
-                                y,
-                            },
-                            other => other,
-                        },
-                    )?;
-                }
+                    target,
+                    device,
+                    now,
+                )?;
+                send_scroll(&self.events, screen.remote, batch)?;
             }
             SdlEvent::KeyDown {
                 scancode: Some(code),
@@ -452,6 +495,25 @@ impl Displays {
         Ok(())
     }
 }
+/// Scroll events of a monitor window: its pointer positions are that
+/// monitor's.
+fn send_scroll(events: &mpsc::Sender<Event>, remote: usize, batch: Vec<Event>) -> Result<()> {
+    for event in batch {
+        send(
+            events,
+            match event {
+                Event::Motion { x, y } => Event::MonitorMotion {
+                    index: remote,
+                    x,
+                    y,
+                },
+                other => other,
+            },
+        )?;
+    }
+    Ok(())
+}
+
 impl Drop for Displays {
     fn drop(&mut self) {
         self.stop();

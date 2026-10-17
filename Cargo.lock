@@ -3464,6 +3464,7 @@ dependencies = [
  "argon2",
  "ashpd",
  "base64 0.22.1",
+ "block2",
  "bytes",
  "cc",
  "clap",

@@ -3920,6 +3920,7 @@ fn desktop_for_monitor(
         hardware_ten_bit: options.hardware_formats.ten_bit.clone(),
         ten_bit: options.ten_bit,
         extra_mouse_buttons: true,
+        smooth_scroll: capture.smooth_scroll(),
         encoder_presets: true,
         encoder_preset: options.encoder_preset,
         // `TELEPORT_NETWORK_FEEDBACK=0`: the RTT-only controller, no step-down

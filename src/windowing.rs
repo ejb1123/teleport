@@ -36,6 +36,17 @@ pub fn init() -> Result<(Sdl, VideoSubsystem)> {
     if std::env::var("TELEPORT_X11_EGL").as_deref() == Ok("1") {
         sdl2::hint::set("SDL_VIDEO_X11_FORCE_EGL", "1");
     }
+    // sdl2-compat renders SDL2 programs at 1x on Wayland and lets the
+    // compositor upscale them (blurry text and a half-size stream request on
+    // HiDPI). Teleport draws at the drawable's own density, as on macOS.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY").is_none() {
+        sdl2::hint::set_with_priority(
+            "SDL_VIDEO_WAYLAND_SCALE_TO_DISPLAY",
+            "0",
+            &sdl2::hint::Hint::Override,
+        );
+    }
     let sdl = sdl2::init().map_err(anyhow::Error::msg)?;
     let video = sdl.video().map_err(anyhow::Error::msg).context(
         "Could not initialize local window backend; check DISPLAY/Wayland or SDL_VIDEODRIVER",

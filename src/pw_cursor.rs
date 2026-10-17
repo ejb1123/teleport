@@ -408,6 +408,12 @@ fn filter(source: &mut Source, info: &mut gst::PadProbeInfo) -> gst::PadProbeRet
         repeat.set_pts(buffer.pts());
         repeat.set_dts(buffer.dts());
         repeat.set_duration(buffer.duration());
+        // The copy shares the DMA-BUF but not the PipeWire pool buffer that
+        // owns it. Without this, the next good frame replaces `last_good`,
+        // the pool buffer goes back to the compositor, and it may draw a
+        // newer frame into that memory while the encoder still reads the
+        // repeat: a torn frame mixing two images (ghosted, doubled text).
+        gst::ParentBufferMeta::add(repeat, good);
     }
     source.last_pass = now;
     info.data = Some(gst::PadProbeData::Buffer(repeat));
