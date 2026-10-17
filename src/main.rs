@@ -19,6 +19,7 @@ mod hdr_present;
 mod host;
 #[cfg(target_os = "linux")]
 mod host_admin;
+mod host_command;
 #[cfg(target_os = "linux")]
 mod host_ui;
 // Unix-wide: `teleport relay` uses it too, and runs on macOS.
@@ -54,6 +55,7 @@ mod system_pam;
 mod virtual_display;
 #[cfg(target_os = "linux")]
 mod virtual_mic;
+mod wake;
 mod windowing;
 #[cfg(target_os = "linux")]
 mod x11_cursor;
@@ -120,7 +122,7 @@ enum Command {
     HostAdmin(host_admin::Options),
     /// Share a Linux desktop (or a synthetic test screen).
     #[cfg(target_os = "linux")]
-    Host(host::Options),
+    Host(Box<host::Options>),
     /// Open a native remote desktop window.
     Client(client::Options),
     /// Run a minimal MoQ relay (self-hosted alternative to a provider relay).
@@ -151,6 +153,14 @@ enum Command {
         #[arg(long, default_value_t = 45)]
         timeout_secs: u64,
     },
+    /// Wake a sleeping desktop with Wake-on-LAN: a magic packet on this
+    /// network, and through a saved wake relay on the desktop's network.
+    Wake(wake::Options),
+    /// Print the Wake-on-LAN packets this machine receives (to check that
+    /// wakes reach it).
+    WakeListen(wake::ListenOptions),
+    /// Ask a desktop to suspend (its host needs --allow-suspend).
+    Suspend(host_command::SuspendOptions),
     /// Check required media plugins without sharing the desktop.
     Doctor {
         /// Test synthetic HEVC Main 10 support; does not imply HDR desktop capture/display.
@@ -196,6 +206,21 @@ fn main() -> Result<()> {
         }
         _ => {}
     }
+    // Power commands use no media either.
+    match cli.command {
+        Some(Command::WakeListen(options)) => wake::listen(options),
+        Some(Command::Wake(options)) => {
+            tokio::runtime::Runtime::new()?.block_on(wake::run(options))
+        }
+        Some(Command::Suspend(options)) => {
+            tokio::runtime::Runtime::new()?.block_on(host_command::suspend(options))
+        }
+        command => run(command),
+    }
+}
+
+fn run(command: Option<Command>) -> Result<()> {
+    let cli = Cli { command };
     // Key diagnostics and enrollment do not use media or scan desktop plugins.
     // SDL is still linked: its load-time library selection is isolated by the
     // Linux package wrapper before this process starts.
@@ -262,12 +287,14 @@ fn main() -> Result<()> {
         }
         Some(Command::SecurityKey { command }) => security_key::run(command),
         #[cfg(target_os = "linux")]
-        Some(Command::Host(options)) => runtime.block_on(host::run(options)),
+        Some(Command::Host(options)) => runtime.block_on(host::run(*options)),
         #[cfg(target_os = "linux")]
         Some(Command::HostManager) => host_ui::run(),
         // Handled before media initialisation.
         #[cfg(target_os = "linux")]
         Some(Command::PrivacyRestore { .. } | Command::PrivacyGuard { .. }) => Ok(()),
+        // Handled before media initialisation.
+        Some(Command::Wake(_) | Command::WakeListen(_) | Command::Suspend(_)) => Ok(()),
         #[cfg(target_os = "linux")]
         Some(Command::HostAdmin(options)) => host_admin::run(options),
         Some(Command::Login {

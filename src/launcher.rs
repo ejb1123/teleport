@@ -40,6 +40,7 @@ fn session_profile(
             pairing_file: Some(path),
             fingerprint: Some(pairing.fingerprint.clone()),
             relay: None,
+            wake: None,
         },
         directory,
     ))
@@ -328,6 +329,15 @@ fn presence_shown(profile: &crate::profiles::Profile) -> bool {
         .is_some_and(|relay| relay.route != crate::relay::Route::Direct)
 }
 
+/// The host shared a network card to wake (G23): an offline desktop may
+/// just be asleep.
+fn wakeable(profile: &crate::profiles::Profile) -> bool {
+    profile
+        .wake
+        .as_ref()
+        .is_some_and(|wake| wake.mac().is_some())
+}
+
 struct Approval {
     address: String,
     fingerprint: String,
@@ -437,6 +447,9 @@ pub fn run() -> Result<()> {
     let SETTINGS = Rect::new(304, 342, 220, 36);
     let SIGN_IN = Rect::new(540, 342, 220, 36);
     let RELAY = Rect::new(776, 342, 216, 36);
+    // Power row (G23), below the session buttons while settings are hidden.
+    let WAKE = Rect::new(304, 400, 220, 36);
+    let SLEEP = Rect::new(540, 400, 220, 36);
     let RELAY_URL = Rect::new(304, 220, 688, 44);
     let RELAY_PIN = Rect::new(304, 300, 688, 44);
     let RELAY_KEY = Rect::new(304, 380, 688, 44);
@@ -534,6 +547,10 @@ pub fn run() -> Result<()> {
     let mut relay_forget_key = false;
     let mut presence = crate::presence::Monitor::new();
     let mut presence_profiles = String::new();
+    // A Wake or Sleep request in the background, reporting status lines.
+    let mut power: Option<std::sync::mpsc::Receiver<String>> = None;
+    // Sleep needs a second click within a few seconds.
+    let mut sleep_armed: Option<(String, std::time::Instant)> = None;
     let started = std::time::Instant::now();
     // The text field that keyboard input edits on the current page.
     macro_rules! active_field {
@@ -697,11 +714,33 @@ pub fn run() -> Result<()> {
                 status = message;
             }
         }
+        if let Some(receiver) = &power {
+            loop {
+                match receiver.try_recv() {
+                    Ok(message) => status = message,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        power = None;
+                        break;
+                    }
+                }
+            }
+        }
         if let Some(process) = child.as_mut()
             && let Some(exit) = process.try_wait()?
         {
             child = None;
             progress = None;
+            // The session may have saved the host's wake info (G23).
+            if let Ok(loaded) = crate::profiles::load() {
+                profiles = loaded;
+                if ephemeral.is_none() {
+                    selected = profiles
+                        .iter()
+                        .find(|p| selected.as_ref().is_some_and(|s| s.address == p.address))
+                        .cloned();
+                }
+            }
             if ephemeral.take().is_some() {
                 selected = profiles
                     .iter()
@@ -1033,6 +1072,94 @@ pub fn run() -> Result<()> {
                             }
                             if hit(SETTINGS, x, y) {
                                 settings = !settings;
+                            }
+                            if !settings
+                                && power.is_none()
+                                && child.is_none()
+                                && let Some(profile) = selected.clone()
+                                && let Some(wake) = profile.wake.clone()
+                            {
+                                if hit(WAKE, x, y) && wake.mac().is_some() {
+                                    sleep_armed = None;
+                                    let (sender, receiver) = std::sync::mpsc::channel();
+                                    let profile = profile.clone();
+                                    let all = profiles.clone();
+                                    std::thread::spawn(move || {
+                                        let label = profile.label().to_owned();
+                                        let report = |text: String| {
+                                            let _ = sender.send(text);
+                                        };
+                                        let outcome = tokio::runtime::Builder::new_current_thread()
+                                            .enable_all()
+                                            .build()
+                                            .map_err(anyhow::Error::from)
+                                            .and_then(|runtime| {
+                                                runtime.block_on(crate::wake::wake_saved(
+                                                    profile,
+                                                    all,
+                                                    std::time::Duration::from_secs(120),
+                                                    report,
+                                                ))
+                                            });
+                                        let _ = sender.send(match outcome {
+                                            Ok(true) => format!("{label} is awake. Connect when ready."),
+                                            Ok(false) => format!("{label} did not answer within 2 minutes. Check Wake-on-LAN in its firmware and network card (docs/wake-and-unattended.md)."),
+                                            Err(error) => format!("Could not wake {label}: {error:#}"),
+                                        });
+                                    });
+                                    power = Some(receiver);
+                                    status = "Sending Wake-on-LAN...".into();
+                                }
+                                if hit(SLEEP, x, y) && wake.suspend {
+                                    let now = std::time::Instant::now();
+                                    let confirmed =
+                                        sleep_armed.take().is_some_and(|(address, at)| {
+                                            address == profile.address
+                                                && now.duration_since(at)
+                                                    < std::time::Duration::from_secs(5)
+                                        });
+                                    if confirmed {
+                                        let (sender, receiver) = std::sync::mpsc::channel();
+                                        let asking =
+                                            format!("Asking {} to sleep...", profile.label());
+                                        let profile = profile.clone();
+                                        std::thread::spawn(move || {
+                                            let label = profile.label().to_owned();
+                                            let outcome =
+                                                crate::host_command::Target::saved(&profile)
+                                                    .and_then(|target| {
+                                                        tokio::runtime::Builder::new_current_thread(
+                                                        )
+                                                        .enable_all()
+                                                        .build()?
+                                                        .block_on(crate::host_command::send(
+                                                            &target,
+                                                            &crate::host_command::Command::Suspend,
+                                                        ))
+                                                    });
+                                            let _ = sender.send(match outcome {
+                                                Ok(reply) if reply.ok => format!(
+                                                    "{label}: {}. Wake it from here later.",
+                                                    reply.message
+                                                ),
+                                                Ok(reply) => {
+                                                    format!("{label} refused: {}", reply.message)
+                                                }
+                                                Err(error) => {
+                                                    format!("Could not reach {label}: {error:#}")
+                                                }
+                                            });
+                                        });
+                                        power = Some(receiver);
+                                        status = asking;
+                                    } else {
+                                        sleep_armed = Some((profile.address.clone(), now));
+                                        status = format!(
+                                            "Click Sleep again within 5 seconds to suspend {}.",
+                                            profile.label()
+                                        );
+                                    }
+                                }
                             }
                             if hit(DISCONNECT, x, y)
                                 && let Some(mut process) = child.take()
@@ -1650,6 +1777,9 @@ pub fn run() -> Result<()> {
                             p.address,
                             match presence.state(&p.address) {
                                 crate::presence::State::Online => "Online via relay",
+                                crate::presence::State::Offline if wakeable(p) => {
+                                    "Asleep or off · Wake available"
+                                }
                                 crate::presence::State::Offline => "Offline",
                                 crate::presence::State::Unknown => "Status unknown",
                             }
@@ -1657,6 +1787,23 @@ pub fn run() -> Result<()> {
                         Some(p) => p.address.clone(),
                     };
                     ui.text(&font, &subtitle, 304, 212, 688, MUTED)?;
+                    if !settings && let Some(wake) = selected.as_ref().and_then(|p| p.wake.as_ref())
+                    {
+                        let idle = power.is_none() && child.is_none();
+                        ui.button(WAKE, "Wake", idle && wake.mac().is_some(), false)?;
+                        ui.button(SLEEP, "Sleep", idle && wake.suspend, false)?;
+                        ui.text(&small_font, &wake.summary(), 304, 446, 688, MUTED)?;
+                        if !wake.suspend {
+                            ui.text(
+                                &small_font,
+                                "Sleep needs the host's --allow-suspend (NixOS allowSuspend).",
+                                304,
+                                466,
+                                688,
+                                MUTED,
+                            )?;
+                        }
+                    }
                     ui.button(
                         CONNECT,
                         if child.is_some() {
@@ -2096,6 +2243,7 @@ mod tests {
             pairing_file: None,
             fingerprint: Some("ab".repeat(32)),
             relay: None,
+            wake: None,
         };
         // No relay: inherited relay variables never leak into the client.
         let mut command = std::process::Command::new("teleport");

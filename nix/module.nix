@@ -103,6 +103,41 @@ in
         this unit's `ExecStopPost`. See docs/virtual-display.md.
       '';
     };
+    wakeOnLan = {
+      interface = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "enp5s0";
+        description = ''
+          Arm Wake-on-LAN by magic packet on this wired network card
+          (`networking.interfaces.<name>.wakeOnLan`), so clients can wake
+          the host with the launcher's Wake or `teleport wake`. The
+          firmware must also allow waking from the card (often "Wake on
+          LAN", "Power On By PCI-E" or "ErP" off) and the card needs
+          standby power; Wi-Fi rarely works. See docs/wake-and-unattended.md.
+        '';
+      };
+    };
+    wakeRelay = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Act as a wake relay (`--wake-relay`): when one of the owner's paired
+        devices asks, send a Wake-on-LAN packet on this host's networks, to
+        wake another machine on this LAN from anywhere through the
+        end-to-end encrypted relay. Meant for an always-on machine.
+      '';
+    };
+    allowSuspend = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Suspend this machine when one of the owner's paired devices asks
+        (`--allow-suspend`; launcher Sleep, `teleport suspend`). Grants the
+        allowed users logind's suspend action through polkit, which a user
+        service otherwise may not get without a password.
+      '';
+    };
     preauthorizeRemoteDesktop = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -124,6 +159,22 @@ in
         message = "services.teleport-desktop.users must explicitly list the desktop users allowed to share their session.";
       }
     ];
+    # Wake-on-LAN by magic packet on the host's card (G23).
+    networking.interfaces = lib.optionalAttrs (cfg.wakeOnLan.interface != null) {
+      ${cfg.wakeOnLan.interface}.wakeOnLan.enable = true;
+    };
+    # The host user service suspends through logind; outside a login session
+    # polkit would otherwise ask for a password nobody can type.
+    security.polkit.extraConfig = lib.mkIf cfg.allowSuspend ''
+      // Teleport allowSuspend: the allowed users' host service may suspend.
+      polkit.addRule(function (action, subject) {
+        if ((action.id == "org.freedesktop.login1.suspend" ||
+             action.id == "org.freedesktop.login1.suspend-multiple-sessions") &&
+            ${builtins.toJSON cfg.users}.indexOf(subject.user) >= 0) {
+          return polkit.Result.YES;
+        }
+      });
+    '';
     environment.systemPackages = [
       cfg.package
       # xdg-desktop-portal only accepts the unit-derived application ID when a
@@ -166,10 +217,15 @@ in
       after = [ "graphical-session.target" ];
       partOf = [ "graphical-session.target" ];
       unitConfig.ConditionUser = map (user: "|${user}") cfg.users;
+      # ethtool reads the Wake-on-LAN setting, systemctl suspends;
       # kscreen-doctor sizes virtual displays and runs privacy mode (KDE).
-      path = lib.optional plasma pkgs.kdePackages.libkscreen;
+      path = [
+        pkgs.ethtool
+        pkgs.systemd
+      ]
+      ++ lib.optional plasma pkgs.kdePackages.libkscreen;
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/teleport host --listen ${lib.escapeShellArg cfg.listen} --identity-dir %h/.local/state/teleport/host --restore-token %h/.local/state/teleport/host/portal-restore.json --virtual-display ${cfg.virtualDisplay} --privacy-mode ${cfg.privacyMode} ${lib.optionalString cfg.microphone "--microphone"} ${lib.optionalString cfg.systemLogin "--system-auth-helper ${pamHelper}/libexec/teleport-pam"} ${lib.escapeShellArgs cfg.extraArgs}";
+        ExecStart = "${cfg.package}/bin/teleport host --listen ${lib.escapeShellArg cfg.listen} --identity-dir %h/.local/state/teleport/host --restore-token %h/.local/state/teleport/host/portal-restore.json --virtual-display ${cfg.virtualDisplay} --privacy-mode ${cfg.privacyMode} ${lib.optionalString cfg.microphone "--microphone"} ${lib.optionalString cfg.systemLogin "--system-auth-helper ${pamHelper}/libexec/teleport-pam"} ${lib.optionalString cfg.wakeRelay "--wake-relay"} ${lib.optionalString cfg.allowSuspend "--allow-suspend"} ${lib.escapeShellArgs cfg.extraArgs}";
         # However the host stopped (crash, kill, logout), turn monitors left
         # off by privacy mode back on. "-": nothing to do is not a failure.
         ExecStopPost =

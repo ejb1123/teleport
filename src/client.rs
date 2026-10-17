@@ -1253,9 +1253,30 @@ fn update_nv12(
     Ok(())
 }
 
+/// Save the host's wake info (G23) on the saved desktop at this address,
+/// if that desktop pins the identity this session authenticated.
+fn remember_wake(options: &Options, desktop: &Desktop) {
+    let Some(wake) = &desktop.wake else {
+        return;
+    };
+    let result = (|| {
+        let pairing = Pairing::read(&options.pairing_file)?;
+        let mut profiles = crate::profiles::load()?;
+        crate::profiles::set_wake(&options.address, &pairing.fingerprint, wake, &mut profiles)
+    })();
+    match result {
+        Ok(true) => tracing::info!(summary = wake.summary(), "saved how to wake this desktop"),
+        Ok(false) => (),
+        Err(error) => tracing::debug!(error = format!("{error:#}"), "wake info not saved"),
+    }
+}
+
 fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool> {
     let session_path = link.path;
     tracing::info!(path = session_path.as_str(), width = link.desktop.width, height = link.desktop.height, source = %link.desktop.source, "desktop connected; Ctrl+Alt+Q quits locally");
+    if options.headless_frames.is_none() {
+        remember_wake(options, &link.desktop);
+    }
     // Choose the presentation format from the actual renderer, not the decoder
     // name. NV12 is useful only when SDL can convert it with its GPU renderer.
     let mut window_state = if options.headless_frames.is_none() {

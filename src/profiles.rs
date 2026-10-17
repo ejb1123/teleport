@@ -20,6 +20,10 @@ pub struct Profile {
     /// profiles saved before relay support (and then never written).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relay: Option<RelaySettings>,
+    /// How to wake this desktop, as its host last reported it in an
+    /// authenticated session (`Desktop::wake`, G23).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<crate::wake::WakeInfo>,
 }
 
 /// How a saved desktop is reached through a relay. Saved by the launcher's
@@ -305,6 +309,7 @@ fn save_desktop_in(
         pairing_file: None,
         fingerprint: None,
         relay: None,
+        wake: None,
     };
     let mut updated = profiles.clone();
     updated.push(profile.clone());
@@ -395,6 +400,8 @@ fn save_pairing_in(
         fingerprint: Some(pairing.fingerprint.to_ascii_lowercase()),
         // Signing in again keeps how the desktop is reached.
         relay: previous.and_then(|profile| profile.relay.clone()),
+        // The pin is unchanged (checked above), so the host is the same.
+        wake: previous.and_then(|profile| profile.wake.clone()),
     };
     // Keep the previous trusted credential until the updated index has been saved.
     let mut updated = profiles.clone();
@@ -510,8 +517,114 @@ fn set_relay_in(
     Ok(result)
 }
 
+/// Save the wake info a host reported in a session authenticated with
+/// `fingerprint`, on the saved desktop at `address` whose pin is that same
+/// fingerprint (any other desktop is left alone). Returns whether it changed.
+pub fn set_wake(
+    address: &str,
+    fingerprint: &str,
+    wake: &crate::wake::WakeInfo,
+    profiles: &mut Vec<Profile>,
+) -> Result<bool> {
+    set_wake_in(address, fingerprint, wake, profiles, &directory()?)
+}
+
+fn set_wake_in(
+    address: &str,
+    fingerprint: &str,
+    wake: &crate::wake::WakeInfo,
+    profiles: &mut Vec<Profile>,
+    directory: &Path,
+) -> Result<bool> {
+    wake.validate()?;
+    let pin = moq_native::tls::parse_fingerprint(fingerprint)?;
+    let _lock = lock_and_reload(directory, profiles)?;
+    let mut updated = profiles.clone();
+    let Some(profile) = updated.iter_mut().find(|profile| {
+        profile.address == address
+            && profile
+                .trusted_fingerprint()
+                .ok()
+                .flatten()
+                .and_then(|saved| moq_native::tls::parse_fingerprint(&saved).ok())
+                .is_some_and(|saved| saved == pin)
+    }) else {
+        return Ok(false);
+    };
+    if profile.wake.as_ref() == Some(wake) {
+        return Ok(false);
+    }
+    profile.wake = Some(wake.clone());
+    private_write(
+        &directory.join("profiles.json"),
+        &serde_json::to_vec_pretty(&updated)?,
+    )?;
+    *profiles = updated;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wake_info_is_saved_only_for_the_authenticated_desktop() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut profiles = Vec::new();
+        super::save_desktop_in("Home", "home:4443", &mut profiles, dir.path())?;
+        super::save_desktop_in("Other", "other:4443", &mut profiles, dir.path())?;
+        let pin = "ab".repeat(32);
+        super::approve_fingerprint_in("home:4443", &pin, &mut profiles, dir.path())?;
+        let wake = crate::wake::WakeInfo {
+            mac: Some("00:1b:21:3c:4d:5e".into()),
+            wake_on_lan: Some(true),
+            ipv4: Some("192.168.1.20/24".into()),
+            wake_relay: false,
+            suspend: true,
+        };
+        // Another host's identity, or an unpinned desktop, changes nothing.
+        let other = "cd".repeat(32);
+        assert!(!super::set_wake_in(
+            "home:4443",
+            &other,
+            &wake,
+            &mut profiles,
+            dir.path()
+        )?);
+        assert!(!super::set_wake_in(
+            "other:4443",
+            &pin,
+            &wake,
+            &mut profiles,
+            dir.path()
+        )?);
+        assert!(super::set_wake_in(
+            "home:4443",
+            &pin.to_ascii_uppercase(),
+            &wake,
+            &mut profiles,
+            dir.path()
+        )?);
+        assert!(!super::set_wake_in(
+            "home:4443",
+            &pin,
+            &wake,
+            &mut profiles,
+            dir.path()
+        )?);
+        let loaded = super::load_in(dir.path())?;
+        assert_eq!(loaded[0].wake.as_ref(), Some(&wake));
+        assert!(loaded[1].wake.is_none());
+        // Malformed host data is refused.
+        let bad = crate::wake::WakeInfo {
+            mac: Some("ff:ff:ff:ff:ff:ff".into()),
+            ..wake.clone()
+        };
+        assert!(super::set_wake_in("home:4443", &pin, &bad, &mut profiles, dir.path()).is_err());
+        // Profiles without the field (older launchers) still load.
+        let json = std::fs::read_to_string(dir.path().join("profiles.json"))?;
+        assert!(json.contains("\"suspend\": true"));
+        Ok(())
+    }
+
     #[test]
     fn relay_settings_round_trip_keep_trust_and_store_the_key_privately() -> anyhow::Result<()> {
         use super::{RelayKey, RelayUpdate};

@@ -570,6 +570,15 @@ mod server {
         proof: KeyProof,
     }
     impl SessionLease {
+        /// Whether the credential is the desktop owner's, for owner-only
+        /// requests (`crate::host_command`). Every credential this host
+        /// admits is the owner's today: paired devices, the host pairing
+        /// token, and system-login tickets (the account password). Guest
+        /// roles would narrow this.
+        pub fn owner(&self) -> bool {
+            true
+        }
+
         /// Whether the session may continue: its credential is still
         /// accepted with the key proof it was leased with. Cheap enough to
         /// poll (one lock, at most 128 records).
@@ -1503,6 +1512,7 @@ mod server {
             assert!(!reopened.authorized(&ticket.token));
             assert!(!fs::read_to_string(&state.path)?.contains(&ticket.token));
             let lease = state.begin_session(&ticket.token)?;
+            assert!(lease.owner());
             assert!(state.begin_session(&ticket.token).is_err());
             assert!(state.authorized(&ticket.token));
             drop(lease);

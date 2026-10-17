@@ -208,6 +208,26 @@ pub struct Options {
     /// The session's client strips `protocol::FrameTiming` headers.
     #[arg(skip)]
     pub frame_timing: bool,
+    /// Wake relay: send Wake-on-LAN packets on this host's networks when
+    /// the owner's devices ask (`teleport wake`, the launcher's Wake), to
+    /// wake their other machines here. Never at the MoQ relay's request
+    /// (docs/wake-and-unattended.md).
+    #[arg(long)]
+    pub wake_relay: bool,
+    /// With --wake-relay: only wake these hardware addresses (repeatable;
+    /// default: any device address).
+    #[arg(long, requires = "wake_relay")]
+    pub wake_relay_allow: Vec<crate::wake::Mac>,
+    /// Suspend this machine when the owner's device asks (`teleport
+    /// suspend`, the launcher's Sleep); wake it again with Wake-on-LAN.
+    #[arg(long)]
+    pub allow_suspend: bool,
+    /// Tests: run this instead of `systemctl suspend`.
+    #[arg(long, hide = true, default_value = "systemctl suspend")]
+    pub suspend_command: String,
+    /// What clients are told about waking this host (`Desktop::wake`).
+    #[arg(skip)]
+    pub wake: Option<crate::wake::WakeInfo>,
 }
 
 pub async fn run(mut options: Options) -> Result<()> {
@@ -284,6 +304,29 @@ pub async fn run(mut options: Options) -> Result<()> {
             tracing::warn!("microphone passthrough unavailable: it needs PipeWire (pw-cli)");
         }
     }
+    // Wake-on-LAN details (G23).
+    let (listen, wake_relay, suspend) = (
+        options.listen.clone(),
+        options.wake_relay,
+        options.allow_suspend,
+    );
+    let wake =
+        tokio::task::spawn_blocking(move || crate::wake::host::info(&listen, wake_relay, suspend))
+            .await?;
+    tracing::info!(
+        mac = wake.mac.as_deref().unwrap_or("unknown"),
+        wake_on_lan = ?wake.wake_on_lan,
+        network = wake.ipv4.as_deref().unwrap_or("unknown"),
+        wake_relay,
+        suspend,
+        "power control"
+    );
+    if wake.mac.is_some() && wake.wake_on_lan == Some(false) {
+        tracing::warn!(
+            "Wake-on-LAN is off on this network card; clients cannot wake this host (docs/wake-and-unattended.md)"
+        );
+    }
+    options.wake = Some(wake);
     let result = serve(&options, &mut capture).await;
     capture.close().await;
     result
@@ -393,6 +436,12 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
     }
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+    let policy = crate::host_command::host::Policy::new(
+        options.wake_relay,
+        options.wake_relay_allow.clone(),
+        options.allow_suspend,
+        &options.suspend_command,
+    );
     let relay_identity = match (&relay_endpoint, &identity, &access) {
         (Some(_), Some(identity), Some(_)) => Some(Arc::new(identity.e2e()?)),
         (Some(_), _, _) => {
@@ -491,6 +540,25 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
             }, if relay_endpoint.is_some() => {
                 match (accepted, &access, &relay) {
                     (Some(accepted), Some(access), Some((link, _, _))) => {
+                        // Owner commands need no desktop; they run beside
+                        // sessions.
+                        match crate::host_command::Command::parse(Some(&accepted.request)) {
+                            Ok(Some(command)) => {
+                                match access.begin_session_hash(accepted.credential.to_vec(), accepted.device_key.as_deref()).and_then(|lease| Ok((crate::relay::host(link, &accepted)?, lease))) {
+                                    Ok((bridged, lease)) => {
+                                        let owner = lease.owner();
+                                        tokio::spawn(crate::host_command::host::relayed(bridged, accepted, command, policy.clone(), owner, lease));
+                                    }
+                                    Err(error) => tracing::warn!(%error, "relayed command refused"),
+                                }
+                                continue;
+                            }
+                            Ok(None) => (),
+                            Err(error) => {
+                                tracing::warn!(%error, "relayed client sent a malformed command");
+                                continue;
+                            }
+                        }
                         restore_capture(capture).await;
                         let result = tokio::select! {
                             result = relayed(link, accepted, access, options, capture) => result,
@@ -550,6 +618,26 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         } else {
             None
         };
+        // Owner commands (wake relay, suspend, ping): no desktop capture.
+        match crate::host_command::Command::parse(request.query()) {
+            Ok(Some(command)) => {
+                let owner = session_lease.as_ref().is_none_or(|lease| lease.owner());
+                tokio::spawn(crate::host_command::host::direct(
+                    request,
+                    command,
+                    policy.clone(),
+                    owner,
+                    session_lease,
+                ));
+                continue;
+            }
+            Ok(None) => (),
+            Err(error) => {
+                tracing::warn!(%error, "client sent a malformed command");
+                request.close().await;
+                continue;
+            }
+        }
         restore_capture(capture).await;
         let result = tokio::select! {
             result = connection(request, options, capture) => result,
@@ -1983,6 +2071,7 @@ fn desktop_for_monitor(
             format: options.audio_format,
             bitrate: options.audio_bitrate,
         },
+        wake: options.wake.clone(),
     })
 }
 
