@@ -15,6 +15,7 @@ fn encoder_config(name: &str, codec: VideoCodec, width: usize, height: usize) ->
         codec,
         hdr: false,
         chroma444: false,
+        ten_bit: false,
         width: width as u32,
         height: height as u32,
         fps: 60,
@@ -169,6 +170,104 @@ fn chroma_444_keeps_single_pixel_colour() -> Result<()> {
             Codec::new(config.clone()).is_err(),
             "{} 4:4:4 accepted",
             config.name
+        );
+    }
+    Ok(())
+}
+
+/// Main 10 from an 8-bit-precision-or-better source (10-bit SDR): x265 and
+/// SVT-AV1 keep 10-bit precision with BT.709 tags, the P010 output keeps
+/// it, the NV12 output (CPU presentation) is dithered down to 8 bits, and
+/// H.264, HDR or 4:4:4 with it are refused.
+#[test]
+fn ten_bit_sdr_keeps_precision_and_dithers_to_eight_bits() -> Result<()> {
+    let (width, height) = (256, 64);
+    // Top half: a luma ramp at 10-bit precision (four code values per 8-bit
+    // step); bottom half: flat at 258, half way between 8-bit 64 and 65.
+    let luma: Vec<u16> = (0..width * height)
+        .map(|i| {
+            if i / width < height / 2 {
+                256 + (i % width) as u16
+            } else {
+                258
+            }
+        })
+        .collect();
+    let raw: Vec<u8> = luma
+        .iter()
+        .copied()
+        .chain(std::iter::repeat_n(512, width * height / 2))
+        .flat_map(|value| (value << 6).to_le_bytes())
+        .collect();
+    for (name, codec) in [
+        ("libx265", VideoCodec::H265),
+        ("libsvtav1", VideoCodec::Av1),
+    ] {
+        let config = Config {
+            ten_bit: true,
+            kbps: 20_000,
+            ..encoder_config(name, codec, width, height)
+        };
+        let mut encoder = Codec::new(config.clone())?;
+        let mut packets = Vec::new();
+        for pts in 0..4 {
+            encoder.submit(&raw, pts)?;
+            while let Some(packet) = encoder.receive()? {
+                packets.push((pts, packet.bytes));
+            }
+        }
+        let last = |output| -> Result<super::Frame> {
+            let (frames, _) = decode_all(&config, &packets, "software", output)?;
+            Ok(frames.into_iter().last().context("nothing decoded")?.1)
+        };
+        // P010: values between 8-bit steps survive.
+        let ten = last(2)?;
+        let row: Vec<u16> = ten.bytes[height / 4 * width * 2..][..width * 2]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]) >> 6)
+            .collect();
+        let between = row.iter().filter(|&&value| value % 4 != 0).count();
+        ensure!(
+            between > width / 2,
+            "{name}: 10-bit precision lost ({between} of {width})"
+        );
+        let error = row
+            .iter()
+            .zip(&luma[height / 4 * width..])
+            .map(|(a, b)| u32::from(a.abs_diff(*b)))
+            .max()
+            .unwrap_or(0);
+        ensure!(error <= 4, "{name}: 10-bit luma off by {error}");
+        // NV12: the flat half step comes out as a 64/65 pattern averaging
+        // 64.5, not as a flat 64 or 65.
+        let eight = last(1)?;
+        let row = &eight.bytes[height * 3 / 4 * width..][..width];
+        let changes = row.windows(2).filter(|pair| pair[0] != pair[1]).count();
+        let mean = row.iter().map(|&value| f64::from(value)).sum::<f64>() / width as f64;
+        ensure!(
+            changes > width / 4 && (mean - 64.5).abs() < 0.2,
+            "{name}: 8-bit output not dithered ({changes} changes, mean {mean:.2})"
+        );
+    }
+    for config in [
+        Config {
+            ten_bit: true,
+            ..encoder_config("libx264", VideoCodec::H264, 64, 64)
+        },
+        Config {
+            ten_bit: true,
+            hdr: true,
+            ..encoder_config("libx265", VideoCodec::H265, 64, 64)
+        },
+        Config {
+            ten_bit: true,
+            chroma444: true,
+            ..encoder_config("libx265", VideoCodec::H265, 64, 64)
+        },
+    ] {
+        ensure!(
+            Codec::new(config).is_err(),
+            "invalid 10-bit configuration accepted"
         );
     }
     Ok(())
@@ -594,9 +693,10 @@ fn chroma_444_text_sharpness() -> Result<()> {
 /// Two 1920x1080 sources: a dark luma ramp (16..48 across the width, one
 /// code value per 60 columns) and the same ramp at 10-bit precision
 /// dithered to 8 bits (what a renderer's dithering produces), each still
-/// and slowly panning. Encoded 8-bit (NV12) and 10-bit (P010 = 8-bit << 2;
-/// FFmpeg's Main 10 path, which tags PQ, irrelevant to the coding) at 2 and
-/// 6 Mbps, decoded and rounded back to 8 bits as an SDR display shows it.
+/// and slowly panning. Encoded 8-bit (NV12) and 10-bit SDR (P010 = 8-bit
+/// << 2) at 2 and 6 Mbps, decoded and brought back to 8 bits as the client
+/// shows it: rounded (zero-copy GL presentation) and dithered by swscale
+/// (CPU presentation, NV12).
 /// Banding: RMS error of the 16x16 box-filtered luma against the source's
 /// (in 8-bit code values; contours show up there, dither noise does not),
 /// the mean run of equal values along rows (long runs: visible bands), and
@@ -668,7 +768,7 @@ fn ten_bit_sdr_banding() -> Result<()> {
                         .collect();
                     let config = Config {
                         kbps,
-                        hdr: ten_bit,
+                        ten_bit,
                         output: if ten_bit { 2 } else { 1 },
                         ..encoder_config(name, VideoCodec::H265, width, height)
                     };
@@ -684,51 +784,72 @@ fn ten_bit_sdr_banding() -> Result<()> {
                     drop(encoder);
                     let (encode_mean, _) = stats(&mut times);
                     let (decoded, _) = decode_all(&config, &packets, "software", config.output)?;
+                    let dithered = if ten_bit {
+                        Some(decode_all(&config, &packets, "software", 1)?.0)
+                    } else {
+                        None
+                    };
                     let mut line = format!(
                         "BANDING {} {kbps} kbps {name} {}:",
                         if dither { "dithered" } else { "stepped" },
                         if ten_bit { "Main 10" } else { "Main" }
                     );
-                    for (label, pts) in [("still", FRAMES / 2 - 1), ("panning", FRAMES - 1)] {
-                        let frame = &decoded
+                    let find = |frames: &[(u64, super::Frame)], pts: usize| -> Result<Vec<u8>> {
+                        Ok(frames
                             .iter()
                             .find(|(at, _)| *at as usize == pts)
                             .context("frame not decoded")?
-                            .1;
-                        let luma: Vec<u8> = if ten_bit {
-                            frame.bytes[..width * height * 2]
+                            .1
+                            .bytes
+                            .clone())
+                    };
+                    for (label, pts) in [("still", FRAMES / 2 - 1), ("panning", FRAMES - 1)] {
+                        let frame = find(&decoded, pts)?;
+                        let variants = if ten_bit {
+                            let rounded = frame[..width * height * 2]
                                 .chunks_exact(2)
                                 .map(|pair| {
                                     let value = u16::from_le_bytes([pair[0], pair[1]]) >> 6;
                                     ((value + 2) >> 2).min(255) as u8
                                 })
-                                .collect()
+                                .collect();
+                            let dithered =
+                                find(dithered.as_deref().context("no NV12 decode")?, pts)?;
+                            vec![
+                                ("rounded", rounded),
+                                ("dithered", dithered[..width * height].to_vec()),
+                            ]
                         } else {
-                            frame.bytes[..width * height].to_vec()
+                            vec![("", frame[..width * height].to_vec())]
                         };
-                        let (psnr, _) = plane_quality(&sources[pts], &luma, width, height, 1);
-                        let (reference, smooth) = (box_filter(&sources[pts]), box_filter(&luma));
-                        let banding = (reference
-                            .iter()
-                            .zip(&smooth)
-                            .map(|(a, b)| (a - b).powi(2))
-                            .sum::<f64>()
-                            / reference.len() as f64)
-                            .sqrt();
-                        // Visible contours: how long runs of one code value
-                        // get along a row (dither keeps them short).
-                        let runs = |plane: &[u8]| {
-                            let changes = plane
-                                .chunks_exact(width)
-                                .map(|row| row.windows(2).filter(|pair| pair[0] != pair[1]).count())
-                                .sum::<usize>();
-                            (width * height) as f64 / (changes + height) as f64
-                        };
-                        line += &format!(
-                            " {label} PSNR {psnr:.2} dB, box RMSE {banding:.3}, runs {:.1} px (source {:.1}) |",
-                            runs(&luma),
-                            runs(&sources[pts])
-                        );
+                        for (variant, luma) in variants {
+                            let (psnr, _) = plane_quality(&sources[pts], &luma, width, height, 1);
+                            let (reference, smooth) =
+                                (box_filter(&sources[pts]), box_filter(&luma));
+                            let banding = (reference
+                                .iter()
+                                .zip(&smooth)
+                                .map(|(a, b)| (a - b).powi(2))
+                                .sum::<f64>()
+                                / reference.len() as f64)
+                                .sqrt();
+                            // Visible contours: how long runs of one code value
+                            // get along a row (dither keeps them short).
+                            let runs = |plane: &[u8]| {
+                                let changes = plane
+                                    .chunks_exact(width)
+                                    .map(|row| {
+                                        row.windows(2).filter(|pair| pair[0] != pair[1]).count()
+                                    })
+                                    .sum::<usize>();
+                                (width * height) as f64 / (changes + height) as f64
+                            };
+                            line += &format!(
+                                " {label} {variant} PSNR {psnr:.2} dB, box RMSE {banding:.3}, runs {:.1} px (source {:.1}) |",
+                                runs(&luma),
+                                runs(&sources[pts])
+                            );
+                        }
                     }
                     eprintln!(
                         "{line} encode {encode_mean:.2} ms | {:.2} Mbps | load {}",

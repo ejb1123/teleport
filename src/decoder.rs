@@ -273,6 +273,7 @@ mod tests {
             codec: VideoCodec::H265,
             dynamic_range: crate::protocol::DynamicRange::Hdr10,
             chroma444: false,
+            ten_bit: false,
         };
         probe("avdec_h265", format)?;
         if let Err(error) = probe_inner("nvh265dec", format, false) {
@@ -337,6 +338,7 @@ mod tests {
                     codec,
                     dynamic_range: crate::protocol::DynamicRange::Hdr10,
                     chroma444: false,
+                    ten_bit: false,
                 });
             }
             for format in formats {

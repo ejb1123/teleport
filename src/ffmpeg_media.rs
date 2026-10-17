@@ -206,6 +206,7 @@ fn config(name: &str, format: VideoFormat, output: i32) -> Config {
         codec: format.codec,
         hdr: format.hdr(),
         chroma444: format.chroma444,
+        ten_bit: format.ten_bit,
         width,
         height,
         fps: 30,
@@ -231,7 +232,12 @@ fn synthetic(format: VideoFormat) -> Result<Vec<Vec<u8>>> {
     let mut config = config(software_encoder(format.codec), format, 1);
     config.encoder = true;
     let mut encoder = Codec::new(config.clone())?;
-    let raw = neutral_frame(config.width, config.height, format.hdr(), format.chroma444);
+    let raw = neutral_frame(
+        config.width,
+        config.height,
+        format.depth10(),
+        format.chroma444,
+    );
     let mut packets = Vec::new();
     for pts in 0..3 {
         encoder.submit(&raw, pts)?;
@@ -1085,14 +1091,14 @@ mod tests {
         Ok(())
     }
 }
-fn neutral_frame(width: u32, height: u32, hdr: bool, chroma444: bool) -> Vec<u8> {
+fn neutral_frame(width: u32, height: u32, depth10: bool, chroma444: bool) -> Vec<u8> {
     let pixels = width as usize * height as usize;
     if chroma444 {
         let mut raw = vec![90; pixels];
         raw.extend(vec![128; pixels * 2]);
         return raw;
     }
-    if hdr {
+    if depth10 {
         (0..pixels * 3 / 2)
             .flat_map(|index| {
                 (if index < pixels {
@@ -1139,10 +1145,15 @@ fn probe_decoder(name: &str, format: VideoFormat, packets: &[Vec<u8>], output: i
 /// decodes GPU-resident frames of `format`. Cached per process.
 #[cfg(target_os = "linux")]
 fn gpu_decoder_verified(name: &str, format: VideoFormat) -> bool {
-    type Cache = BTreeMap<(String, &'static str, bool), bool>;
+    type Cache = BTreeMap<(String, &'static str, bool, bool), bool>;
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     let mut cache = CACHE.get_or_init(Mutex::default).lock().unwrap();
-    let key = (name.to_owned(), format.codec.track(), format.chroma444);
+    let key = (
+        name.to_owned(),
+        format.codec.track(),
+        format.chroma444,
+        format.ten_bit,
+    );
     if let Some(&verified) = cache.get(&key) {
         return verified;
     }
@@ -1163,7 +1174,7 @@ fn gpu_decoder_verified(name: &str, format: VideoFormat) -> bool {
 }
 
 pub(super) fn select_decoder(software: bool, format: VideoFormat) -> Result<String> {
-    type Cache = BTreeMap<(bool, &'static str, bool, bool), String>;
+    type Cache = BTreeMap<(bool, &'static str, bool, bool, bool), String>;
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     format.validate()?;
     let mut cache = CACHE.get_or_init(Mutex::default).lock().unwrap();
@@ -1172,6 +1183,7 @@ pub(super) fn select_decoder(software: bool, format: VideoFormat) -> Result<Stri
         format.codec.track(),
         format.hdr(),
         format.chroma444,
+        format.ten_bit,
     );
     if let Some(name) = cache.get(&key) {
         return Ok(name.clone());
@@ -1188,7 +1200,7 @@ pub(super) fn select_decoder(software: bool, format: VideoFormat) -> Result<Stri
     for &name in candidates {
         match probe_decoder(name, format, &packets, output_format(format, false)) {
             Ok(()) => {
-                tracing::info!(backend="ffmpeg", decoder=name, codec=?format.codec, chroma444=format.chroma444, "direct decoder produced verified output");
+                tracing::info!(backend="ffmpeg", decoder=name, codec=?format.codec, chroma444=format.chroma444, ten_bit=format.ten_bit, "direct decoder produced verified output");
                 cache.insert(key, name.into());
                 return Ok(name.into());
             }
@@ -1202,7 +1214,8 @@ pub(super) fn select_decoder(software: bool, format: VideoFormat) -> Result<Stri
 }
 
 /// Decoder output for `format` without GPU frames: P010 for HDR, RGB24 for
-/// 4:4:4 (NV12 would halve its chroma again), else NV12 or RGB24.
+/// 4:4:4 (NV12 would halve its chroma again), else NV12 or RGB24 (10-bit SDR
+/// too: swscale dithers it to 8 bits).
 fn output_format(format: VideoFormat, nv12: bool) -> i32 {
     if format.hdr() {
         2
@@ -1232,16 +1245,19 @@ pub(super) fn decoder(
     // GPU-resident frames only for an 8-bit decode on the presenter's own GPU
     // ("cuda", or "vaapi@<render node>" of its EGL display).
     #[cfg(target_os = "linux")]
-    // 4:4:4 stays on the GPU only through CUDA (three planes into GL); a
-    // VA-API surface would be packed, so it is converted on the CPU.
+    // 4:4:4 and 10-bit SDR stay on the GPU only through CUDA (three planes,
+    // or 16-bit ones, into GL); the VA-API presenter imports 8-bit NV12
+    // layers, so those are converted on the CPU.
     let gpu = gpu.filter(|preferred| {
         !software
             && !format.hdr()
-            && (!format.chroma444 || *preferred == "cuda")
+            && (!(format.chroma444 || format.ten_bit) || *preferred == "cuda")
             && (*preferred == selected || gpu_decoder_verified(preferred, format))
     });
     #[cfg(not(target_os = "linux"))]
-    let gpu = gpu.filter(|preferred| !format.hdr() && !format.chroma444 && *preferred == selected);
+    let gpu = gpu.filter(|preferred| {
+        !format.hdr() && !format.chroma444 && !format.ten_bit && *preferred == selected
+    });
     let (name, output) = if let Some(preferred) = gpu {
         (preferred.to_owned(), 3)
     } else if !nv12 && !format.hdr() {
@@ -1260,9 +1276,10 @@ pub(super) fn decoder(
         reopen: Default::default(),
     });
     *stats.decoder.lock().unwrap() = format!(
-        "ffmpeg:{}{}:{name}",
+        "ffmpeg:{}{}{}:{name}",
         format.codec.track(),
-        if format.chroma444 { " 4:4:4" } else { "" }
+        if format.chroma444 { " 4:4:4" } else { "" },
+        if format.ten_bit { " 10-bit" } else { "" }
     );
     let pipeline = Pipeline(gst::parse::launch(&format!(
         "appsrc name=in is-live=true format=time max-bytes=8388608 block=false caps={},stream-format=byte-stream,alignment=au ! appsink name=compressed sync=false max-buffers=1 drop=false",
@@ -1640,7 +1657,12 @@ fn encoder_name(kind: EncoderKind, codec: VideoCodec) -> String {
 #[cfg(target_os = "linux")]
 fn probe_encoder(config: &Config) -> Result<()> {
     let mut codec = Codec::new(config.clone())?;
-    let raw = neutral_frame(config.width, config.height, config.hdr, config.chroma444);
+    let raw = neutral_frame(
+        config.width,
+        config.height,
+        config.hdr || config.ten_bit,
+        config.chroma444,
+    );
     let mut emitted = false;
     for n in 0..3 {
         codec.submit(&raw, n)?;
@@ -1658,11 +1680,16 @@ fn probe_encoder(config: &Config) -> Result<()> {
 /// hosts advertise this to clients choosing a codec automatically.
 #[cfg(target_os = "linux")]
 pub(super) fn hardware_encoder(kind: EncoderKind, format: VideoFormat) -> Option<String> {
-    type Cache = BTreeMap<(String, &'static str, bool), Option<String>>;
+    type Cache = BTreeMap<(String, &'static str, bool, bool), Option<String>>;
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     let mut cache = CACHE.get_or_init(Mutex::default).lock().unwrap();
     let codec = format.codec;
-    let key = (format!("{kind:?}"), codec.track(), format.chroma444);
+    let key = (
+        format!("{kind:?}"),
+        codec.track(),
+        format.chroma444,
+        format.ten_bit,
+    );
     if let Some(found) = cache.get(&key) {
         return found.clone();
     }
@@ -1694,7 +1721,7 @@ pub(super) fn hardware_encoder(kind: EncoderKind, format: VideoFormat) -> Option
             }
         }
     });
-    tracing::info!(?codec, chroma444 = format.chroma444, encoder = ?found, "hardware encoder probe");
+    tracing::info!(?codec, chroma444 = format.chroma444, ten_bit = format.ten_bit, encoder = ?found, "hardware encoder probe");
     cache.insert(key, found.clone());
     found
 }
@@ -1724,13 +1751,14 @@ pub(super) fn encoder(
     // Probing opens and exercises up to four encoders. Quality and monitor
     // changes re-create the encoder inside the session loop, so remember which
     // one worked for this request and only probe again if it later fails.
-    type Cache = BTreeMap<(String, &'static str, bool, bool, u32, u32), String>;
+    type Cache = BTreeMap<(String, &'static str, bool, bool, bool, u32, u32), String>;
     static ENCODERS: OnceLock<Mutex<Cache>> = OnceLock::new();
     let cache_key = (
         format!("{kind:?}"),
         format.codec.track(),
         format.hdr(),
         format.chroma444,
+        format.ten_bit,
         size.0,
         size.1,
     );
@@ -1866,13 +1894,16 @@ fn start(
         ?format.codec,
         bitrate,
         capture = if zero_copy { "DMA-BUF zero-copy" } else { "CPU" },
+        chroma444 = format.chroma444,
+        ten_bit = format.ten_bit,
         "direct video encoder"
     );
     let metrics = Arc::new(EncoderMetrics {
         encoder: format!(
-            "ffmpeg:{}{}{}{}",
+            "ffmpeg:{}{}{}{}{}",
             codec.config.name,
             if format.chroma444 { " 4:4:4" } else { "" },
+            if format.ten_bit { " 10-bit" } else { "" },
             if zero_copy { " DMA-BUF zero-copy" } else { "" },
             match codec.config.preset {
                 crate::protocol::EncoderPreset::Latency => String::new(),
@@ -1894,6 +1925,8 @@ fn start(
     });
     let pixel = if format.hdr() {
         "P010_10LE,colorimetry=bt2100-pq"
+    } else if format.ten_bit {
+        "P010_10LE,colorimetry=bt709"
     } else if format.chroma444 {
         "Y444,colorimetry=bt709"
     } else {
@@ -2012,7 +2045,7 @@ fn start(
                             &info,
                         )?;
                         use gstreamer_video::prelude::*;
-                        let stride = size.0 as usize * if format.hdr() { 2 } else { 1 };
+                        let stride = size.0 as usize * if format.depth10() { 2 } else { 1 };
                         raw.reserve(stride * size.1 as usize * 3);
                         for &(plane, divisor) in planes {
                             let rows = size.1 as usize / divisor;
@@ -2029,7 +2062,7 @@ fn start(
                         }
                     }
                     if let Some(white) = crate::media::test_flash::white()
-                        && !format.hdr()
+                        && !format.depth10()
                         && !raw.is_empty()
                     {
                         // `--flash-on-input`: the whole frame black or white.

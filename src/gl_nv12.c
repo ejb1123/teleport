@@ -48,7 +48,7 @@ static int load_gl(TpGl *gl, TpGetProc get) {
     LOAD(GetError) LOAD(GetIntegerv) LOAD(GetProgramiv) LOAD(GetShaderiv) LOAD(GetString)
     LOAD(GetUniformLocation) LOAD(GetVertexAttribiv) LOAD(GetVertexAttribPointerv)
     LOAD(IsEnabled) LOAD(LinkProgram) LOAD(ShaderSource) LOAD(TexImage2D)
-    LOAD(TexParameteri) LOAD(Uniform1i) LOAD(UseProgram) LOAD(VertexAttribPointer)
+    LOAD(TexParameteri) LOAD(Uniform1f) LOAD(Uniform1i) LOAD(UseProgram) LOAD(VertexAttribPointer)
     LOAD(Viewport)
 #undef LOAD
     return 1;
@@ -64,13 +64,16 @@ static const char *VERTEX =
     "}\n";
 
 /* Limited-range BT.709, matching the encoder's colour negotiation. Chroma
- * from NV12's RG plane, or (planar, 4:4:4) from separate Cb and Cr planes. */
+ * from NV12's RG plane, or (planar, 4:4:4) from separate Cb and Cr planes.
+ * `dither` (10-bit planes) adds a 2x2 ordered dither of one 8-bit step, as
+ * the CPU path does, so the extra precision is not rounded into contours. */
 static const char *FRAGMENT =
     "#version 120\n"
     "uniform sampler2D y_plane;\n"
     "uniform sampler2D uv_plane;\n"
     "uniform sampler2D v_plane;\n"
     "uniform int planar;\n"
+    "uniform float dither;\n"
     "varying vec2 coord;\n"
     "void main() {\n"
     "  float y = (texture2D(y_plane, coord).r - 16.0 / 255.0) * (255.0 / 219.0);\n"
@@ -78,6 +81,9 @@ static const char *FRAGMENT =
     "                        : texture2D(uv_plane, coord).rg;\n"
     "  vec2 c = (uv - 128.0 / 255.0) * (255.0 / 224.0);\n"
     "  vec3 rgb = vec3(y + 1.5748 * c.y, y - 0.1873 * c.x - 0.4681 * c.y, y + 1.8556 * c.x);\n"
+    "  vec2 cell = mod(floor(gl_FragCoord.xy), 2.0);\n"
+    "  float threshold = (mod(cell.x * 2.0 + cell.y * 3.0, 4.0) + 0.5) / 4.0 - 0.5;\n"
+    "  rgb += dither * threshold / 255.0;\n"
     "  gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);\n"
     "}\n";
 
@@ -127,6 +133,7 @@ int tp_nv12_gl_init(TpNv12Gl *g, TpGetProc get) {
         g->uv_plane = gl->GetUniformLocation(g->program, "uv_plane");
         g->v_plane = gl->GetUniformLocation(g->program, "v_plane");
         g->planar_location = gl->GetUniformLocation(g->program, "planar");
+        g->dither_location = gl->GetUniformLocation(g->program, "dither");
         static const GLfloat quad[] = {-1, -1, 1, -1, -1, 1, 1, 1};
         gl->GenBuffers(1, &g->vbo);
         gl->BindBuffer(GL_ARRAY_BUFFER, g->vbo);
@@ -187,6 +194,7 @@ int tp_nv12_gl_draw(TpNv12Gl *g, TpNv12Upload upload, void *presenter, const AVF
         gl->Uniform1i(g->uv_plane, 1);
         gl->Uniform1i(g->v_plane, 2);
         gl->Uniform1i(g->planar_location, g->planar);
+        gl->Uniform1f(g->dither_location, g->ten_bit ? 1.0f : 0.0f);
         gl->Disable(GL_BLEND); gl->Disable(GL_SCISSOR_TEST);
         gl->Disable(GL_DEPTH_TEST); gl->Disable(GL_CULL_FACE);
         gl->Viewport(x, framebuffer_height - y - height, width, height);

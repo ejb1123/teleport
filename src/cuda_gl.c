@@ -1,7 +1,7 @@
 /* Zero-copy presentation of NVDEC (FFmpeg CUDA) frames in an OpenGL context.
  *
- * The decoded NV12 (or 4:4:4 YUV444P) surface never leaves the GPU: CUDA
- * copies its two (three) planes
+ * The decoded NV12 (or 4:4:4 YUV444P, or 10-bit P010) surface never leaves
+ * the GPU: CUDA copies its two (three) planes
  * device-to-device into GL textures registered for interop, and the shared
  * NV12 shader (gl_nv12.c) converts limited-range BT.709 to RGB while drawing
  * a quad into the current framebuffer. Replaces download + CPU copies +
@@ -24,7 +24,7 @@
 typedef struct TpCudaGl {
     TpNv12Gl nv12;
     CudaFunctions *cu;
-    int width, height, planes;
+    int width, height, planes, sixteen;
     CUcontext registered_for;
     CUgraphicsResource resources[3];
 } TpCudaGl;
@@ -69,17 +69,20 @@ TpCudaGl *tp_cuda_gl_new(TpGetProc get) {
 }
 
 /* (Re)allocate texture storage and register it with CUDA: NV12's R8 and
- * half-size RG8 planes, or three full-size R8 planes (4:4:4). Runs inside
+ * half-size RG8 planes (R16 and RG16 for P010, whose normalised values the
+ * same shader reads), or three full-size R8 planes (4:4:4). Runs inside
  * tp_nv12_gl_draw's saved-state region. */
-static int ensure_textures(TpCudaGl *g, CUcontext ctx, int width, int height, int planes) {
-    if (g->width == width && g->height == height && g->planes == planes && g->registered_for == ctx) return 0;
+static int ensure_textures(TpCudaGl *g, CUcontext ctx, int width, int height, int planes, int sixteen) {
+    if (g->width == width && g->height == height && g->planes == planes && g->sixteen == sixteen
+        && g->registered_for == ctx) return 0;
     TpGl *gl = &g->nv12.gl;
     unregister(g);
     for (int i = 0; i < planes; i++) {
         int half = i && planes == 2;
         gl->BindTexture(GL_TEXTURE_2D, g->nv12.textures[i]);
-        gl->TexImage2D(GL_TEXTURE_2D, 0, half ? GL_RG8 : GL_R8, half ? width / 2 : width,
-            half ? height / 2 : height, 0, half ? GL_RG : GL_RED, GL_UNSIGNED_BYTE, NULL);
+        gl->TexImage2D(GL_TEXTURE_2D, 0, sixteen ? (half ? GL_RG16_EXT : GL_R16_EXT) : (half ? GL_RG8 : GL_R8),
+            half ? width / 2 : width, half ? height / 2 : height, 0, half ? GL_RG : GL_RED,
+            sixteen ? GL_UNSIGNED_SHORT : GL_UNSIGNED_BYTE, NULL);
     }
     if (gl->GetError() != GL_NO_ERROR) return AVERROR_EXTERNAL;
     for (int i = 0; i < planes; i++) {
@@ -89,7 +92,7 @@ static int ensure_textures(TpCudaGl *g, CUcontext ctx, int width, int height, in
             return AVERROR_EXTERNAL;
         }
     }
-    g->width = width; g->height = height; g->planes = planes; g->registered_for = ctx;
+    g->width = width; g->height = height; g->planes = planes; g->sixteen = sixteen; g->registered_for = ctx;
     return 0;
 }
 
@@ -98,15 +101,18 @@ static int upload(void *presenter, const AVFrame *frame) {
     TpCudaGl *g = presenter;
     if (frame->format != AV_PIX_FMT_CUDA || !frame->hw_frames_ctx) return AVERROR(EINVAL);
     AVHWFramesContext *frames = (AVHWFramesContext *)frame->hw_frames_ctx->data;
-    /* 10-bit/HDR: CPU path */
-    if (frames->sw_format != AV_PIX_FMT_NV12 && frames->sw_format != AV_PIX_FMT_YUV444P) return AVERROR(ENOSYS);
+    /* 10-bit SDR as P010 (HDR never reaches GPU presentation). */
+    int sixteen = frames->sw_format == AV_PIX_FMT_P010LE;
+    if (frames->sw_format != AV_PIX_FMT_NV12 && frames->sw_format != AV_PIX_FMT_YUV444P && !sixteen)
+        return AVERROR(ENOSYS);
     if ((frame->width | frame->height) & 1) return AVERROR(EINVAL);
     int planes = frames->sw_format == AV_PIX_FMT_YUV444P ? 3 : 2;
     AVCUDADeviceContext *device = frames->device_ctx->hwctx;
     CudaFunctions *cu = g->cu;
     if (cu->cuCtxPushCurrent(device->cuda_ctx) != CUDA_SUCCESS) return AVERROR_EXTERNAL;
-    int result = ensure_textures(g, device->cuda_ctx, frame->width, frame->height, planes);
+    int result = ensure_textures(g, device->cuda_ctx, frame->width, frame->height, planes, sixteen);
     g->nv12.planar = planes == 3;
+    g->nv12.ten_bit = sixteen;
     if (result == 0 && cu->cuGraphicsMapResources(planes, g->resources, 0) != CUDA_SUCCESS)
         result = AVERROR_EXTERNAL;
     if (result == 0) {
@@ -122,7 +128,8 @@ static int upload(void *presenter, const AVFrame *frame) {
             copy.srcPitch = frame->linesize[plane];
             copy.dstMemoryType = CU_MEMORYTYPE_ARRAY;
             copy.dstArray = array;
-            copy.WidthInBytes = frame->width; /* NV12 UV: width/2 texels of 2 bytes */
+            /* NV12 UV: width/2 texels of 2 bytes; P010 twice that */
+            copy.WidthInBytes = frame->width * (sixteen ? 2 : 1);
             copy.Height = plane && planes == 2 ? frame->height / 2 : frame->height;
             if (cu->cuMemcpy2D(&copy) != CUDA_SUCCESS) result = AVERROR_EXTERNAL;
         }

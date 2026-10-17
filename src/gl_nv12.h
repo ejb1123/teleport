@@ -32,6 +32,9 @@ typedef ptrdiff_t GLsizeiptr;
 #define GL_RED 0x1903
 #define GL_RG 0x8227
 #define GL_UNSIGNED_BYTE 0x1401
+#define GL_UNSIGNED_SHORT 0x1403
+#define GL_R16_EXT 0x822A
+#define GL_RG16_EXT 0x822C
 #define GL_NO_ERROR 0
 #define GL_VENDOR 0x1F00
 
@@ -71,6 +74,7 @@ typedef struct {
     void (*ShaderSource)(GLuint, GLsizei, const GLchar *const *, const GLint *);
     void (*TexImage2D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
     void (*TexParameteri)(GLenum, GLenum, GLint);
+    void (*Uniform1f)(GLint, GLfloat);
     void (*Uniform1i)(GLint, GLint);
     void (*UseProgram)(GLuint);
     void (*VertexAttribPointer)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void *);
@@ -82,8 +86,9 @@ typedef struct {
     /* NV12: textures 0 (R8 luma) and 1 (RG8 chroma). With `planar` set by
      * the upload (4:4:4), three full-size R8 textures: Y, Cb, Cr. */
     GLuint program, vbo, textures[3];
-    GLint y_plane, uv_plane, v_plane, planar_location;
-    int planar;
+    GLint y_plane, uv_plane, v_plane, planar_location, dither_location;
+    /* Set by the upload: 4:4:4 planes, 10-bit (16-bit) planes. */
+    int planar, ten_bit;
 } TpNv12Gl;
 
 /* Fills `textures` with the frame's planes. Called by tp_nv12_gl_draw after

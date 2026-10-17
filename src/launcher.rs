@@ -171,6 +171,12 @@ const CHROMA_444: [(&str, &str); 3] = [
     ("4:4:4 colour: auto", "auto"),
     ("4:4:4 colour: on", "on"),
 ];
+/// `--ten-bit`: Main 10 from 8-bit capture, against banding.
+const TEN_BIT: [(&str, &str); 3] = [
+    ("10-bit: off", "off"),
+    ("10-bit: auto", "auto"),
+    ("10-bit: on", "on"),
+];
 /// `--relative-mouse`: lock the pointer for games while the host hides it,
 /// always, or only by Ctrl+Alt+M.
 const RELATIVE_MOUSE: [(&str, &str); 3] = [
@@ -478,6 +484,7 @@ pub fn run() -> Result<()> {
     let mut stream = StreamPreferences::default();
     let mut codec = 0usize;
     let mut chroma_444 = 0usize;
+    let mut ten_bit = 0usize;
     let mut relative_mouse = 0usize;
     let mut encoder_preset = 0usize;
     let mut host_display = 0usize;
@@ -1047,6 +1054,9 @@ pub fn run() -> Result<()> {
                                 if hit(pref_rect(16), x, y) {
                                     chroma_444 = (chroma_444 + 1) % CHROMA_444.len();
                                 }
+                                if hit(pref_rect(17), x, y) {
+                                    ten_bit = (ten_bit + 1) % TEN_BIT.len();
+                                }
                                 if hit(pref_rect(3), x, y) {
                                     codec = (codec + 1) % CODECS.len();
                                     if CODECS[codec].1 != "h265" {
@@ -1199,6 +1209,8 @@ pub fn run() -> Result<()> {
                             .arg(CODECS[codec].1)
                             .arg("--chroma-444")
                             .arg(CHROMA_444[chroma_444].1)
+                            .arg("--ten-bit")
+                            .arg(TEN_BIT[ten_bit].1)
                             .arg("--relative-mouse")
                             .arg(RELATIVE_MOUSE[relative_mouse].1)
                             .arg("--dynamic-range")
@@ -1704,6 +1716,7 @@ pub fn run() -> Result<()> {
                             },
                             GAMEPAD_TYPES[gamepad_type].0,
                             CHROMA_444[chroma_444].0,
+                            TEN_BIT[ten_bit].0,
                         ];
                         for (index, label) in labels.into_iter().enumerate() {
                             ui.button(

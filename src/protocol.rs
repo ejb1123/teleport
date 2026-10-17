@@ -171,6 +171,11 @@ impl VideoCodec {
     pub fn supports_444(self) -> bool {
         self != Self::Av1
     }
+    /// Codecs that can carry 10-bit SDR here (`SelectCodec::ten_bit`): no
+    /// hardware encodes or decodes H.264 High 10.
+    pub fn supports_ten_bit(self) -> bool {
+        self != Self::H264
+    }
 }
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 pub const INPUT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -315,6 +320,15 @@ pub struct Desktop {
     /// The session's video is 4:4:4 (full-resolution chroma).
     #[serde(default)]
     pub chroma_444: bool,
+    /// Host applies `SelectCodec::ten_bit` (H.265/AV1 Main 10 SDR).
+    #[serde(default)]
+    pub ten_bit_selection: bool,
+    /// Codecs the host encodes as Main 10 in hardware.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hardware_ten_bit: Vec<VideoCodec>,
+    /// The session's video is 10-bit SDR (Main 10, BT.709).
+    #[serde(default)]
+    pub ten_bit: bool,
     /// Host injects the back and forward mouse buttons
     /// ([`BUTTON_BACK`], [`BUTTON_FORWARD`]); older hosts reject them.
     #[serde(default)]
@@ -829,6 +843,10 @@ pub enum Event {
         /// advertising `Desktop::chroma_444_selection`.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         chroma_444: bool,
+        /// Main 10 from 8-bit capture (H.265/AV1 SDR, not with 4:4:4), only
+        /// to hosts advertising `Desktop::ten_bit_selection`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        ten_bit: bool,
     },
     /// The client's display and stream choices; the host picks the stream
     /// size, rate and bitrate from them ([`negotiate`]) and answers with
@@ -1782,6 +1800,7 @@ mod tests {
                 codec: VideoCodec::H265,
                 encoder_preset: None,
                 chroma_444: false,
+                ten_bit: false,
             }
         ));
         assert!(event.validate().is_ok() && !event.is_lossy());
@@ -1813,14 +1832,18 @@ mod tests {
         assert!(!desktop.av1 && !desktop.hardware_av1);
         assert!(!desktop.chroma_444_selection && !desktop.chroma_444);
         assert!(desktop.hardware_444.is_empty());
+        assert!(!desktop.ten_bit_selection && !desktop.ten_bit);
+        assert!(desktop.hardware_ten_bit.is_empty());
         assert_eq!(desktop.encoder_preset, EncoderPreset::Latency);
         let chosen = Event::SelectCodec {
             codec: VideoCodec::H264,
             encoder_preset: Some(EncoderPreset::Quality),
             chroma_444: false,
+            ten_bit: true,
         };
         let wire = serde_json::to_string(&chosen).unwrap();
         assert!(wire.contains(r#""encoder_preset":"quality""#), "{wire}");
+        assert!(wire.contains(r#""ten_bit":true"#), "{wire}");
         assert!(matches!(
             serde_json::from_str::<Event>(&wire).unwrap(),
             Event::SelectCodec {
@@ -1832,10 +1855,14 @@ mod tests {
             codec: VideoCodec::H264,
             encoder_preset: None,
             chroma_444: false,
+            ten_bit: false,
         })
         .unwrap();
         assert!(!plain.contains("encoder_preset"), "{plain}");
-        assert!(!plain.contains("chroma_444"), "{plain}");
+        assert!(
+            !plain.contains("chroma_444") && !plain.contains("ten_bit"),
+            "{plain}"
+        );
     }
     #[test]
     fn rumble_updates_are_bounded_and_declared_by_the_client() {

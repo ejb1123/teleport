@@ -491,6 +491,7 @@ impl Screen {
                 codec: desktop.codec,
                 dynamic_range: desktop.dynamic_range,
                 chroma444: desktop.chroma_444,
+                ten_bit: desktop.ten_bit,
             },
             nv12,
             native,

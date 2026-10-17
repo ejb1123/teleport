@@ -125,6 +125,7 @@ impl Pair {
             codec,
             hdr: false,
             chroma444: false,
+            ten_bit: false,
             width: WIDTH as u32,
             height: HEIGHT as u32,
             fps: FPS,

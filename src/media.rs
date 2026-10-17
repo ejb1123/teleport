@@ -24,6 +24,8 @@ pub struct VideoFormat {
     pub dynamic_range: DynamicRange,
     /// Full-resolution chroma (4:4:4), H.264/H.265 SDR only.
     pub chroma444: bool,
+    /// Main 10 from 8-bit capture (BT.709), H.265/AV1 SDR without 4:4:4.
+    pub ten_bit: bool,
 }
 
 impl From<VideoCodec> for VideoFormat {
@@ -45,15 +47,24 @@ impl VideoFormat {
             !self.chroma444 || (self.codec.supports_444() && !self.hdr()),
             "4:4:4 needs H.264 or H.265 SDR"
         );
-        Ok(())
-    }
-    /// The legacy GStreamer backend streams 4:2:0 H.264 and H.265 only.
-    fn legacy_supported(self) -> Result<()> {
         ensure!(
-            self.codec != VideoCodec::Av1 && !self.chroma444,
-            "AV1 and 4:4:4 need the direct FFmpeg backend (unset TELEPORT_VIDEO_BACKEND)"
+            !self.ten_bit || (self.codec.supports_ten_bit() && !self.hdr() && !self.chroma444),
+            "10-bit SDR needs H.265 or AV1 without 4:4:4"
         );
         Ok(())
+    }
+    /// The legacy GStreamer backend streams 4:2:0 8-bit H.264 and H.265 only
+    /// (and HDR10).
+    fn legacy_supported(self) -> Result<()> {
+        ensure!(
+            self.codec != VideoCodec::Av1 && !self.chroma444 && !self.ten_bit,
+            "AV1, 4:4:4 and 10-bit SDR need the direct FFmpeg backend (unset TELEPORT_VIDEO_BACKEND)"
+        );
+        Ok(())
+    }
+    /// Ten bits per sample: HDR10 or 10-bit SDR.
+    fn depth10(self) -> bool {
+        self.hdr() || self.ten_bit
     }
     fn hdr(self) -> bool {
         self.dynamic_range == DynamicRange::Hdr10
@@ -936,6 +947,28 @@ pub fn hardware_444_codecs(kind: EncoderKind) -> Vec<VideoCodec> {
         .collect()
 }
 
+/// Codecs this host encodes as Main 10 SDR in hardware with `kind` (probed
+/// once per process).
+#[cfg(target_os = "linux")]
+pub fn hardware_ten_bit_codecs(kind: EncoderKind) -> Vec<VideoCodec> {
+    if !crate::ffmpeg::enabled().unwrap_or(false) {
+        return Vec::new();
+    }
+    [VideoCodec::H265, VideoCodec::Av1]
+        .into_iter()
+        .filter(|&codec| {
+            hardware_encoder(
+                kind,
+                VideoFormat {
+                    codec,
+                    ten_bit: true,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
 /// This build encodes AV1 at all (in hardware or with SVT-AV1): the direct
 /// FFmpeg backend with an AV1 encoder.
 #[cfg(target_os = "linux")]
@@ -1239,6 +1272,7 @@ mod native_surface_tests {
                     codec: VideoCodec::H265,
                     dynamic_range: range,
                     chroma444: false,
+                    ten_bit: false,
                 },
                 false,
                 true,
@@ -2085,6 +2119,7 @@ mod tests {
             codec: VideoCodec::H265,
             dynamic_range: DynamicRange::Hdr10,
             chroma444: false,
+            ten_bit: false,
         };
         assert_eq!(
             decoder::output_fragment_for(hdr, true),
@@ -2629,6 +2664,7 @@ mod tests {
             codec: VideoCodec::H265,
             dynamic_range: DynamicRange::Hdr10,
             chroma444: false,
+            ten_bit: false,
         };
         assert_eq!(encoder_pixel_format(EncoderKind::Qsv, hdr), "P010_10LE");
         assert!(encoder_fragment(EncoderKind::Qsv, 60, 8000, hdr).ends_with("profile=main-10"));
@@ -2644,6 +2680,7 @@ mod tests {
                 codec: VideoCodec::H264,
                 dynamic_range: DynamicRange::Hdr10,
                 chroma444: false,
+                ten_bit: false,
             }
             .validate()
             .is_err()
@@ -2671,6 +2708,7 @@ mod tests {
             codec: VideoCodec::H265,
             dynamic_range: DynamicRange::Hdr10,
             chroma444: false,
+            ten_bit: false,
         };
         for kind in TEST_ENCODERS {
             if !test_encoder_available(kind, format) {
@@ -2761,6 +2799,7 @@ mod tests {
                 codec: VideoCodec::H264,
                 dynamic_range: DynamicRange::Hdr10,
                 chroma444: false,
+                ten_bit: false,
             }
             .validate()
             .is_err()
@@ -2791,6 +2830,7 @@ mod tests {
             codec: VideoCodec::H265,
             dynamic_range: DynamicRange::Hdr10,
             chroma444: false,
+            ten_bit: false,
         };
         let result = encoder(
             "videotestsrc is-live=true ! capsfilter name=hdr_source caps=video/x-raw,format=RGB,width=320,height=180,framerate=30/1,colorimetry=sRGB",

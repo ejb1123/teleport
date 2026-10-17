@@ -185,12 +185,15 @@ pub struct Options {
     /// and `hardware_av1`).
     #[arg(skip)]
     pub hardware_codecs: Vec<protocol::VideoCodec>,
-    /// Codecs `encoder` encodes 4:4:4 in hardware (`Desktop::hardware_444`).
+    /// Codecs `encoder` encodes 4:4:4 and Main 10 in hardware.
     #[arg(skip)]
-    pub hardware_444: Vec<protocol::VideoCodec>,
+    pub hardware_formats: Box<HardwareFormats>,
     /// The session streams 4:4:4 (the client asked in `SelectCodec`).
     #[arg(skip)]
     pub chroma_444: bool,
+    /// The session streams 10-bit SDR (the client asked in `SelectCodec`).
+    #[arg(skip)]
+    pub ten_bit: bool,
     /// Set while a network step-down streams below `width`/`fps`
     /// (`Desktop::stepped_down`); `width` and `fps` then hold the step.
     #[arg(skip)]
@@ -198,6 +201,35 @@ pub struct Options {
     /// The session's client strips `protocol::FrameTiming` headers.
     #[arg(skip)]
     pub frame_timing: bool,
+}
+
+/// The host can serve AV1: in hardware, or with SVT-AV1 when `--encoder`
+/// allows software (explicit hardware encoders never fall back).
+fn offers_av1(options: &Options) -> bool {
+    options.hardware_codecs.contains(&protocol::VideoCodec::Av1)
+        || (matches!(
+            options.encoder,
+            media::EncoderKind::Auto | media::EncoderKind::Software
+        ) && media::av1_available())
+}
+
+/// The host can serve a format (4:4:4 or 10-bit SDR) its `hardware` probe
+/// found, or any of them when `--encoder` allows software.
+fn offers_format(options: &Options, hardware: &[protocol::VideoCodec]) -> bool {
+    crate::ffmpeg::enabled().unwrap_or(false)
+        && (!hardware.is_empty()
+            || matches!(
+                options.encoder,
+                media::EncoderKind::Auto | media::EncoderKind::Software
+            ))
+}
+
+/// Codecs the host encodes in hardware as 4:4:4 (`Desktop::hardware_444`)
+/// and as Main 10 SDR (`Desktop::hardware_ten_bit`).
+#[derive(Clone, Debug, Default)]
+pub struct HardwareFormats {
+    pub chroma_444: Vec<protocol::VideoCodec>,
+    pub ten_bit: Vec<protocol::VideoCodec>,
 }
 
 pub async fn run(mut options: Options) -> Result<()> {
@@ -271,6 +303,7 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         std::thread::spawn(move || {
             media::hardware_codecs(kind);
             media::hardware_444_codecs(kind);
+            media::hardware_ten_bit_codecs(kind);
         });
     }
     let mut config = moq_native::ServerConfig::default();
@@ -839,18 +872,24 @@ async fn run_session(
     }
     // Probed once per process (src/ffmpeg_media.rs), off the async loop.
     let kind = options.encoder;
-    (options.hardware_codecs, options.hardware_444) = match &options.smoke_hardware_codecs {
-        Some(codecs) => (codecs.clone(), Vec::new()),
+    let (codecs, formats) = match &options.smoke_hardware_codecs {
+        Some(codecs) => (codecs.clone(), HardwareFormats::default()),
         None => tokio::task::spawn_blocking(move || {
             (
                 media::hardware_codecs(kind),
-                media::hardware_444_codecs(kind),
+                HardwareFormats {
+                    chroma_444: media::hardware_444_codecs(kind),
+                    ten_bit: media::hardware_ten_bit_codecs(kind),
+                },
             )
         })
         .await
         .context("hardware encoder probe failed")?,
     };
+    options.hardware_codecs = codecs;
+    *options.hardware_formats = formats;
     options.chroma_444 = false;
+    options.ten_bit = false;
     // The metadata goes out before video starts: a client that chooses the
     // codec (Desktop::codec_selection) needs it to decide.
     let info = desktop(options, capture, video_start_group)?;
@@ -885,6 +924,7 @@ async fn run_session(
             codec,
             encoder_preset,
             chroma_444,
+            ten_bit,
         })) => {
             if let Some(preset) = encoder_preset {
                 options.encoder_preset = preset;
@@ -895,7 +935,7 @@ async fn run_session(
                 "HDR10 requires H.265"
             );
             ensure!(
-                codec != protocol::VideoCodec::Av1 || media::av1_available(),
+                codec != protocol::VideoCodec::Av1 || offers_av1(options),
                 "this host has no AV1 encoder"
             );
             ensure!(
@@ -905,8 +945,17 @@ async fn run_session(
                         && crate::ffmpeg::enabled()?),
                 "4:4:4 needs H.264 or H.265 SDR with the FFmpeg backend"
             );
+            ensure!(
+                !ten_bit
+                    || (codec.supports_ten_bit()
+                        && !chroma_444
+                        && options.dynamic_range == protocol::DynamicRange::Sdr
+                        && crate::ffmpeg::enabled()?),
+                "10-bit SDR needs H.265 or AV1 without 4:4:4 and the FFmpeg backend"
+            );
             options.codec = codec;
             options.chroma_444 = chroma_444;
+            options.ten_bit = ten_bit;
             true
         }
         Ok(Some(event)) => {
@@ -919,6 +968,7 @@ async fn run_session(
     tracing::info!(
         codec = options.codec.label(),
         chroma_444 = options.chroma_444,
+        ten_bit = options.ten_bit,
         chosen_by_client,
         encoder_preset = options.encoder_preset.label(),
         hardware = ?options.hardware_codecs,
@@ -1925,11 +1975,14 @@ fn desktop_for_monitor(
             .copied()
             .filter(|&codec| codec != protocol::VideoCodec::Av1)
             .collect(),
-        av1: media::av1_available(),
+        av1: offers_av1(options),
         hardware_av1: options.hardware_codecs.contains(&protocol::VideoCodec::Av1),
-        chroma_444_selection: crate::ffmpeg::enabled().unwrap_or(false),
-        hardware_444: options.hardware_444.clone(),
+        chroma_444_selection: offers_format(options, &options.hardware_formats.chroma_444),
+        hardware_444: options.hardware_formats.chroma_444.clone(),
         chroma_444: options.chroma_444,
+        ten_bit_selection: offers_format(options, &options.hardware_formats.ten_bit),
+        hardware_ten_bit: options.hardware_formats.ten_bit.clone(),
+        ten_bit: options.ten_bit,
         extra_mouse_buttons: true,
         encoder_presets: true,
         encoder_preset: options.encoder_preset,
@@ -2036,6 +2089,7 @@ fn start_encoder(
         codec: options.codec,
         dynamic_range: options.dynamic_range,
         chroma444: options.chroma_444,
+        ten_bit: options.ten_bit,
     };
     tokio::task::spawn_blocking(move || {
         media::encoder(&source, size, fps, bitrate, track, kind, format)
@@ -2146,6 +2200,7 @@ fn requested_format(
         codec: codec.unwrap_or(default),
         dynamic_range: range.unwrap_or_default(),
         chroma444: false,
+        ten_bit: false,
     };
     ensure!(
         format.dynamic_range != protocol::DynamicRange::Hdr10

@@ -91,21 +91,22 @@ impl CodecChoice {
     }
 }
 
-/// The client's `--chroma-444`: full-resolution chroma (sharper coloured
-/// text) for H.264/H.265 SDR sessions with hosts advertising
-/// `Desktop::chroma_444_selection`.
+/// The client's `--chroma-444` (full-resolution chroma: sharper coloured
+/// text, H.264/H.265) and `--ten-bit` (Main 10 from 8-bit sources: less
+/// banding, H.265/AV1), for SDR sessions with hosts advertising
+/// `Desktop::chroma_444_selection` / `ten_bit_selection`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
-pub enum ChromaChoice {
-    /// 4:2:0, as always.
+pub enum FormatChoice {
+    /// 4:2:0 / 8-bit, as always.
     #[default]
     Off,
-    /// 4:4:4 when the host encodes and this client decodes it in hardware.
+    /// When the host encodes and this client decodes it in hardware.
     Auto,
-    /// 4:4:4 whenever the host can, in software if need be.
+    /// Whenever the host can, in software if need be.
     On,
 }
 
-impl ChromaChoice {
+impl FormatChoice {
     pub fn label(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -123,14 +124,64 @@ pub struct ClientDecoders {
     pub av1: Option<String>,
     /// H.265 4:4:4.
     pub hevc_444: Option<String>,
+    /// H.265 and AV1 Main 10 (SDR).
+    pub hevc_10: Option<String>,
+    pub av1_10: Option<String>,
 }
 
-/// The session codec and chroma and why, for logs and Stats (F8).
+/// The session codec, chroma and depth and why, for logs and Stats (F8).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodecDecision {
     pub codec: protocol::VideoCodec,
     pub chroma_444: bool,
+    pub ten_bit: bool,
     pub reason: String,
+}
+
+/// Picks the session codec, chroma and depth once the host's `Desktop` is
+/// known: the codec and chroma as [`choose_codec_and_chroma`] does, then
+/// Main 10 (`ten_bit`) for H.265/AV1 SDR without 4:4:4. `auto` needs Main 10
+/// in hardware on both ends; `on` also moves an automatic H.264 choice to
+/// H.265.
+pub fn choose_codec(
+    choice: CodecChoice,
+    chroma: FormatChoice,
+    ten_bit: FormatChoice,
+    range: protocol::DynamicRange,
+    desktop: &Desktop,
+    decoders: &ClientDecoders,
+) -> CodecDecision {
+    use protocol::VideoCodec::{Av1, H264, H265};
+    let mut decision = choose_codec_and_chroma(choice, chroma, range, desktop, decoders);
+    if range != protocol::DynamicRange::Sdr
+        || !desktop.ten_bit_selection
+        || decision.chroma_444
+        || ten_bit == FormatChoice::Off
+    {
+        return decision;
+    }
+    let hardware = |codec| {
+        desktop.hardware_ten_bit.contains(&codec)
+            && match codec {
+                H265 => decoders.hevc_10.is_some(),
+                Av1 => decoders.av1_10.is_some(),
+                H264 => false,
+            }
+    };
+    decision.ten_bit = match ten_bit {
+        FormatChoice::Auto => hardware(decision.codec),
+        FormatChoice::On if decision.codec.supports_ten_bit() => true,
+        FormatChoice::On if choice == CodecChoice::Auto => {
+            decision.codec = H265;
+            decision.reason = "auto: H.265 for 10-bit".into();
+            true
+        }
+        _ => false,
+    };
+    if decision.ten_bit {
+        decision.reason += &format!("; 10-bit ({})", ten_bit.label());
+    }
+    decision
 }
 
 /// Picks the session codec once the host's `Desktop` is known. `auto`
@@ -139,9 +190,9 @@ pub struct CodecDecision {
 /// encode or decode costs more latency than the bitrate saves (SVT-AV1 more
 /// than most). 4:4:4 (`chroma`) is H.264/H.265 only; with `auto` codec and
 /// chroma it takes H.265 4:4:4 over AV1 when both ends have the hardware.
-pub fn choose_codec(
+pub fn choose_codec_and_chroma(
     choice: CodecChoice,
-    chroma: ChromaChoice,
+    chroma: FormatChoice,
     range: protocol::DynamicRange,
     desktop: &Desktop,
     decoders: &ClientDecoders,
@@ -157,6 +208,7 @@ pub fn choose_codec(
     let decision = |codec: protocol::VideoCodec, chroma_444: bool, reason: String| CodecDecision {
         codec,
         chroma_444,
+        ten_bit: false,
         reason: if chroma_444 {
             format!("{reason}; 4:4:4 ({})", chroma.label())
         } else {
@@ -167,9 +219,9 @@ pub fn choose_codec(
         let chroma_444 = can_444
             && codec.supports_444()
             && match chroma {
-                ChromaChoice::Off => false,
-                ChromaChoice::Auto => hardware_444(codec),
-                ChromaChoice::On => true,
+                FormatChoice::Off => false,
+                FormatChoice::Auto => hardware_444(codec),
+                FormatChoice::On => true,
             };
         return decision(codec, chroma_444, "chosen with --codec".into());
     }
@@ -179,7 +231,7 @@ pub fn choose_codec(
     if !desktop.codec_selection {
         return decision(H264, false, "auto: older host keeps H.264".into());
     }
-    if can_444 && chroma != ChromaChoice::Off && hardware_444(H265) {
+    if can_444 && chroma != FormatChoice::Off && hardware_444(H265) {
         return decision(
             H265,
             true,
@@ -201,7 +253,7 @@ pub fn choose_codec(
         (_, Some(_)) => (H264, "auto: no hardware H.265 encoder on host".into()),
         (_, None) => (H264, "auto: no hardware H.265 decoder here".into()),
     };
-    if can_444 && chroma == ChromaChoice::On {
+    if can_444 && chroma == FormatChoice::On {
         // 4:4:4 wanted even in software: the best 4:4:4-capable codec.
         let codec = if codec == Av1 || desktop.hardware_444.contains(&H265) {
             H265
@@ -605,7 +657,8 @@ mod tests {
         let pick = |choice, range, desktop: &Desktop, decoder| {
             choose_codec(
                 choice,
-                ChromaChoice::Off,
+                FormatChoice::Off,
+                FormatChoice::Off,
                 range,
                 desktop,
                 &decoders(decoder),
@@ -618,7 +671,8 @@ mod tests {
         // Both ends in hardware: H.265, and the reason names the decoder.
         let both = choose_codec(
             CodecChoice::Auto,
-            ChromaChoice::Off,
+            FormatChoice::Off,
+            FormatChoice::Off,
             Sdr,
             &hevc_host,
             &decoders(Some("vaapi")),
@@ -650,13 +704,28 @@ mod tests {
             ..Default::default()
         };
         let pick = |choice, desktop: &Desktop, decoders: &ClientDecoders| {
-            choose_codec(choice, ChromaChoice::Off, Sdr, desktop, decoders).codec
+            choose_codec(
+                choice,
+                FormatChoice::Off,
+                FormatChoice::Off,
+                Sdr,
+                desktop,
+                decoders,
+            )
+            .codec
         };
         // SVT-AV1 only on the host: H.265 in hardware instead.
         assert_eq!(pick(CodecChoice::Auto, &host, &both), H265);
         let mut av1_host = host.clone();
         av1_host.hardware_av1 = true;
-        let chosen = choose_codec(CodecChoice::Auto, ChromaChoice::Off, Sdr, &av1_host, &both);
+        let chosen = choose_codec(
+            CodecChoice::Auto,
+            FormatChoice::Off,
+            FormatChoice::Off,
+            Sdr,
+            &av1_host,
+            &both,
+        );
         assert_eq!(chosen.codec, Av1);
         assert!(chosen.reason.contains("AV1"), "{}", chosen.reason);
         // No AV1 decoder here, or an older host: never AV1.
@@ -689,27 +758,35 @@ mod tests {
             hevc: Some("cuda".into()),
             av1: Some("cuda".into()),
             hevc_444: Some("cuda".into()),
+            ..Default::default()
         };
         let pick = |codec, chroma, desktop: &Desktop, decoders: &ClientDecoders| {
-            let decision = choose_codec(codec, chroma, Sdr, desktop, decoders);
+            let decision = choose_codec(codec, chroma, FormatChoice::Off, Sdr, desktop, decoders);
             (decision.codec, decision.chroma_444)
         };
         // Older hosts: never 4:4:4, whatever was asked.
-        for chroma in [ChromaChoice::Off, ChromaChoice::Auto, ChromaChoice::On] {
+        for chroma in [FormatChoice::Off, FormatChoice::Auto, FormatChoice::On] {
             assert!(!pick(CodecChoice::Auto, chroma, &host, &client).1);
         }
         host.chroma_444_selection = true;
         assert_eq!(
-            pick(CodecChoice::Auto, ChromaChoice::Off, &host, &client),
+            pick(CodecChoice::Auto, FormatChoice::Off, &host, &client),
             (Av1, false)
         );
         // Auto needs hardware 4:4:4 on both ends, then prefers it to AV1.
         assert_eq!(
-            pick(CodecChoice::Auto, ChromaChoice::Auto, &host, &client),
+            pick(CodecChoice::Auto, FormatChoice::Auto, &host, &client),
             (Av1, false)
         );
         host.hardware_444 = vec![H264, H265];
-        let chosen = choose_codec(CodecChoice::Auto, ChromaChoice::Auto, Sdr, &host, &client);
+        let chosen = choose_codec(
+            CodecChoice::Auto,
+            FormatChoice::Auto,
+            FormatChoice::Off,
+            Sdr,
+            &host,
+            &client,
+        );
         assert_eq!((chosen.codec, chosen.chroma_444), (H265, true));
         assert!(chosen.reason.contains("4:4:4"), "{}", chosen.reason);
         let no_444_decoder = ClientDecoders {
@@ -719,7 +796,7 @@ mod tests {
         assert_eq!(
             pick(
                 CodecChoice::Auto,
-                ChromaChoice::Auto,
+                FormatChoice::Auto,
                 &host,
                 &no_444_decoder
             ),
@@ -727,19 +804,116 @@ mod tests {
         );
         // On: 4:4:4 even in software, never on AV1 or HDR.
         assert_eq!(
-            pick(CodecChoice::Auto, ChromaChoice::On, &host, &no_444_decoder),
+            pick(CodecChoice::Auto, FormatChoice::On, &host, &no_444_decoder),
             (H265, true)
         );
         assert_eq!(
-            pick(CodecChoice::H264, ChromaChoice::On, &host, &no_444_decoder),
+            pick(CodecChoice::H264, FormatChoice::On, &host, &no_444_decoder),
             (H264, true)
         );
         assert_eq!(
-            pick(CodecChoice::Av1, ChromaChoice::On, &host, &client),
+            pick(CodecChoice::Av1, FormatChoice::On, &host, &client),
             (Av1, false)
         );
         assert!(
-            !choose_codec(CodecChoice::H265, ChromaChoice::On, Hdr10, &host, &client).chroma_444
+            !choose_codec(
+                CodecChoice::H265,
+                FormatChoice::On,
+                FormatChoice::Off,
+                Hdr10,
+                &host,
+                &client
+            )
+            .chroma_444
+        );
+    }
+
+    #[test]
+    fn ten_bit_is_off_by_default_and_gated_on_the_host() {
+        use protocol::{DynamicRange::*, VideoCodec::*};
+        let mut host = desktop(true);
+        host.codec_selection = true;
+        host.hardware_codecs = vec![H264, H265];
+        host.chroma_444_selection = true;
+        let client = ClientDecoders {
+            hevc: Some("cuda".into()),
+            hevc_10: Some("cuda".into()),
+            ..Default::default()
+        };
+        let pick = |codec, ten_bit, chroma, desktop: &Desktop| {
+            let decision = choose_codec(codec, chroma, ten_bit, Sdr, desktop, &client);
+            (decision.codec, decision.ten_bit, decision.reason)
+        };
+        // Older hosts never.
+        assert!(
+            !pick(
+                CodecChoice::Auto,
+                FormatChoice::On,
+                FormatChoice::Off,
+                &host
+            )
+            .1
+        );
+        host.ten_bit_selection = true;
+        assert!(
+            !pick(
+                CodecChoice::Auto,
+                FormatChoice::Off,
+                FormatChoice::Off,
+                &host
+            )
+            .1
+        );
+        // Auto: hardware Main 10 on both ends.
+        assert!(
+            !pick(
+                CodecChoice::Auto,
+                FormatChoice::Auto,
+                FormatChoice::Off,
+                &host
+            )
+            .1
+        );
+        host.hardware_ten_bit = vec![H265];
+        let (codec, ten_bit, reason) = pick(
+            CodecChoice::Auto,
+            FormatChoice::Auto,
+            FormatChoice::Off,
+            &host,
+        );
+        assert_eq!((codec, ten_bit), (H265, true));
+        assert!(reason.contains("10-bit (auto)"), "{reason}");
+        // On: H.264 moves to H.265 unless chosen explicitly; never with 4:4:4.
+        let mut software = host.clone();
+        software.hardware_codecs = vec![H264];
+        software.hardware_ten_bit.clear();
+        let (codec, ten_bit, _) = pick(
+            CodecChoice::Auto,
+            FormatChoice::On,
+            FormatChoice::Off,
+            &software,
+        );
+        assert_eq!((codec, ten_bit), (H265, true));
+        let (codec, ten_bit, _) = pick(
+            CodecChoice::H264,
+            FormatChoice::On,
+            FormatChoice::Off,
+            &software,
+        );
+        assert_eq!((codec, ten_bit), (H264, false));
+        let (codec, ten_bit, _) =
+            pick(CodecChoice::H265, FormatChoice::On, FormatChoice::On, &host);
+        assert_eq!((codec, ten_bit), (H265, false));
+        assert!(
+            !choose_codec(
+                CodecChoice::H265,
+                FormatChoice::Off,
+                FormatChoice::On,
+                Hdr10,
+                &host,
+                &client
+            )
+            .ten_bit
         );
     }
 }

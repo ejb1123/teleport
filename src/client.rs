@@ -187,7 +187,14 @@ pub struct Options {
     /// be). H.264/H.265 SDR only; costs bitrate and, on the client, a CPU
     /// conversion per frame.
     #[arg(long = "chroma-444", value_enum, default_value = "off")]
-    pub chroma_444: stream_settings::ChromaChoice,
+    pub chroma_444: stream_settings::FormatChoice,
+    /// 10-bit SDR (Main 10 from the host's 8-bit capture: less banding in
+    /// dark gradients on NVENC): `off`, `auto` (H.265/AV1 Main 10 when the
+    /// host encodes and this client decodes it in hardware) or `on`
+    /// (whenever the host can; moves an automatic H.264 choice to H.265).
+    /// Not with 4:4:4.
+    #[arg(long, value_enum, default_value = "off")]
+    pub ten_bit: stream_settings::FormatChoice,
     /// Explicit experimental HDR10 requires patched capture and a macOS HDR display.
     #[arg(long, value_enum, default_value = "sdr")]
     pub dynamic_range: protocol::DynamicRange,
@@ -551,11 +558,13 @@ async fn connect_via(
         // Behave like a client from before codec selection.
         desktop.codec_selection = false;
         desktop.chroma_444_selection = false;
+        desktop.ten_bit_selection = false;
         desktop.av1 = false;
     }
     let decision = stream_settings::choose_codec(
         options.codec,
         options.chroma_444,
+        options.ten_bit,
         options.dynamic_range,
         &desktop,
         &client_decoders(options),
@@ -577,6 +586,7 @@ async fn connect_via(
                     codec: decision.codec,
                     encoder_preset: options.encoder_preset.filter(|_| desktop.encoder_presets),
                     chroma_444: decision.chroma_444 && desktop.chroma_444_selection,
+                    ten_bit: decision.ten_bit && desktop.ten_bit_selection,
                 },
                 motion: None,
             })?,
@@ -585,6 +595,7 @@ async fn connect_via(
         input_sequence = 1;
         desktop.codec = decision.codec;
         desktop.chroma_444 = decision.chroma_444 && desktop.chroma_444_selection;
+        desktop.ten_bit = decision.ten_bit && desktop.ten_bit_selection;
     }
     ensure!(
         desktop.codec == decision.codec,
@@ -594,6 +605,7 @@ async fn connect_via(
     tracing::info!(
         codec = decision.codec.label(),
         chroma_444 = desktop.chroma_444,
+        ten_bit = desktop.ten_bit,
         reason = %decision.reason,
         host_hardware = ?desktop.hardware_codecs,
         "session video codec"
@@ -719,9 +731,9 @@ impl Drop for Network {
     }
 }
 
-/// This client's hardware decoders for `--codec auto` (H.265, AV1) and
-/// `--chroma-444 auto` (H.265 4:4:4), SDR only; probed once per process, so
-/// call it before connecting.
+/// This client's hardware decoders for `--codec auto` (H.265, AV1),
+/// `--chroma-444 auto` (H.265 4:4:4) and `--ten-bit auto` (H.265/AV1 Main
+/// 10), SDR only; probed once per process, so call it before connecting.
 fn client_decoders(options: &Options) -> stream_settings::ClientDecoders {
     let mut decoders = stream_settings::ClientDecoders::default();
     if options.software_decoder || options.dynamic_range != protocol::DynamicRange::Sdr {
@@ -729,7 +741,7 @@ fn client_decoders(options: &Options) -> stream_settings::ClientDecoders {
     }
     let probe = |format: media::VideoFormat| {
         media::hardware_decoder(format).unwrap_or_else(|error| {
-            tracing::info!(%error, codec = ?format.codec, chroma444 = format.chroma444, "no decoder for automatic codec choice");
+            tracing::info!(%error, codec = ?format.codec, chroma444 = format.chroma444, ten_bit = format.ten_bit, "no decoder for automatic codec choice");
             None
         })
     };
@@ -737,12 +749,21 @@ fn client_decoders(options: &Options) -> stream_settings::ClientDecoders {
         decoders.hevc = probe(protocol::VideoCodec::H265.into());
         decoders.av1 = probe(protocol::VideoCodec::Av1.into());
     }
-    if options.chroma_444 == stream_settings::ChromaChoice::Auto {
+    if options.chroma_444 == stream_settings::FormatChoice::Auto {
         decoders.hevc_444 = probe(media::VideoFormat {
             codec: protocol::VideoCodec::H265,
             chroma444: true,
             ..Default::default()
         });
+    }
+    if options.ten_bit == stream_settings::FormatChoice::Auto {
+        let ten_bit = |codec| media::VideoFormat {
+            codec,
+            ten_bit: true,
+            ..Default::default()
+        };
+        decoders.hevc_10 = probe(ten_bit(protocol::VideoCodec::H265));
+        decoders.av1_10 = probe(ten_bit(protocol::VideoCodec::Av1));
     }
     decoders
 }
@@ -770,6 +791,7 @@ pub fn run(options: Options, runtime: &Runtime) -> Result<()> {
             codec: options.codec.requested(options.dynamic_range),
             dynamic_range: options.dynamic_range,
             chroma444: false,
+            ten_bit: false,
         },
     )?;
     client_decoders(&options);
@@ -1250,6 +1272,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         codec: link.desktop.codec,
         dynamic_range: link.desktop.dynamic_range,
         chroma444: link.desktop.chroma_444,
+        ten_bit: link.desktop.ten_bit,
     };
     #[cfg(target_os = "linux")]
     let mut zero_copy = match window_state.as_mut() {
@@ -2899,13 +2922,14 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     desktop.codec.label()
                 ),
                 format!(
-                    "Codec                 {}{}   |   {codec_reason}",
+                    "Codec                 {}{}{}   |   {codec_reason}",
                     desktop.codec.label(),
                     if desktop.chroma_444 {
                         " 4:4:4"
                     } else {
                         " 4:2:0"
-                    }
+                    },
+                    if desktop.ten_bit { " 10-bit" } else { "" }
                 ),
                 format!(
                     "Encoder preset        {}",
@@ -4789,13 +4813,14 @@ mod tests {
         assert!(Arguments::try_parse_from(base.into_iter().chain(["--codec", "vp9"])).is_err());
         assert_eq!(
             parsed.options.chroma_444,
-            stream_settings::ChromaChoice::Off
+            stream_settings::FormatChoice::Off
         );
+        assert_eq!(parsed.options.ten_bit, stream_settings::FormatChoice::Off);
         let parsed =
             Arguments::try_parse_from(base.into_iter().chain(["--chroma-444", "auto"])).unwrap();
         assert_eq!(
             parsed.options.chroma_444,
-            stream_settings::ChromaChoice::Auto
+            stream_settings::FormatChoice::Auto
         );
     }
 
