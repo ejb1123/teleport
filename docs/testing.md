@@ -15,6 +15,13 @@ the full commands. Keep host and client on the same revision.
 
 ## macOS client
 
+Without a Mac, `tools/check-macos.sh` type-checks the macOS build from Linux
+(`cargo check -Zbuild-std --target aarch64-apple-darwin`, C code stubbed). It
+catches Rust code that only breaks on macOS, such as Linux-only items used
+from cross-platform code; it does not link or compile the C shim, so a real
+Mac build is still the final check. Run it before pushing changes that touch
+cfg-gated code.
+
 For code pairing, start the host with `--pair` and its persistent identity
 directory; allow TCP 4443 for enrollment and UDP 4443 for desktop streaming.
 Enter the address/code in the launcher, click **Pair & save host**, then connect.
