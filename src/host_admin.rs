@@ -40,6 +40,53 @@ pub enum AdminCommand {
         id: String,
     },
     RevokeAllDevices,
+    /// Connected sessions, guests waiting for approval and open invites.
+    Sessions,
+    /// Invite guests: prints a link (as secret as a pairing code) that
+    /// enrolls up to `--uses` guest devices until it expires.
+    CreateInvite {
+        /// Names the guest devices in prompts and lists.
+        #[arg(long, default_value = "Guest")]
+        name: String,
+        #[arg(long, default_value_t = 1)]
+        uses: u32,
+        /// Lifetime in minutes (1 to 10080, a week).
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=10080))]
+        minutes: u64,
+        /// What the guests may do besides watching: view, gamepad,
+        /// keyboard-mouse, clipboard, microphone (comma separated).
+        #[arg(long, default_value = "view,gamepad", value_parser = crate::protocol::Permissions::parse)]
+        permissions: crate::protocol::Permissions,
+    },
+    RevokeInvite {
+        id: String,
+    },
+    /// Let a waiting guest join.
+    Approve {
+        id: u64,
+    },
+    /// Refuse a waiting guest.
+    Deny {
+        id: u64,
+    },
+    /// Disconnect a session (a guest may ask again; revoke its device to
+    /// keep it out).
+    Kick {
+        id: u64,
+    },
+    /// Change a guest device's permissions (applies to its running
+    /// sessions at once) or its trusted flag (joins without approval).
+    SetGuest {
+        id: String,
+        #[arg(long, value_parser = crate::protocol::Permissions::parse)]
+        permissions: Option<crate::protocol::Permissions>,
+        #[arg(long)]
+        trusted: Option<bool>,
+    },
+    /// Take keyboard and mouse control for the person at the host.
+    TakeControl,
+    /// Let guests take keyboard and mouse control again.
+    ReleaseControl,
 }
 #[derive(Serialize, Deserialize)]
 pub enum Request {
@@ -59,6 +106,31 @@ pub enum Request {
         id: String,
     },
     RevokeAllDevices,
+    Sessions,
+    CreateInvite {
+        name: String,
+        uses: u32,
+        /// Lifetime (5 s to a week).
+        seconds: u64,
+        permissions: crate::protocol::Permissions,
+    },
+    RevokeInvite {
+        id: String,
+    },
+    AnswerGuest {
+        id: u64,
+        allow: bool,
+    },
+    Kick {
+        id: u64,
+    },
+    SetGuest {
+        id: String,
+        permissions: Option<crate::protocol::Permissions>,
+        trusted: Option<bool>,
+    },
+    TakeControl,
+    ReleaseControl,
 }
 impl Request {
     pub fn clear_password(&mut self) {
@@ -87,11 +159,28 @@ pub struct Response {
     /// by `teleport login --relay-host`.
     #[serde(default)]
     pub relay_host: Option<String>,
+    /// Connected sessions (docs/guests.md).
+    #[serde(default)]
+    pub sessions: Vec<crate::guests::SessionSummary>,
+    /// Guests waiting for approval.
+    #[serde(default)]
+    pub approvals: Vec<crate::guests::ApprovalSummary>,
+    /// Open invites (no secrets).
+    #[serde(default)]
+    pub invites: Vec<crate::access::InviteSummary>,
+    /// A newly created invite's link: as secret as a pairing code.
+    #[serde(default)]
+    pub invite: Option<String>,
 }
 #[derive(Serialize, Deserialize)]
 pub struct Device {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub source: String,
+    /// Set for guest devices.
+    #[serde(default)]
+    pub guest: Option<crate::access::GuestGrant>,
 }
 pub fn default_directory() -> Result<PathBuf> {
     Ok(
@@ -128,6 +217,33 @@ pub fn run(options: Options) -> Result<()> {
         AdminCommand::DisableU2f => Request::DisableU2f,
         AdminCommand::RevokeDevice { id } => Request::RevokeDevice { id },
         AdminCommand::RevokeAllDevices => Request::RevokeAllDevices,
+        AdminCommand::Sessions => Request::Sessions,
+        AdminCommand::CreateInvite {
+            name,
+            uses,
+            minutes,
+            permissions,
+        } => Request::CreateInvite {
+            name,
+            uses,
+            seconds: minutes.saturating_mul(60),
+            permissions,
+        },
+        AdminCommand::RevokeInvite { id } => Request::RevokeInvite { id },
+        AdminCommand::Approve { id } => Request::AnswerGuest { id, allow: true },
+        AdminCommand::Deny { id } => Request::AnswerGuest { id, allow: false },
+        AdminCommand::Kick { id } => Request::Kick { id },
+        AdminCommand::SetGuest {
+            id,
+            permissions,
+            trusted,
+        } => Request::SetGuest {
+            id,
+            permissions,
+            trusted,
+        },
+        AdminCommand::TakeControl => Request::TakeControl,
+        AdminCommand::ReleaseControl => Request::ReleaseControl,
     };
     let result = call(
         &options.identity_dir.unwrap_or(default_directory()?),
@@ -239,6 +355,7 @@ pub struct Control {
     epoch: AtomicU64,
     system: Option<crate::system_login::Config>,
     relay: Option<crate::relay::Endpoint>,
+    hub: Arc<crate::guests::Hub>,
 }
 pub struct Service {
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -479,6 +596,12 @@ impl Control {
                 let config = self.system.as_ref().context("system login is disabled")?;
                 crate::system_login::handle(stream, source, config, self.access.clone()).await
             }
+            b"TPINVT01" if !pairing_only => tokio::time::timeout(
+                Duration::from_secs(10),
+                crate::pairing::accept_invite(&mut stream, &self.access),
+            )
+            .await
+            .context("invite exchange timed out")?,
             b"TPPAIR01" | b"TPPAIR02" => {
                 let attempt = {
                     let mut network = self.network.lock().await;
@@ -523,11 +646,58 @@ impl Control {
         Ok(())
     }
     async fn request(self: &Arc<Self>, request: Request) -> Result<Response> {
+        use crate::guests::Command;
         let mut code = None;
         let mut relay_pairing = None;
+        let mut invite = None;
         match request {
+            Request::Sessions => (),
+            Request::CreateInvite {
+                name,
+                uses,
+                seconds,
+                permissions,
+            } => {
+                let created = self.access.create_invite(
+                    &name,
+                    uses,
+                    Duration::from_secs(seconds),
+                    permissions,
+                )?;
+                // Direct enrollment needs the TCP port; relayed enrollment
+                // uses the host's own relay namespace, named in the link.
+                self.bind(&mut *self.network.lock().await).await?;
+                self.changed.notify_one();
+                invite = Some(match &self.relay {
+                    Some(_) => format!(
+                        "{}/{}",
+                        created.link(),
+                        crate::relay::namespace(&self.pairing.fingerprint)?
+                    ),
+                    None => created.link(),
+                });
+            }
+            Request::RevokeInvite { id } => self.access.revoke_invite(&id)?,
+            Request::AnswerGuest { id, allow } => self.hub.answer(id, allow)?,
+            Request::Kick { id } => self.hub.command(Command::Kick(id))?,
+            Request::SetGuest {
+                id,
+                permissions,
+                trusted,
+            } => {
+                self.access.set_guest(&id, permissions, trusted)?;
+                self.hub.poke(Command::Refresh);
+            }
+            Request::TakeControl => self.hub.command(Command::TakeControl)?,
+            Request::ReleaseControl => self.hub.command(Command::ReleaseControl)?,
             Request::Status => (),
             Request::OpenPairing => {
+                // A pairing code enrolls an owner device; guests watch the
+                // screen it would be shown on.
+                ensure!(
+                    !self.hub.guest_connected(),
+                    "a guest is connected and could read the pairing code off the screen; disconnect guests before pairing"
+                );
                 let opened = self.open_pairing().await?;
                 code = Some(opened.code);
                 relay_pairing = opened.relay_link;
@@ -564,8 +734,16 @@ impl Control {
                 self.access.disable_u2f()?;
                 self.changed.notify_one();
             }
-            Request::RevokeDevice { id } => self.access.revoke_device(&id)?,
-            Request::RevokeAllDevices => self.access.revoke_all_devices()?,
+            // Running sessions of revoked devices end now, not at the next
+            // once-a-second check.
+            Request::RevokeDevice { id } => {
+                self.access.revoke_device(&id)?;
+                self.hub.poke(Command::Refresh);
+            }
+            Request::RevokeAllDevices => {
+                self.access.revoke_all_devices()?;
+                self.hub.poke(Command::Refresh);
+            }
         }
         let status = self.access.status();
         Ok(Response {
@@ -581,6 +759,8 @@ impl Control {
                 .map(|d| Device {
                     id: d.id,
                     name: d.name,
+                    source: d.source,
+                    guest: d.guest,
                 })
                 .collect(),
             pairing_open: self.network.lock().await.code.as_ref().is_some_and(|c| {
@@ -594,6 +774,10 @@ impl Control {
                 .relay
                 .as_ref()
                 .and_then(|_| crate::relay::namespace(&self.pairing.fingerprint).ok()),
+            sessions: self.hub.sessions(),
+            approvals: self.hub.approvals(),
+            invites: self.access.invites(),
+            invite,
         })
     }
     async fn network(self: Arc<Self>) -> Result<()> {
@@ -610,6 +794,7 @@ impl Control {
                 if network.code.is_none()
                     && self.access.status().username.is_none()
                     && self.system.is_none()
+                    && self.access.invites().is_empty()
                 {
                     network.listener = None;
                 } else {
@@ -639,7 +824,16 @@ pub async fn start(
     pairing: crate::protocol::Pairing,
     access: Arc<crate::access::ServerState>,
 ) -> Result<(Service, Arc<Control>)> {
-    start_with_system(directory, address, pairing, access, None, None).await
+    start_with_system(
+        directory,
+        address,
+        pairing,
+        access,
+        None,
+        None,
+        crate::guests::Hub::new(Default::default()),
+    )
+    .await
 }
 
 pub async fn start_with_system(
@@ -649,6 +843,7 @@ pub async fn start_with_system(
     access: Arc<crate::access::ServerState>,
     helper: Option<PathBuf>,
     relay: Option<crate::relay::Endpoint>,
+    hub: Arc<crate::guests::Hub>,
 ) -> Result<(Service, Arc<Control>)> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     check_directory(directory)?;
@@ -685,8 +880,12 @@ pub async fn start_with_system(
         epoch: AtomicU64::new(0),
         system,
         relay,
+        hub,
     });
-    if control.access.status().username.is_some() || control.system.is_some() {
+    if control.access.status().username.is_some()
+        || control.system.is_some()
+        || !control.access.invites().is_empty()
+    {
         control.bind(&mut *control.network.lock().await).await?;
     }
     let admin = control.clone();
@@ -901,6 +1100,7 @@ mod tests {
             access.clone(),
             None,
             Some(endpoint.clone()),
+            crate::guests::Hub::new(Default::default()),
         )
         .await?;
         let namespace = crate::relay::namespace(&pairing.fingerprint)?;

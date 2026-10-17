@@ -770,6 +770,9 @@ pub struct HostSession {
     pub outgoing: moq_net::origin::Producer,
     /// `controls` is announced here (opened by the bridge).
     pub incoming: moq_net::origin::Producer,
+    /// Turns true once the client's controls broadcast is gone from the
+    /// relay (the client left); the relay connection itself is shared.
+    pub gone: tokio::sync::watch::Receiver<bool>,
     _bridges: Vec<AbortOnDrop>,
 }
 
@@ -816,10 +819,28 @@ pub fn host(link: &Link, accepted: &Accepted) -> Result<HostSession> {
             Direction::ClientToHost,
         ))
     };
+    // The client leaving: its controls broadcast ends on the relay.
+    let (left, gone) = tokio::sync::watch::channel(false);
+    let watcher = {
+        let network_origin = link.incoming.consume();
+        let path = format!("{session_id}/controls");
+        tokio::spawn(async move {
+            if let Some(controls) = network_origin.announced_broadcast(path.as_str()).await {
+                controls.closed().await;
+            }
+            let _ = left.send(true);
+            Ok(())
+        })
+    };
     Ok(HostSession {
         outgoing,
         incoming,
-        _bridges: vec![AbortOnDrop(export), AbortOnDrop(import)],
+        gone,
+        _bridges: vec![
+            AbortOnDrop(export),
+            AbortOnDrop(import),
+            AbortOnDrop(watcher),
+        ],
     })
 }
 

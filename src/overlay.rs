@@ -338,6 +338,99 @@ impl Graph {
     }
 }
 
+/// Shared sessions (docs/guests.md): guests asking to join, for an owner
+/// to answer with Ctrl+Alt+Y / Ctrl+Alt+N, and what changed about this
+/// session's access (permissions, keyboard/mouse control), over the video.
+#[derive(Default)]
+pub struct GuestPanel {
+    /// `(id, name, deadline)`, oldest first.
+    requests: Vec<(u64, String, Instant)>,
+    notice: Option<(String, Instant)>,
+}
+
+impl GuestPanel {
+    pub fn request(&mut self, id: u64, name: &str, timeout_s: u32, now: Instant) {
+        self.requests.retain(|(other, _, _)| *other != id);
+        self.requests.push((
+            id,
+            name.chars().take(64).collect(),
+            now + Duration::from_secs(timeout_s.into()),
+        ));
+    }
+
+    /// Answered (here or elsewhere) or timed out on the host.
+    pub fn closed(&mut self, id: u64) {
+        self.requests.retain(|(other, _, _)| *other != id);
+    }
+
+    /// The request Ctrl+Alt+Y / Ctrl+Alt+N answers: the oldest.
+    pub fn first(&mut self, now: Instant) -> Option<u64> {
+        self.requests.retain(|(_, _, deadline)| *deadline > now);
+        self.requests.first().map(|(id, _, _)| *id)
+    }
+
+    /// Show `text` for a few seconds.
+    pub fn notice(&mut self, text: impl Into<String>, now: Instant) {
+        self.notice = Some((text.into(), now + SHOWN_FOR));
+    }
+
+    /// What `next` changed for the user, compared with `previous`.
+    pub fn access_changed(
+        &mut self,
+        previous: Option<&crate::protocol::SessionAccess>,
+        next: &crate::protocol::SessionAccess,
+        now: Instant,
+    ) {
+        use crate::protocol::ControlHolder;
+        let Some(previous) = previous else {
+            return;
+        };
+        if previous.permissions != next.permissions || previous.role != next.role {
+            self.notice(
+                format!(
+                    "The host changed what you may do: {}",
+                    next.permissions.label()
+                ),
+                now,
+            );
+        } else if previous.control == ControlHolder::You && next.control != ControlHolder::You {
+            self.notice(
+                format!(
+                    "Keyboard and mouse control taken by {}",
+                    next.control.label()
+                ),
+                now,
+            );
+        }
+    }
+
+    /// The lines to draw now (nothing when there is nothing to show).
+    pub fn lines(&mut self, now: Instant) -> Vec<String> {
+        self.requests.retain(|(_, _, deadline)| *deadline > now);
+        if self.notice.as_ref().is_some_and(|(_, until)| *until <= now) {
+            self.notice = None;
+        }
+        let mut lines: Vec<String> = self
+            .requests
+            .iter()
+            .take(2)
+            .map(|(_, name, deadline)| {
+                format!(
+                    "Guest \u{201c}{name}\u{201d} asks to join \u{2014} Ctrl+Alt+Y allow, Ctrl+Alt+N deny ({} s)",
+                    deadline.saturating_duration_since(now).as_secs()
+                )
+            })
+            .collect();
+        if self.requests.len() > 2 {
+            lines.push(format!("{} more waiting", self.requests.len() - 2));
+        }
+        if let Some((text, _)) = &self.notice {
+            lines.push(text.clone());
+        }
+        lines
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,5 +664,58 @@ mod tests {
         assert!(points[0].y() > rect.y() + 30);
         assert!(software_encoder("ffmpeg:libx264"));
         assert!(!software_encoder("ffmpeg:h264_nvenc DMA-BUF zero-copy"));
+    }
+
+    #[test]
+    fn guest_prompts_expire_and_access_changes_are_explained() {
+        use crate::protocol::{ControlHolder, Permissions, Role, SessionAccess};
+        let now = Instant::now();
+        let mut panel = GuestPanel::default();
+        assert!(panel.lines(now).is_empty() && panel.first(now).is_none());
+        panel.request(7, "Alice", 30, now);
+        panel.request(8, "Bob", 5, now);
+        assert_eq!(panel.first(now), Some(7));
+        let lines = panel.lines(now);
+        assert!(
+            lines[0].contains("Alice") && lines[0].contains("30 s"),
+            "{lines:?}"
+        );
+        panel.closed(7);
+        assert_eq!(panel.first(now), Some(8));
+        // The host denies on timeout; the prompt goes with it.
+        assert_eq!(panel.first(now + Duration::from_secs(6)), None);
+        let owner = SessionAccess {
+            role: Role::Owner,
+            permissions: Permissions::ALL,
+            control: ControlHolder::You,
+            others: 1,
+        };
+        let guest = SessionAccess {
+            role: Role::Guest,
+            permissions: Permissions::GUEST_DEFAULT,
+            control: ControlHolder::You,
+            others: 1,
+        };
+        // The first access is no change.
+        panel.access_changed(None, &guest, now);
+        assert!(panel.lines(now).is_empty());
+        let taken = SessionAccess {
+            control: ControlHolder::Owner,
+            ..guest
+        };
+        panel.access_changed(Some(&guest), &taken, now);
+        assert_eq!(
+            panel.lines(now),
+            ["Keyboard and mouse control taken by the owner"]
+        );
+        let fewer = SessionAccess {
+            permissions: Permissions::default(),
+            ..taken
+        };
+        panel.access_changed(Some(&taken), &fewer, now);
+        assert_eq!(panel.lines(now), ["The host changed what you may do: view"]);
+        assert!(panel.lines(now + SHOWN_FOR).is_empty());
+        panel.access_changed(Some(&owner), &owner, now);
+        assert!(panel.lines(now).is_empty());
     }
 }

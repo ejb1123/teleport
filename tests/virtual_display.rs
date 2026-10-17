@@ -265,6 +265,7 @@ impl Client {
             virtual_monitor,
             gamepad_lights: false,
             microphone: false,
+            guests: false,
         })
     }
 

@@ -454,7 +454,90 @@ pub struct DeviceSummary {
     pub name: String,
     pub created_unix: u64,
     pub source: String,
+    /// Set for a guest device (enrolled through an invite); owners' devices
+    /// have none. Never set or cleared after enrollment except by
+    /// [`ServerState::set_guest`], which only edits existing guests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest: Option<GuestGrant>,
 }
+
+/// What a guest device was granted (docs/guests.md).
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct GuestGrant {
+    pub permissions: crate::protocol::Permissions,
+    /// Set by the owner: this guest joins without a live approval.
+    #[serde(default)]
+    pub trusted: bool,
+}
+
+/// Who an authorized credential belongs to, looked up live (permission
+/// changes and revocation apply to running sessions).
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRole {
+    pub role: crate::protocol::Role,
+    /// The managed device id; `None` for the host pairing file and Linux
+    /// login tickets (both owners).
+    pub device: Option<String>,
+    pub name: String,
+    pub permissions: crate::protocol::Permissions,
+    pub trusted: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl SessionRole {
+    pub fn owner(name: &str, device: Option<String>) -> Self {
+        Self {
+            role: crate::protocol::Role::Owner,
+            device,
+            name: name.into(),
+            permissions: crate::protocol::Permissions::ALL,
+            trusted: true,
+        }
+    }
+
+    pub fn is_owner(&self) -> bool {
+        self.role == crate::protocol::Role::Owner
+    }
+}
+
+/// An open invite, without its secret.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct InviteSummary {
+    pub id: String,
+    pub label: String,
+    pub permissions: crate::protocol::Permissions,
+    pub uses_left: u32,
+    pub expires_unix: u64,
+}
+
+/// A newly created invite: share [`NewInvite::link`] with the guest.
+#[cfg(target_os = "linux")]
+pub struct NewInvite {
+    pub id: String,
+    pub secret: String,
+    pub expires_unix: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl NewInvite {
+    pub fn link(&self) -> String {
+        crate::pairing::invite_link(&self.id, &self.secret)
+    }
+}
+
+/// Most open invites per host.
+#[cfg(target_os = "linux")]
+pub const MAX_INVITES: usize = 16;
+/// Most uses one invite may grant.
+#[cfg(target_os = "linux")]
+pub const MAX_INVITE_USES: u32 = 50;
+/// Longest invite lifetime (a week).
+#[cfg(target_os = "linux")]
+pub const MAX_INVITE_LIFETIME: Duration = Duration::from_secs(7 * 24 * 3600);
+
 #[cfg(target_os = "linux")]
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct AccessStatus {
@@ -531,6 +614,37 @@ mod server {
         u2f: Option<crate::security_key::Credential>,
         #[serde(default)]
         u2f_counter: u32,
+        /// Open guest invites (G16). Uses are counted down in the same
+        /// persisted update that stores the guest device, so an invite can
+        /// never enroll more devices than it allows, even across restarts.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        invites: Vec<StoredInvite>,
+    }
+    #[derive(Clone, Serialize, Deserialize)]
+    struct StoredInvite {
+        id: String,
+        /// The SPAKE2 password (128 random bits as hex). As secret as a
+        /// device token; this file is private to the host user.
+        secret: String,
+        label: String,
+        permissions: crate::protocol::Permissions,
+        uses_left: u32,
+        /// Devices enrolled so far (names them `label #n`).
+        #[serde(default)]
+        used: u32,
+        expires_unix: u64,
+    }
+    impl StoredInvite {
+        fn live(&self, time: u64) -> bool {
+            self.uses_left > 0 && time < self.expires_unix
+        }
+    }
+    fn valid_hex(text: &str, length: usize) -> bool {
+        text.len() == length && text.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+    /// Invite labels name guest devices in prompts and lists.
+    fn valid_label(label: &str) -> bool {
+        !label.trim().is_empty() && label.len() <= 64 && !label.chars().any(char::is_control)
     }
     pub struct ServerState {
         path: PathBuf,
@@ -573,12 +687,13 @@ mod server {
     }
     impl SessionLease {
         /// Whether the credential is the desktop owner's, for owner-only
-        /// requests (`crate::host_command`). Every credential this host
-        /// admits is the owner's today: paired devices, the host pairing
-        /// token, and system-login tickets (the account password). Guest
-        /// roles would narrow this.
+        /// requests (`crate::host_command`: wake relay, suspend), read now
+        /// from the access record: devices paired with a code, password or
+        /// Linux login, the host pairing token and system-login tickets are
+        /// owners; invited guest devices are not, whatever they were
+        /// granted (docs/guests.md). A revoked credential is no owner.
         pub fn owner(&self) -> bool {
-            true
+            self.access().is_some_and(|role| role.is_owner())
         }
 
         /// The session came from a system login (PAM just verified the
@@ -590,8 +705,16 @@ mod server {
         /// Whether the session may continue: its credential is still
         /// accepted with the key proof it was leased with. Cheap enough to
         /// poll (one lock, at most 128 records).
+        #[cfg(test)]
         pub fn authorized(&self) -> bool {
             self.state.authorized_with(&self.hash, &self.proof)
+        }
+
+        /// The session's current role and permissions, or `None` once it is
+        /// no longer authorized. Read live from the access record, so an
+        /// owner's permission change applies to running sessions.
+        pub fn access(&self) -> Option<SessionRole> {
+            self.state.role_with(&self.hash, &self.proof)
         }
     }
     impl Drop for SessionLease {
@@ -615,9 +738,19 @@ mod server {
     /// A managed device with this credential hash that accepts `proof`
     /// (constant time over the hashes).
     fn saved_device(record: &Record, hash: &[u8], proof: &KeyProof) -> bool {
-        record.devices.iter().fold(false, |accepted, d| {
-            accepted
-                | (bool::from(d.token_hash.ct_eq(hash)) & proof.accepts(d.public_key.as_deref()))
+        matching_device(record, hash, proof).is_some()
+    }
+    /// The managed device with this credential hash that accepts `proof`;
+    /// every record is compared (constant time over the hashes).
+    fn matching_device<'a>(
+        record: &'a Record,
+        hash: &[u8],
+        proof: &KeyProof,
+    ) -> Option<&'a Device> {
+        record.devices.iter().fold(None, |found, d| {
+            let matches =
+                bool::from(d.token_hash.ct_eq(hash)) & proof.accepts(d.public_key.as_deref());
+            if matches { Some(d) } else { found }
         })
     }
 
@@ -662,6 +795,16 @@ mod server {
                 if let Some(key) = &record.u2f {
                     crate::security_key::validate_u2f_credential(key, &legacy_pairing.fingerprint)?;
                 }
+                ensure!(
+                    record.invites.len() <= MAX_INVITES
+                        && record.invites.iter().all(|invite| {
+                            valid_hex(&invite.id, 32)
+                                && valid_hex(&invite.secret, 32)
+                                && invite.uses_left <= MAX_INVITE_USES
+                                && valid_label(&invite.label)
+                        }),
+                    "invalid stored invite"
+                );
                 record
             } else {
                 let record = Record {
@@ -673,6 +816,7 @@ mod server {
                     attempts: Vec::new(),
                     u2f: None,
                     u2f_counter: 0,
+                    invites: Vec::new(),
                 };
                 crate::identity::write_new(&path, &serde_json::to_vec(&record)?)?;
                 record
@@ -834,9 +978,12 @@ mod server {
                 Ok(())
             })
         }
+        /// The panic button: every managed device, guests included, and
+        /// every open invite (a leaked link must not enroll anyone after it).
         pub fn revoke_all_devices(&self) -> Result<()> {
             self.update(|r| {
                 r.devices.clear();
+                r.invites.clear();
                 r.generation = r
                     .generation
                     .checked_add(1)
@@ -911,8 +1058,15 @@ mod server {
         }
 
         fn authorized_with(&self, hash: &[u8], proof: &KeyProof) -> bool {
+            self.role_with(hash, proof).is_some()
+        }
+
+        /// Who `hash` (with `proof`) is, if it is authorized at all: the
+        /// host pairing file and Linux login tickets are owners; a managed
+        /// device is an owner unless it was enrolled through an invite.
+        fn role_with(&self, hash: &[u8], proof: &KeyProof) -> Option<SessionRole> {
             if bool::from(token_hash(&self.legacy.token).ct_eq(hash)) {
-                return true;
+                return Some(SessionRole::owner("Host pairing file", None));
             }
             if self.system_login_allowed()
                 && let Ok(generation) = self.system_generation()
@@ -922,12 +1076,182 @@ mod server {
                         && (s.active || s.deadline > std::time::Instant::now())
                 })
             {
-                return true;
+                return Some(SessionRole::owner("Linux account login", None));
             }
+            let record = self.record.lock().ok()?;
+            let device = matching_device(&record, hash, proof)?;
+            Some(match device.summary.guest {
+                None => SessionRole::owner(&device.summary.name, Some(device.summary.id.clone())),
+                Some(grant) => SessionRole {
+                    role: crate::protocol::Role::Guest,
+                    device: Some(device.summary.id.clone()),
+                    name: device.summary.name.clone(),
+                    permissions: grant.permissions,
+                    trusted: grant.trusted,
+                },
+            })
+        }
+
+        /// A new guest invite (G16): `uses` enrollments until `lifetime`
+        /// passes, each a guest device with `permissions`. Local trusted
+        /// callers only (the admin socket).
+        pub fn create_invite(
+            &self,
+            label: &str,
+            uses: u32,
+            lifetime: Duration,
+            permissions: crate::protocol::Permissions,
+        ) -> Result<NewInvite> {
+            let label = label.trim();
+            ensure!(
+                valid_label(label),
+                "invite name: 1-64 characters, no control characters"
+            );
+            ensure!(
+                (1..=MAX_INVITE_USES).contains(&uses),
+                "an invite allows 1-{MAX_INVITE_USES} uses"
+            );
+            ensure!(
+                lifetime >= Duration::from_secs(5) && lifetime <= MAX_INVITE_LIFETIME,
+                "an invite lasts from 5 seconds to a week"
+            );
+            let invite = NewInvite {
+                id: crate::relay::hex(&crate::e2e::random::<16>()),
+                secret: crate::relay::hex(&crate::e2e::random::<16>()),
+                expires_unix: now().saturating_add(lifetime.as_secs()),
+            };
+            self.update(|r| {
+                let time = now();
+                r.invites.retain(|stored| stored.live(time));
+                ensure!(
+                    r.invites.len() < MAX_INVITES,
+                    "too many open invites; revoke one first"
+                );
+                r.invites.push(StoredInvite {
+                    id: invite.id.clone(),
+                    secret: invite.secret.clone(),
+                    label: label.into(),
+                    permissions,
+                    uses_left: uses,
+                    used: 0,
+                    expires_unix: invite.expires_unix,
+                });
+                Ok(())
+            })?;
+            Ok(invite)
+        }
+
+        /// Open invites (live ones only), without secrets.
+        pub fn invites(&self) -> Vec<InviteSummary> {
+            let time = now();
             self.record
                 .lock()
-                .map(|r| saved_device(&r, hash, proof))
-                .unwrap_or(false)
+                .map(|r| {
+                    r.invites
+                        .iter()
+                        .filter(|invite| invite.live(time))
+                        .map(|invite| InviteSummary {
+                            id: invite.id.clone(),
+                            label: invite.label.clone(),
+                            permissions: invite.permissions,
+                            uses_left: invite.uses_left,
+                            expires_unix: invite.expires_unix,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+
+        /// Close an invite. Devices it already enrolled stay (revoke them
+        /// separately).
+        pub fn revoke_invite(&self, id: &str) -> Result<()> {
+            self.update(|r| {
+                let before = r.invites.len();
+                r.invites.retain(|invite| invite.id != id);
+                ensure!(r.invites.len() < before, "invite not found");
+                Ok(())
+            })
+        }
+
+        /// The SPAKE2 password of a live invite, for one enrollment attempt.
+        pub(crate) fn invite_secret(&self, id: &str) -> Result<zeroize::Zeroizing<String>> {
+            let record = self
+                .record
+                .lock()
+                .map_err(|_| anyhow::anyhow!("access unavailable"))?;
+            let time = now();
+            record
+                .invites
+                .iter()
+                .find(|invite| invite.id == id && invite.live(time))
+                .map(|invite| zeroize::Zeroizing::new(invite.secret.clone()))
+                .context("invite not found, used up or expired")
+        }
+
+        /// Local trusted caller only: invoke after the invite's SPAKE2 proof
+        /// with `secret` succeeded. Spends one use of the invite and stores
+        /// the guest device (with its key) in one persisted update, or does
+        /// neither.
+        pub fn enroll_guest(
+            &self,
+            invite: &str,
+            secret: &str,
+            public_key: &DevicePublicKey,
+        ) -> Result<IssuedDevice> {
+            self.add_device_with("invite", Some(public_key), |r| {
+                let time = now();
+                let stored = r
+                    .invites
+                    .iter_mut()
+                    .find(|stored| {
+                        stored.id == invite
+                            && bool::from(stored.secret.as_bytes().ct_eq(secret.as_bytes()))
+                    })
+                    .context("invite revoked")?;
+                ensure!(stored.live(time), "invite used up or expired");
+                stored.uses_left -= 1;
+                stored.used = stored.used.saturating_add(1);
+                let name = if stored.used == 1 && stored.uses_left == 0 {
+                    stored.label.clone()
+                } else {
+                    format!("{} #{}", stored.label, stored.used)
+                };
+                let grant = GuestGrant {
+                    permissions: stored.permissions,
+                    trusted: false,
+                };
+                r.invites.retain(|stored| stored.live(time));
+                Ok((name, Some(grant)))
+            })
+        }
+
+        /// Change a guest device's permissions and/or trusted flag. Owners'
+        /// devices cannot be changed (or turned into guests) here.
+        pub fn set_guest(
+            &self,
+            id: &str,
+            permissions: Option<crate::protocol::Permissions>,
+            trusted: Option<bool>,
+        ) -> Result<()> {
+            self.update(|r| {
+                let device = r
+                    .devices
+                    .iter_mut()
+                    .find(|d| d.summary.id == id)
+                    .context("device not found")?;
+                let grant = device
+                    .summary
+                    .guest
+                    .as_mut()
+                    .context("not a guest device; owners' devices always have full control")?;
+                if let Some(permissions) = permissions {
+                    grant.permissions = permissions;
+                }
+                if let Some(trusted) = trusted {
+                    grant.trusted = trusted;
+                }
+                Ok(())
+            })
         }
 
         pub fn system_login_allowed(&self) -> bool {
@@ -1102,20 +1426,36 @@ mod server {
             public_key: Option<&DevicePublicKey>,
             check: impl FnOnce(&Record) -> Result<()>,
         ) -> Result<IssuedDevice> {
+            self.add_device_with(source, public_key, |r| {
+                check(r)?;
+                Ok((name.to_owned(), None))
+            })
+        }
+
+        /// [`Self::add_device`] where `prepare` may change the record in the
+        /// same persisted update (an invite's use) and names the device and
+        /// its guest grant.
+        fn add_device_with(
+            &self,
+            source: &str,
+            public_key: Option<&DevicePublicKey>,
+            prepare: impl FnOnce(&mut Record) -> Result<(String, Option<GuestGrant>)>,
+        ) -> Result<IssuedDevice> {
             let token = crate::identity::token();
             let id = crate::identity::token();
             self.update(|r| {
-                check(r)?;
                 ensure!(
                     r.devices.len() < 128,
                     "device limit reached; remove an old device on the host"
                 );
+                let (name, guest) = prepare(r)?;
                 r.devices.push(Device {
                     summary: DeviceSummary {
                         id: id.clone(),
-                        name: name.into(),
+                        name,
                         created_unix: now(),
                         source: source.into(),
+                        guest,
                     },
                     token_hash: token_hash(&token),
                     public_key: public_key.map(|key| key.to_vec()),
@@ -1552,6 +1892,173 @@ mod server {
         }
 
         #[test]
+        fn invites_enroll_guests_within_their_uses_and_lifetime() -> Result<()> {
+            use crate::protocol::{Permissions, Role};
+            let (_temporary, state) = state()?;
+            let key = || crate::e2e::DeviceKey::generate().map(|(key, _)| key.public_key());
+            let hour = Duration::from_secs(3600);
+            // Bounds: name, uses, lifetime.
+            assert!(
+                state
+                    .create_invite("", 1, hour, Permissions::GUEST_DEFAULT)
+                    .is_err()
+            );
+            assert!(
+                state
+                    .create_invite("Bad\nname", 1, hour, Permissions::GUEST_DEFAULT)
+                    .is_err()
+            );
+            assert!(
+                state
+                    .create_invite("Alice", 0, hour, Permissions::GUEST_DEFAULT)
+                    .is_err()
+            );
+            assert!(
+                state
+                    .create_invite(
+                        "Alice",
+                        MAX_INVITE_USES + 1,
+                        hour,
+                        Permissions::GUEST_DEFAULT
+                    )
+                    .is_err()
+            );
+            assert!(
+                state
+                    .create_invite(
+                        "Alice",
+                        1,
+                        Duration::from_secs(4),
+                        Permissions::GUEST_DEFAULT
+                    )
+                    .is_err()
+            );
+            assert!(
+                state
+                    .create_invite(
+                        "Alice",
+                        1,
+                        MAX_INVITE_LIFETIME * 2,
+                        Permissions::GUEST_DEFAULT
+                    )
+                    .is_err()
+            );
+            // Two uses: two guest devices, then nothing (no replay).
+            let invite = state.create_invite("Couch", 2, hour, Permissions::GUEST_DEFAULT)?;
+            assert_eq!(state.invites().len(), 1);
+            assert_eq!(*state.invite_secret(&invite.id)?, invite.secret);
+            // The wrong secret (another invite's) spends nothing.
+            assert!(
+                state
+                    .enroll_guest(&invite.id, &"0".repeat(32), &key()?)
+                    .is_err()
+            );
+            let first = state.enroll_guest(&invite.id, &invite.secret, &key()?)?;
+            let second = state.enroll_guest(&invite.id, &invite.secret, &key()?)?;
+            assert!(
+                state
+                    .enroll_guest(&invite.id, &invite.secret, &key()?)
+                    .is_err()
+            );
+            assert!(state.invite_secret(&invite.id).is_err());
+            assert!(state.invites().is_empty());
+            let devices = state.status().devices;
+            assert_eq!(
+                devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+                ["Couch #1", "Couch #2"]
+            );
+            assert!(devices.iter().all(|d| d.source == "invite"
+                && d.guest
+                    == Some(GuestGrant {
+                        permissions: Permissions::GUEST_DEFAULT,
+                        trusted: false
+                    })));
+            // A guest's session is a guest's, read live.
+            let lease = state.begin_session(&first.pairing.token)?;
+            let role = lease.access().unwrap();
+            assert_eq!(role.role, Role::Guest);
+            assert_eq!(role.permissions, Permissions::GUEST_DEFAULT);
+            assert!(!role.trusted && !role.is_owner());
+            // Owner-only requests (wake relay, suspend) refuse it.
+            assert!(!lease.owner());
+            let keys = Permissions {
+                keyboard_mouse: true,
+                ..Permissions::default()
+            };
+            state.set_guest(&first.id, Some(keys), Some(true))?;
+            let role = lease.access().unwrap();
+            assert_eq!((role.permissions, role.trusted), (keys, true));
+            // Whatever a guest is granted, it is never the owner.
+            state.set_guest(&first.id, Some(Permissions::ALL), Some(true))?;
+            assert!(!lease.owner());
+            state.set_guest(&first.id, Some(keys), Some(true))?;
+            // Owners' devices are not guests and cannot be made guests here.
+            let owner = state.enroll_device("Laptop", None)?;
+            assert!(state.set_guest(&owner.id, Some(keys), None).is_err());
+            let owner_lease = state.begin_session(&owner.pairing.token)?;
+            assert!(owner_lease.access().unwrap().is_owner());
+            assert_eq!(owner_lease.access().unwrap().permissions, Permissions::ALL);
+            let legacy = state.begin_session(&state.legacy.token)?;
+            assert!(legacy.access().unwrap().is_owner());
+            assert!(owner_lease.owner() && legacy.owner());
+            // Revocation ends the role at once.
+            state.revoke_device(&first.id)?;
+            assert!(lease.access().is_none());
+            assert!(!lease.owner());
+            assert!(
+                state
+                    .begin_session(&second.pairing.token)?
+                    .access()
+                    .is_some()
+            );
+            // Expired invites enroll nothing and are not listed.
+            let expiring = state.create_invite("Later", 5, hour, Permissions::default())?;
+            state.update(|r| {
+                r.invites
+                    .iter_mut()
+                    .for_each(|invite| invite.expires_unix = now().saturating_sub(1));
+                Ok(())
+            })?;
+            assert!(state.invites().is_empty());
+            assert!(state.invite_secret(&expiring.id).is_err());
+            assert!(
+                state
+                    .enroll_guest(&expiring.id, &expiring.secret, &key()?)
+                    .is_err()
+            );
+            // Revoked invites likewise; uses survive a restart.
+            let revoked = state.create_invite("Gone", 1, hour, Permissions::default())?;
+            state.revoke_invite(&revoked.id)?;
+            assert!(
+                state
+                    .enroll_guest(&revoked.id, &revoked.secret, &key()?)
+                    .is_err()
+            );
+            let kept = state.create_invite("Kept", 2, hour, Permissions::default())?;
+            state.enroll_guest(&kept.id, &kept.secret, &key()?)?;
+            let directory = state.path.parent().unwrap().to_owned();
+            let reopened = ServerState::open(&directory, state.legacy.clone())?;
+            assert_eq!(reopened.invites()[0].uses_left, 1);
+            reopened.enroll_guest(&kept.id, &kept.secret, &key()?)?;
+            assert!(
+                reopened
+                    .enroll_guest(&kept.id, &kept.secret, &key()?)
+                    .is_err()
+            );
+            // Revoke all removes guests and open invites too.
+            let open = reopened.create_invite("Open", 3, hour, Permissions::default())?;
+            reopened.revoke_all_devices()?;
+            assert!(reopened.status().devices.is_empty());
+            assert!(reopened.invites().is_empty());
+            assert!(
+                reopened
+                    .enroll_guest(&open.id, &open.secret, &key()?)
+                    .is_err()
+            );
+            Ok(())
+        }
+
+        #[test]
         fn device_keys_gate_relayed_leases_and_old_records_still_load() -> Result<()> {
             let (_temporary, state) = state()?;
             let (key, _) = crate::e2e::DeviceKey::generate()?;
@@ -1911,7 +2418,7 @@ mod server {
 #[cfg(target_os = "linux")]
 pub(crate) use server::read_device_key;
 #[cfg(target_os = "linux")]
-pub use server::{ServerState, handle};
+pub use server::{ServerState, SessionLease, handle};
 
 #[cfg(test)]
 mod tests {

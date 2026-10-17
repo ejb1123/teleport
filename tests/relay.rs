@@ -608,3 +608,158 @@ fn auto_route_falls_back_to_the_relay_and_presence_follows_the_host() {
         std::thread::sleep(Duration::from_secs(1));
     }
 }
+
+/// One request on the host's admin socket (docs/guests.md).
+fn admin(setup: &Setup, request: serde_json::Value) -> serde_json::Value {
+    use std::io::{Read, Write};
+    let identity = setup.temp.path().join("identity");
+    let mut socket = std::os::unix::net::UnixStream::connect(identity.join("admin.sock")).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let bytes = serde_json::to_vec(&request).unwrap();
+    socket
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .unwrap();
+    socket.write_all(&bytes).unwrap();
+    let mut length = [0; 4];
+    socket.read_exact(&mut length).unwrap();
+    let mut response = vec![0; u32::from_be_bytes(length) as usize];
+    socket.read_exact(&mut response).unwrap();
+    let response: serde_json::Value = serde_json::from_slice(&response).unwrap();
+    assert!(response["error"].is_null(), "admin {request}: {response}");
+    response
+}
+
+/// A relayed headless client writing to `log`.
+fn relayed_client(
+    setup: &Setup,
+    pairing: &std::path::Path,
+    frames: &str,
+    args: &[&str],
+    log: &std::path::Path,
+) -> Process {
+    let file = std::fs::File::create(log).unwrap();
+    Process(
+        teleport()
+            .args(["client", "127.0.0.1:9", "--pairing-file"])
+            .arg(pairing)
+            .args(["--relay", &setup.relay_url])
+            .args(["--relay-fingerprint", &setup.relay_fingerprint])
+            .args(["--relay-key", RELAY_KEY])
+            .args(["--headless-frames", frames, "--software-decoder"])
+            .args(args)
+            .env_remove("TELEPORT_RELAY_KEY")
+            .stdout(file.try_clone().unwrap())
+            .stderr(file)
+            .spawn()
+            .unwrap(),
+    )
+}
+
+/// G15/G16 through the relay: a guest enrolls with an invite link through
+/// the relay alone, waits for approval, shares the owner's stream and gets
+/// only what it was granted, exactly as on a direct connection.
+#[test]
+#[ignore = "requires local UDP sockets and GStreamer plugins"]
+fn guest_joins_through_the_relay_with_approval_and_permissions() {
+    let setup = setup();
+    let wait_log = |needles: &[&str]| {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !host_log(&setup)
+            .lines()
+            .any(|line| needles.iter().all(|needle| line.contains(needle)))
+        {
+            assert!(
+                Instant::now() < deadline,
+                "host did not log {needles:?}:\n{}",
+                host_log(&setup)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let invite = admin(
+        &setup,
+        serde_json::json!({ "CreateInvite": {
+            "name": "Remote", "uses": 1, "seconds": 600,
+            "permissions": { "gamepad": true }
+        }}),
+    )["invite"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The link names the host's relay id: enrollment needs no reachable port.
+    let relay_host = admin(&setup, serde_json::json!("Status"))["relay_host"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(invite.ends_with(&relay_host), "{invite}");
+    let config = setup.temp.path().join("guest-config");
+    let output = pair_via_relay(&setup, &config, &invite);
+    assert!(
+        output.status.success(),
+        "invite through the relay failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let profiles: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config.join("teleport/profiles.json")).unwrap())
+            .unwrap();
+    let guest = std::path::PathBuf::from(profiles[0]["pairing_file"].as_str().unwrap());
+    // Used up: the same link again gets nothing.
+    let again = pair_via_relay(&setup, &setup.temp.path().join("again"), &invite);
+    assert!(!again.status.success());
+    let owner_log = setup.temp.path().join("owner.log");
+    let mut owner = relayed_client(
+        &setup,
+        &setup.temp.path().join("identity/pairing.json"),
+        "900",
+        &[],
+        &owner_log,
+    );
+    wait_log(&["session started the desktop"]);
+    let guest_log = setup.temp.path().join("guest.log");
+    let mut guest_client =
+        relayed_client(&setup, &guest, "60", &["--smoke-guest-input"], &guest_log);
+    wait_log(&["guest asks to join", "Remote"]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let id = loop {
+        if let Some(id) =
+            admin(&setup, serde_json::json!("Sessions"))["approvals"][0]["id"].as_u64()
+        {
+            break id;
+        }
+        assert!(Instant::now() < deadline, "no guest waiting");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    admin(
+        &setup,
+        serde_json::json!({ "AnswerGuest": { "id": id, "allow": true } }),
+    );
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        if let Some(status) = guest_client.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "guest did not finish");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let log = std::fs::read_to_string(&guest_log).unwrap();
+    assert!(
+        status.success() && log.contains("SMOKE PASS"),
+        "relayed guest failed: {log}\nhost log:\n{}",
+        host_log(&setup)
+    );
+    assert!(log.contains("end-to-end encrypted relay session established"));
+    let sessions = admin(&setup, serde_json::json!("Sessions"));
+    assert!(
+        sessions["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| session["transport"] == "relay"),
+        "{sessions}"
+    );
+    wait_log(&["refused input from session", "Remote", "keyboard and mouse"]);
+    wait_log(&["gamepad connected", "pad=4"]);
+    assert!(owner.0.try_wait().unwrap().is_none(), "owner session ended");
+}

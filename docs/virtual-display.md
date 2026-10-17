@@ -98,9 +98,12 @@ switch-back check does not run, and privacy mode is not offered.
 
 While a session lasts the physical monitors are **off (disabled outputs)**
 and the session streams a virtual output; someone at the desk sees nothing.
-Every authenticated session is an owner session today (Teleport has no guest
-roles yet). The host must opt in (`--privacy-mode`), and with `request` the
-client must ask.
+Only an owner session that leads the stream may ask for it (or for a
+virtual monitor); guests cannot ([guests](guests.md)). The host must opt in
+(`--privacy-mode`), and with `request` the client must ask. Privacy mode
+lasts while sessions run: if its owner leaves while guests stay
+(`--keep-guests-without-owner`), the monitors stay off until the last one
+leaves.
 
 Order of operations (`host::enter_privacy`):
 

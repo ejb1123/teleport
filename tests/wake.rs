@@ -210,3 +210,72 @@ sleep 0.5
     assert!(!host.contains("as wake relay"), "{detail}");
     assert!(host.contains("host command"), "{detail}");
 }
+
+/// Wake relaying and suspend are the owner's (docs/guests.md): a guest
+/// device enrolled through an invite, with every permission, is refused
+/// both, directly and through the relay; the owner then still gets both.
+#[test]
+#[ignore = "requires unprivileged user/network/mount namespaces, iproute2 and GStreamer plugins"]
+fn guests_are_refused_owner_power_requests() {
+    let body = format!(
+        r#"{HOST}
+"$TELEPORT" host-admin --identity-dir "$DIR/id" create-invite --name Mallory --uses 1 \
+    --minutes 10 --permissions view,gamepad,keyboard-mouse,clipboard,microphone >"$DIR/invite.json"
+link=$(sed -n 's/.*"invite": *"\([^"]*\)".*/\1/p' "$DIR/invite.json")
+[ -n "$link" ] || {{ cat "$DIR/invite.json" >&2; exit 93; }}
+echo "$link" | XDG_CONFIG_HOME="$DIR/guest" "$TELEPORT" pair 127.0.0.1:4443 >"$DIR/pair.log" 2>&1 \
+    || {{ cat "$DIR/pair.log" >&2; exit 94; }}
+guest=$(grep -o '"pairing_file": *"[^"]*"' "$DIR/guest/teleport/profiles.json" | sed 's/.*: *"\(.*\)"/\1/')
+[ -s "$guest" ] || {{ echo "no guest credential" >&2; exit 95; }}
+"$TELEPORT" suspend 127.0.0.1:4443 --pairing-file "$guest" 2>&1 && echo GUEST-SUSPEND-ACCEPTED
+"$TELEPORT" suspend 127.0.0.1:9 --pairing-file "$guest" $relay_args --route relay 2>&1 \
+    && echo GUEST-SUSPEND-RELAYED-ACCEPTED
+"$TELEPORT" wake --mac {MAC} --no-local --via 127.0.0.1:4443 --via-pairing-file "$guest" 2>&1 \
+    && echo GUEST-WAKE-ACCEPTED
+"$TELEPORT" wake --mac {MAC} --no-local --via 127.0.0.1:9 --via-pairing-file "$guest" \
+    $relay_args --route relay 2>&1 && echo GUEST-WAKE-RELAYED-ACCEPTED
+sleep 3
+[ -e "$DIR/suspended" ] && echo SUSPENDED-FOR-GUEST
+# The owner still may: through the relay (the listener's two packets).
+"$TELEPORT" wake --mac {MAC} --no-local --via 127.0.0.1:9 \
+    --via-pairing-file "$DIR/id/pairing.json" $relay_args --route relay && echo OWNER-WAKE
+"$TELEPORT" suspend 127.0.0.1:4443 --pairing-file "$DIR/id/pairing.json"
+sleep 3
+[ -e "$DIR/suspended" ] && echo SUSPENDED-FOR-OWNER
+"#
+    );
+    let (output, listened, temp) = in_namespace(&body, 2);
+    let detail = describe(&output, &listened, &temp);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{detail}");
+    for refused in [
+        "GUEST-SUSPEND-ACCEPTED",
+        "GUEST-SUSPEND-RELAYED-ACCEPTED",
+        "GUEST-WAKE-ACCEPTED",
+        "GUEST-WAKE-RELAYED-ACCEPTED",
+        "SUSPENDED-FOR-GUEST",
+    ] {
+        assert!(!stdout.contains(refused), "{refused}\n{detail}");
+    }
+    assert_eq!(
+        stdout
+            .matches("only the owner's devices may ask this")
+            .count(),
+        4,
+        "{detail}"
+    );
+    assert!(stdout.contains("OWNER-WAKE"), "{detail}");
+    assert!(stdout.contains("SUSPENDED-FOR-OWNER"), "{detail}");
+    // Only the owner's wake reached the LAN.
+    assert_eq!(
+        listened
+            .lines()
+            .filter(|line| line.starts_with(&format!("WAKE {MAC} from 10.9.0.1:")))
+            .count(),
+        2,
+        "{detail}"
+    );
+    let host = std::fs::read_to_string(temp.path().join("host.log")).unwrap_or_default();
+    assert_eq!(host.matches("owner=false").count(), 4, "{detail}");
+    assert_eq!(host.matches("as wake relay").count(), 1, "{detail}");
+}

@@ -40,8 +40,14 @@ Discord or a game record it from an input named **Teleport Microphone**.
 
 - Host: `teleport host --microphone` (NixOS: `services.teleport-desktop.microphone`).
   It needs PipeWire (`pw-cli`, included in the Nix package). The host offers
-  it to every paired client; there are no guest roles yet, so every paired
-  client is an owner.
+  it to its owner's devices, and to an invited guest only with the guest's
+  **microphone** permission (off by default, docs/guests.md): applications
+  on the host hear the virtual microphone as the host user's own voice, so
+  a guest's voice there could speak for you in a call.
+- One virtual microphone, one session at a time: the first session that
+  sends its microphone keeps it until it stops, leaves or loses the
+  permission; another session's microphone is refused meanwhile (with a
+  notice), even an owner's.
 - Client: `teleport client --mic`, or **Microphone on** in the launcher's
   connection settings. `--mic-muted` starts muted; **Ctrl+Alt+V**
   (Control+Option+V on macOS) mutes and unmutes; F8 shows the state. On

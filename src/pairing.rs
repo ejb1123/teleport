@@ -65,7 +65,18 @@ struct Keys {
 }
 impl Keys {
     fn new(magic: &[u8; 8], shared: &[u8], client: &[u8], host: &[u8]) -> Result<Self> {
+        Self::with_context(magic, &[], shared, client, host)
+    }
+    /// `context` (an invite id) follows the magic in the transcript.
+    fn with_context(
+        magic: &[u8; 8],
+        context: &[u8],
+        shared: &[u8],
+        client: &[u8],
+        host: &[u8],
+    ) -> Result<Self> {
         let mut transcript = magic.to_vec();
+        transcript.extend_from_slice(context);
         transcript.extend_from_slice(client);
         transcript.extend_from_slice(host);
         let hash = digest::digest(&digest::SHA256, &transcript);
@@ -231,6 +242,195 @@ pub(crate) async fn pair_over(
             ..keys.open(packet)?
         }),
     }
+}
+
+/// Guest invites (docs/guests.md): the same SPAKE2 exchange as `TPPAIR02`,
+/// with the invite's 128-bit secret as the password. The invite id goes
+/// first in the clear (so the host can pick the secret) and is bound into
+/// the transcript. A device key is mandatory.
+pub(crate) const MAGIC_INVITE: &[u8; 8] = b"TPINVT01";
+/// Prefix of a guest invite link.
+pub const INVITE_PREFIX: &str = "teleport://invite/";
+
+/// `teleport://invite/<id>/<secret>[/<relay host id>]`; as secret as a
+/// pairing code until it is used up or expires.
+#[derive(Clone, PartialEq, Eq)]
+pub struct InviteLink {
+    /// 32 hex digits naming the invite on the host (not secret on its own).
+    pub id: String,
+    /// 32 hex digits: the SPAKE2 password.
+    pub secret: String,
+    /// The host's relay id (`relay_host`), for enrolling through a relay.
+    pub relay_host: Option<String>,
+}
+
+impl std::fmt::Debug for InviteLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InviteLink")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The link for invite `id` with `secret` (no relay host).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn invite_link(id: &str, secret: &str) -> String {
+    format!("{INVITE_PREFIX}{id}/{secret}")
+}
+
+impl InviteLink {
+    pub fn parse(text: &str) -> Result<Self> {
+        let text = text.trim();
+        ensure!(text.len() <= 160, "invalid invite link");
+        let rest = text
+            .strip_prefix(INVITE_PREFIX)
+            .context("enter the invite link from the host (teleport://invite/...)")?;
+        let parts: Vec<&str> = rest.split('/').collect();
+        ensure!(
+            (2..=3).contains(&parts.len())
+                && parts
+                    .iter()
+                    .all(|part| part.len() == 32 && part.bytes().all(|b| b.is_ascii_hexdigit())),
+            "invalid invite link"
+        );
+        Ok(Self {
+            id: parts[0].to_ascii_lowercase(),
+            secret: parts[1].to_ascii_lowercase(),
+            relay_host: parts.get(2).map(|host| host.to_ascii_lowercase()),
+        })
+    }
+
+    #[cfg(test)]
+    pub fn link(&self) -> String {
+        let base = invite_link(&self.id, &self.secret);
+        match &self.relay_host {
+            Some(host) => format!("{base}/{host}"),
+            None => base,
+        }
+    }
+
+    fn id_bytes(&self) -> Result<[u8; 16]> {
+        let mut bytes = [0; 16];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&self.id[index * 2..index * 2 + 2], 16)?;
+        }
+        Ok(bytes)
+    }
+}
+
+/// Enroll as a guest with an invite over direct TCP.
+pub async fn join(address: &str, invite: &InviteLink) -> Result<Pairing> {
+    validate_address(address)?;
+    tokio::time::timeout(TIMEOUT, async {
+        let stream = TcpStream::connect(address)
+            .await
+            .context("cannot reach the host's enrollment port (TCP, same port as the desktop)")?;
+        join_over(stream, invite).await
+    })
+    .await
+    .context("invite enrollment timed out; check the address and TCP firewall")?
+}
+
+/// Client side of invite enrollment over any ordered byte stream (TCP or
+/// a relay stream). The caller bounds the time.
+pub(crate) async fn join_over(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    invite: &InviteLink,
+) -> Result<Pairing> {
+    let id = invite.id_bytes()?;
+    let (state, message) = Spake2::<Ed25519Group>::start_a(
+        &Password::new(invite.secret.as_bytes()),
+        &Identity::new(CLIENT),
+        &Identity::new(HOST),
+    );
+    stream.write_all(MAGIC_INVITE).await?;
+    write_packet(&mut stream, &id).await?;
+    write_packet(&mut stream, &message).await?;
+    stream.flush().await?;
+    let remote = read_packet(&mut stream, 128)
+        .await
+        .context("no answer; the invite may be used up, expired or revoked, or the host needs a newer Teleport")?;
+    let shared = state
+        .finish(&remote)
+        .map_err(|_| anyhow::anyhow!("invalid invite exchange"))?;
+    let keys = Keys::with_context(MAGIC_INVITE, &id, &shared, &message, &remote)?;
+    let confirmation = hmac::sign(&keys.confirmation, &keys.transcript);
+    write_packet(&mut stream, confirmation.as_ref()).await?;
+    let offer = crate::access::DeviceKeyOffer::new()?;
+    write_packet(&mut stream, &offer.request(&keys.registration)).await?;
+    stream.flush().await?;
+    let packet = read_packet(&mut stream, 4096)
+        .await
+        .context("invite rejected; it may be used up, expired or revoked")?;
+    offer
+        .accept(&keys.registration, &packet)
+        .context("invite authentication failed; check the link")
+}
+
+/// Host side of invite enrollment (`TPINVT01`): look up the invite, prove
+/// its secret, take the device key, then spend one use and store the guest
+/// device in one update before sealing its credential to the key.
+#[cfg(target_os = "linux")]
+pub(crate) async fn accept_invite(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    access: &crate::access::ServerState,
+) -> Result<()> {
+    let mut magic = [0; 8];
+    stream.read_exact(&mut magic).await?;
+    ensure!(&magic == MAGIC_INVITE, "unsupported invite protocol");
+    let id: [u8; 16] = read_packet(stream, 16)
+        .await?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid invite id"))?;
+    let id_hex = crate::relay::hex(&id);
+    let secret = access.invite_secret(&id_hex)?;
+    let client = read_packet(stream, 128).await?;
+    let (state, host) = Spake2::<Ed25519Group>::start_b(
+        &Password::new(secret.as_bytes()),
+        &Identity::new(CLIENT),
+        &Identity::new(HOST),
+    );
+    let shared = state
+        .finish(&client)
+        .map_err(|_| anyhow::anyhow!("invalid invite exchange"))?;
+    let keys = Keys::with_context(MAGIC_INVITE, &id, &shared, &client, &host)?;
+    write_packet(stream, &host).await?;
+    stream.flush().await?;
+    let proof = read_packet(stream, 32).await?;
+    hmac::verify(&keys.confirmation, &keys.transcript, &proof)
+        .map_err(|_| anyhow::anyhow!("invite authentication failed"))?;
+    // The key before anything is spent or issued: without it, nothing is.
+    let device_key = crate::access::read_device_key(stream, &keys.registration).await?;
+    let device = access.enroll_guest(&id_hex, &secret, &device_key)?;
+    // Cancelled before delivery (the exchange dropped mid-write): nobody
+    // holds the credential, so the device goes again. The use stays spent.
+    struct Undelivered<'a> {
+        access: &'a crate::access::ServerState,
+        id: Option<String>,
+    }
+    impl Drop for Undelivered<'_> {
+        fn drop(&mut self) {
+            if let Some(id) = self.id.take()
+                && let Err(error) = self.access.revoke_device(&id)
+            {
+                tracing::warn!(%error, "could not remove an undelivered guest device");
+            }
+        }
+    }
+    let mut guard = Undelivered {
+        access,
+        id: Some(device.id.clone()),
+    };
+    let packet = keys
+        .registration
+        .seal_credential(Some(&device_key), &serde_json::to_vec(&device.pairing)?);
+    // `deliver` removes the device itself when the write fails.
+    let result = access.deliver(stream, &device, &packet).await;
+    guard.id = None;
+    if result.is_ok() {
+        tracing::info!(device = %device.id, "guest enrolled through an invite");
+    }
+    result
 }
 
 #[cfg(target_os = "linux")]
@@ -404,6 +604,109 @@ mod tests {
         }
         assert!(validate_address("[::1]:4443").is_ok());
     }
+    #[test]
+    fn invite_links_round_trip_and_reject_garbage() {
+        let id = "0123456789abcdef0123456789abcdef";
+        let secret = "fedcba9876543210fedcba9876543210";
+        let host = "00112233445566778899aabbccddeeff";
+        let plain = InviteLink::parse(&format!(" {INVITE_PREFIX}{id}/{secret}\n")).unwrap();
+        assert_eq!((plain.id.as_str(), plain.secret.as_str()), (id, secret));
+        assert!(plain.relay_host.is_none());
+        assert_eq!(plain.link(), invite_link(id, secret));
+        let relayed = InviteLink::parse(&format!(
+            "{INVITE_PREFIX}{}/{secret}/{host}",
+            id.to_uppercase()
+        ))
+        .unwrap();
+        assert_eq!(relayed.id, id);
+        assert_eq!(relayed.relay_host.as_deref(), Some(host));
+        assert_eq!(relayed.id_bytes().unwrap()[0], 0x01);
+        // The secret never shows in debug output.
+        assert!(!format!("{relayed:?}").contains(secret));
+        for bad in [
+            format!("teleport://relay/{id}/123-456"),
+            format!("{INVITE_PREFIX}{id}"),
+            format!("{INVITE_PREFIX}{id}/{secret}/{host}/{host}"),
+            format!("{INVITE_PREFIX}{id}/{}", &secret[1..]),
+            format!("{INVITE_PREFIX}{id}/{}g", &secret[1..]),
+            format!("{INVITE_PREFIX}{id}/{secret}/"),
+        ] {
+            assert!(InviteLink::parse(&bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Invite enrollment over an in-memory stream: the link's secret enrolls
+    /// a keyed guest device, a wrong secret or a used-up invite nothing, and
+    /// a relay that drops the device key spends no use.
+    #[tokio::test]
+    #[cfg(target_os = "linux")]
+    async fn invite_enrollment_binds_the_key_and_counts_uses() -> Result<()> {
+        use crate::access::meddler::Action;
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir()?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let host_token = Pairing {
+            token: "a".repeat(64),
+            fingerprint: "b".repeat(64),
+            device_key: None,
+        };
+        let state = crate::access::ServerState::open(directory.path(), host_token)?;
+        let invite = state.create_invite(
+            "Friend",
+            1,
+            Duration::from_secs(600),
+            crate::protocol::Permissions::GUEST_DEFAULT,
+        )?;
+        let link = InviteLink::parse(&invite.link())?;
+        let exchange = |link: InviteLink, drop_key: bool| {
+            let state = state.clone();
+            async move {
+                // Towards the host: 0 magic, 1 id, 2 SPAKE2, 3 confirmation, 4 key.
+                let (client, host, relay) = crate::access::meddler::spawn(move |up, index, _| {
+                    match drop_key && up && index == 4 {
+                        true => Action::HangUp,
+                        false => Action::Forward,
+                    }
+                });
+                // The host hangs up when done, as `host_admin` does.
+                let accept = async move {
+                    let mut host = host;
+                    accept_invite(&mut host, &state).await
+                };
+                let (joined, accepted) = tokio::join!(join_over(client, &link), accept);
+                relay.abort();
+                (joined, accepted)
+            }
+        };
+        // Wrong secret: key confirmation fails, nothing spent.
+        let wrong = InviteLink {
+            secret: "0".repeat(32),
+            ..link.clone()
+        };
+        let (joined, accepted) = exchange(wrong, false).await;
+        assert!(joined.is_err() && accepted.is_err());
+        // The device key dropped by a relay: nothing issued or spent.
+        let (joined, accepted) = exchange(link.clone(), true).await;
+        assert!(joined.is_err() && accepted.is_err());
+        assert!(state.status().devices.is_empty());
+        assert_eq!(state.invites().len(), 1);
+        // The real link: a keyed guest device.
+        let (joined, accepted) = exchange(link.clone(), false).await;
+        let guest = joined?;
+        accepted?;
+        let public =
+            crate::e2e::DeviceKey::from_hex(guest.device_key.as_deref().unwrap())?.public_key();
+        let hash = crate::e2e::credential_hash(&guest.token).to_vec();
+        assert!(state.begin_session_hash(hash.clone(), None).is_err());
+        let lease = state.begin_session_hash(hash, Some(&public))?;
+        assert_eq!(lease.access().unwrap().role, crate::protocol::Role::Guest);
+        // Used up: replaying the link enrolls nothing more.
+        let (joined, accepted) = exchange(link, false).await;
+        assert!(joined.is_err() && accepted.is_err());
+        assert_eq!(state.status().devices.len(), 1);
+        Ok(())
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn authenticated_keys_reject_wrong_code_and_tampering() -> Result<()> {

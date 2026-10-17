@@ -6,8 +6,9 @@ Electron, WebRTC, external relay, or account is required (an optional relay can
 reach hosts behind NAT; see [relay mode](docs/relay.md)).
 
 This is an experimental implementation, not a production Parsec replacement yet.
-It shares an existing graphical session, one client at a time. Start on a LAN
-or a VPN with direct UDP connectivity.
+It shares an existing graphical session with your own devices and, if you
+invite them, guests ([guests and shared sessions](docs/guests.md)). Start on a
+LAN or a VPN with direct UDP connectivity.
 See [implementation status](docs/status.md) for verified features and unfinished work.
 
 Video encoding and decoding now default to directly linked FFmpeg libraries
@@ -439,6 +440,11 @@ to separate networking/decoding problems from portal/capture problems.
   choice. See [gamepads](docs/gamepad.md).
 - Virtual displays and privacy mode need KDE Plasma 6 (GNOME untested);
   see [virtual displays](docs/virtual-display.md).
+- Co-op: up to eight sessions share one stream. Invite guests with a link
+  (`teleport host-admin create-invite`), approve each connection (host
+  settings, `host-admin approve`, or Ctrl+Alt+Y in your own client), and
+  grant gamepad, keyboard and mouse or clipboard per guest; one session
+  drives the keyboard and mouse at a time. See [guests](docs/guests.md).
 - No file transfer, IME, monitor hotplug or
   keychain-backed credentials yet. NAT traversal needs a relay for
   signalling; behind a symmetric NAT the session uses the relay itself
@@ -505,6 +511,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test --locked
 cargo test --locked --test smoke -- --ignored --nocapture
 cargo test --locked --test ui -- --ignored --nocapture
+# Owners and guests on one test host (approval, permissions, invites)
+cargo test --locked --test guests -- --ignored --test-threads=1
 cargo test --locked --bin teleport -- --ignored --nocapture
 # KDE hosts: a private headless KWin with its own portal (never your session)
 cargo test --locked --test virtual_display -- --ignored --test-threads=1
