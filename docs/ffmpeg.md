@@ -48,6 +48,93 @@ Set that variable independently on the host/client being compared. Building does
 not update an installed host service. The old GStreamer VideoToolbox patch applies
 only to the legacy backend.
 
+## Encoder presets
+
+`--encoder-preset latency|balanced|quality` (host default for its clients;
+client and launcher **Encoder:** choose per session through `SelectCodec`,
+gated on `Desktop.encoder_presets`) trades encode time for quality. All keep
+B-frames, look-ahead and NVENC's output delay off, so none adds frame delay;
+the cost is encode time per frame. `latency` is the historical setting and the
+default. F8 shows the preset and the host encoder name carries it.
+
+| Encoder | latency | balanced | quality |
+| --- | --- | --- | --- |
+| NVENC H.264 | p1, ull | p4, ull | p6, hq, two-pass (quarter res) |
+| NVENC H.265 | p1, ull | p4, ull | p6, hq |
+| VA-API | driver default | quality level 4 | quality level 1 |
+| Quick Sync | veryfast | medium | slower |
+| x264 / x265 | ultrafast | superfast | veryfast |
+
+Measured (`ffmpeg::quality::encoder_presets_time_and_quality`, synthetic
+desktop text scrolling 3 rows per frame, 2560x1440 at 60 FPS and 20 Mbps CBR,
+RTX 3080 and Intel UHD 630, debug test build, load average 9-11):
+
+| Encoder | Preset | Encode mean / p95 (ms) | Luma PSNR (dB) | SSIM | Mbps |
+| --- | --- | --- | --- | --- | --- |
+| h264_nvenc | latency | 4.9 / 6.7 | 42.95 | 0.9828 | 19.6 |
+| h264_nvenc | balanced | 7.4 / 8.8 | 43.26 | 0.9850 | 19.6 |
+| h264_nvenc | quality | 10.4 / 11.9 | 46.50 | 0.9932 | 19.8 |
+| hevc_nvenc | latency | 4.7 / 5.9 | 48.63 | 0.9869 | 16.4 |
+| hevc_nvenc | balanced | 8.4 / 9.7 | 47.42 | 0.9892 | 7.8 |
+| hevc_nvenc | quality | 15.1 / 16.5 | 48.04 | 0.9922 | 7.4 |
+| h264_vaapi | latency / balanced / quality | 12.6 / 12.4 / 13.2 | 17.50 / 17.50 / 17.63 | 0.738-0.749 | 19.9 |
+| hevc_vaapi | latency / balanced / quality | 21.0 / 21.1 / 27.7 | 17.75 | 0.793 | 19.5 |
+| libx264 | latency | 8.4 / 15.4 | 37.30 | 0.9538 | 14.2 |
+| libx264 | balanced | 12.9 / 23.4 | 42.09 | 0.9753 | 13.1 |
+| libx264 | quality | 16.4 / 26.1 | 41.81 | 0.9796 | 10.6 |
+
+- NVENC: `quality` costs ~5 ms (H.264) to ~10 ms (H.265) per 1440p frame,
+  fine at 60 FPS, too slow for 120 FPS and above. H.265 at `balanced` and
+  `quality` reaches higher SSIM with under half the bits (its rate control
+  does not fill CBR on this content). Two-pass on H.265 was rejected: the
+  encoder undershot to 3 Mbps and lost 14 dB.
+- VA-API (Intel UHD 630): the quality level changes encode time but not
+  measurable quality here, because this content stays at ~17.5 dB on every
+  preset: every frame uses its whole CBR budget (~41 kB) yet the text stays
+  coarse, even when the screen is static. Cause not yet known (filler data
+  or the 2-frame VBV suspected); see docs/review-2026-10.md.
+- x264: `balanced` is the sweet spot (+4.8 dB for +4.5 ms).
+- Not measured: Quick Sync (no working runtime here), AMD, real games.
+
+## Static-scene refinement
+
+Capture is damage-driven, so when the screen stops the last frame stays at
+motion quality; only the 250 ms capture keepalive repeats it, and each
+repeat (a P-frame at the frame budget) sharpens it a little. Once the screen
+has been still for 200 ms (the first keepalive repeat), the encoder thread
+encodes the still frame 8 more times back to back, then waits for the next
+change. The burst stops as soon as a new frame is captured (the capture
+queue is checked before each repeat), so a change waits at most one encode.
+Repeats are ordinary P-frames at the frame budget: the burst spends what the
+idle link would have carried (~133 ms of the configured bitrate).
+
+- A frame counts as unchanged when it is a keepalive repeat: zero-copy
+  capture compares the memory address and the compositor's frame sequence
+  (no reference is held; holding the compositor's buffer starved capture),
+  CPU capture a hash of every fourth row.
+- Only below 0.05 bits per pixel and frame (e.g. under ~11 Mbps at 1440p60):
+  above, the still frame is already sharp. Not on VA-API or Quick Sync:
+  repeats did not change the picture on the UHD 630.
+
+Measured (`ffmpeg::quality::static_refinement_burst`, desktop text at
+2560x1440 60 FPS, NVENC on the RTX 3080, load average 4-6). PSNR of the still
+frame after the first keepalive, after the 8-frame burst (~130 ms later), and
+two seconds later:
+
+| Encoder, bitrate | Keepalive only | Burst | +2 s without burst | +2 s with burst | Burst cost |
+| --- | --- | --- | --- | --- | --- |
+| h264_nvenc 5 Mbps | 25.64 dB | 27.24 dB | 27.24 dB | 29.04 dB | 95 kB |
+| hevc_nvenc 5 Mbps | 28.63 dB | 32.51 dB | 32.51 dB | 36.27 dB | 95 kB |
+| libx264 5 Mbps | 14.05 dB | 14.91 dB | 14.97 dB | 15.85 dB | 45 kB |
+| h264_nvenc 20 Mbps (not refined) | 50.05 dB | 50.25 dB | 50.25 dB | 50.25 dB | 375 kB |
+
+The burst reaches in ~130 ms what keepalives alone reach in two seconds, and
+the picture keeps improving from there. Rejected (docs/review-2026-10.md):
+a per-frame quality boost instead of repeats (VA-API region-of-interest QP
+offsets: +0.2 dB on H.264, a worse frame at -18 QP; libx264 bitrate and VBV
+boost: under +1 dB; NVENC bitrate boost: FFmpeg turns it into an IDR, which
+lost 8-12 dB).
+
 ## Important limits
 
 **Zero-copy on Linux with NVIDIA (2026-10-16):** when the session window uses

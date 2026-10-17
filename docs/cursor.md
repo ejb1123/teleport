@@ -1,26 +1,22 @@
 # Local cursor
 
-With an X11 host (`teleport host --source x11`), the client draws the remote
-pointer itself instead of showing the one encoded into the video. The local
-window system moves it, so the pointer follows the mouse with no network,
-encode or decode latency; only its *shape* comes from the host.
+The client draws the remote pointer itself instead of showing the one encoded
+into the video. The local window system moves it, so the pointer follows the
+mouse with no network, encode or decode latency; only its *shape* comes from
+the host. This works with X11 hosts (`teleport host --source x11`) and with
+Wayland hosts whose ScreenCast portal offers cursor metadata (KDE Plasma 6;
+GNOME's portal offers it too, untested).
 
 ## How it works
 
-- The host advertises `Desktop::local_cursor` (X11 sources only). The client
-  opts in with `ClientFeatures { local_cursor: true }`. Neither side sends
-  anything new to a peer that did not advertise or request it, so old hosts and
-  old clients keep the cursor in the video.
-- On opt-in the host starts a watcher thread with its own X connection
-  (XFixes `SelectCursorInput(root, DisplayCursor)`), restarts the video with
-  `ximagesrc show-pointer=false` (the same restart as a monitor switch, also
-  for active auxiliary monitor streams), and sends the current shape.
-- Each `CursorNotify` reads the image with `GetCursorImage`, converts the
-  premultiplied ARGB to straight RGBA and, if its cursor serial is new, sends
-  `Update::Cursor` on the reliable updates track. Shapes are latest-wins: a
-  burst of changes sends only the newest. A fully transparent cursor (common
-  in games) is sent as `cursor: None` (hidden). Cursors over 256x256 are not
-  sent; the client keeps the previous shape.
+- The host advertises `Desktop::local_cursor`. The client opts in with
+  `ClientFeatures { local_cursor: true }`. Neither side sends anything new to a
+  peer that did not advertise or request it, so old hosts and old clients keep
+  the cursor in the video.
+- Shapes go to the client as `Update::Cursor` on the reliable updates track:
+  straight RGBA, at most 256x256, latest wins. A fully transparent or empty
+  cursor (common in games) is sent as `cursor: None` (hidden). Cursors over
+  256x256 are not sent; the client keeps the previous shape.
 - The client validates every shape (size 1-256, hot spot inside, exact pixel
   length, base64 bounded before decoding) and creates an SDL colour cursor
   (`SDL_CreateRGBSurfaceFrom` + `SDL_CreateColorCursor`). It is shown while
@@ -29,42 +25,127 @@ encode or decode latency; only its *shape* comes from the host.
   arrow. A hidden host cursor hides the local pointer over video. Mouse lock
   (Ctrl+Alt+M) still hides the pointer independently. The cursor is freed when
   replaced and on session exit, and the arrow is restored.
-- The watcher stops when the session ends. The next client starts with the
-  pointer back in the video until it opts in.
+
+### X11 hosts
+
+- On opt-in the host starts a watcher thread with its own X connection
+  (XFixes `SelectCursorInput(root, DisplayCursor)`), restarts the video with
+  `ximagesrc show-pointer=false` (the same restart as a monitor switch, also
+  for active auxiliary monitor streams), and sends the current shape.
+- Each `CursorNotify` reads the image with `GetCursorImage`, converts the
+  premultiplied ARGB to straight RGBA and, if its cursor serial is new, sends
+  it. The watcher stops when the session ends.
+
+### Wayland (desktop portal) hosts
+
+- The cursor mode belongs to the portal's ScreenCast session. The host opens
+  it with `CursorMode::Metadata` when the portal offers it (`AvailableCursorModes`):
+  the compositor then leaves the pointer out of the frames and attaches
+  `SPA_META_Cursor` (position, hot spot and, when the shape changed, a
+  premultiplied RGBA bitmap) to the same PipeWire buffers, DMA-BUFs included.
+  `teleport host --embedded-cursor` keeps the pointer in the video instead.
+- A client that does not opt in (an old client, `--embedded-cursor`, or no
+  `ClientFeatures` within 3 s) gets the pointer back in the video: the host
+  recreates the portal session in embedded mode and restarts every capture
+  pipeline, as for a lost session. The next opted-in client switches it back.
+  Recreating the session uses the saved restore token or the compositor's
+  pre-authorization; without either, the compositor asks locally again.
+- GStreamer's `pipewiresrc` (PipeWire 1.x) negotiates the cursor meta but only
+  exposes the position. `src/pw_cursor.rs` adds a pad probe on every
+  `pipewiresrc` that reads the meta from the PipeWire buffer behind each
+  GStreamer buffer (pipewiresrc's pool data, validated against the buffer and
+  its pool type before use), parses it with bounds checks and publishes shapes
+  and positions to a process-wide hub. Only a changed bitmap is copied.
+- KWin sends a cursor-only update as a buffer whose pixels are marked
+  corrupted (stale). The probe drops those, and at most every 250 ms repeats
+  the last good frame in their place (same memory, new timestamp), so moving
+  the pointer over a static desktop costs no encoding but keyframe requests
+  still find a frame.
+- The client also declares `ClientFeatures::cursor_positions`; the host then
+  sends `Update::CursorPosition { monitor, x, y }` (normalised, latest wins, at
+  most ~30/s). The client uses it to place its pointer when relative mode ends.
+
+## Automatic pointer lock (relative mouse)
+
+Games hide the pointer and read relative motion. With a local cursor the
+client sees that as `Update::Cursor { cursor: None }` and, by default
+(`--relative-mouse auto`, launcher **Mouse: auto lock**), switches to SDL
+relative mode (the same pointer lock as Ctrl+Alt+M, `Event::RelativeMotion`):
+
+- It locks only while a session window has focus and the pointer is over
+  the video, and releases when the host pointer reappears (a menu). On
+  release the local pointer is warped to the host pointer's last
+  `Update::CursorPosition` (Wayland hosts), so it continues where the game
+  left it.
+- Ctrl+Alt+M releases an automatic lock until the host pointer reappears and
+  hides again. Focus loss releases it as before; returning re-locks while
+  the pointer is still hidden.
+- `--relative-mouse always` (**Mouse: always relative**) locks whenever a
+  session window has focus; Ctrl+Alt+M releases it until focus leaves and
+  returns. `never` (**Mouse: lock by hotkey**) only locks on Ctrl+Alt+M.
+- F8 shows the mode and state (`locked (host pointer hidden)`, `released by
+  user`, ...). Hosts without relative input (`Desktop.relative_pointer`)
+  never lock. Clients with `--embedded-cursor` get no shapes, so auto never
+  triggers. Pointer-constraint signals (Wayland locked-pointer) are not
+  available through the portal; the hidden pointer is the only signal.
 
 `teleport client --embedded-cursor` keeps the old behaviour (pointer in the
 video), e.g. to compare or if a host theme's cursor renders poorly.
 
 ## Limits and remaining gaps
 
-- **Wayland hosts keep the cursor in the video.** The ScreenCast portal can
-  deliver the cursor as PipeWire metadata (`CursorMode::Metadata`), but
-  GStreamer's `pipewiresrc` does not expose `SPA_META_Cursor` to the pipeline.
-  Supporting it needs our own PipeWire consumer (or an upstream change) that
-  reads the cursor meta per buffer.
+- **The first shape on Wayland with DMA-BUF capture.** KWin sends a bitmap
+  only when the shape changes, and the first one (sent when the stream starts)
+  is lost when the DMA-BUF buffers are renegotiated. Until the shape first
+  changes (hovering text or a link, a window edge), the client shows its own
+  arrow. The host replays the last visible shape it saw to later sessions.
+  CPU (shared-memory) capture gets the first bitmap.
 - The cursor is drawn at the host's pixel size. When the client scales the
   video (window smaller or larger than the remote monitor), the pointer does not
   scale with it.
 - A cursor larger than 256x256 is not sent (the previous shape stays). No
-  current cursor theme reaches that size.
-- Animated cursors are sent frame by frame, since each frame has its own
-  serial.
+  current cursor theme reaches that size; KWin caps its bitmaps at 256x256.
+- Animated cursors are sent frame by frame (X11: each frame has its own
+  serial; KWin: each frame invalidates the bitmap).
 - The pointer position is the client's. Host-side warps (an app moving the
-  pointer) are not shown until the local mouse moves. Games that need raw
-  input should use mouse lock (Ctrl+Alt+M); automatic locking when the host
-  hides its cursor is not implemented (review item R3).
+  pointer) are not shown until the local mouse moves, except that ending an
+  automatic lock warps to the host position.
+- Automatic pointer lock was not verified with a real game on a KDE host.
+- The pipewiresrc probe depends on its private pool data layout (stable since
+  PipeWire 0.3, checked at runtime). If the check fails, no shapes arrive and
+  the client keeps its arrow; `--embedded-cursor` on either end avoids it.
 
 ## Verification
 
 - `protocol::tests::cursor_updates_roundtrip_compactly_and_reject_bad_images`
   and `local_cursor_is_negotiated_by_both_ends` cover wire format, bounds and
   defaults; `x11_cursor::tests` covers premultiplied-to-straight conversion,
-  hidden cursors and rejected images.
+  hidden cursors and rejected images; `pw_cursor::tests` covers SPA cursor
+  meta parsing (strides, formats, hidden and malformed bitmaps) and the
+  stale-buffer filter.
 - `cargo test --test smoke -- --ignored x11_local_cursor_shapes` runs an X11 host
   on Xvfb with a headless client. It checks that an `--embedded-cursor` client
   receives no shapes, that an opted-in client gets the initial cursor, a window
   cursor change and a fully transparent (hidden) cursor.
   `x11_capture_input_and_native_window` also checks that the default headless
   client receives a shape.
-- Not tested automatically: the SDL cursor on a real display (toolbar arrow,
-  hide over video, auxiliary windows). Check this by hand on an X11 host.
+- `TELEPORT_TEST_PORTAL=1 cargo test --bin teleport portal_cursor_metadata --
+  --ignored --nocapture` opens its own portal session in metadata mode and
+  captures each monitor through the real encoder pipeline. On KDE Plasma
+  6.7.5 (RTX 3080, 2×2560x1440) the meta was on every buffer with DMA-BUF
+  zero-copy capture and NVENC, the position was reported for the monitor with
+  the pointer; the 32x32 Breeze arrow arrived with CPU capture
+  (`TELEPORT_CAPTURE_ZERO_COPY=0`) but not with DMA-BUFs (see limits).
+- By hand against the same KDE desktop (a `--source portal` host on a spare
+  port, pre-authorized portal, headless clients): an opted-in client kept the
+  metadata session; an `--embedded-cursor` client switched the host to an
+  embedded session and the next opted-in client back, each switch about
+  0.4 s (portal session plus NVENC restart), with no dialog.
+- `cargo test --test ui -- --ignored hidden_host_pointer_locks_the_client_mouse`
+  runs an X11 host on one Xvfb and a windowed client on another: the host
+  window's blank cursor makes the client grab the pointer (SDL relative
+  mode), its arrow cursor releases it. `client::tests` cover the lock policy
+  (auto, always, never, hotkey suppression, focus).
+- Not tested: the SDL cursor on a real display (toolbar arrow, hide over
+  video, auxiliary windows) and a shape change on Wayland (it needs the local
+  pointer to move). Check these by hand.

@@ -27,6 +27,37 @@ pub enum VideoCodec {
     H265,
 }
 
+/// Encoder speed/quality trade-off (parsec-comparison G10). None adds frame
+/// delay; slower presets spend more encode time per frame on quality.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum EncoderPreset {
+    /// Fastest encode (NVENC p1/ull, x264 ultrafast): the historical setting.
+    #[default]
+    Latency,
+    Balanced,
+    Quality,
+}
+
+impl EncoderPreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Latency => "lowest latency",
+            Self::Balanced => "balanced",
+            Self::Quality => "quality",
+        }
+    }
+
+    /// `tp_codec_open`'s preset number.
+    pub fn level(self) -> i32 {
+        match self {
+            Self::Latency => 0,
+            Self::Balanced => 1,
+            Self::Quality => 2,
+        }
+    }
+}
+
 /// HDR10 here specifies PQ/BT.2020 limited-range 10-bit video, not mastering metadata.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -184,6 +215,12 @@ pub struct Desktop {
     /// ([`BUTTON_BACK`], [`BUTTON_FORWARD`]); older hosts reject them.
     #[serde(default)]
     pub extra_mouse_buttons: bool,
+    /// Host applies `SelectCodec::encoder_preset`.
+    #[serde(default)]
+    pub encoder_presets: bool,
+    /// The host's preset for clients that do not choose one.
+    #[serde(default)]
+    pub encoder_preset: EncoderPreset,
 }
 
 impl Desktop {
@@ -319,6 +356,14 @@ pub enum Update {
     Cursor {
         cursor: Option<CursorImage>,
     },
+    /// Where the host pointer is on monitor `monitor`, normalised like
+    /// `Event::Motion` (0..=1). Latest wins, at most ~30 per second; only
+    /// sent after the client declared `ClientFeatures::cursor_positions`.
+    CursorPosition {
+        monitor: usize,
+        x: f64,
+        y: f64,
+    },
     /// Force feedback a game started on virtual pad `pad`: play `low`
     /// (strong, low-frequency motor) and `high` (weak, high-frequency) for
     /// `duration_ms` unless a newer update replaces it; zeros stop it. Only
@@ -343,6 +388,10 @@ impl Update {
             Self::Cursor {
                 cursor: Some(image),
             } => image.validate()?,
+            Self::CursorPosition { monitor, x, y } => ensure!(
+                *monitor < 64 && (0.0..=1.0).contains(x) && (0.0..=1.0).contains(y),
+                "invalid cursor position"
+            ),
             Self::Rumble {
                 pad, duration_ms, ..
             } => ensure!(
@@ -508,12 +557,21 @@ pub enum Event {
         /// ignore the field.
         #[serde(default)]
         rumble: bool,
+        /// The client takes `Update::CursorPosition` (it places its pointer
+        /// there when it leaves relative mode). Older hosts ignore the field.
+        #[serde(default)]
+        cursor_positions: bool,
     },
     /// The session's video codec. Sent as the very first input event to hosts
     /// advertising `Desktop::codec_selection`, which wait for it before
     /// starting video; it overrides the connection's `codec` parameter.
     SelectCodec {
         codec: VideoCodec,
+        /// Encoder preset for this session, only to hosts advertising
+        /// `Desktop::encoder_presets` (older hosts ignore the field); `None`
+        /// keeps the host's `--encoder-preset`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encoder_preset: Option<EncoderPreset>,
     },
     /// The client's display and stream choices; the host picks the stream
     /// size, rate and bitrate from them ([`negotiate`]) and answers with
@@ -1034,6 +1092,7 @@ mod tests {
                 pointer_datagrams: true,
                 local_cursor: true,
                 rumble: true,
+                cursor_positions: true,
             },
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
@@ -1185,6 +1244,7 @@ mod tests {
                 pointer_datagrams: false,
                 local_cursor: false,
                 rumble: false,
+                cursor_positions: false,
             }
         ));
         let primary: Event = serde_json::from_str(r#"{"type":"request_keyframe"}"#).unwrap();
@@ -1217,7 +1277,8 @@ mod tests {
         assert!(matches!(
             event,
             Event::SelectCodec {
-                codec: VideoCodec::H265
+                codec: VideoCodec::H265,
+                encoder_preset: None,
             }
         ));
         assert!(event.validate().is_ok() && !event.is_lossy());
@@ -1232,6 +1293,28 @@ mod tests {
             desktop.hardware_codecs,
             [VideoCodec::H264, VideoCodec::H265]
         );
+        // Encoder presets: optional on the wire, old hosts default to none.
+        assert!(!desktop.encoder_presets);
+        assert_eq!(desktop.encoder_preset, EncoderPreset::Latency);
+        let chosen = Event::SelectCodec {
+            codec: VideoCodec::H264,
+            encoder_preset: Some(EncoderPreset::Quality),
+        };
+        let wire = serde_json::to_string(&chosen).unwrap();
+        assert!(wire.contains(r#""encoder_preset":"quality""#), "{wire}");
+        assert!(matches!(
+            serde_json::from_str::<Event>(&wire).unwrap(),
+            Event::SelectCodec {
+                encoder_preset: Some(EncoderPreset::Quality),
+                ..
+            }
+        ));
+        let plain = serde_json::to_string(&Event::SelectCodec {
+            codec: VideoCodec::H264,
+            encoder_preset: None,
+        })
+        .unwrap();
+        assert!(!plain.contains("encoder_preset"), "{plain}");
     }
     #[test]
     fn rumble_updates_are_bounded_and_declared_by_the_client() {
@@ -1358,6 +1441,33 @@ mod tests {
             "active_monitor": 0, "audio": false, "clipboard": false, "local_cursor": true }))
         .unwrap();
         assert!(desktop.local_cursor);
+        // Positions only go to clients that ask for them, and are bounded.
+        let features: Event = serde_json::from_str(
+            r#"{"type":"client_features","local_cursor":true,"cursor_positions":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            features,
+            Event::ClientFeatures {
+                cursor_positions: true,
+                ..
+            }
+        ));
+        let position = Update::CursorPosition {
+            monitor: 1,
+            x: 0.25,
+            y: 1.0,
+        };
+        let wire = serde_json::to_vec(&position).unwrap();
+        assert!(
+            serde_json::from_slice::<Update>(&wire)
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+        for (monitor, x, y) in [(64, 0.5, 0.5), (0, -0.1, 0.5), (0, 0.5, f64::NAN)] {
+            assert!(Update::CursorPosition { monitor, x, y }.validate().is_err());
+        }
     }
 
     #[test]

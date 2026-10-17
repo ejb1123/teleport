@@ -743,6 +743,15 @@ refresh. Effort M.**
 
 **G9. Static-scene refinement ("Constant FPS" equivalent). Effort S.**
 
+- **Status (2026-10-16): implemented** (docs/ffmpeg.md "Static-scene
+  refinement"), as a burst of 8 repeated frames 200 ms after the screen
+  stops rather than a low-QP frame: per-frame QP or bitrate boosts gained
+  little (VA-API, x264) or forced an IDR (NVENC). At 1440p60 5 Mbps on
+  NVENC the still frame gains 1.6 dB (H.264) / 3.9 dB (H.265) within
+  ~130 ms for 95 kB, what the keepalive alone takes two seconds to reach.
+  Only below 0.05 bits per pixel; not on Intel VA-API/Quick Sync, where
+  repeats did not refine. Not verified on a real still KDE desktop.
+
 - **Why:** Parsec offers Constant FPS because damage-driven capture leaves the
   last, motion-quality frame on screen (ADV, QUAL). Teleport's capture is also
   damage-driven, with only a 250 ms keepalive.
@@ -753,6 +762,15 @@ refresh. Effort M.**
 
 **G10. Encoder quality preset. Effort S.**
 
+- **Status (2026-10-16): implemented** (docs/ffmpeg.md "Encoder presets").
+  `--encoder-preset latency|balanced|quality` on the host (default for its
+  clients) and the client/launcher (per session, in `SelectCodec`, gated on
+  `Desktop.encoder_presets`); F8 shows it. Default stays `latency`. At 1440p60
+  20 Mbps on desktop text, NVENC H.264 `quality` (p6, hq, two-pass) gained
+  3.5 dB PSNR for +5.5 ms per frame; H.265 `quality` (p6, hq) raised SSIM
+  0.987 → 0.992 at half the bits for +10 ms. VA-API levels changed encode
+  time, not quality, on the UHD 630.
+
 - **Why:** Parsec exposes Lowest Latency / Balanced / Highest Quality (QP).
   Teleport is fixed at NVENC `p1`/`ull` (`src/ffmpeg_codec.c:147-152`).
 - **Steps:** add `--quality latency|balanced|quality` mapping to NVENC
@@ -762,6 +780,21 @@ refresh. Effort M.**
 ### Tier 2: input
 
 **G11. Wayland local cursor and automatic pointer lock. Effort M.**
+
+- **Status (2026-10-16): step 1–2 implemented** (docs/cursor.md, tracker
+  R5). Not with a separate PipeWire consumer: `pipewiresrc` already
+  negotiates `SPA_META_Cursor`, and a pad probe (`src/pw_cursor.rs`) reads it
+  from the PipeWire buffer behind each GStreamer buffer, so it rides on the
+  zero-copy DMA-BUFs. The portal session is opened in metadata mode and
+  switched back to an embedded pointer for clients that do not opt in.
+  Verified on KDE Plasma 6.7.5. Gap: with DMA-BUF capture KWin's first
+  bitmap is lost, so the shape arrives with its first change.
+- **Status (2026-10-16): step 3 implemented** (G11b, tracker R3):
+  `--relative-mouse auto|always|never` (launcher button, F8 line). Auto locks
+  while the host hides its pointer and a session window has focus with the
+  pointer over video (keyboard capture is not required); Ctrl+Alt+M or the
+  pointer reappearing releases it. Verified in an Xvfb UI test, not with a
+  real game. Step 4 (scaling the cursor) is open.
 
 - **Why:** local cursor only works on X11 hosts (docs/cursor.md), and KDE
   Wayland is the primary host. On Wayland the pointer has a full

@@ -30,6 +30,8 @@ mod pairing;
 mod presence;
 mod profiles;
 mod protocol;
+#[cfg(target_os = "linux")]
+mod pw_cursor;
 mod relay;
 mod relay_enroll;
 mod security_key;

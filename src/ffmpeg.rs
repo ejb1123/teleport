@@ -41,6 +41,7 @@ unsafe extern "C" {
         output: c_int,
         gop: c_int,
         gpu_input: c_int,
+        preset: c_int,
         error: *mut c_int,
     ) -> *mut c_void;
     fn tp_codec_free(codec: *mut c_void);
@@ -77,6 +78,8 @@ pub struct Config {
     /// NVENC / VA-API encoders: also accept captured DMA-BUFs
     /// ([`Codec::submit_dmabuf`]). NVENC then takes CUDA frames.
     pub gpu_input: bool,
+    /// Encoders: speed/quality preset.
+    pub preset: crate::protocol::EncoderPreset,
 }
 
 /// A captured DMA-BUF frame (see `src/dmabuf_encode.h`). The descriptors are
@@ -169,6 +172,7 @@ impl Codec {
                 config.output,
                 config.gop.try_into()?,
                 config.gpu_input.into(),
+                config.preset.level(),
                 &mut error,
             )
         };
@@ -549,6 +553,7 @@ mod tests {
             output: 1,
             gop: 0,
             gpu_input: false,
+            preset: Default::default(),
         }
     }
     #[test]
@@ -1156,3 +1161,6 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod quality;

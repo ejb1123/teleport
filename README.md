@@ -191,6 +191,13 @@ nix run . -- client LINUX_IP:4443 --pairing-file pairing.json \
 encodes it in hardware and the client decodes it in hardware, and H.264 otherwise
 or with hosts from before automatic choice. An explicit `--codec h264|h265` always
 wins. Stats (F8) shows the codec and why it was chosen.
+`--encoder-preset latency|balanced|quality` (host default, or per session from
+the client; launcher **Encoder:**) trades host encode time for quality without
+adding frame delay; `latency` is the default. See
+[encoder presets](docs/ffmpeg.md#encoder-presets) for what each maps to and
+measurements. On low-bitrate links the host sharpens a still screen with a
+short burst of repeated frames 200 ms after it stops changing
+([static-scene refinement](docs/ffmpeg.md#static-scene-refinement)).
 `--width match --fps match --bitrate auto` negotiate as above. `--width 0` means native; a positive width requests scaling, with a supported
 ceiling of 7680 pixels wide, 8192 high and 33,554,432 total pixels. Actual encoder
 hardware may have lower limits. Host CLI defaults remain 1280 wide for older
@@ -361,6 +368,13 @@ to separate networking/decoding problems from portal/capture problems.
 - Initial local approval is required for Wayland. Saved permission is opt-in
   and compositor-dependent. No login-screen access or unattended-access guarantee.
 - HDR requires the experimental patched-KWin/Mac path; see [its limitations](docs/hdr.md).
+- The client draws the remote pointer locally (no round trip) with X11 hosts
+  and Wayland hosts whose portal sends cursor metadata (KDE Plasma 6);
+  `--embedded-cursor` on either end keeps it in the video. See
+  [local cursor](docs/cursor.md).
+- Games: the client locks the mouse (relative mode) while the host hides
+  its pointer; `--relative-mouse always|never` (launcher **Mouse** button)
+  changes that, Ctrl+Alt+M toggles the lock by hand.
 - Gamepads (with rumble) need a Linux host with `/dev/uinput` access;
   see [gamepads](docs/gamepad.md).
 - No file transfer, virtual display, IME, monitor hotplug or
