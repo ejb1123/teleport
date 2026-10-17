@@ -33,6 +33,8 @@ EOF
 chmod +x "$work/cc" "$work/ar"
 
 library=$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#rustPlatform.rustLibSrc)
+# sccache rejects the stand-in C compiler, so build without it.
+unset RUSTC_WRAPPER
 RUSTC_BOOTSTRAP=1 \
   __CARGO_TESTS_ONLY_SRC_ROOT="$library" \
   CC_aarch64_apple_darwin="$work/cc" CXX_aarch64_apple_darwin="$work/cc" \
