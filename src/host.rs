@@ -93,6 +93,11 @@ pub struct Options {
     pub listen: String,
     #[arg(long, default_value = "auto", value_parser = ["auto", "portal", "x11", "test"])]
     pub source: String,
+    /// With `--source test`: stream a black screen that turns white, and
+    /// back, on every key or mouse-button press, to time input→photon with a
+    /// photodiode or camera (docs/performance.md).
+    #[arg(long)]
+    pub flash_on_input: bool,
     /// New private pairing file; never overwritten. Copy securely to the client.
     #[arg(long, default_value = "pairing.json")]
     pub pairing_file: PathBuf,
@@ -156,6 +161,9 @@ pub struct Options {
     /// (`Desktop::stepped_down`); `width` and `fps` then hold the step.
     #[arg(skip)]
     pub stepped_down: Option<protocol::SteppedDown>,
+    /// The session's client strips `protocol::FrameTiming` headers.
+    #[arg(skip)]
+    pub frame_timing: bool,
 }
 
 pub async fn run(options: Options) -> Result<()> {
@@ -171,6 +179,13 @@ pub async fn run(options: Options) -> Result<()> {
         "pairing file already exists; choose a new --pairing-file (credentials rotate each host start)"
     );
     media::doctor()?;
+    if options.flash_on_input {
+        ensure!(
+            options.source == "test",
+            "--flash-on-input needs --source test"
+        );
+        media::test_flash::enable();
+    }
     // Create the private directory before a portal restore token inside it is written.
     if let Some(directory) = &options.identity_dir {
         crate::identity::open(directory)?;
@@ -1155,7 +1170,13 @@ async fn run_session(
                     // Auxiliary streams currently use fixed bitrate. Their
                     // congestion must never adapt the independent primary.
                     Event::MonitorFeedback { .. } => {}
-                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble, cursor_positions: wants_positions } => {
+                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble, cursor_positions: wants_positions, frame_timing } => {
+                        if frame_timing && !options.frame_timing {
+                            // Encoders started later inherit it from options.
+                            options.frame_timing = true;
+                            pipeline.set_frame_timing();
+                            for stream in monitor_streams.values() { stream.pipeline.set_frame_timing(); }
+                        }
                         if plays_rumble && rumble.is_none() {
                             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
                             capture.enable_rumble(sender);
@@ -1337,13 +1358,15 @@ async fn run_session(
                     Event::Clipboard { .. } | Event::ClipboardRequest => publish_update(&mut updates, Update::Notice { text: "Host clipboard is disabled; start host with --clipboard to opt in".into() })?,
                     Event::Probe { id } => {
                         telemetry_enabled = true;
-                        publish_update(&mut updates, Update::Pong { id })?;
+                        let host_us = options.frame_timing.then(|| protocol::clock_us(Instant::now()));
+                        publish_update(&mut updates, Update::Pong { id, host_us })?;
                     },
                     event => {
                         // Invalid events still fail closed. An injection error
                         // (portal/D-Bus hiccup) drops that one event; only a
                         // persistently broken input path ends the session.
                         event.validate()?;
+                        flash_on_input(&event);
                         match capture.input(event).await {
                             Ok(()) => input_failures = 0,
                             Err(error) if crate::capture::portal_session_lost(&error) => {
@@ -1373,6 +1396,17 @@ async fn run_session(
 
 /// Applied to every new primary encoder: long GOPs once the client requests
 /// keyframes itself.
+/// `--flash-on-input`: each key or mouse-button press switches the test
+/// picture between black and white.
+fn flash_on_input(event: &Event) {
+    if matches!(
+        event,
+        Event::Key { down: true, .. } | Event::Button { down: true, .. }
+    ) {
+        media::test_flash::toggle();
+    }
+}
+
 fn session_video(pipeline: &media::Pipeline, fps: u32, long_gop: bool) {
     if long_gop {
         pipeline.set_key_interval(fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS));
@@ -1558,6 +1592,7 @@ fn desktop_for_monitor(
         network_feedback: std::env::var_os("TELEPORT_NETWORK_FEEDBACK")
             .is_none_or(|value| value != "0"),
         stepped_down: options.stepped_down,
+        frame_timing: true,
     })
 }
 
@@ -1645,6 +1680,7 @@ fn start_encoder(
         media::EncoderChoice {
             kind: options.encoder,
             preset: options.encoder_preset,
+            frame_timing: options.frame_timing,
         },
     );
     let format = media::VideoFormat {
@@ -1698,7 +1734,8 @@ async fn while_starting<T: Send + 'static>(
                     return work.await.context("encoder task failed")?;
                 };
                 match event {
-                    Event::Probe { id } => publish_update(updates, Update::Pong { id })?,
+                    // No host clock here; the client's next probe gets one.
+                    Event::Probe { id } => publish_update(updates, Update::Pong { id, host_us: None })?,
                     event if reorderable(&event) => events.deferred.push_back(event),
                     Event::MonitorStream { .. }
                     | Event::MonitorMotion { .. }
@@ -1716,6 +1753,8 @@ async fn while_starting<T: Send + 'static>(
                         if event.validate().is_err() || capture.input(event.clone()).await.is_err() {
                             ordered = true;
                             events.deferred.push_back(event);
+                        } else {
+                            flash_on_input(&event);
                         }
                     }
                 }

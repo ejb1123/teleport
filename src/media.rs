@@ -125,6 +125,15 @@ impl Pipeline {
         Ok(encoder.property::<u32>("bitrate"))
     }
 
+    /// Stamp every frame from now on with `protocol::FrameTiming` (the client
+    /// declared it strips them). Direct FFmpeg only.
+    #[cfg(target_os = "linux")]
+    pub fn set_frame_timing(&self) {
+        if let Some(state) = ffmpeg_media::state(&self.0) {
+            state.set_frame_timing();
+        }
+    }
+
     /// Space periodic IDRs `frames` apart once the client requests keyframes
     /// itself. Direct FFmpeg only; the legacy encoder keeps its fixed GOP.
     /// Encoders with intra refresh send none (only requested IDRs).
@@ -337,6 +346,9 @@ pub enum EncoderKind {
 pub struct EncoderChoice {
     pub kind: EncoderKind,
     pub preset: crate::protocol::EncoderPreset,
+    /// Stamp frames with `protocol::FrameTiming` from the start (direct
+    /// FFmpeg encoders; `Pipeline::set_frame_timing` turns it on later).
+    pub frame_timing: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -344,7 +356,7 @@ impl From<EncoderKind> for EncoderChoice {
     fn from(kind: EncoderKind) -> Self {
         Self {
             kind,
-            preset: Default::default(),
+            ..Default::default()
         }
     }
 }
@@ -712,6 +724,8 @@ pub fn encoder(
 
 pub struct Image {
     pub decoded_at: Instant,
+    /// Host stamps and receive/decode times, when the host sent them.
+    pub latency: Option<crate::stats::FrameLatency>,
     pub decoder_recovery: u64,
     pub video_group: Option<u64>,
     pub data: Vec<u8>,
@@ -790,6 +804,35 @@ pub fn set_presenter_wake(wake: fn()) {
 pub fn wake_presenter() {
     if let Some(wake) = PRESENTER_WAKE.get() {
         wake();
+    }
+}
+
+/// Host `--flash-on-input` (test source only): every captured frame is
+/// painted black or white, switching on each key or mouse-button press, so a
+/// photodiode or camera can time input→photon (docs/performance.md).
+pub mod test_flash {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    /// 0 off, 1 black, 2 white.
+    static STATE: AtomicU8 = AtomicU8::new(0);
+
+    pub fn enable() {
+        let _ = STATE.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed);
+    }
+
+    /// Switches black↔white; nothing when disabled.
+    pub fn toggle() {
+        let _ = STATE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| {
+            (state != 0).then_some(3 - state)
+        });
+    }
+
+    /// `Some(white)` when enabled.
+    pub fn white() -> Option<bool> {
+        match STATE.load(Ordering::Relaxed) {
+            0 => None,
+            state => Some(state == 2),
+        }
     }
 }
 
@@ -1008,13 +1051,14 @@ pub fn decoder_with_stats_presentation(
                 if native_surface {
                     // Keep the decoder buffer (and its CVPixelBuffer owner) alive.
                     // Never VideoFrame-map, lock, convert or copy these pixels.
-                    let video_group = stats.decoded(key);
+                    let (video_group, latency) = stats.decoded_with_latency(key);
                     let mut latest = latest.lock().unwrap();
                     if latest.is_some() {
                         stats.overwritten_frames.fetch_add(1, Ordering::Relaxed);
                     }
                     *latest = Some(Image {
                         decoded_at: Instant::now(),
+                        latency,
                         decoder_recovery: stats.decoder_recoveries.load(Ordering::Relaxed),
                         video_group,
                         data: Vec::new(),
@@ -1096,7 +1140,7 @@ pub fn decoder_with_stats_presentation(
                 let stale_after_copy = key
                     .and_then(|key| stats.frame_age(key))
                     .is_some_and(|age| age > Duration::from_millis(250));
-                let video_group = stats.decoded(key);
+                let (video_group, latency) = stats.decoded_with_latency(key);
                 if stale_after_copy {
                     stats.stale_frames.fetch_add(1, Ordering::Relaxed);
                     return Ok(gst::FlowSuccess::Ok);
@@ -1111,6 +1155,7 @@ pub fn decoder_with_stats_presentation(
                     hdr,
                     nv12,
                     decoded_at: Instant::now(),
+                    latency,
                     decoder_recovery: stats.decoder_recoveries.load(Ordering::Relaxed),
                     video_group,
                     data,
@@ -1511,6 +1556,8 @@ async fn receive_video_inner(
             }
             MediaEvent::Frame(frame) => match frame {
                 Ok(Some((timestamp, arrived, bytes))) => {
+                    // Hosts stamp frames once this client declares frame timing.
+                    let (host_timing, bytes) = crate::protocol::FrameTiming::split(bytes);
                     if let Some(meter) = &meter {
                         meter.lock().unwrap().frame(
                             arrived,
@@ -1593,6 +1640,7 @@ async fn receive_video_inner(
                         bytes.len(),
                         video_group,
                         crate::protocol::video_frame_age(timestamp),
+                        host_timing,
                     );
                     let mut buffer = gst::Buffer::from_slice(bytes);
                     stamp_video_buffer(buffer.get_mut().unwrap(), pts);

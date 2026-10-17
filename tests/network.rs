@@ -35,6 +35,10 @@ struct Profile {
     /// Stream width; height follows the 16:9 test source.
     width: u32,
     frames: u32,
+    /// Host `--flash-on-input`, client `--smoke-flash`: click→changed frame.
+    flash: bool,
+    /// Extra client arguments.
+    client_args: &'static str,
 }
 
 const PROFILE: Profile = Profile {
@@ -48,6 +52,8 @@ const PROFILE: Profile = Profile {
     reconfigure: false,
     width: 640,
     frames: FRAMES,
+    flash: false,
+    client_args: "",
 };
 
 #[derive(Debug)]
@@ -81,7 +87,29 @@ struct Outcome {
     /// Host bitrate changes and resolution/FPS steps.
     rate_changes: usize,
     steps: usize,
+    /// End-to-end stage (p50, p95) µs from host stamps and the
+    /// clock estimate, in `E2E_STAGES` order.
+    e2e: Vec<(i64, i64)>,
+    e2e_frames: u64,
+    /// Frames whose estimate was checked against the wall clock, and the
+    /// estimate's error: median and largest absolute, µs.
+    clock_checked: u64,
+    clock_error_p50_us: i64,
+    clock_error_max_us: i64,
+    clock_rtt_us: u64,
+    flash_presses: u64,
+    flash_p50_us: u64,
+    flash_p95_us: u64,
 }
+
+const E2E_STAGES: [&str; 6] = [
+    "capture_encode",
+    "encode_send",
+    "network",
+    "receive_decode",
+    "decode_present",
+    "total",
+];
 
 /// Encoded packet sizes over every encoder the host ran.
 #[derive(Debug, Default)]
@@ -133,7 +161,7 @@ fn run(profile: &Profile) -> Outcome {
 ip link set lo up
 tc qdisc add dev lo root netem {netem}
 TELEPORT_TEST_PATTERN={pattern} "$TELEPORT" host --source test --encoder "${{TELEPORT_TEST_ENCODER:-software}}" --listen 127.0.0.1:4443 \
-    --width {width} --fps {FPS} --bitrate {bitrate} --pairing-file "$DIR/pairing.json" \
+    --width {width} --fps {FPS} --bitrate {bitrate} --pairing-file "$DIR/pairing.json" {host_flash} \
     >"$DIR/host.log" 2>&1 &
 host=$!
 trap 'kill $host 2>/dev/null || true' EXIT
@@ -145,7 +173,7 @@ done
 sleep 0.3
 {burst}
 "$TELEPORT" client 127.0.0.1:4443 --pairing-file "$DIR/pairing.json" \
-    --headless-frames {frames} --software-decoder --bitrate {bitrate} {input} {reconfigure}
+    --headless-frames {frames} --software-decoder --bitrate {bitrate} {input} {reconfigure} {client_flash} {client_args}
 # Let the host notice the disconnect and log its encoder summary.
 sleep 1.5
 "#,
@@ -164,6 +192,13 @@ sleep 1.5
             ""
         },
         bitrate = profile.bitrate,
+        host_flash = if profile.flash {
+            "--flash-on-input"
+        } else {
+            ""
+        },
+        client_flash = if profile.flash { "--smoke-flash" } else { "" },
+        client_args = profile.client_args,
     );
     let output = Command::new("unshare")
         .args(["-rn", "sh", "-c", &script])
@@ -239,6 +274,24 @@ sleep 1.5
         sizes: host_sizes(&host_log),
         rate_changes: count("adapted video bitrate"),
         steps: count("stepped video"),
+        e2e: E2E_STAGES
+            .iter()
+            .map(|stage| {
+                let pair = fields
+                    .get(&format!("e2e_{stage}_us"))
+                    .unwrap_or_else(|| panic!("[{}] summary missing {stage}", profile.name));
+                let (p50, p95) = pair.split_once('/').unwrap();
+                (p50.parse().unwrap(), p95.parse().unwrap())
+            })
+            .collect(),
+        e2e_frames: field("e2e_frames"),
+        clock_checked: field("clock_checked"),
+        clock_error_p50_us: signed(&fields, "clock_error_p50_us"),
+        clock_error_max_us: signed(&fields, "clock_error_max_us"),
+        clock_rtt_us: field("clock_rtt_us"),
+        flash_presses: field("flash_presses"),
+        flash_p50_us: field("flash_p50_us"),
+        flash_p95_us: field("flash_p95_us"),
     };
     let utilisation = profile
         .capacity
@@ -288,6 +341,32 @@ sleep 1.5
         outcome.host_prepare_us as f64 / 1000.0,
         outcome.host_encode_us as f64 / 1000.0,
     );
+    let ms = |us: i64| us as f64 / 1000.0;
+    println!(
+        "E2E     {:<10} frames={} {} clock_rtt_ms={:.2} clock_checked={} clock_error_p50_ms={:.2} clock_error_max_ms={:.2}",
+        profile.name,
+        outcome.e2e_frames,
+        E2E_STAGES
+            .iter()
+            .zip(&outcome.e2e)
+            .map(|(stage, (p50, p95))| format!("{stage}_ms={:.1}/{:.1}", ms(*p50), ms(*p95)))
+            .collect::<Vec<_>>()
+            .join(" "),
+        outcome.clock_rtt_us as f64 / 1000.0,
+        outcome.clock_checked,
+        ms(outcome.clock_error_p50_us),
+        ms(outcome.clock_error_max_us),
+    );
+    if profile.flash {
+        println!(
+            "FLASH   {:<10} netem=[{}] presses={} click_to_frame_p50_ms={:.1} p95_ms={:.1}",
+            profile.name,
+            profile.netem,
+            outcome.flash_presses,
+            outcome.flash_p50_us as f64 / 1000.0,
+            outcome.flash_p95_us as f64 / 1000.0,
+        );
+    }
     if profile.input_latency {
         println!(
             "INPUT   {:<10} netem=[{}] probes={} p50_ms={:.1} p95_ms={:.1} max_ms={:.1}",
@@ -331,6 +410,13 @@ fn host_sizes(log: &str) -> Sizes {
         sizes.max_delta_bytes = sizes.max_delta_bytes.max(value("max_delta_bytes"));
     }
     sizes
+}
+
+fn signed(fields: &BTreeMap<String, String>, name: &str) -> i64 {
+    fields
+        .get(name)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("summary missing {name}"))
 }
 
 /// Parses `key=value` pairs from the client's SMOKE PASS log line.
@@ -593,4 +679,45 @@ fn input_keeps_flowing_while_the_encoder_restarts() {
     // tail shows how long input waits behind that. TELEPORT_TEST_ENCODER
     // selects another encoder kind (e.g. nvidia, vaapi).
     input_profile_with("reconfig", "delay 1ms", true);
+}
+
+/// G3: the client's NTP-style clock-offset estimate (control probes, RTT/2,
+/// min-filtered) against the Unix clock both processes share here. Each
+/// frame's estimated capture→present is compared with the wall-clock one;
+/// the difference is the estimate's error. 40 ms RTT, symmetric.
+#[test]
+#[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
+fn clock_offset_estimate_matches_the_wall_clock() {
+    let outcome = run(&Profile {
+        name: "clock",
+        netem: "delay 20ms",
+        ..PROFILE
+    });
+    assert!(outcome.clock_checked >= 100, "{outcome:?}");
+    assert!(
+        outcome.clock_error_p50_us.abs() < 1_500,
+        "estimate off by {} µs: {outcome:?}",
+        outcome.clock_error_p50_us
+    );
+    // The stages see the shaped link: ~20 ms one way.
+    let network_p50 = outcome.e2e[2].0;
+    assert!((15_000..40_000).contains(&network_p50), "{outcome:?}");
+    let total_p50 = outcome.e2e[5].0;
+    assert!(total_p50 > network_p50, "{outcome:?}");
+}
+
+/// `--flash-on-input` host and `--smoke-flash` client: software
+/// click→changed frame (no display), the part of input→photon a glass-to-glass
+/// rig cannot split out.
+#[test]
+#[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
+fn flash_on_input_follows_clicks() {
+    let outcome = run(&Profile {
+        name: "flash",
+        flash: true,
+        frames: 300,
+        ..PROFILE
+    });
+    assert!(outcome.flash_presses >= 10, "{outcome:?}");
+    assert!(outcome.flash_p50_us < 200_000, "{outcome:?}");
 }

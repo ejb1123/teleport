@@ -834,6 +834,7 @@ mod tests {
     fn frame() -> media::Image {
         media::Image {
             decoded_at: Instant::now(),
+            latency: None,
             decoder_recovery: 0,
             video_group: Some(0),
             data: vec![0; 12],

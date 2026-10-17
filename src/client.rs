@@ -63,6 +63,10 @@ pub struct Options {
     /// mid-session (input stall measurements with --smoke-input-latency).
     #[arg(long, hide = true, requires = "headless_frames")]
     pub smoke_reconfigure: bool,
+    /// Click every 400 ms and time each click until a decoded frame changes
+    /// between black and white (hosts with `--flash-on-input`).
+    #[arg(long, hide = true, requires = "headless_frames")]
+    pub smoke_flash: bool,
     /// Send pointer motion on the ordered input track even when the host
     /// accepts datagrams (comparison and troubleshooting).
     #[arg(long, hide = true)]
@@ -893,9 +897,36 @@ fn connect_window(
     }
 }
 
+/// When each `Update::Pong` arrived, stamped by the update reader so the
+/// clock-offset estimate does not include render-loop scheduling.
+#[derive(Clone, Default)]
+struct PongArrivals(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<(u64, Instant)>>>);
+
+impl PongArrivals {
+    fn record(&self, id: u64) {
+        let mut arrivals = self.0.lock().unwrap();
+        arrivals.push_back((id, Instant::now()));
+        while arrivals.len() > 64 {
+            arrivals.pop_front();
+        }
+    }
+
+    /// When probe `id`'s answer arrived (now, if it was not recorded).
+    fn take(&self, id: u64) -> Instant {
+        let mut arrivals = self.0.lock().unwrap();
+        match arrivals.iter().position(|(seen, _)| *seen == id) {
+            Some(index) => arrivals
+                .remove(index)
+                .map_or_else(Instant::now, |(_, at)| at),
+            None => Instant::now(),
+        }
+    }
+}
+
 async fn receive_updates(
     mut track: moq_net::track::Subscriber,
     sender: mpsc::Sender<Update>,
+    pong_arrivals: PongArrivals,
 ) -> Result<()> {
     let mut sequence = 0;
     let mut pending = std::collections::BTreeMap::new();
@@ -911,6 +942,9 @@ async fn receive_updates(
         .context("empty host update")?;
         let update: Update = serde_json::from_slice(&bytes)?;
         update.validate()?;
+        if let Update::Pong { id, .. } = &update {
+            pong_arrivals.record(*id);
+        }
         sender.send(update).await.context("session window closed")?;
         media::wake_presenter();
     }
@@ -1250,6 +1284,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let pointer_datagrams =
         desktop.pointer_datagrams && !options.reliable_pointer && link.session.version().is_lite();
     let remote = link.remote.clone();
+    let pong_arrivals = PongArrivals::default();
+    let update_pongs = pong_arrivals.clone();
+    // Host stamps on video frames and its clock on probe answers (G3).
+    let frame_timing = desktop.frame_timing;
+    let mut clock = crate::stats::ClockSync::default();
+    let mut e2e_latency = crate::stats::LatencyStats::default();
     let mut network = Network(runtime.spawn(async move {
         let mut ssh_agent = link.ssh_agent;
         let _origin = link._origin;
@@ -1258,7 +1298,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             result = crate::ssh_agent::closed(&mut ssh_agent) => result,
             result = media::receive_video_with_stats(link.video, source, feedback, network_stats, keyframe_requests, network_feedback) => result,
             result = send_input(link.input, link.pointer, pointer_datagrams, receiver, link.input_sequence) => result,
-            result = receive_updates(link.updates, updates_sender) => result,
+            result = receive_updates(link.updates, updates_sender, update_pongs) => result,
             result = async {
                 if let (Some(track), Some(source)) = (link.audio, audio_source)
                     && let Err(error) = crate::audio::receive(track, source).await {
@@ -1290,6 +1330,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 rumble: desktop.gamepads,
                 // Where to put the pointer when relative mode ends.
                 cursor_positions: local_cursor,
+                frame_timing,
             },
         )?;
     }
@@ -1350,6 +1391,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let mut frames_after_display_change = 0_u32;
         // --smoke-input-latency: probe send times by id, and completed round trips.
         let mut probes_in_flight = std::collections::BTreeMap::<u64, Instant>::new();
+        // --smoke-flash: click→changed frame against a --flash-on-input host.
+        let mut flash = options.smoke_flash.then(FlashTimer::default);
         let mut probe_rtts = Vec::<Duration>::new();
         let mut next_probe = Instant::now();
         let mut probe_id = 0_u64;
@@ -1398,9 +1441,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         }
                     }
                     Update::Clipboard { text } => clipboard_ok = text == CLIPBOARD_SMOKE,
-                    Update::Pong { id } => {
+                    Update::Pong { id, host_us } => {
+                        let arrived = pong_arrivals.take(id);
                         if let Some(sent) = probes_in_flight.remove(&id) {
-                            probe_rtts.push(sent.elapsed());
+                            probe_rtts.push(arrived.saturating_duration_since(sent));
+                            if let Some(host_us) = host_us {
+                                clock.observe(sent, arrived, host_us);
+                            }
                         }
                     }
                     Update::Notice { text } => tracing::info!(%text, "host notice"),
@@ -1450,6 +1497,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 protocol::validate_video_size(frame.width, frame.height)?;
                 count += 1;
                 let now = Instant::now();
+                if let Some(frame_latency) = &frame.latency {
+                    // Headless: "presented" is when this loop takes the frame.
+                    e2e_latency.presented(frame_latency, now, &clock);
+                }
+                if let Some(flash) = flash.as_mut() {
+                    flash.frame(&frame, now);
+                }
                 if let Some(last) = last_frame_at {
                     max_frame_gap = max_frame_gap.max(now - last);
                     if now - last > Duration::from_millis(100) {
@@ -1597,6 +1651,23 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     send(&events, Event::Probe { id: probe_id })?;
                 }
             }
+            probes_in_flight.retain(|_, sent| sent.elapsed() < Duration::from_secs(3));
+            if frame_timing
+                && !options.smoke_input_latency
+                && Instant::now() >= next_probe
+                && probes_in_flight.is_empty()
+            {
+                // Clock-offset samples for the end-to-end breakdown.
+                next_probe = Instant::now() + clock.probe_interval();
+                probe_id += 1;
+                probes_in_flight.insert(probe_id, Instant::now());
+                send(&events, Event::Probe { id: probe_id })?;
+            }
+            if let Some(flash) = flash.as_mut()
+                && let Some(event) = flash.click(Instant::now())
+            {
+                send(&events, event)?;
+            }
             std::thread::sleep(Duration::from_millis(2));
         }
         ensure!(
@@ -1629,6 +1700,14 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let (probe_p50_us, probe_p95_us) = (probe_percentile(50), probe_percentile(95));
         let probe_max_us = probe_rtts.last().map_or(0, |rtt| rtt.as_micros() as u64);
         let (latency_p50_us, latency_p95_us, latency_max_us) = stream_stats.capture_to_ready_us();
+        // End to end from host stamps and the clock estimate: stage p50/p95
+        // pairs in µs, `capture_encode=p50/p95 ...`.
+        let stages = e2e_latency.percentiles(true);
+        let stage = |index: usize| format!("{}/{}", stages[index].0, stages[index].1);
+        let (clock_offset_us, clock_rtt_us) = clock.offset().unwrap_or_default();
+        let (clock_checked, clock_error_p50_us, clock_error_max_us) = e2e_latency.clock_error();
+        let (flash_presses, flash_p50_us, flash_p95_us) =
+            flash.as_ref().map_or((0, 0, 0), FlashTimer::summary);
         let span_ms = first_frame_at
             .zip(last_frame_at)
             .map_or(0, |(first, last)| (last - first).as_millis() as u64);
@@ -1652,6 +1731,21 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             latency_p50_us,
             latency_p95_us,
             latency_max_us,
+            e2e_frames = e2e_latency.frames(),
+            e2e_capture_encode_us = stage(0),
+            e2e_encode_send_us = stage(1),
+            e2e_network_us = stage(2),
+            e2e_receive_decode_us = stage(3),
+            e2e_decode_present_us = stage(4),
+            e2e_total_us = stage(5),
+            clock_offset_us,
+            clock_rtt_us,
+            clock_checked,
+            clock_error_p50_us,
+            clock_error_max_us,
+            flash_presses,
+            flash_p50_us,
+            flash_p95_us,
             probes = probe_rtts.len(),
             probe_p50_us,
             probe_p95_us,
@@ -1784,6 +1878,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut last_display_poll = Instant::now();
     // Decoder store time of the frame drawn by the next present.
     let mut frame_decoded_at: Option<Instant> = None;
+    // Its host stamps, for the end-to-end breakdown.
+    let mut frame_latency: Option<crate::stats::FrameLatency> = None;
     'running: loop {
         present_timer.iterations += 1;
         WAKE_QUEUED.store(false, Ordering::Release);
@@ -1882,7 +1978,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 negotiation.sent(changed);
             }
         }
-        if desktop.telemetry && last_probe.elapsed() >= Duration::from_secs(1) {
+        // Every second, faster while the clock estimate is still forming.
+        let probe_interval = if frame_timing {
+            clock.probe_interval()
+        } else {
+            Duration::from_secs(1)
+        };
+        if desktop.telemetry && last_probe.elapsed() >= probe_interval {
             if pending_probe.is_some_and(|(_, sent)| sent.elapsed() >= Duration::from_secs(3)) {
                 pending_probe = None;
                 rtt = None;
@@ -1917,12 +2019,16 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     host_bitrate = bitrate;
                     host_encoder = encoder.chars().take(48).collect();
                 }
-                Update::Pong { id } => {
+                Update::Pong { id, host_us } => {
+                    let arrived = pong_arrivals.take(id);
                     if let Some((expected, sent)) = pending_probe
                         && id == expected
                     {
-                        rtt = Some(sent.elapsed());
+                        rtt = Some(arrived.saturating_duration_since(sent));
                         pending_probe = None;
+                        if let Some(host_us) = host_us {
+                            clock.observe(sent, arrived, host_us);
+                        }
                     }
                 }
                 Update::Desktop { desktop: next } => {
@@ -2359,6 +2465,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             new_frame = true;
             decoded_age = frame.decoded_at.elapsed();
             frame_decoded_at = Some(frame.decoded_at);
+            frame_latency = frame.latency;
             present_timer.picked_up(frame.decoded_at);
             protocol::validate_video_size(frame.width, frame.height)?;
             'frame: {
@@ -2521,6 +2628,40 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     format!("{:.2} ms (latest frame)", microseconds as f64 / 1000.0)
                 }
             };
+            // End to end over the recent frames, p50 / p95 per stage.
+            let stages = e2e_latency.percentiles(false);
+            let e2e = |index: usize| {
+                format!(
+                    "{:.1} / {:.1} ms",
+                    stages[index].0 as f64 / 1000.0,
+                    stages[index].1 as f64 / 1000.0
+                )
+            };
+            let end_to_end = if e2e_latency.is_empty() {
+                vec![format!(
+                    "Capture to present    {}",
+                    if !frame_timing {
+                        "not supported by this host"
+                    } else if clock.offset().is_none() {
+                        "waiting for clock samples"
+                    } else {
+                        "waiting for frames"
+                    }
+                )]
+            } else {
+                vec![
+                    format!(
+                        "Capture to present    {} p50/p95 (clock ±{:.1} ms)",
+                        e2e(5),
+                        clock.offset().map_or(0, |(_, rtt)| rtt) as f64 / 2000.0
+                    ),
+                    format!("  capture→encode      {}", e2e(0)),
+                    format!("  encode→send         {}", e2e(1)),
+                    format!("  network             {}", e2e(2)),
+                    format!("  receive→decode      {}", e2e(3)),
+                    format!("  decode→present      {}", e2e(4)),
+                ]
+            };
             let encode = if host_encode_us == 0 {
                 "Unavailable".into()
             } else {
@@ -2672,8 +2813,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 ),
                 "Decode includes scheduling/download, not pure GPU time.".into(),
                 "RTT includes control scheduling, not just network transit.".into(),
-                "Capture, scanout and end-to-end latency: unmeasured.".into(),
+                "Present = buffer swap; scanout and display lag unmeasured.".into(),
             ];
+            stats_lines.splice(1..1, end_to_end);
             let refresh = protocol::refresh_hz(local_display.refresh_mhz);
             if refresh > 0 && refresh < desktop.fps {
                 stats_lines.push(format!(
@@ -2968,6 +3110,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         if let Some(decoded_at) = frame_decoded_at.take() {
             present_timer.presented(decoded_at);
         }
+        if let Some(frame_latency) = frame_latency.take() {
+            e2e_latency.presented(&frame_latency, Instant::now(), &clock);
+        }
         if options
             .exit_after_frames
             .is_some_and(|limit| total_frames >= limit)
@@ -2977,6 +3122,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         last_present = Some(Instant::now());
     }
     present_timer.log();
+    log_end_to_end(&e2e_latency, &clock);
     let _ = events.try_send(Event::ReleaseAll);
     // Disconnect also triggers host-side release of every held key/button.
     Ok(reconnect)
@@ -3091,6 +3237,117 @@ impl PresentTimer {
             loop_cpu_percent = format!("{:.1}", cpu * 100.0 / wall),
             "video presentation summary (mean/p50/p95/max)"
         );
+    }
+}
+
+/// Whole-session end-to-end stages (p50/p95 µs), logged when the window
+/// closes; nothing for hosts without frame timing.
+fn log_end_to_end(latency: &crate::stats::LatencyStats, clock: &crate::stats::ClockSync) {
+    if latency.frames() == 0 {
+        return;
+    }
+    let stages = latency.percentiles(true);
+    let stage = |index: usize| format!("{}/{}", stages[index].0, stages[index].1);
+    let (clock_offset_us, clock_rtt_us) = clock.offset().unwrap_or_default();
+    tracing::info!(
+        frames = latency.frames(),
+        capture_encode_us = stage(0),
+        encode_send_us = stage(1),
+        network_us = stage(2),
+        receive_decode_us = stage(3),
+        decode_present_us = stage(4),
+        total_us = stage(5),
+        clock_offset_us,
+        clock_rtt_us,
+        "end-to-end latency summary (p50/p95)"
+    );
+}
+
+/// `--smoke-flash`: clicks against a `--flash-on-input` host and times each
+/// click until a frame shows the other colour (software click→frame,
+/// without display scanout; docs/performance.md).
+#[derive(Default)]
+struct FlashTimer {
+    /// Last seen picture: white or black.
+    white: Option<bool>,
+    /// Press time while its flip has not been seen.
+    pressed: Option<Instant>,
+    /// Release due for the press in flight.
+    release_at: Option<Instant>,
+    next_press: Option<Instant>,
+    samples: Vec<Duration>,
+}
+
+impl FlashTimer {
+    const INTERVAL: Duration = Duration::from_millis(400);
+
+    /// The next click event due, if any.
+    fn click(&mut self, now: Instant) -> Option<Event> {
+        if self.release_at.is_some_and(|at| now >= at) {
+            self.release_at = None;
+            return Some(Event::Button {
+                button: 1,
+                down: false,
+            });
+        }
+        // Start once a frame was seen; one press in flight at a time.
+        let due = self.white.is_some()
+            && self.pressed.is_none()
+            && self.release_at.is_none()
+            && self.next_press.is_none_or(|at| now >= at);
+        if !due {
+            return None;
+        }
+        self.pressed = Some(now);
+        self.release_at = Some(now + Duration::from_millis(30));
+        self.next_press = Some(now + Self::INTERVAL);
+        Some(Event::Button {
+            button: 1,
+            down: true,
+        })
+    }
+
+    fn frame(&mut self, frame: &media::Image, now: Instant) {
+        let (width, height) = (frame.width as usize, frame.height as usize);
+        let luma = if let Some(nv12) = &frame.nv12 {
+            nv12.y.get(height / 2 * nv12.y_stride + width / 2).copied()
+        } else {
+            frame
+                .data
+                .get(height / 2 * frame.stride + width / 2 * 3)
+                .copied()
+        };
+        let Some(luma) = luma else {
+            return;
+        };
+        let white = luma > 128;
+        if self.white.is_some_and(|seen| seen != white)
+            && let Some(pressed) = self.pressed.take()
+        {
+            self.samples.push(now.saturating_duration_since(pressed));
+        }
+        self.white = Some(white);
+        // A press whose flip never came (lost or late) does not block forever.
+        if self
+            .pressed
+            .is_some_and(|at| now.saturating_duration_since(at) > Duration::from_secs(2))
+        {
+            self.pressed = None;
+        }
+    }
+
+    /// (presses timed, p50 µs, p95 µs).
+    fn summary(&self) -> (usize, i64, i64) {
+        let mut micros: Vec<i64> = self
+            .samples
+            .iter()
+            .map(|sample| sample.as_micros() as i64)
+            .collect();
+        (
+            micros.len(),
+            crate::stats::percentile(&mut micros, 50),
+            crate::stats::percentile(&mut micros, 95),
+        )
     }
 }
 

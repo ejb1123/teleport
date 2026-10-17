@@ -16,6 +16,9 @@ pub(super) struct State {
     /// historical fps/4 so every client recovers by itself; lengthened once
     /// the client declares it requests keyframes on loss.
     key_interval: std::sync::atomic::AtomicU32,
+    /// Encoders: put a `protocol::FrameTiming` header in front of every
+    /// frame (the client declared `ClientFeatures::frame_timing`).
+    frame_timing: std::sync::atomic::AtomicBool,
     #[cfg(target_os = "linux")]
     pub metrics: Option<Arc<EncoderMetrics>>,
     #[cfg(target_os = "linux")]
@@ -79,6 +82,10 @@ impl State {
             frames
         };
         self.key_interval.store(frames.max(1), Ordering::Relaxed);
+    }
+    #[cfg(target_os = "linux")]
+    pub fn set_frame_timing(&self) {
+        self.frame_timing.store(true, Ordering::Relaxed);
     }
     /// The encoder heals losses by periodic intra refresh.
     #[cfg(target_os = "linux")]
@@ -1195,6 +1202,7 @@ pub(super) fn decoder(
         codec: Mutex::new(Codec::new(config(&name, format, output))?),
         keyframe: Default::default(),
         key_interval: Default::default(),
+        frame_timing: Default::default(),
         #[cfg(target_os = "linux")]
         metrics: None,
         #[cfg(target_os = "linux")]
@@ -1241,7 +1249,7 @@ pub(super) fn decoder(
                             .pts
                             .and_then(|key| stats.frame_age(key))
                             .is_some_and(|age| age > Duration::from_millis(250));
-                        let group = stats.decoded(frame.pts);
+                        let (group, latency) = stats.decoded_with_latency(frame.pts);
                         if stale {
                             stats.stale_frames.fetch_add(1, Ordering::Relaxed);
                             continue;
@@ -1290,6 +1298,7 @@ pub(super) fn decoder(
                         }
                         *latest = Some(Image {
                             decoded_at: Instant::now(),
+                            latency,
                             decoder_recovery: stats.decoder_recoveries.load(Ordering::Relaxed),
                             video_group: group,
                             data,
@@ -1645,7 +1654,11 @@ pub(super) fn encoder(
     choice: impl Into<EncoderChoice>,
     format: VideoFormat,
 ) -> Result<Pipeline> {
-    let EncoderChoice { kind, preset } = choice.into();
+    let EncoderChoice {
+        kind,
+        preset,
+        frame_timing,
+    } = choice.into();
     format.validate()?;
     crate::protocol::validate_video_size(size.0, size.1)?;
     // Zero-copy capture needs a DMA-BUF source, an 8-bit stream and an
@@ -1749,7 +1762,7 @@ pub(super) fn encoder(
             )
         });
         match attempt {
-            Ok(pipeline) => return Ok(pipeline),
+            Ok(pipeline) => return Ok(frame_timing_on(pipeline, frame_timing)),
             Err(error) => {
                 ZERO_COPY_FAILED.store(true, Ordering::Relaxed);
                 tracing::warn!(
@@ -1762,6 +1775,15 @@ pub(super) fn encoder(
         }
     }
     start(source, None, codec, size, fps, bitrate, track, format)
+        .map(|pipeline| frame_timing_on(pipeline, frame_timing))
+}
+
+#[cfg(target_os = "linux")]
+fn frame_timing_on(pipeline: Pipeline, enabled: bool) -> Pipeline {
+    if enabled && let Some(state) = state(&pipeline.0) {
+        state.set_frame_timing();
+    }
+    pipeline
 }
 
 /// Build and start the capture → encode pipeline around an open encoder.
@@ -1808,6 +1830,7 @@ fn start(
         codec: Mutex::new(codec),
         keyframe: Default::default(),
         key_interval: std::sync::atomic::AtomicU32::new((fps / 4).max(1)),
+        frame_timing: Default::default(),
         metrics: Some(metrics.clone()),
         reopen: Default::default(),
     });
@@ -1937,6 +1960,15 @@ fn start(
                             }
                         }
                     }
+                    if let Some(white) = crate::media::test_flash::white()
+                        && !format.hdr()
+                        && !raw.is_empty()
+                    {
+                        // `--flash-on-input`: the whole frame black or white.
+                        let luma = size.0 as usize * size.1 as usize;
+                        raw[..luma].fill(if white { 235 } else { 16 });
+                        raw[luma..].fill(128);
+                    }
                     let unchanged = refiner.unchanged(&sample, &raw, size.0 as usize);
                     let start = Instant::now();
                     let prepare_us = start.duration_since(pulled).as_micros() as u64;
@@ -2006,6 +2038,7 @@ fn start(
                     }
                     encode_failures = 0;
                     let refresh = codec.config.intra_refresh > 0;
+                    let encoded = Instant::now();
                     for packet in packets {
                         // With intra refresh, encoders flag refresh starts as key
                         // frames too; only IDRs start a group a decoder can join.
@@ -2039,11 +2072,24 @@ fn start(
                             group = Some(track.append_group()?);
                         }
                         if let Some(group) = &mut group {
+                            let payload = match captured_at {
+                                Some(captured)
+                                    if state.frame_timing.load(Ordering::Relaxed) =>
+                                {
+                                    crate::protocol::FrameTiming {
+                                        capture_us: crate::protocol::clock_us(captured),
+                                        encoded_us: crate::protocol::clock_us(encoded),
+                                        sent_us: crate::protocol::clock_us(Instant::now()),
+                                    }
+                                    .prepend(&packet.bytes)
+                                }
+                                _ => bytes::Bytes::from(packet.bytes),
+                            };
                             group.write_frame(
                                 crate::protocol::video_timestamp(
                                     captured_at.unwrap_or_else(Instant::now),
                                 ),
-                                bytes::Bytes::from(packet.bytes),
+                                payload,
                             )?;
                         }
                         if let Some(tx) = ready_tx.take() {

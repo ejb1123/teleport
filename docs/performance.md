@@ -35,8 +35,80 @@ heartbeats, and cache their selection for that client process.
 | Decode errors | Access units the direct FFmpeg decoder rejected; each triggers one recovery rather than ending the session |
 | Stale frames | Output discarded because it was already more than 250 ms old before publication |
 
-No cross-machine wall-clock subtraction is used. Capture latency, one-way network
-latency, GPU presentation/scanout, and input-to-photon latency are **not measured**.
+The rows above are client-local. The end-to-end rows below are not: they need
+the host's clock.
+
+## End-to-end latency (capture → present)
+
+With hosts that advertise `Desktop.frame_timing`, the client declares
+`ClientFeatures.frame_timing`. The host then puts a 28-byte header in front
+of every video frame: its capture timestamp (the source's buffer time),
+when the encoder returned the frame, and when it was handed to MoQ, all on
+the host's monotonic clock. It also adds its clock to every `Pong`. Older
+peers see neither.
+
+The client estimates host clock − client clock the NTP way. It assumes each
+`Probe`/`Pong` round trip is symmetric and keeps the sample with the lowest
+round trip of the last 16 (probes go out every 200 ms until 8 are in, then
+once a second). Arrival is stamped by the update reader, not the render
+loop. The error is at most half that round trip, and less on a symmetric
+path. F8 shows that bound as `clock ±`. No new port or trust is involved:
+probes already ran over the authenticated control tracks.
+
+| F8 line | Interval | Clock |
+| --- | --- | --- |
+| Capture to present | host capture → the client's present call returns | both (estimate) |
+| capture→encode | source timestamp → encoder output, including colour conversion and the capture queue | host |
+| encode→send | encoder output → handed to MoQ (QUIC's send buffer counts as network) | host |
+| network | handed to MoQ → whole frame received | both (estimate) |
+| receive→decode | whole frame received → decoded picture ready (Receive to ready) | client |
+| decode→present | ready → present returned (render-loop pickup, upload, draw, swap) | client |
+
+Each line is p50 / p95 over the last 300 presented frames. The stages add up
+to the total. Network and the total carry the clock error, so on loopback
+they can read slightly negative. Present is the buffer swap returning, not
+scanout: the display's own processing and scanout are not in it.
+Refinement re-encodes of a still frame (R12) carry no stamps. The whole-run
+p50/p95 go to the log when the window closes (`end-to-end latency summary`)
+and into headless smoke summaries (`e2e_*_us`).
+
+`tests/network.rs` checks the estimate against the Unix clock both
+processes share on one machine (`TELEPORT_TEST_WALL_CLOCK=1`):
+`clock_offset_estimate_matches_the_wall_clock`. Every profile prints an
+`E2E` line.
+
+### Glass to glass and input to photon
+
+The software number stops at present. To include the display, and to time
+a click, use light:
+
+1. Start a test host that flashes on input:
+   `teleport host --source test --flash-on-input --encoder <kind> ...`.
+   It streams black and switches to white, then back, on every key or
+   mouse-button press it receives.
+2. Connect the client full screen on the display under test, with the
+   settings you want to measure (VSync, pacing, codec). Turn the host's own
+   monitor off or point nothing at it: only the client's screen matters.
+3. **Photodiode** (best): a photodiode or phototransistor taped to the
+   client screen, into a microcontroller or a scope. Wire the same
+   microcontroller as a USB HID mouse (or tap the mouse button with a
+   second channel). Each click starts a timer and the light edge stops it:
+   click → photon. Repeat 100+ times; report p50/p95 and the display
+   model, refresh rate and mode.
+4. **High-speed camera** (240–1000 fps phone slow motion works): film the
+   mouse button and the screen in one shot. Count frames from the button
+   bottoming out to the screen changing. At 240 fps each frame is 4.2 ms,
+   so take 30+ clicks.
+5. Glass to glass without input: point the camera at a physical stopwatch
+   (or a second screen with a running ms counter) shown on the host, and at
+   the client's screen in the same shot. This needs a real capture source
+   (`--source portal`/`x11`), not the test pattern.
+
+To separate the display, also measure local click → photon with a local app
+that flashes on click (same screen and mode), and subtract. The software
+part of the path is measured by `flash_on_input_follows_clicks`
+(`--smoke-flash` clicks every 400 ms and times until a decoded frame flips)
+and by F8.
 
 With the Linux SDR NV12 renderer path (0.5.4), `Convert / copy` measures the
 post-decode raw queue plus any YUV normalization/download and CPU plane copy;
@@ -47,8 +119,10 @@ The normal NV12 path halves unpadded pixel bytes versus RGB24, while retaining
 CPU mapping/copying and GPU upload. This is not a fully GPU-resident pipeline.
 Use the renderer/device log and F8 to distinguish GPU-backed OpenGL from CPU
 renderers such as llvmpipe. X11 versus Wayland alone does not determine that.
-Do not add these partial numbers and label the sum end-to-end latency. A physical
-high-speed-camera test remains the acceptance method for input-to-photon latency.
+Do not add these partial client-side numbers and call the sum end-to-end
+latency; use the Capture to present line, which stamps each frame. The
+glass-to-glass rig above remains the acceptance method for input-to-photon
+latency.
 An unchanged desktop may produce fewer captured frames; requested FPS is a cap,
 not a promise of unique frames. Values shown for the latest frame are samples,
 not percentiles. HDR codec diagnostics are separate from performance telemetry.

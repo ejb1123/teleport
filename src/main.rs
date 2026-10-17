@@ -127,6 +127,8 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    // Start the frame-timing clock before any instant it may be asked about.
+    protocol::clock_us(std::time::Instant::now());
     tracing_subscriber::fmt()
         .with_ansi(std::io::stdout().is_terminal())
         .with_env_filter(

@@ -229,6 +229,11 @@ pub struct Desktop {
     /// the link cannot carry it; `None` at the negotiated stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stepped_down: Option<SteppedDown>,
+    /// Host stamps video frames with [`FrameTiming`] and answers probes with
+    /// its clock (`Update::Pong::host_us`) once the client declares
+    /// `ClientFeatures::frame_timing`; older hosts do neither.
+    #[serde(default)]
+    pub frame_timing: bool,
 }
 
 /// A network step-down: the negotiated stream, and the bitrate that made the
@@ -356,6 +361,10 @@ pub enum Update {
     },
     Pong {
         id: u64,
+        /// The host's [`clock_us`] when it answered, only to clients that
+        /// declared `ClientFeatures::frame_timing` (clock-offset estimate).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_us: Option<u64>,
     },
     Desktop {
         desktop: Desktop,
@@ -578,6 +587,11 @@ pub enum Event {
         /// there when it leaves relative mode). Older hosts ignore the field.
         #[serde(default)]
         cursor_positions: bool,
+        /// The client strips a [`FrameTiming`] header from video frames and
+        /// reads `Update::Pong::host_us`. Only sent to hosts advertising
+        /// `Desktop::frame_timing`; older hosts ignore the field.
+        #[serde(default)]
+        frame_timing: bool,
     },
     /// The session's video codec. Sent as the very first input event to hosts
     /// advertising `Desktop::codec_selection`, which wait for it before
@@ -939,6 +953,64 @@ pub async fn read_timed_frame(
     Ok(Some((timestamp, arrived, frame.read_all().await?)))
 }
 
+/// Microseconds on this process's monotonic clock from its first use, which
+/// `main` makes the process start (earlier instants would all read 0).
+/// Hosts stamp [`FrameTiming`] and `Update::Pong::host_us` with it; clients
+/// map those onto their own clock with an NTP-style offset estimate
+/// (`crate::stats::ClockSync`). Never a wall clock.
+pub fn clock_us(at: std::time::Instant) -> u64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let origin = *ORIGIN.get_or_init(std::time::Instant::now);
+    at.saturating_duration_since(origin).as_micros() as u64
+}
+
+/// Host-side times of one video frame on the host's [`clock_us`]: captured
+/// (the source's timestamp), out of the encoder, and handed to MoQ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameTiming {
+    pub capture_us: u64,
+    pub encoded_us: u64,
+    pub sent_us: u64,
+}
+
+/// Starts a [`FrameTiming`] header. Annex B access units always start with
+/// a zero byte, so a frame starting with this is never video.
+const FRAME_TIMING_MAGIC: [u8; 4] = *b"TPT1";
+const FRAME_TIMING_LEN: usize = 4 + 3 * 8;
+
+impl FrameTiming {
+    /// `payload` with this header in front (`ClientFeatures::frame_timing`).
+    pub fn prepend(&self, payload: &[u8]) -> bytes::Bytes {
+        let mut out = Vec::with_capacity(FRAME_TIMING_LEN + payload.len());
+        out.extend_from_slice(&FRAME_TIMING_MAGIC);
+        for value in [self.capture_us, self.encoded_us, self.sent_us] {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out.extend_from_slice(payload);
+        out.into()
+    }
+
+    /// Splits the header off a received frame; frames without one come back
+    /// unchanged. Inconsistent times (not capture ≤ encoded ≤ sent) are
+    /// dropped with the header.
+    pub fn split(frame: bytes::Bytes) -> (Option<Self>, bytes::Bytes) {
+        if frame.len() < FRAME_TIMING_LEN || frame[..4] != FRAME_TIMING_MAGIC {
+            return (None, frame);
+        }
+        let value = |index: usize| {
+            let start = 4 + index * 8;
+            u64::from_le_bytes(frame[start..start + 8].try_into().unwrap())
+        };
+        let timing = Self {
+            capture_us: value(0),
+            encoded_us: value(1),
+            sent_us: value(2),
+        };
+        let valid = timing.capture_us <= timing.encoded_us && timing.encoded_us <= timing.sent_us;
+        (valid.then_some(timing), frame.slice(FRAME_TIMING_LEN..))
+    }
+}
+
 /// Test harnesses only (`TELEPORT_TEST_WALL_CLOCK=1` on both ends of one
 /// machine): video frames carry their capture time on the Unix clock instead
 /// of moq's jittered local clock, so the client can measure capture→ready.
@@ -1199,6 +1271,7 @@ mod tests {
                 local_cursor: true,
                 rumble: true,
                 cursor_positions: true,
+                frame_timing: true,
             },
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
@@ -1351,6 +1424,7 @@ mod tests {
                 local_cursor: false,
                 rumble: false,
                 cursor_positions: false,
+                frame_timing: false,
             }
         ));
         let primary: Event = serde_json::from_str(r#"{"type":"request_keyframe"}"#).unwrap();
@@ -1803,5 +1877,61 @@ mod tests {
         assert_eq!(refresh_hz(179_960), 180);
         assert_eq!(refresh_hz(59_940), 60);
         assert_eq!(refresh_hz(0), 0);
+    }
+
+    #[test]
+    fn frame_timing_header_roundtrips_and_is_negotiated() {
+        let timing = FrameTiming {
+            capture_us: 1_000,
+            encoded_us: 4_500,
+            sent_us: 4_600,
+        };
+        let video = bytes::Bytes::from_static(&[0, 0, 0, 1, 0x65, 0x88]);
+        let (parsed, payload) = FrameTiming::split(timing.prepend(&video));
+        assert_eq!(parsed, Some(timing));
+        assert_eq!(payload, video);
+        // Plain Annex B (older hosts, or before the client declared) is untouched.
+        assert_eq!(FrameTiming::split(video.clone()), (None, video.clone()));
+        // Times out of order are discarded; the payload is still stripped.
+        let backwards = FrameTiming {
+            capture_us: 5_000,
+            ..timing
+        };
+        assert_eq!(
+            FrameTiming::split(backwards.prepend(&video)),
+            (None, video.clone())
+        );
+        // Off unless the host says so; a Pong without host_us still parses
+        // and host_us is only on the wire when set.
+        let desktop: Desktop = serde_json::from_value(serde_json::json!({ "version": 2,
+            "width": 1, "height": 1, "fps": 1, "source": "test", "monitors": [],
+            "active_monitor": 0, "audio": false, "clipboard": false }))
+        .unwrap();
+        assert!(!desktop.frame_timing);
+        assert!(matches!(
+            serde_json::from_str::<Update>(r#"{"type":"pong","id":3}"#).unwrap(),
+            Update::Pong {
+                id: 3,
+                host_us: None
+            }
+        ));
+        let wire = serde_json::to_string(&Update::Pong {
+            id: 4,
+            host_us: Some(77),
+        })
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Update>(&wire).unwrap(),
+            Update::Pong {
+                id: 4,
+                host_us: Some(77)
+            }
+        ));
+        let plain = serde_json::to_string(&Update::Pong {
+            id: 4,
+            host_us: None,
+        })
+        .unwrap();
+        assert!(!plain.contains("host_us"));
     }
 }

@@ -1,6 +1,8 @@
-//! Client-local measurements. No cross-machine clock subtraction.
+//! Client-local measurements, plus end-to-end latency from host timestamps
+//! mapped onto this clock by an NTP-style offset estimate ([`ClockSync`]).
+use crate::protocol::{FrameTiming, clock_us};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -15,6 +17,194 @@ struct PendingFrame {
     group: u64,
     /// Capture→receipt, only in test wall-clock mode (protocol::test_wall_clock).
     captured_age: Option<Duration>,
+    /// The host's stamps, from hosts that send them (`Desktop::frame_timing`).
+    host: Option<FrameTiming>,
+}
+
+/// One decoded frame's path so far: the host's stamps (host clock) and when
+/// it was received and decoded here (`protocol::clock_us`, client clock).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameLatency {
+    pub host: FrameTiming,
+    pub received_us: u64,
+    pub ready_us: u64,
+    /// Capture→receipt on the Unix clock, in test wall-clock mode only: the
+    /// reference the offset estimate is checked against on one machine.
+    pub wall_capture_to_received_us: Option<u64>,
+}
+
+/// Microseconds per stage of one presented frame. Network and the total
+/// cross machines and carry the clock estimate's error (at most half the
+/// best probe's round trip, less on a symmetric path), so they are signed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stages {
+    pub capture_encode: i64,
+    pub encode_send: i64,
+    pub network: i64,
+    pub receive_decode: i64,
+    pub decode_present: i64,
+    pub total: i64,
+}
+
+impl Stages {
+    fn values(&self) -> [i64; 6] {
+        [
+            self.capture_encode,
+            self.encode_send,
+            self.network,
+            self.receive_decode,
+            self.decode_present,
+            self.total,
+        ]
+    }
+}
+
+impl FrameLatency {
+    /// Stages of this frame shown at `presented_us` (client clock), with
+    /// `offset_us` = host clock − client clock.
+    pub fn stages(&self, presented_us: u64, offset_us: i64) -> Stages {
+        let local = |host_us: u64| host_us as i64 - offset_us;
+        let host = self.host;
+        Stages {
+            capture_encode: host.encoded_us as i64 - host.capture_us as i64,
+            encode_send: host.sent_us as i64 - host.encoded_us as i64,
+            network: self.received_us as i64 - local(host.sent_us),
+            receive_decode: self.ready_us as i64 - self.received_us as i64,
+            decode_present: presented_us as i64 - self.ready_us as i64,
+            total: presented_us as i64 - local(host.capture_us),
+        }
+    }
+
+    /// Estimated minus wall-clock capture→`presented_us`, in test
+    /// wall-clock mode: the offset estimate's error for this frame.
+    pub fn clock_error_us(&self, presented_us: u64, offset_us: i64) -> Option<i64> {
+        let wall = self.wall_capture_to_received_us? as i64
+            + (presented_us as i64 - self.received_us as i64);
+        Some(self.stages(presented_us, offset_us).total - wall)
+    }
+}
+
+/// Probe samples kept; at one probe a second the best of the last ~16 s,
+/// short enough that clock drift (tens of ppm) stays well under 1 ms.
+const CLOCK_SAMPLES: usize = 16;
+
+/// NTP-style estimate of host clock − client clock from control probes:
+/// each `Probe`/`Pong` round trip gives the host's time against the
+/// midpoint of the client's send and receive (symmetric paths assumed). The
+/// sample with the lowest round trip, the least queueing, wins.
+#[derive(Default)]
+pub struct ClockSync {
+    /// (round trip µs, offset µs), oldest first.
+    samples: VecDeque<(u64, i64)>,
+}
+
+impl ClockSync {
+    pub fn observe(&mut self, sent: Instant, received: Instant, host_us: u64) {
+        let (sent, received) = (clock_us(sent), clock_us(received));
+        let Some(rtt) = received.checked_sub(sent) else {
+            return;
+        };
+        let midpoint = sent + rtt / 2;
+        self.samples
+            .push_back((rtt, host_us as i64 - midpoint as i64));
+        while self.samples.len() > CLOCK_SAMPLES {
+            self.samples.pop_front();
+        }
+    }
+
+    /// (host − client offset, round trip of the sample it came from), both µs.
+    pub fn offset(&self) -> Option<(i64, u64)> {
+        self.samples
+            .iter()
+            .min_by_key(|(rtt, _)| *rtt)
+            .map(|&(rtt, offset)| (offset, rtt))
+    }
+
+    /// Probe quickly until a few samples are in, then once a second.
+    pub fn probe_interval(&self) -> Duration {
+        if self.samples.len() < 8 {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(1)
+        }
+    }
+}
+
+/// Frames in the F8 window (a few seconds at typical rates).
+const RECENT_FRAMES: usize = 300;
+/// Whole-run samples kept for summaries (tests, logs).
+const RUN_FRAMES: usize = 100_000;
+
+/// End-to-end stage samples of presented frames: a recent window for F8 and
+/// the whole run for summaries.
+#[derive(Default)]
+pub struct LatencyStats {
+    recent: VecDeque<Stages>,
+    run: Vec<Stages>,
+    clock_errors: Vec<i64>,
+}
+
+impl LatencyStats {
+    /// A frame was presented (or taken by a headless client) at `presented`.
+    pub fn presented(&mut self, latency: &FrameLatency, presented: Instant, clock: &ClockSync) {
+        let Some((offset, _)) = clock.offset() else {
+            return;
+        };
+        let presented_us = clock_us(presented);
+        let stages = latency.stages(presented_us, offset);
+        self.recent.push_back(stages);
+        while self.recent.len() > RECENT_FRAMES {
+            self.recent.pop_front();
+        }
+        if self.run.len() < RUN_FRAMES {
+            self.run.push(stages);
+            if let Some(error) = latency.clock_error_us(presented_us, offset) {
+                self.clock_errors.push(error);
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.recent.is_empty()
+    }
+
+    /// (p50, p95) µs of each stage in field order (capture→encode … total), over the
+    /// recent window or the whole run.
+    pub fn percentiles(&self, whole_run: bool) -> [(i64, i64); 6] {
+        let samples: Vec<Stages> = if whole_run {
+            self.run.clone()
+        } else {
+            self.recent.iter().copied().collect()
+        };
+        let mut result = [(0, 0); 6];
+        for (index, slot) in result.iter_mut().enumerate() {
+            let mut values: Vec<i64> = samples.iter().map(|s| s.values()[index]).collect();
+            *slot = (percentile(&mut values, 50), percentile(&mut values, 95));
+        }
+        result
+    }
+
+    /// Whole-run frames measured.
+    pub fn frames(&self) -> usize {
+        self.run.len()
+    }
+
+    /// (frames checked, median, largest absolute) estimate − wall-clock
+    /// error in µs; frames only in test wall-clock mode.
+    pub fn clock_error(&self) -> (usize, i64, i64) {
+        let mut errors = self.clock_errors.clone();
+        let worst = errors.iter().map(|e| e.abs()).max().unwrap_or(0);
+        (errors.len(), percentile(&mut errors, 50), worst)
+    }
+}
+
+/// `p`th percentile (nearest rank); 0 when empty. Sorts `values`.
+pub fn percentile(values: &mut [i64], p: usize) -> i64 {
+    values.sort_unstable();
+    values
+        .get((values.len() * p / 100).min(values.len().saturating_sub(1)))
+        .copied()
+        .unwrap_or(0)
 }
 
 #[derive(Default, Clone, Copy)]
@@ -98,15 +288,17 @@ impl Default for StreamStats {
 impl StreamStats {
     #[cfg(test)]
     pub fn received(&self, bytes: usize, video_group: u64) -> u64 {
-        self.received_frame(bytes, video_group, None)
+        self.received_frame(bytes, video_group, None, None)
     }
 
-    /// [`Self::received`] with the frame's capture→receipt age, when known.
+    /// [`Self::received`] with the frame's capture→receipt age (test
+    /// wall-clock mode) and the host's stamps, when known.
     pub fn received_frame(
         &self,
         bytes: usize,
         video_group: u64,
         captured_age: Option<Duration>,
+        host: Option<FrameTiming>,
     ) -> u64 {
         self.received_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
@@ -128,6 +320,7 @@ impl StreamStats {
                 output: None,
                 group: video_group,
                 captured_age,
+                host,
             },
         );
         while pending.len() > 256 {
@@ -198,6 +391,12 @@ impl StreamStats {
     }
 
     pub fn decoded(&self, pts: Option<u64>) -> Option<u64> {
+        self.decoded_with_latency(pts).0
+    }
+
+    /// [`Self::decoded`], plus the frame's end-to-end record when the host
+    /// stamped it.
+    pub fn decoded_with_latency(&self, pts: Option<u64>) -> (Option<u64>, Option<FrameLatency>) {
         self.decoded_frames.fetch_add(1, Ordering::Relaxed);
         let now = Instant::now();
         let mut pending = self.pending.lock().unwrap();
@@ -248,7 +447,15 @@ impl StreamStats {
             sums.1 += 1;
         }
         *self.timings.lock().unwrap() = timings;
-        matched.map(|frame| frame.group)
+        let latency = matched.as_ref().and_then(|frame| {
+            Some(FrameLatency {
+                host: frame.host?,
+                received_us: clock_us(frame.received),
+                ready_us: clock_us(now),
+                wall_capture_to_received_us: frame.captured_age.map(|age| age.as_micros() as u64),
+            })
+        });
+        (matched.map(|frame| frame.group), latency)
     }
 
     /// Whole-run means in microseconds: (receive→ready, compressed queue,
@@ -435,5 +642,90 @@ mod tests {
             stats.received(10, 5);
         }
         assert_eq!(stats.decoded(Some(evicted)), None);
+    }
+
+    #[test]
+    fn clock_offset_uses_the_least_queued_probe() {
+        let mut clock = ClockSync::default();
+        assert_eq!(clock.offset(), None);
+        assert_eq!(clock.probe_interval(), Duration::from_millis(200));
+        // After the clock's origin, which its first use sets.
+        let base = Instant::now() + Duration::from_secs(1);
+        let at = |ms: u64| base + Duration::from_millis(ms);
+        // Host clock runs 5 s ahead. A 40 ms round trip that took 30 ms out
+        // and 10 ms back reads 10 ms too far ahead.
+        let host = |client_ms: u64| clock_us(at(client_ms)) + 5_000_000;
+        clock.observe(at(0), at(40), host(30));
+        assert_eq!(clock.offset(), Some((5_000_000 + 10_000, 40_000)));
+        // A clean 10 ms round trip (5 ms each way) replaces it.
+        clock.observe(at(100), at(110), host(105));
+        assert_eq!(clock.offset(), Some((5_000_000, 10_000)));
+        // A reply "before" its probe is ignored; old samples age out.
+        clock.observe(at(200), at(150), host(0));
+        for index in 0..CLOCK_SAMPLES as u64 {
+            clock.observe(
+                at(1000 + index * 100),
+                at(1020 + index * 100),
+                host(1012 + index * 100),
+            );
+        }
+        assert_eq!(clock.offset(), Some((5_000_000 + 2_000, 20_000)));
+        assert_eq!(clock.probe_interval(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn stages_add_up_to_capture_to_present() {
+        let mut clock = ClockSync::default();
+        let base = Instant::now() + Duration::from_secs(1);
+        let client = |ms: u64| clock_us(base + Duration::from_millis(ms));
+        // Host clock 2 s ahead of this one; a symmetric 4 ms round trip.
+        let offset = 2_000_000_i64;
+        let host = |client_us: u64| (client_us as i64 + offset) as u64;
+        clock.observe(base, base + Duration::from_millis(4), host(client(2)));
+        let latency = FrameLatency {
+            host: FrameTiming {
+                capture_us: host(client(0)),
+                encoded_us: host(client(6)),
+                sent_us: host(client(7)),
+            },
+            received_us: client(10),
+            ready_us: client(14),
+            wall_capture_to_received_us: Some(9_000),
+        };
+        let presented = base + Duration::from_millis(17);
+        let stages = latency.stages(clock_us(presented), offset);
+        assert_eq!(
+            stages,
+            Stages {
+                capture_encode: 6_000,
+                encode_send: 1_000,
+                network: 3_000,
+                receive_decode: 4_000,
+                decode_present: 3_000,
+                total: 17_000,
+            }
+        );
+        // The wall clock puts capture 1 ms later than the estimate does.
+        assert_eq!(
+            latency.clock_error_us(clock_us(presented), offset),
+            Some(1_000)
+        );
+        let mut stats = LatencyStats::default();
+        stats.presented(&latency, presented, &ClockSync::default());
+        assert!(stats.is_empty(), "no estimate yet, nothing recorded");
+        stats.presented(&latency, presented, &clock);
+        assert_eq!(stats.percentiles(false)[5], (17_000, 17_000));
+        assert_eq!(stats.percentiles(true)[2], (3_000, 3_000));
+        assert_eq!(stats.clock_error(), (1, 1_000, 1_000));
+        // The decoded frame carries the host stamps to the presenter.
+        let stats = StreamStats::default();
+        let key = stats.received_frame(10, 1, None, Some(latency.host));
+        let (group, decoded) = stats.decoded_with_latency(Some(key));
+        assert_eq!(group, Some(1));
+        let decoded = decoded.unwrap();
+        assert_eq!(decoded.host, latency.host);
+        assert!(decoded.ready_us >= decoded.received_us);
+        let plain = stats.received(10, 2);
+        assert_eq!(stats.decoded_with_latency(Some(plain)), (Some(2), None));
     }
 }

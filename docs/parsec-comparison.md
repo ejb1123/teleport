@@ -588,8 +588,9 @@ What is on `main`/this branch, from README, docs and code:
 - **Stats (F8):** requested, accepted and current bitrate. Control RTT
   (includes scheduling). Encoded payload. Received, decoded and displayed FPS.
   Skipped groups. Decoder queue. Receive→decoded, decode stages, host encode
-  time, decoder name, renderer and pixel path. No capture time, no
-  glass-to-glass number, no warnings.
+  time, decoder name, renderer and pixel path. (Since 2026-10-17, G3:
+  capture→present p50/p95 per stage.) No glass-to-glass number, no
+  warnings.
 - **Distribution:** Nix (flake, NixOS module, systemd user unit). A native
   `.app` that depends on the Nix store; no signed installer and no Windows
   build.
@@ -658,7 +659,7 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Guest permission levels | Pad, keyboard, mouse per guest | All or nothing | Missing | |
 | Chat | Yes | No | Do not copy | |
 | Stats overlay | Rich, plus graph and warnings | Rich F8, no warnings or graph | Partial | |
-| Published latency numbers | "7 ms LAN", "4–8 ms at 240 FPS" | Component timings only | Missing | |
+| Published latency numbers | "7 ms LAN", "4–8 ms at 240 FPS" | Measured capture→present per stage in F8 (2026-10-17); no glass-to-glass number yet | Partial | G3 |
 | Teams / SSO / audit / API | Yes | No | Not a gamer gap | |
 | Installers | Signed Windows/macOS/deb/APK | Nix only | **Missing** | |
 
@@ -772,6 +773,15 @@ blocked on Mac hardware.**
 
 **G3. A published glass-to-glass latency number and harness. Effort S–M.**
 
+- **Status (2026-10-17): steps 1–2 implemented** (review tracker R13). F8
+  shows capture→present p50/p95 split into capture→encode, encode→send,
+  network, receive→decode and decode→present, from per-frame host stamps
+  and an NTP-style clock estimate over the control probes (capability-gated
+  `frame_timing`). On loopback the estimate is within ~0.5 ms of the shared
+  wall clock. Headless 640×360@30 on a clean link: 3.2 ms p50; 1080p: 12.2 ms
+  (software codecs). `--source test --flash-on-input` and the photodiode or
+  camera method in docs/performance.md time input to photon. Open: a
+  glass-to-glass number on real hardware, and step 3 (Parsec side by side).
 - **Why:** Parsec markets "adds only 7 ms on LAN" (OVR) and "4–8 ms at 240
   FPS" (B240). Teleport has component timings but no headline number, and
   "beats Parsec" needs a like-for-like measurement.

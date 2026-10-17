@@ -214,8 +214,13 @@ current target, control round-trip time, actual main-stream encoded-video payloa
 received/decoded/displayed FPS, skipped groups, superseded decoded frames,
 decoder input queue, receive-to-decoded time, decoded-frame wait, and host encoder
 time where timestamps survive. RTT includes scheduling; it is **not** one-way
-network latency or input-to-photon latency. Capture and display scanout timing
-are not measured. See [performance diagnostics](docs/performance.md).
+network latency. With updated hosts F8 also shows **capture to present**
+p50/p95, split into capture→encode, encode→send, network, receive→decode
+and decode→present: hosts stamp each frame and the client maps their clock
+onto its own from the control round trips (NTP-style). Display scanout is
+not in it; `teleport host --source test --flash-on-input` and a photodiode
+or high-speed camera time input to photon. See
+[performance diagnostics](docs/performance.md).
 
 Clipboard transfers are explicit text-only actions, limited to 64 KiB. Enable
 `--clipboard` on the host and the client (or the launcher's clipboard toggle).
@@ -359,7 +364,7 @@ to separate networking/decoding problems from portal/capture problems.
 - Auto hardware encoding with CPU x264/x265 fallback, low-delay settings and short
   keyframe groups. Frames still copy through CPU memory; zero-copy rendering
   is not implemented. FPS in the stats overlay is decoded/displayed frame
-  rate, **not** end-to-end latency.
+  rate, **not** end-to-end latency (that is the Capture to present line).
 - macOS probes VideoToolbox; Linux probes NVIDIA/VA/QSV decoding, with software
   fallback for H.264 and H.265. Actual NVIDIA output has been tested locally.
 - KDE/GNOME require working RemoteDesktop and ScreenCast portal backends.

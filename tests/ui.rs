@@ -1455,6 +1455,12 @@ fn windowed_presentation_latency() {
     println!("{summary}");
     assert!(output.status.success(), "client failed:\n{log}");
     assert!(!summary.contains(" frames=0 "), "no frames presented");
+    // G3: capture→present from host stamps and the clock estimate.
+    let end_to_end = log
+        .lines()
+        .find(|line| line.contains("end-to-end latency summary"))
+        .unwrap_or_else(|| panic!("no end-to-end summary:\n{log}"));
+    println!("{end_to_end}");
     drop(host);
 }
 

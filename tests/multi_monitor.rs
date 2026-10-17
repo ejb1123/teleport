@@ -262,7 +262,10 @@ async fn independent_monitors_share_one_authenticated_session_and_restart_safely
     send(&mut input, &mut sequence, protocol::Event::Probe { id: 99 })?;
     assert!(matches!(
         update(&mut updates).await?,
-        protocol::Update::Pong { id: 99 }
+        protocol::Update::Pong {
+            id: 99,
+            host_us: None,
+        }
     ));
     assert!(matches!(
         update(&mut updates).await?,
