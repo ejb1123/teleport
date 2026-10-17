@@ -75,8 +75,9 @@ fn run(scenario: &Scenario) -> Outcome {
 ip link set lo up
 sysctl -qw net.ipv4.ip_forward=1
 pids=""
-cleanup() {{ for pid in $pids; do kill $pid 2>/dev/null || true; done; }}
+cleanup() {{ for pid in $pids; do kill $pid 2>/dev/null || true; done; wait 2>/dev/null || true; }}
 trap cleanup EXIT
+trap 'exit 130' INT TERM
 # A network namespace is a sleeping process; nsenter joins it.
 namespace() {{ unshare -n sleep 600 >/dev/null 2>&1 & pids="$pids $!"; eval "$1=$!"; }}
 namespace RELAY; namespace NATA; namespace HOST; namespace NATB; namespace CLIENT
@@ -117,7 +118,9 @@ if [ {block} = 1 ]; then
     iptables -A FORWARD -p udp -s 198.51.100.0/24 -d 203.0.113.0/24 -j DROP
     iptables -A FORWARD -p udp -s 203.0.113.0/24 -d 198.51.100.0/24 -j DROP
 fi
-at $RELAY "$TELEPORT" relay --listen 0.0.0.0:4444 --key {key} >"$DIR/relay.log" 2>&1 &
+# Backgrounded directly (not through `at`): `$!` must be the teleport
+# process itself, which nsenter -n becomes, or cleanup misses it.
+nsenter -t $RELAY -n "$TELEPORT" relay --listen 0.0.0.0:4444 --key {key} >"$DIR/relay.log" 2>&1 &
 pids="$pids $!"
 tries=0
 until grep -q "RELAY FINGERPRINT" "$DIR/relay.log"; do
@@ -125,7 +128,7 @@ until grep -q "RELAY FINGERPRINT" "$DIR/relay.log"; do
     sleep 0.05
 done
 FP=$(sed -n 's/^RELAY FINGERPRINT //p' "$DIR/relay.log")
-at $HOST env TELEPORT_TEST_PATTERN=ball "$TELEPORT" host --source test --encoder software \
+nsenter -t $HOST -n env TELEPORT_TEST_PATTERN=ball "$TELEPORT" host --source test --encoder software \
     --listen 0.0.0.0:4443 --width 640 --fps 30 --bitrate 2000 --identity-dir "$DIR/identity" \
     --relay moqt://192.0.2.10:4444 --relay-fingerprint "$FP" --relay-key {key} {host_args} \
     >"$DIR/host.log" 2>&1 &
