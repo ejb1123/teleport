@@ -614,6 +614,7 @@ impl Capture {
             | Event::Probe { .. }
             | Event::ConfigureVideo { .. }
             | Event::Feedback { .. }
+            | Event::NetworkFeedback { .. }
             | Event::Clipboard { .. }
             | Event::ClipboardRequest
             | Event::RequestKeyframe { .. }

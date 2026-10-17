@@ -1531,6 +1531,7 @@ fn start(
         pending: Mutex::default(),
         encode_us: std::sync::atomic::AtomicU64::new(0),
         totals: Mutex::default(),
+        sizes: Mutex::default(),
     });
     let state = Arc::new(State {
         codec: Mutex::new(codec),
@@ -1733,10 +1734,9 @@ fn start(
                             .pts
                             .and_then(|pts| metrics.pending.lock().unwrap().remove(&pts))
                             .map(|at| at.elapsed());
-                        let capture = packet
-                            .pts
-                            .and_then(|pts| captured.remove(&pts))
-                            .map(|at| at.elapsed());
+                        let captured_at = packet.pts.and_then(|pts| captured.remove(&pts));
+                        let capture = captured_at.map(|at| at.elapsed());
+                        metrics.record_packet(packet.bytes.len(), packet.key);
                         metrics.encode_us.store(
                             elapsed.map_or(0, |elapsed| elapsed.as_micros().max(1) as u64),
                             Ordering::Relaxed,
@@ -1756,7 +1756,9 @@ fn start(
                         }
                         if let Some(group) = &mut group {
                             group.write_frame(
-                                moq_net::Timestamp::now(),
+                                crate::protocol::video_timestamp(
+                                    captured_at.unwrap_or_else(Instant::now),
+                                ),
                                 bytes::Bytes::from(packet.bytes),
                             )?;
                         }

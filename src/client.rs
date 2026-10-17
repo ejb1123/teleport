@@ -1233,6 +1233,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let local_notices = updates_sender.clone();
     let network_stats = stream_stats.clone();
     let keyframe_requests = desktop.keyframe_requests;
+    let network_feedback = desktop.network_feedback;
     // IETF MoQ Transport sessions (provider relays) deliver no datagrams.
     let pointer_datagrams =
         desktop.pointer_datagrams && !options.reliable_pointer && link.session.version().is_lite();
@@ -1243,7 +1244,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let _broadcast = link._broadcast;
         let result = tokio::select! {
             result = crate::ssh_agent::closed(&mut ssh_agent) => result,
-            result = media::receive_video_with_stats(link.video, source, feedback, network_stats, keyframe_requests) => result,
+            result = media::receive_video_with_stats(link.video, source, feedback, network_stats, keyframe_requests, network_feedback) => result,
             result = send_input(link.input, link.pointer, pointer_datagrams, receiver, link.input_sequence) => result,
             result = receive_updates(link.updates, updates_sender) => result,
             result = async {
@@ -1315,9 +1316,16 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     }
     if let Some(frames) = options.headless_frames {
         ensure!(frames > 0, "headless frame count must be positive");
-        let deadline = Instant::now() + Duration::from_secs(20);
+        // Long network-condition runs get ~3x real time at 30 FPS.
+        let deadline = Instant::now()
+            + Duration::from_secs(20).max(Duration::from_millis(u64::from(frames) * 100));
         let mut count = 0;
-        // Delivery timing for network-condition tests: span and longest stall.
+        // Delivery timing for network-condition tests: span, longest stall and
+        // freezes (gaps over 100 ms: count and total time).
+        let mut freezes = 0_u64;
+        let mut freeze_ms = 0_u64;
+        // Received bytes and time at the halfway frame: the tail is the steady state.
+        let mut halfway: Option<(u64, Instant)> = None;
         let mut first_frame_at: Option<Instant> = None;
         let mut last_frame_at: Option<Instant> = None;
         let mut max_frame_gap = Duration::ZERO;
@@ -1427,9 +1435,16 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 let now = Instant::now();
                 if let Some(last) = last_frame_at {
                     max_frame_gap = max_frame_gap.max(now - last);
+                    if now - last > Duration::from_millis(100) {
+                        freezes += 1;
+                        freeze_ms += (now - last).as_millis() as u64;
+                    }
                 }
                 first_frame_at.get_or_insert(now);
                 last_frame_at = Some(now);
+                if count == frames / 2 {
+                    halfway = Some((stream_stats.received_bytes.load(Ordering::Relaxed), now));
+                }
                 if options.smoke_clipboard && count == 5 {
                     ensure!(
                         options.clipboard && desktop.clipboard,
@@ -1596,13 +1611,30 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         };
         let (probe_p50_us, probe_p95_us) = (probe_percentile(50), probe_percentile(95));
         let probe_max_us = probe_rtts.last().map_or(0, |rtt| rtt.as_micros() as u64);
+        let (latency_p50_us, latency_p95_us, latency_max_us) = stream_stats.capture_to_ready_us();
         let span_ms = first_frame_at
             .zip(last_frame_at)
             .map_or(0, |(first, last)| (last - first).as_millis() as u64);
+        let (tail_bytes, tail_ms) =
+            halfway
+                .zip(last_frame_at)
+                .map_or((0, 0), |((bytes, at), last)| {
+                    (
+                        snapshot.received_bytes.saturating_sub(bytes),
+                        (last - at).as_millis() as u64,
+                    )
+                });
         tracing::info!(
             frames = count,
             span_ms,
             max_frame_gap_ms = max_frame_gap.as_millis() as u64,
+            freezes,
+            freeze_ms,
+            tail_bytes,
+            tail_ms,
+            latency_p50_us,
+            latency_p95_us,
+            latency_max_us,
             probes = probe_rtts.len(),
             probe_p50_us,
             probe_p95_us,
@@ -2460,6 +2492,18 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         (Some(_), false) => "requested (older host)",
                     }
                 ),
+                match desktop.stepped_down {
+                    Some(step) => format!(
+                        "Network step-down     from {} wide at {} fps   |   link ~{:.1} Mbps",
+                        step.width,
+                        step.fps,
+                        f64::from(step.kbps) / 1000.0
+                    ),
+                    None if desktop.network_feedback => {
+                        "Network step-down     none (full negotiated stream)".into()
+                    }
+                    None => "Network step-down     not supported by host".into(),
+                },
                 format!(
                     "Local display         {} x {} px at {}   |   {presentation}",
                     local_display.width,
