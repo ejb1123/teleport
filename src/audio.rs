@@ -247,7 +247,9 @@ pub async fn receive(mut track: moq_net::track::Subscriber, source: AppSrc) -> R
             }
             crate::media::MediaEvent::Frame(packet) => {
                 current = None;
-                let Ok(Some(bytes)) = packet else { continue };
+                let Ok(Some((_, _, bytes))) = packet else {
+                    continue;
+                };
                 ensure!(
                     source.current_level_bytes() < 65536,
                     "audio decoder is not keeping up"

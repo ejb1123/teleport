@@ -13,6 +13,8 @@ struct PendingFrame {
     entered: Option<Instant>,
     output: Option<Instant>,
     group: u64,
+    /// Capture→receipt, only in test wall-clock mode (protocol::test_wall_clock).
+    captured_age: Option<Duration>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -31,6 +33,8 @@ pub struct StreamStats {
     timings: Mutex<Timings>,
     /// Sums over every matched frame, for whole-run means (Timings is latest-only).
     timing_sums: Mutex<(Timings, u64)>,
+    /// Capture→ready per decoded frame (µs), in test wall-clock mode only.
+    capture_to_ready_us: Mutex<Vec<u64>>,
     pub received_bytes: AtomicU64,
     pub received_frames: AtomicU64,
     pub decoded_frames: AtomicU64,
@@ -74,6 +78,7 @@ impl Default for StreamStats {
             last_key: AtomicU64::new(0),
             timings: Mutex::default(),
             timing_sums: Mutex::default(),
+            capture_to_ready_us: Mutex::default(),
             received_bytes: AtomicU64::new(0),
             received_frames: AtomicU64::new(0),
             decoded_frames: AtomicU64::new(0),
@@ -91,7 +96,18 @@ impl Default for StreamStats {
 }
 
 impl StreamStats {
+    #[cfg(test)]
     pub fn received(&self, bytes: usize, video_group: u64) -> u64 {
+        self.received_frame(bytes, video_group, None)
+    }
+
+    /// [`Self::received`] with the frame's capture→receipt age, when known.
+    pub fn received_frame(
+        &self,
+        bytes: usize,
+        video_group: u64,
+        captured_age: Option<Duration>,
+    ) -> u64 {
         self.received_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
         self.received_frames.fetch_add(1, Ordering::Relaxed);
@@ -111,6 +127,7 @@ impl StreamStats {
                 entered: None,
                 output: None,
                 group: video_group,
+                captured_age,
             },
         );
         while pending.len() > 256 {
@@ -216,6 +233,12 @@ impl StreamStats {
                     .output
                     .map_or(0, |output| micros(now.saturating_duration_since(output))),
             });
+        if let Some(age) = matched.as_ref().and_then(|frame| frame.captured_age) {
+            let mut latencies = self.capture_to_ready_us.lock().unwrap();
+            if latencies.len() < 100_000 {
+                latencies.push(age.as_micros() as u64 + timings.total_us);
+            }
+        }
         if matched.is_some() {
             let mut sums = self.timing_sums.lock().unwrap();
             sums.0.total_us += timings.total_us;
@@ -239,6 +262,20 @@ impl StreamStats {
             mean(sum.decoder_us),
             mean(sum.conversion_us),
         )
+    }
+
+    /// Capture→ready (p50, p95, max) in µs over every decoded frame; zero
+    /// unless both ends run in test wall-clock mode.
+    pub fn capture_to_ready_us(&self) -> (u64, u64, u64) {
+        let mut latencies = self.capture_to_ready_us.lock().unwrap().clone();
+        latencies.sort_unstable();
+        let at = |p: usize| {
+            latencies
+                .get((latencies.len() * p / 100).min(latencies.len().saturating_sub(1)))
+                .copied()
+                .unwrap_or(0)
+        };
+        (at(50), at(95), latencies.last().copied().unwrap_or(0))
     }
 
     pub fn snapshot(&self) -> Snapshot {

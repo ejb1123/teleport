@@ -221,6 +221,23 @@ pub struct Desktop {
     /// The host's preset for clients that do not choose one.
     #[serde(default)]
     pub encoder_preset: EncoderPreset,
+    /// Host accepts `Event::NetworkFeedback` and controls the bitrate from
+    /// it (src/congestion.rs); older hosts reject unknown events.
+    #[serde(default)]
+    pub network_feedback: bool,
+    /// Set while the host streams below the negotiated size or rate because
+    /// the link cannot carry it; `None` at the negotiated stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stepped_down: Option<SteppedDown>,
+}
+
+/// A network step-down: the negotiated stream, and the bitrate that made the
+/// host leave it.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SteppedDown {
+    pub width: u32,
+    pub fps: u32,
+    pub kbps: u32,
 }
 
 impl Desktop {
@@ -579,6 +596,14 @@ pub enum Event {
     /// display, size or refresh rate changes. Only sent to hosts advertising
     /// `Desktop::display_negotiation`.
     ClientDisplay(ClientDisplay),
+    /// Every ~100 ms of video: the mean queueing delay of frame arrivals
+    /// above the lowest one-way time seen recently (`None` when no frame
+    /// arrived) and the rate received. Only sent to hosts advertising
+    /// `Desktop::network_feedback`.
+    NetworkFeedback {
+        delay_ms: Option<u32>,
+        received_kbps: u32,
+    },
 }
 
 /// What the client shows video on, and what the user asked for.
@@ -639,6 +664,7 @@ impl Event {
                 | Self::MonitorMotion { .. }
                 | Self::Scroll { .. }
                 | Self::Feedback { .. }
+                | Self::NetworkFeedback { .. }
                 | Self::MonitorFeedback { .. }
                 | Self::Probe { .. }
                 | Self::Ping
@@ -711,6 +737,13 @@ impl Event {
             } => ensure!(
                 *queue_ms <= 60_000 && *dropped_groups <= 100_000,
                 "invalid video feedback"
+            ),
+            Self::NetworkFeedback {
+                delay_ms,
+                received_kbps,
+            } => ensure!(
+                delay_ms.is_none_or(|delay| delay <= 60_000) && *received_kbps <= 10_000_000,
+                "invalid network feedback"
             ),
             Self::GamepadConnected { pad, name } => ensure!(
                 *pad < MAX_GAMEPADS
@@ -857,11 +890,84 @@ pub async fn read_frame(
     group: &mut moq_net::group::Consumer,
     limit: usize,
 ) -> Result<Option<bytes::Bytes>> {
+    Ok(read_timed_frame(group, limit)
+        .await?
+        .map(|(_, _, bytes)| bytes))
+}
+
+/// Whether an Annex B access unit is an IDR (H.264) or IRAP (H.265) picture,
+/// where a decoder can start. Decided by its first slice NAL unit, so only
+/// the parameter sets in front of it are scanned. Encoders with intra
+/// refresh also flag refresh starts as key frames; those are not.
+pub fn annexb_keyframe(codec: VideoCodec, data: &[u8]) -> bool {
+    let mut index = 0;
+    while index + 3 < data.len() {
+        if data[index] != 0 || data[index + 1] != 0 || data[index + 2] != 1 {
+            index += 1;
+            continue;
+        }
+        let header = data[index + 3];
+        match codec {
+            VideoCodec::H264 => match header & 0x1f {
+                5 => return true,
+                1..=4 => return false,
+                _ => (),
+            },
+            VideoCodec::H265 => match (header >> 1) & 0x3f {
+                16..=21 => return true,
+                0..=31 => return false,
+                _ => (),
+            },
+        }
+        index += 3;
+    }
+    false
+}
+
+/// [`read_frame`] with the frame's MoQ timestamp and when its first byte
+/// arrived.
+pub async fn read_timed_frame(
+    group: &mut moq_net::group::Consumer,
+    limit: usize,
+) -> Result<Option<(moq_net::Timestamp, std::time::Instant, bytes::Bytes)>> {
     let Some(mut frame) = group.next_frame().await? else {
         return Ok(None);
     };
+    let arrived = std::time::Instant::now();
     ensure!(frame.size <= limit as u64, "frame exceeds {limit} bytes");
-    Ok(Some(frame.read_all().await?))
+    let timestamp = frame.timestamp;
+    Ok(Some((timestamp, arrived, frame.read_all().await?)))
+}
+
+/// Test harnesses only (`TELEPORT_TEST_WALL_CLOCK=1` on both ends of one
+/// machine): video frames carry their capture time on the Unix clock instead
+/// of moq's jittered local clock, so the client can measure capture→ready.
+/// Off by default; peers never compare clocks across machines.
+pub fn test_wall_clock() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("TELEPORT_TEST_WALL_CLOCK").is_some_and(|v| v == "1"))
+}
+
+/// The timestamp of a video frame captured at `captured`.
+pub fn video_timestamp(captured: std::time::Instant) -> moq_net::Timestamp {
+    if test_wall_clock()
+        && let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        && let Ok(timestamp) = moq_net::Timestamp::try_from(now.saturating_sub(captured.elapsed()))
+    {
+        return timestamp;
+    }
+    moq_net::Timestamp::now()
+}
+
+/// Capture→now of a frame stamped by [`video_timestamp`], in test mode only.
+pub fn video_frame_age(timestamp: moq_net::Timestamp) -> Option<Duration> {
+    if !test_wall_clock() {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    now.checked_sub(Duration::from(timestamp))
 }
 
 /// Control/update history must not be skipped when QUIC streams reorder.

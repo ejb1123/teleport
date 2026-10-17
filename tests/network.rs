@@ -3,9 +3,13 @@
 //! processes inside a private, unprivileged network namespace whose loopback
 //! is shaped with `tc netem` (delay applies in each direction, so RTT is twice
 //! the delay). Needs `unshare -rn`, `ip` and `tc` (iproute2, in the dev shell).
+//! A `rate` limit shapes both directions together (loopback is one device);
+//! `limit` is the bottleneck queue in packets.
 //!
-//! The summary line for every profile is printed even on success, so runs can
-//! be compared before and after transport/encoder changes.
+//! The summary lines for every profile are printed even on success, so runs
+//! can be compared before and after transport/encoder changes. Both ends run
+//! with `TELEPORT_TEST_WALL_CLOCK=1`, so the client measures capture→ready per
+//! frame (one machine, one clock). `TELEPORT_TEST_LOG_DIR` keeps both logs.
 
 use std::{collections::BTreeMap, process::Command};
 
@@ -15,9 +19,13 @@ const FPS: u32 = 30;
 struct Profile {
     name: &'static str,
     netem: &'static str,
+    /// Bottleneck capacity in kbps (`rate` in `netem`). Utilisation is the
+    /// tail rate over the lower of this and `bitrate`.
+    capacity: Option<u32>,
     bitrate: u32,
-    /// Seconds of 100% loss starting 3 s into the session.
-    blackout: Option<u32>,
+    /// Another netem setting (e.g. `loss 100%`) for this many milliseconds,
+    /// starting 3 s into the session; then `netem` again.
+    burst: Option<(&'static str, u32)>,
     /// `snow` fills the configured bitrate; `ball` compresses to almost nothing.
     pattern: &'static str,
     /// Stream ~500 Hz pointer motion and time input-path probe round trips.
@@ -26,17 +34,39 @@ struct Profile {
     reconfigure: bool,
     /// Stream width; height follows the 16:9 test source.
     width: u32,
+    frames: u32,
 }
+
+const PROFILE: Profile = Profile {
+    name: "",
+    netem: "delay 1ms",
+    capacity: None,
+    bitrate: 2000,
+    burst: None,
+    pattern: "ball",
+    input_latency: false,
+    reconfigure: false,
+    width: 640,
+    frames: FRAMES,
+};
 
 #[derive(Debug)]
 struct Outcome {
     frames: u64,
     span_ms: u64,
     max_frame_gap_ms: u64,
+    freezes: u64,
+    freeze_ms: u64,
+    latency_p50_us: u64,
+    latency_p95_us: u64,
     decoder_recoveries: u64,
     skipped_groups: u64,
     decode_errors: u64,
     received_bytes: u64,
+    /// Bytes and time over the second half of the run (after convergence).
+    tail_bytes: u64,
+    tail_ms: u64,
+    width: u64,
     probes: u64,
     probe_p50_us: u64,
     probe_p95_us: u64,
@@ -47,6 +77,30 @@ struct Outcome {
     mean_queue_us: u64,
     mean_decode_us: u64,
     mean_convert_us: u64,
+    sizes: Sizes,
+    /// Host bitrate changes and resolution/FPS steps.
+    rate_changes: usize,
+    steps: usize,
+}
+
+/// Encoded packet sizes over every encoder the host ran.
+#[derive(Debug, Default)]
+struct Sizes {
+    delta_frames: u64,
+    delta_bytes: u64,
+    keyframes: u64,
+    key_bytes: u64,
+    max_key_bytes: u64,
+    max_delta_bytes: u64,
+}
+
+impl Sizes {
+    fn mean_delta(&self) -> u64 {
+        self.delta_bytes.checked_div(self.delta_frames).unwrap_or(0)
+    }
+    fn mean_key(&self) -> u64 {
+        self.key_bytes.checked_div(self.keyframes).unwrap_or(0)
+    }
 }
 
 impl Outcome {
@@ -56,16 +110,20 @@ impl Outcome {
     fn mbps(&self) -> f64 {
         self.received_bytes as f64 * 8.0 / 1000.0 / self.span_ms.max(1) as f64
     }
+    fn tail_mbps(&self) -> f64 {
+        self.tail_bytes as f64 * 8.0 / 1000.0 / self.tail_ms.max(1) as f64
+    }
 }
 
 fn run(profile: &Profile) -> Outcome {
     let temp = tempfile::tempdir().unwrap();
-    let blackout = profile
-        .blackout
-        .map(|seconds| {
+    let burst = profile
+        .burst
+        .map(|(netem, ms)| {
             format!(
-                "( sleep 3; tc qdisc change dev lo root netem loss 100%; sleep {seconds}; \
+                "( sleep 3; tc qdisc change dev lo root netem {netem}; sleep {}; \
                  tc qdisc change dev lo root netem {} ) &",
+                f64::from(ms) / 1000.0,
                 profile.netem
             )
         })
@@ -85,15 +143,16 @@ until [ -s "$DIR/pairing.json" ]; do
     sleep 0.05
 done
 sleep 0.3
-{blackout}
+{burst}
 "$TELEPORT" client 127.0.0.1:4443 --pairing-file "$DIR/pairing.json" \
-    --headless-frames {FRAMES} --software-decoder --bitrate {bitrate} {input} {reconfigure}
+    --headless-frames {frames} --software-decoder --bitrate {bitrate} {input} {reconfigure}
 # Let the host notice the disconnect and log its encoder summary.
-sleep 0.5
+sleep 1.5
 "#,
         netem = profile.netem,
         pattern = profile.pattern,
         width = profile.width,
+        frames = profile.frames,
         input = if profile.input_latency {
             "--smoke-input-latency"
         } else {
@@ -110,10 +169,22 @@ sleep 0.5
         .args(["-rn", "sh", "-c", &script])
         .env("TELEPORT", teleport_binary())
         .env("DIR", temp.path())
+        .env("TELEPORT_TEST_WALL_CLOCK", "1")
         .output()
         .expect("unshare is required for network-condition tests");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let host_log = std::fs::read_to_string(temp.path().join("host.log")).unwrap_or_default();
+    if let Some(directory) = std::env::var_os("TELEPORT_TEST_LOG_DIR") {
+        let directory = std::path::Path::new(&directory);
+        let _ = std::fs::write(
+            directory.join(format!("{}.host.log", profile.name)),
+            &host_log,
+        );
+        let _ = std::fs::write(
+            directory.join(format!("{}.client.log", profile.name)),
+            stdout.as_bytes(),
+        );
+    }
     assert!(
         output.status.success() && stdout.contains("SMOKE PASS"),
         "[{}] session did not survive ({})\nclient stdout:\n{stdout}\nclient stderr:\n{}\nhost:\n{}",
@@ -134,14 +205,27 @@ sleep 0.5
             .and_then(|value| value.parse().ok())
             .unwrap_or_else(|| panic!("[{}] summary missing {name}: {stdout}", profile.name))
     };
+    let count = |needle: &str| {
+        host_log
+            .lines()
+            .filter(|line| line.contains(needle))
+            .count()
+    };
     let outcome = Outcome {
         frames: field("frames"),
         span_ms: field("span_ms"),
         max_frame_gap_ms: field("max_frame_gap_ms"),
+        freezes: field("freezes"),
+        freeze_ms: field("freeze_ms"),
+        latency_p50_us: field("latency_p50_us"),
+        latency_p95_us: field("latency_p95_us"),
         decoder_recoveries: field("decoder_recoveries"),
         skipped_groups: field("skipped_groups"),
         decode_errors: field("decode_errors"),
         received_bytes: field("received_bytes"),
+        tail_bytes: field("tail_bytes"),
+        tail_ms: field("tail_ms"),
+        width: field("width"),
         probes: field("probes"),
         probe_p50_us: field("probe_p50_us"),
         probe_p95_us: field("probe_p95_us"),
@@ -152,17 +236,47 @@ sleep 0.5
         mean_queue_us: field("mean_queue_us"),
         mean_decode_us: field("mean_decode_us"),
         mean_convert_us: field("mean_convert_us"),
+        sizes: host_sizes(&host_log),
+        rate_changes: count("adapted video bitrate"),
+        steps: count("stepped video"),
     };
+    let utilisation = profile
+        .capacity
+        .map(|kbps| {
+            format!(
+                " util={:.0}%",
+                outcome.tail_mbps() * 100_000.0 / f64::from(kbps.min(profile.bitrate))
+            )
+        })
+        .unwrap_or_default();
     println!(
-        "NETWORK {:<10} netem=[{}] fps={:.1} mbps={:.2} max_gap_ms={} recoveries={} skipped_groups={} decode_errors={}",
+        "NETWORK {:<10} netem=[{}] fps={:.1} mbps={:.2} tail_mbps={:.2}{utilisation} max_gap_ms={} freezes={} freeze_ms={} latency_p50_ms={:.1} latency_p95_ms={:.1} recoveries={} skipped_groups={} decode_errors={} width={} rate_changes={} steps={}",
         profile.name,
         profile.netem,
         outcome.fps(),
         outcome.mbps(),
+        outcome.tail_mbps(),
         outcome.max_frame_gap_ms,
+        outcome.freezes,
+        outcome.freeze_ms,
+        outcome.latency_p50_us as f64 / 1000.0,
+        outcome.latency_p95_us as f64 / 1000.0,
         outcome.decoder_recoveries,
         outcome.skipped_groups,
         outcome.decode_errors,
+        outcome.width,
+        outcome.rate_changes,
+        outcome.steps,
+    );
+    println!(
+        "SIZES   {:<10} keyframes={} mean_key_bytes={} max_key_bytes={} mean_delta_bytes={} max_delta_bytes={} max_key_ratio={:.1}",
+        profile.name,
+        outcome.sizes.keyframes,
+        outcome.sizes.mean_key(),
+        outcome.sizes.max_key_bytes,
+        outcome.sizes.mean_delta(),
+        outcome.sizes.max_delta_bytes,
+        outcome.sizes.max_key_bytes as f64 / outcome.sizes.mean_delta().max(1) as f64,
     );
     println!(
         "DECODE  {:<10} ready_ms={:.2} queue_ms={:.2} decode_ms={:.2} convert_ms={:.2} host_prepare_ms={:.2} host_encode_ms={:.2}",
@@ -193,13 +307,30 @@ fn host_field(log: &str, name: &str) -> u64 {
     log.lines()
         .rev()
         .find(|line| line.contains("encoder summary"))
-        .and_then(|line| {
-            line.split_whitespace()
-                .filter_map(|pair| pair.split_once('='))
-                .find(|(key, _)| *key == name)
-                .and_then(|(_, value)| value.parse().ok())
-        })
+        .and_then(|line| line_field(line, name))
         .unwrap_or(0)
+}
+
+fn line_field(line: &str, name: &str) -> Option<u64> {
+    line.split_whitespace()
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == name)
+        .and_then(|(_, value)| value.parse().ok())
+}
+
+/// Packet sizes summed over every "encoder summary" line.
+fn host_sizes(log: &str) -> Sizes {
+    let mut sizes = Sizes::default();
+    for line in log.lines().filter(|line| line.contains("encoder summary")) {
+        let value = |name| line_field(line, name).unwrap_or(0);
+        sizes.delta_frames += value("delta_frames");
+        sizes.delta_bytes += value("delta_bytes");
+        sizes.keyframes += value("keyframes");
+        sizes.key_bytes += value("key_bytes");
+        sizes.max_key_bytes = sizes.max_key_bytes.max(value("max_key_bytes"));
+        sizes.max_delta_bytes = sizes.max_delta_bytes.max(value("max_delta_bytes"));
+    }
+    sizes
 }
 
 /// Parses `key=value` pairs from the client's SMOKE PASS log line.
@@ -224,13 +355,7 @@ fn teleport_binary() -> std::ffi::OsString {
 fn clean_link_streams_at_full_rate() {
     let outcome = run(&Profile {
         name: "clean",
-        netem: "delay 1ms",
-        bitrate: 2000,
-        blackout: None,
-        pattern: "ball",
-        input_latency: false,
-        reconfigure: false,
-        width: 640,
+        ..PROFILE
     });
     assert!(outcome.fps() >= 25.0, "{outcome:?}");
     assert!(outcome.max_frame_gap_ms < 250, "{outcome:?}");
@@ -242,12 +367,7 @@ fn high_latency_link_keeps_full_rate() {
     let outcome = run(&Profile {
         name: "rtt100",
         netem: "delay 50ms",
-        bitrate: 2000,
-        blackout: None,
-        pattern: "ball",
-        input_latency: false,
-        reconfigure: false,
-        width: 640,
+        ..PROFILE
     });
     assert!(outcome.fps() >= 25.0, "{outcome:?}");
 }
@@ -259,11 +379,8 @@ fn one_percent_loss_survives_with_usable_rate() {
         name: "loss1",
         netem: "delay 20ms loss 1%",
         bitrate: 4000,
-        blackout: None,
         pattern: "snow",
-        input_latency: false,
-        reconfigure: false,
-        width: 640,
+        ..PROFILE
     });
     assert!(outcome.fps() >= 20.0, "{outcome:?}");
 }
@@ -275,11 +392,8 @@ fn five_percent_loss_survives() {
         name: "loss5",
         netem: "delay 20ms loss 5%",
         bitrate: 4000,
-        blackout: None,
         pattern: "snow",
-        input_latency: false,
-        reconfigure: false,
-        width: 640,
+        ..PROFILE
     });
 }
 
@@ -290,11 +404,8 @@ fn jitter_and_reordering_survive() {
         name: "jitter",
         netem: "delay 20ms 15ms distribution normal",
         bitrate: 4000,
-        blackout: None,
         pattern: "snow",
-        input_latency: false,
-        reconfigure: false,
-        width: 640,
+        ..PROFILE
     });
     assert!(outcome.fps() >= 20.0, "{outcome:?}");
 }
@@ -306,12 +417,10 @@ fn bitrate_above_link_capacity_survives() {
     run(&Profile {
         name: "capped",
         netem: "delay 10ms rate 3mbit",
+        capacity: Some(3000),
         bitrate: 6000,
-        blackout: None,
         pattern: "snow",
-        input_latency: false,
-        reconfigure: false,
-        width: 640,
+        ..PROFILE
     });
 }
 
@@ -321,16 +430,113 @@ fn two_second_blackout_recovers_without_reconnect() {
     let outcome = run(&Profile {
         name: "blackout",
         netem: "delay 10ms",
-        bitrate: 2000,
-        blackout: Some(2),
-        pattern: "ball",
-        input_latency: false,
-        reconfigure: false,
-        width: 640,
+        burst: Some(("loss 100%", 2000)),
+        ..PROFILE
     });
     // The stall must cover the outage, and video must resume promptly after.
     assert!(outcome.max_frame_gap_ms >= 1500, "{outcome:?}");
     assert!(outcome.max_frame_gap_ms < 4000, "{outcome:?}");
+}
+
+/// G6/G7 profiles: 20 s of `snow` (always fills its target) so the rate
+/// controller converges and the tail half measures the steady state.
+const LONG: Profile = Profile {
+    pattern: "snow",
+    frames: 600,
+    ..PROFILE
+};
+
+/// 720p into a 10 Mbps bottleneck with a ~120 ms queue (150 packets).
+#[test]
+#[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
+fn capped_ten_megabit_link_is_used_without_queueing() {
+    let outcome = run(&Profile {
+        name: "cap10",
+        netem: "delay 15ms rate 10mbit limit 150",
+        capacity: Some(10_000),
+        bitrate: 16_000,
+        width: 1280,
+        ..LONG
+    });
+    assert!(outcome.fps() >= 20.0, "{outcome:?}");
+}
+
+/// 720p into a 5 Mbps bottleneck with a ~120 ms queue (75 packets).
+#[test]
+#[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
+fn capped_five_megabit_link_is_used_without_queueing() {
+    let outcome = run(&Profile {
+        name: "cap5",
+        netem: "delay 15ms rate 5mbit limit 75",
+        capacity: Some(5_000),
+        bitrate: 16_000,
+        width: 1280,
+        ..LONG
+    });
+    assert!(outcome.fps() >= 20.0, "{outcome:?}");
+}
+
+/// 720p at 8 Mbps into 1.2 Mbps: below the 720p floor, so the host should
+/// step the resolution down rather than starve every frame.
+#[test]
+#[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
+fn narrow_link_steps_resolution_down() {
+    let outcome = run(&Profile {
+        name: "cap1",
+        netem: "delay 15ms rate 1200kbit limit 30",
+        capacity: Some(1_200),
+        bitrate: 8_000,
+        width: 1280,
+        ..LONG
+    });
+    assert!(outcome.fps() >= 15.0, "{outcome:?}");
+}
+
+/// Random loss on a 10 Mbps bottleneck: loss alone must not starve the rate.
+#[test]
+#[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
+fn capped_link_with_random_loss() {
+    let outcome = run(&Profile {
+        name: "cap10loss2",
+        netem: "delay 15ms rate 10mbit limit 150 loss 2%",
+        capacity: Some(10_000),
+        bitrate: 8_000,
+        width: 1280,
+        ..LONG
+    });
+    assert!(outcome.fps() >= 20.0, "{outcome:?}");
+}
+
+/// Wi-Fi-like: 20–30 Mbps with aggregation bursts (netem `slot`), jitter and
+/// a little loss.
+#[test]
+#[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
+fn wifi_like_link() {
+    let outcome = run(&Profile {
+        name: "wifi",
+        netem: "delay 5ms 5ms distribution paretonormal rate 25mbit limit 300 slot 2ms 12ms loss 0.5%",
+        capacity: Some(25_000),
+        bitrate: 8_000,
+        width: 1280,
+        ..LONG
+    });
+    assert!(outcome.fps() >= 20.0, "{outcome:?}");
+}
+
+/// A 400 ms loss burst (a Wi-Fi roam or a microwave) on an otherwise clean
+/// 20 ms RTT link: recovery time is the longest gap minus the burst.
+#[test]
+#[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
+fn loss_burst_recovers_quickly() {
+    let outcome = run(&Profile {
+        name: "burst",
+        netem: "delay 10ms",
+        burst: Some(("delay 10ms loss 100%", 400)),
+        bitrate: 4_000,
+        width: 1280,
+        ..LONG
+    });
+    assert!(outcome.max_frame_gap_ms < 3000, "{outcome:?}");
 }
 
 /// Key-path latency while the pointer streams at a gaming poll rate. Probes
@@ -344,12 +550,9 @@ fn input_profile_with(name: &'static str, netem: &'static str, reconfigure: bool
     let outcome = run(&Profile {
         name,
         netem,
-        bitrate: 2000,
-        blackout: None,
-        pattern: "ball",
         input_latency: true,
         reconfigure,
-        width: 640,
+        ..PROFILE
     });
     assert!(outcome.probes >= 50, "too few probe replies: {outcome:?}");
     outcome
@@ -375,13 +578,10 @@ fn full_hd_clean_link_decode_path() {
     // Client-side receive→ready cost at 1080p (software decode, NV12 output).
     let outcome = run(&Profile {
         name: "hd",
-        netem: "delay 1ms",
         bitrate: 8000,
-        blackout: None,
         pattern: "snow",
-        input_latency: false,
-        reconfigure: false,
         width: 1920,
+        ..PROFILE
     });
     assert!(outcome.fps() >= 25.0, "{outcome:?}");
 }

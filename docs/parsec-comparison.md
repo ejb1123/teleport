@@ -697,6 +697,19 @@ VRR itself is WIP.**
 **G6. Congestion behaviour on capped links, and resolution/FPS step-down.
 Effort M.**
 
+- **Status (2026-10-17): implemented** (review tracker H12 follow-up,
+  "Capped links and loss recovery"). Clients send `NetworkFeedback` (one-way
+  queueing delay of each frame's first byte, received rate, every 100 ms)
+  to hosts advertising `network_feedback`; the host holds the encoder at 85%
+  of what a busy link delivered and probes fast far from, and slowly near,
+  the last bottleneck. Below 0.05 bit per pixel it steps width to 75%, 50%,
+  then halves the FPS, at most every 8 s, back up with hysteresis; never
+  above the negotiated stream or the user's bitrate. F8 shows the step.
+  Utilisation of 10 and 5 Mbit/s bottlenecks 50–57% and 36–39% → 75–81%
+  and 57–79%; a 3 Mbit/s link 23% → 70–74%. Not done: a quality metric
+  (PSNR/VMAF) in the harness to tune the step floors; the first seconds of
+  a session still start at the full bitrate.
+
 - **Why:** the tracker's own follow-up to H12. A 3 Mbps capped link carries
   only ~1.8 Mbps. There is no resolution or FPS step-down, so heavy
   congestion costs frame rate instead of sharpness. Parsec relies on manual
@@ -713,6 +726,17 @@ Effort M.**
 
 **G7. Loss recovery without IDR bursts: per-frame groups (R1) and intra
 refresh. Effort M.**
+
+- **Status (2026-10-17): intra refresh done, R1 rejected.** libx264 and
+  h264_nvenc refresh intra blocks over one second instead of sending
+  periodic IDRs (keyframes per 20 s 6 → 1, largest keyframe 10–30% smaller
+  against the mean frame). H.265 and VA-API/QSV keep IDRs: FFmpeg's H.265
+  decoder cannot decode past a missing reference, and FFmpeg has no VA-API
+  intra refresh. One group per frame (R1) cut tail latency on capped links
+  but added 1–11 s freezes (newest-first group delivery in moq-lite, IDR
+  retries on slow links, FFmpeg's H.264 decoder showing nothing after
+  longer gaps until the refresh completes), so loss still recovers with a
+  requested IDR. Details in the tracker.
 
 - **Why:** keyframe-on-request (C3) still sends a full IDR after loss, which is
   a burst on exactly the link that just lost packets.

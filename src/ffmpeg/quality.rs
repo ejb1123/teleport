@@ -126,6 +126,7 @@ impl Pair {
             gop: FPS * 10,
             gpu_input: false,
             preset,
+            intra_refresh: 0,
         };
         Ok(Self {
             encoder: Codec::new(config.clone())?,

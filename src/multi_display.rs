@@ -520,7 +520,7 @@ impl Screen {
             let track=tokio::time::timeout(Duration::from_secs(15),async { remote.track(&format!("monitor-{index}-{}",codec.track()))?.subscribe(media::video_subscription()).await.map_err(anyhow::Error::from) }).await.context("additional monitor subscription timed out")??;
             let (feedback,mut receive)=mpsc::channel(32);
             tokio::select! {
-                result=media::receive_video_with_stats(track,source,feedback,stats,keyframe_requests)=>result,
+                result=media::receive_video_with_stats(track,source,feedback,stats,keyframe_requests,false)=>result,
                 result=async { while let Some(event)=receive.recv().await { match event { Event::Feedback{queue_ms,dropped_groups} => output.send(Event::MonitorFeedback{index,queue_ms,dropped_groups}).await?, Event::RequestKeyframe{..} => { let _ = output.try_send(Event::RequestKeyframe{monitor:Some(index)}); } _ => {} } } Ok(()) }=>result,
             }
         })));

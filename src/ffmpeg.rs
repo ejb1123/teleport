@@ -42,6 +42,7 @@ unsafe extern "C" {
         gop: c_int,
         gpu_input: c_int,
         preset: c_int,
+        refresh: c_int,
         error: *mut c_int,
     ) -> *mut c_void;
     fn tp_codec_free(codec: *mut c_void);
@@ -80,6 +81,10 @@ pub struct Config {
     pub gpu_input: bool,
     /// Encoders: speed/quality preset.
     pub preset: crate::protocol::EncoderPreset,
+    /// Encoders: periodic intra refresh over this many frames instead of
+    /// periodic IDRs (libx264, h264_nvenc; 0 = off). Requested keyframes
+    /// stay IDRs.
+    pub intra_refresh: u32,
 }
 
 /// A captured DMA-BUF frame (see `src/dmabuf_encode.h`). The descriptors are
@@ -173,6 +178,7 @@ impl Codec {
                 config.gop.try_into()?,
                 config.gpu_input.into(),
                 config.preset.level(),
+                config.intra_refresh.try_into()?,
                 &mut error,
             )
         };
@@ -554,6 +560,7 @@ mod tests {
             gop: 0,
             gpu_input: false,
             preset: Default::default(),
+            intra_refresh: 0,
         }
     }
     #[test]
@@ -609,6 +616,95 @@ mod tests {
             ensure!(
                 keys == [Some(0), Some(3)],
                 "hevc={hevc}: expected keyframes at 0 and 3, got {keys:?}"
+            );
+        }
+        Ok(())
+    }
+    /// G7: with intra refresh a frame lost after the start heals within the
+    /// refresh period, without an IDR; without it the error persists until
+    /// the next keyframe. Requested keyframes stay IDRs. NVENC is included
+    /// with TELEPORT_TEST_HARDWARE=1.
+    #[test]
+    fn intra_refresh_heals_a_lost_frame_without_an_idr() -> Result<()> {
+        // H.264 only: FFmpeg's H.265 decoder drops every picture whose
+        // reference is missing ("Could not find ref with POC"), so an H.265
+        // stream cannot be decoded through a gap at all.
+        let mut names = vec![("libx264", false)];
+        if std::env::var("TELEPORT_TEST_HARDWARE").as_deref() == Ok("1") {
+            names.push(("h264_nvenc", false));
+        }
+        let (width, height) = (320_usize, 240_usize);
+        // Diagonal stripes moving every frame: a wrong reference stays wrong.
+        let source = |frame: usize| -> Vec<u8> {
+            let mut raw: Vec<u8> = (0..width * height)
+                .map(|i| (((i % width) + (i / width) * 2 + frame * 3) % 256) as u8)
+                .collect();
+            raw.extend(vec![128; width * height / 2]);
+            raw
+        };
+        for (name, hevc) in names {
+            // (refresh, mean luma error over frames 70-89)
+            let mut errors = Vec::new();
+            for refresh in [30, 0] {
+                let config = Config {
+                    name: name.into(),
+                    width: width as u32,
+                    height: height as u32,
+                    kbps: 2000,
+                    gop: 3000,
+                    intra_refresh: refresh,
+                    ..software_config(hevc)
+                };
+                let mut encoder = Codec::new(config.clone())
+                    .with_context(|| format!("{name} refresh={refresh}"))?;
+                let mut decoder = Codec::new(Config {
+                    encoder: false,
+                    name: "software".into(),
+                    ..config
+                })?;
+                let codec = if hevc {
+                    crate::protocol::VideoCodec::H265
+                } else {
+                    crate::protocol::VideoCodec::H264
+                };
+                let (mut idrs, mut error, mut counted) = (Vec::new(), 0_u64, 0_u64);
+                for frame in 0..100_usize {
+                    encoder.submit_frame(&source(frame), frame as u64, frame == 90)?;
+                    while let Some(packet) = encoder.receive()? {
+                        let pts = packet.pts.unwrap_or_default() as usize;
+                        if crate::protocol::annexb_keyframe(codec, &packet.bytes) {
+                            idrs.push(pts);
+                        }
+                        // Lost in transit.
+                        if pts == 20 {
+                            continue;
+                        }
+                        let _ = decoder.submit(&packet.bytes, pts as u64);
+                        while let Ok(Some(decoded)) = decoder.receive() {
+                            let at = decoded.pts.unwrap_or_default() as usize;
+                            if (70..90).contains(&at) {
+                                let expected = source(at);
+                                error += decoded.bytes[..width * height]
+                                    .iter()
+                                    .zip(&expected)
+                                    .map(|(a, b)| u64::from(a.abs_diff(*b)))
+                                    .sum::<u64>()
+                                    / (width * height) as u64;
+                                counted += 1;
+                            }
+                        }
+                    }
+                }
+                ensure!(
+                    idrs == [0, 90],
+                    "{name} refresh={refresh}: IDRs only at the start and when forced, got {idrs:?}"
+                );
+                ensure!(counted >= 8, "{name} refresh={refresh}: decoded {counted}");
+                errors.push(error / counted);
+            }
+            ensure!(
+                errors[0] <= 3 && errors[1] > errors[0],
+                "{name}: mean luma error with/without refresh {errors:?}"
             );
         }
         Ok(())

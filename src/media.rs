@@ -68,6 +68,7 @@ impl Pipeline {
                 .to_string(),
             pending: Mutex::default(),
             totals: Mutex::default(),
+            sizes: Mutex::default(),
             encode_us: std::sync::atomic::AtomicU64::new(0),
         });
         let input = metrics.clone();
@@ -126,6 +127,7 @@ impl Pipeline {
 
     /// Space periodic IDRs `frames` apart once the client requests keyframes
     /// itself. Direct FFmpeg only; the legacy encoder keeps its fixed GOP.
+    /// Encoders with intra refresh send none (only requested IDRs).
     #[cfg(target_os = "linux")]
     pub fn set_key_interval(&self, frames: u32) {
         if let Some(state) = ffmpeg_media::state(&self.0) {
@@ -247,6 +249,43 @@ pub struct EncoderMetrics {
     /// Whole-run sums: (capture copy-in µs, submit-to-packet µs, frames,
     /// capture-timestamp-to-packet µs).
     pub totals: Mutex<(u64, u64, u64, u64)>,
+    /// Whole-run packet sizes, to compare keyframe bursts with the average.
+    pub sizes: Mutex<PacketSizes>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PacketSizes {
+    pub delta_frames: u64,
+    pub delta_bytes: u64,
+    pub keyframes: u64,
+    pub key_bytes: u64,
+    pub max_key_bytes: u64,
+    pub max_delta_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl PacketSizes {
+    pub fn total_bytes(&self) -> u64 {
+        self.delta_bytes + self.key_bytes
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl EncoderMetrics {
+    pub fn record_packet(&self, bytes: usize, key: bool) {
+        let bytes = bytes as u64;
+        let mut sizes = self.sizes.lock().unwrap();
+        if key {
+            sizes.keyframes += 1;
+            sizes.key_bytes += bytes;
+            sizes.max_key_bytes = sizes.max_key_bytes.max(bytes);
+        } else {
+            sizes.delta_frames += 1;
+            sizes.delta_bytes += bytes;
+            sizes.max_delta_bytes = sizes.max_delta_bytes.max(bytes);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -254,6 +293,7 @@ impl Drop for EncoderMetrics {
     /// One line per encoder lifetime, for comparing host-side cost across runs.
     fn drop(&mut self) {
         let (prepare, encode, frames, capture) = *self.totals.lock().unwrap();
+        let sizes = *self.sizes.lock().unwrap();
         if let (Some(mean_prepare_us), Some(mean_encode_us), Some(mean_capture_us)) = (
             prepare.checked_div(frames),
             encode.checked_div(frames),
@@ -265,6 +305,12 @@ impl Drop for EncoderMetrics {
                 mean_prepare_us,
                 mean_encode_us,
                 mean_capture_us,
+                delta_frames = sizes.delta_frames,
+                delta_bytes = sizes.delta_bytes,
+                max_delta_bytes = sizes.max_delta_bytes,
+                keyframes = sizes.keyframes,
+                key_bytes = sizes.key_bytes,
+                max_key_bytes = sizes.max_key_bytes,
                 "encoder summary"
             );
         }
@@ -1126,9 +1172,30 @@ pub async fn receive_video_with_stats(
     events: tokio::sync::mpsc::Sender<crate::protocol::Event>,
     stats: Arc<crate::stats::StreamStats>,
     keyframe_requests: bool,
+    network_feedback: bool,
 ) -> Result<()> {
     let dropped = Arc::new(AtomicU32::new(0));
     let keyframes = keyframe_requests.then(|| events.clone());
+    let meter = network_feedback.then(|| {
+        Arc::new(Mutex::new(crate::congestion::DelayMeter::new(
+            Instant::now(),
+        )))
+    });
+    let network = async {
+        let Some(meter) = &meter else {
+            return std::future::pending().await;
+        };
+        let mut interval = tokio::time::interval(crate::congestion::FEEDBACK_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let (delay_ms, received_kbps) = meter.lock().unwrap().report(Instant::now());
+            let _ = events.try_send(crate::protocol::Event::NetworkFeedback {
+                delay_ms,
+                received_kbps,
+            });
+        }
+    };
     let monitor = async {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1158,8 +1225,9 @@ pub async fn receive_video_with_stats(
     // Keep the read future alive across feedback ticks. Cancelling read_frame in
     // the middle of a GOP would lose a partially-read H.264 access unit.
     tokio::select! {
-        result = receive_video_inner(track, source.clone(), dropped.clone(), stats.clone(), keyframes) => result,
+        result = receive_video_inner(track, source.clone(), dropped.clone(), stats.clone(), keyframes, meter.clone()) => result,
         () = monitor => unreachable!(),
+        () = network => unreachable!(),
     }
 }
 
@@ -1385,6 +1453,7 @@ async fn receive_video_inner(
     dropped: Arc<AtomicU32>,
     stats: Arc<crate::stats::StreamStats>,
     keyframes: Option<tokio::sync::mpsc::Sender<crate::protocol::Event>>,
+    meter: Option<Arc<Mutex<crate::congestion::DelayMeter>>>,
 ) -> Result<()> {
     // Lost decoder state otherwise waits for the host's next scheduled GOP.
     // The host rate-limits too; this only keeps the shared input queue clear.
@@ -1441,7 +1510,15 @@ async fn receive_video_inner(
                 current = Some(next);
             }
             MediaEvent::Frame(frame) => match frame {
-                Ok(Some(bytes)) => {
+                Ok(Some((timestamp, arrived, bytes))) => {
+                    if let Some(meter) = &meter {
+                        meter.lock().unwrap().frame(
+                            arrived,
+                            Instant::now(),
+                            timestamp.into(),
+                            bytes.len(),
+                        );
+                    }
                     let decoder_name = stats.decoder.lock().unwrap().clone();
                     let ready = stats.ready_frames.load(Ordering::Relaxed);
                     if linux_software_fallback(&decoder_name).is_some()
@@ -1512,7 +1589,11 @@ async fn receive_video_inner(
                         continue;
                     }
                     let video_group = sequence.context("video frame arrived without a group")?;
-                    let pts = stats.received(bytes.len(), video_group);
+                    let pts = stats.received_frame(
+                        bytes.len(),
+                        video_group,
+                        crate::protocol::video_frame_age(timestamp),
+                    );
                     let mut buffer = gst::Buffer::from_slice(bytes);
                     stamp_video_buffer(buffer.get_mut().unwrap(), pts);
                     source.push_buffer(buffer)?;
@@ -1531,7 +1612,8 @@ async fn receive_video_inner(
 
 pub(crate) enum MediaEvent {
     Group(moq_net::group::Consumer),
-    Frame(Result<Option<bytes::Bytes>>),
+    /// Send timestamp, arrival of the first byte, payload.
+    Frame(Result<Option<(moq_net::Timestamp, Instant, bytes::Bytes)>>),
 }
 
 /// Preserve a partially-read frame when an older, reordered group arrives.
@@ -1544,7 +1626,7 @@ pub(crate) async fn next_media_event(
 ) -> Result<MediaEvent> {
     let frame = async {
         match current {
-            Some(group) => crate::protocol::read_frame(group, limit).await,
+            Some(group) => crate::protocol::read_timed_frame(group, limit).await,
             None => std::future::pending().await,
         }
     };
@@ -2334,6 +2416,7 @@ mod tests {
                 Arc::new(AtomicU32::new(0)),
                 reader_stats,
                 None,
+                None,
             )
             .await
         });
@@ -2919,6 +3002,7 @@ mod tests {
                     Arc::new(AtomicU32::new(0)),
                     reader_stats,
                     None,
+                    None,
                 )
                 .await
             });
@@ -3022,6 +3106,7 @@ mod tests {
                 Arc::new(AtomicU32::new(0)),
                 reader_stats,
                 None,
+                None,
             )
             .await
         });
@@ -3095,7 +3180,7 @@ mod tests {
         frame.write(bytes::Bytes::from_static(b"def"))?;
         frame.finish()?;
         match tokio::time::timeout(Duration::from_secs(1), read).await?? {
-            MediaEvent::Frame(Ok(Some(bytes))) => assert_eq!(bytes.as_ref(), b"abcdef"),
+            MediaEvent::Frame(Ok(Some((_, _, bytes)))) => assert_eq!(bytes.as_ref(), b"abcdef"),
             _ => anyhow::bail!("partial frame was lost after older group arrived"),
         }
         Ok(())

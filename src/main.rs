@@ -6,6 +6,8 @@ mod capture;
 mod client;
 #[cfg(target_os = "linux")]
 mod clipboard;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod congestion;
 mod e2e;
 mod ffmpeg;
 mod fullscreen;

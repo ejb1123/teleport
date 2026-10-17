@@ -62,6 +62,23 @@ static enum AVPixelFormat choose_hw(AVCodecContext *ctx, const enum AVPixelForma
     return AV_PIX_FMT_NONE; /* Never claim hardware while silently decoding on CPU. */
 }
 
+/* Periodic intra refresh (parsec-comparison G7): instead of periodic IDRs, a
+ * column of intra blocks sweeps the picture every `refresh` frames, so a lost
+ * or skipped frame heals within that many frames without an IDR burst.
+ * Requested keyframes stay IDRs (forced-idr), for decoder starts. Returns 1
+ * when this encoder refreshes (libx264, h264_nvenc), 0 otherwise. H.264 only:
+ * FFmpeg's H.265 decoder drops every picture after a missing reference. */
+static int intra_refresh_options(AVCodecContext *ctx, const char *name, int refresh, AVDictionary **opts) {
+    if (refresh <= 0) return 0;
+    if (!strcmp(name, "libx264") || !strcmp(name, "h264_nvenc")) {
+        av_dict_set(opts, "intra-refresh", "1", 0);
+    } else {
+        return 0;
+    }
+    ctx->gop_size = refresh; /* the refresh period; no periodic IDRs */
+    return 1;
+}
+
 static int dimensions(int width, int height) {
     return width >= 2 && height >= 2 && width <= 7680 && height <= 8192
         && !(width & 1) && !(height & 1) && (int64_t)width * height <= 33554432;
@@ -107,10 +124,11 @@ static void apply_preset(AVDictionary **opts, AVCodecContext *ctx, const char *n
  * (tp_send_dmabuf); NVENC then takes CUDA frames and VA-API opens the first
  * render node with a VA driver, as FFmpeg's default does.
  * preset (encoders): 0 lowest latency (the historical settings), 1 balanced,
- * 2 quality; see apply_preset. */
+ * 2 quality; see apply_preset.
+ * refresh: intra-refresh period in frames (0: off; see intra_refresh_options). */
 TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
                        int width, int height, int fps, int kbps, int output, int gop,
-                       int gpu_input, int preset, int *error) {
+                       int gpu_input, int preset, int refresh, int *error) {
     int result = AVERROR(ENOMEM);
     AVDictionary *opts = NULL;
     const AVCodec *implementation = encoder ? avcodec_find_encoder_by_name(name)
@@ -253,6 +271,7 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
         if (output == 3) codec->ctx->extra_hw_frames = 3;
     }
     if (encoder) apply_preset(&opts, codec->ctx, name, preset);
+    if (encoder) intra_refresh_options(codec->ctx, name, refresh, &opts);
     result = avcodec_open2(codec->ctx, implementation, &opts);
     av_dict_free(&opts);
     if (result < 0) goto fail;

@@ -152,6 +152,10 @@ pub struct Options {
     /// Codecs `encoder` encodes in hardware here (`Desktop::hardware_codecs`).
     #[arg(skip)]
     pub hardware_codecs: Vec<protocol::VideoCodec>,
+    /// Set while a network step-down streams below `width`/`fps`
+    /// (`Desktop::stepped_down`); `width` and `fps` then hold the step.
+    #[arg(skip)]
+    pub stepped_down: Option<protocol::SteppedDown>,
 }
 
 pub async fn run(options: Options) -> Result<()> {
@@ -766,8 +770,7 @@ async fn run_session(
         fps = options.fps,
         "native client connected"
     );
-    let mut adaptation = media::BitrateController::new(options.bitrate);
-    let mut network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
+    let mut rates = Rates::new(options, &info);
     let mut adaptive = !options.fixed_bitrate;
     let mut last_feedback = Instant::now();
     let mut last_switch = Instant::now() - Duration::from_secs(1);
@@ -839,6 +842,7 @@ async fn run_session(
             } else {
                 capture.local_cursor = local;
             }
+            rates.restore(options);
             video_start_group = video_barrier(&video)?;
             let info = desktop(options, capture, video_start_group)?;
             pipeline = while_starting(
@@ -894,8 +898,7 @@ async fn run_session(
                     )?,
                 }
             }
-            adaptation = media::BitrateController::new(options.bitrate);
-            network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
+            rates = Rates::new(options, &info);
             encoder_metrics = pipeline.encoder_metrics()?;
             adaptive = !options.fixed_bitrate;
             last_feedback = Instant::now();
@@ -955,6 +958,7 @@ async fn run_session(
                     }
                 }
             }
+            rates.restore(options);
             video_start_group = video_barrier(&video)?;
             let info = desktop(options, capture, video_start_group)?;
             pipeline = while_starting(
@@ -971,11 +975,8 @@ async fn run_session(
                 &mut updates,
             )
             .await?;
-            if long_gop {
-                pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS));
-            }
-            adaptation = media::BitrateController::new(options.bitrate);
-            network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
+            session_video(&pipeline, options.fps, long_gop);
+            rates = Rates::new(options, &info);
             encoder_metrics = pipeline.encoder_metrics()?;
             adaptive = !options.fixed_bitrate;
             last_feedback = Instant::now();
@@ -1075,15 +1076,37 @@ async fn run_session(
                 if let Some(audio) = &audio { audio.error()?; }
                 if adaptive {
                     let stats = session.stats();
-                    if let (Some(rtt), Some(sent), Some(lost)) = (stats.rtt, stats.packets_sent, stats.packets_lost)
-                        && network_rate.observe(Instant::now(), rtt, sent, lost).is_some() {
-                        let bitrate = adaptation.current().min(network_rate.current());
+                    // Clients sending NetworkFeedback are rate-controlled from it.
+                    if rates.delay.is_none()
+                        && let (Some(rtt), Some(sent), Some(lost)) = (stats.rtt, stats.packets_sent, stats.packets_lost)
+                        && rates.network.observe(Instant::now(), rtt, sent, lost).is_some() {
+                        let bitrate = rates.target();
                         if bitrate != pipeline.video_bitrate()? {
                             match pipeline.set_video_bitrate(bitrate) {
                                 Ok(()) => tracing::info!(bitrate, rtt_ms = rtt.as_millis() as u64, "adapted video bitrate to network"),
                                 Err(error) => { adaptive = false; tracing::warn!(%error, "encoder does not support live bitrate changes; retaining fixed bitrate"); }
                             }
                         }
+                    }
+                    if rates.delay.is_some() && let Some(step) = rates.ladder.observe(Instant::now(), rates.target()) {
+                        // Restart capture and encoder at the new step, as for
+                        // ConfigureVideo, but keep the rate controllers: the
+                        // link has not changed.
+                        let top = rates.ladder.top();
+                        let kbps = rates.target();
+                        options.stepped_down = (rates.ladder.level() > 0).then_some(protocol::SteppedDown { width: top.width, fps: top.fps, kbps });
+                        (options.width, options.fps) = if rates.ladder.level() == 0 { rates.negotiated } else { (step.width, step.fps) };
+                        tracing::info!(width = step.width, fps = step.fps, kbps, level = rates.ladder.level(), "stepped video for the network");
+                        capture.release_all().await;
+                        while_starting(retire(pipeline), &mut events, capture, &mut updates).await?;
+                        video_start_group = video_barrier(&video)?;
+                        let info = desktop(options, capture, video_start_group)?;
+                        capture.select_monitor(capture.active_monitor).await?;
+                        pipeline = while_starting(start_encoder(options, capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, kbps, &video), &mut events, capture, &mut updates).await?;
+                        session_video(&pipeline, options.fps, long_gop);
+                        encoder_metrics = pipeline.encoder_metrics()?;
+                        (rates.encoded_bytes, rates.key_bytes) = (0, 0);
+                        publish_update(&mut updates, Update::Desktop { desktop: info })?;
                     }
                 }
                 if telemetry_enabled && last_telemetry.elapsed() >= Duration::from_secs(1) {
@@ -1219,8 +1242,7 @@ async fn run_session(
                         // no gap. Auxiliary monitors keep their fixed bitrate.
                         if width == options.width && fps == options.fps && pipeline.set_video_bitrate(bitrate).is_ok() {
                             *options = requested;
-                            adaptation = media::BitrateController::new(bitrate);
-                            network_rate = media::NetworkRateController::new(bitrate, Instant::now());
+                            rates = Rates::new(options, &info);
                             adaptive = !options.fixed_bitrate;
                             last_feedback = Instant::now();
                             publish_update(&mut updates, Update::Desktop { desktop: info })?;
@@ -1232,7 +1254,7 @@ async fn run_session(
                         info.video_start_group = video_start_group;
                         capture.select_monitor(capture.active_monitor).await?;
                         pipeline = while_starting(start_encoder(options, capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), fps, bitrate, &video), &mut events, capture, &mut updates).await?;
-                        if long_gop { pipeline.set_key_interval(fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
+                        session_video(&pipeline, fps, long_gop);
                         *options = requested;
                         let active: Vec<_> = monitor_streams.keys().copied().collect();
                         while_starting(retire(std::mem::take(&mut monitor_streams)), &mut events, capture, &mut updates).await?;
@@ -1247,8 +1269,7 @@ async fn run_session(
                             }
                         }
                         encoder_metrics = pipeline.encoder_metrics()?;
-                        adaptation = media::BitrateController::new(bitrate);
-                        network_rate = media::NetworkRateController::new(bitrate, Instant::now());
+                        rates = Rates::new(options, &info);
                         adaptive = !options.fixed_bitrate;
                         last_feedback = Instant::now();
                         publish_update(&mut updates, Update::Desktop { desktop: info })?;
@@ -1264,6 +1285,7 @@ async fn run_session(
                         while_starting(retire(pipeline), &mut events, capture, &mut updates).await?;
                         video_start_group = video_barrier(&video)?;
                         capture.select_monitor(index).await?;
+                        rates.restore(options);
                         if let Some(display) = &client_display {
                             // Fit the new monitor's size and refresh rate.
                             let choice = negotiate_stream(display, capture);
@@ -1271,9 +1293,8 @@ async fn run_session(
                         }
                         let info = desktop(options, capture, video_start_group)?;
                         pipeline = while_starting(start_encoder(options, capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, options.bitrate, &video), &mut events, capture, &mut updates).await?;
-                        if long_gop { pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
-                        adaptation = media::BitrateController::new(options.bitrate);
-                        network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
+                        session_video(&pipeline, options.fps, long_gop);
+                        rates = Rates::new(options, &info);
                         encoder_metrics = pipeline.encoder_metrics()?;
                         adaptive = !options.fixed_bitrate;
                         last_feedback = Instant::now();
@@ -1282,11 +1303,24 @@ async fn run_session(
                     Event::Feedback { queue_ms, dropped_groups } => {
                         if adaptive && last_feedback.elapsed() >= Duration::from_millis(900) {
                             last_feedback = Instant::now();
-                            if adaptation.observe(queue_ms, dropped_groups).is_some()
-                                && adaptation.current().min(network_rate.current()) != pipeline.video_bitrate()? {
-                                let bitrate = adaptation.current().min(network_rate.current());
+                            if rates.adaptation.observe(queue_ms, dropped_groups).is_some()
+                                && rates.target() != pipeline.video_bitrate()? {
+                                let bitrate = rates.target();
                                 match pipeline.set_video_bitrate(bitrate) {
                                     Ok(()) => { tracing::info!(bitrate, queue_ms, dropped_groups, "adapted video bitrate"); },
+                                    Err(error) => { adaptive = false; tracing::warn!(%error, "encoder does not support live bitrate changes; retaining fixed bitrate"); }
+                                }
+                            }
+                        }
+                    }
+                    Event::NetworkFeedback { delay_ms, received_kbps } => {
+                        if adaptive {
+                            let stats = session.stats();
+                            let sizes = *encoder_metrics.sizes.lock().unwrap();
+                            if let Some(bitrate) = rates.feedback(Instant::now(), delay_ms, received_kbps, sizes, stats.packets_sent.zip(stats.packets_lost))
+                                && bitrate != pipeline.video_bitrate()? {
+                                match pipeline.set_video_bitrate(bitrate) {
+                                    Ok(()) => tracing::info!(bitrate, ?delay_ms, received_kbps, capacity = ?rates.delay.as_ref().and_then(|rate| rate.capacity()), "adapted video bitrate to network"),
                                     Err(error) => { adaptive = false; tracing::warn!(%error, "encoder does not support live bitrate changes; retaining fixed bitrate"); }
                                 }
                             }
@@ -1334,6 +1368,135 @@ async fn run_session(
                 }
             },
         }
+    }
+}
+
+/// Applied to every new primary encoder: long GOPs once the client requests
+/// keyframes itself.
+fn session_video(pipeline: &media::Pipeline, fps: u32, long_gop: bool) {
+    if long_gop {
+        pipeline.set_key_interval(fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS));
+    }
+}
+
+/// Bitrate control of the primary stream: client decoder backlog, the
+/// network (client delay feedback, or the host's QUIC RTT for clients that
+/// send none), and the resolution/FPS ladder under the negotiated stream.
+struct Rates {
+    adaptation: media::BitrateController,
+    network: media::NetworkRateController,
+    delay: Option<crate::congestion::DelayRateController>,
+    ladder: crate::congestion::Ladder,
+    /// `options.width`/`fps` as negotiated, restored at the top of the ladder.
+    negotiated: (u32, u32),
+    /// The user's (or negotiated) bitrate: never exceeded.
+    ceiling: u32,
+    started: Instant,
+    /// Encoder output and QUIC packet counters at the last feedback.
+    encoded_bytes: u64,
+    key_bytes: u64,
+    feedback_at: Instant,
+    packets: Option<(u64, u64)>,
+}
+
+impl Rates {
+    /// For a newly negotiated stream (`info` is its `Desktop`).
+    fn new(options: &mut Options, info: &Desktop) -> Self {
+        options.stepped_down = None;
+        let now = Instant::now();
+        Self {
+            adaptation: media::BitrateController::new(options.bitrate),
+            network: media::NetworkRateController::new(options.bitrate, now),
+            delay: None,
+            ladder: crate::congestion::Ladder::new(
+                info.width,
+                info.height,
+                options.fps,
+                options.codec == protocol::VideoCodec::H265,
+            ),
+            negotiated: (options.width, options.fps),
+            ceiling: options.bitrate,
+            started: now,
+            // Unknown until the first feedback.
+            encoded_bytes: u64::MAX,
+            key_bytes: u64::MAX,
+            feedback_at: now,
+            packets: None,
+        }
+    }
+
+    /// Back to the negotiated stream before a restart that keeps it (the
+    /// new `Rates` takes `options` as the negotiated stream).
+    fn restore(&self, options: &mut Options) {
+        if options.stepped_down.take().is_some() {
+            (options.width, options.fps) = self.negotiated;
+        }
+    }
+
+    /// The bitrate the encoder should run at.
+    fn target(&self) -> u32 {
+        let network = match &self.delay {
+            Some(delay) => delay.current(),
+            None => self.network.current(),
+        };
+        self.adaptation.current().min(network)
+    }
+
+    /// `Event::NetworkFeedback`; `encoded` is the encoder's cumulative output
+    /// (bytes) and `packets` the QUIC (sent, lost) counters. Returns the new
+    /// target when it changed.
+    fn feedback(
+        &mut self,
+        now: Instant,
+        delay_ms: Option<u32>,
+        received_kbps: u32,
+        sizes: media::PacketSizes,
+        packets: Option<(u64, u64)>,
+    ) -> Option<u32> {
+        let encoded = sizes.total_bytes();
+        let keyframe_bytes = sizes.key_bytes.saturating_sub(self.key_bytes);
+        self.key_bytes = sizes.key_bytes;
+        if self.delay.is_none() {
+            self.delay = Some(crate::congestion::DelayRateController::new(
+                self.ceiling,
+                self.started,
+            ));
+        }
+        let elapsed = now.duration_since(self.feedback_at).as_millis().max(1) as u64;
+        // A restarted encoder counts from zero.
+        // Encoders that do not count their output (legacy GStreamer) are
+        // taken to produce their target.
+        let encoded_kbps = if encoded == 0 {
+            self.target()
+        } else {
+            (encoded.saturating_sub(self.encoded_bytes) * 8 / elapsed) as u32
+        };
+        self.encoded_bytes = encoded;
+        self.feedback_at = now;
+        let heavy_loss = match (packets, self.packets) {
+            (Some((sent, lost)), Some((sent_before, lost_before))) => {
+                let (sent, lost) = (
+                    sent.saturating_sub(sent_before),
+                    lost.saturating_sub(lost_before),
+                );
+                sent >= 50 && lost * 10 > sent
+            }
+            _ => false,
+        };
+        self.packets = packets;
+        let before = self.target();
+        if let Some(delay) = &mut self.delay {
+            delay.observe(
+                now,
+                delay_ms,
+                received_kbps,
+                encoded_kbps,
+                keyframe_bytes,
+                heavy_loss,
+            );
+        }
+        let after = self.target();
+        (after != before).then_some(after)
     }
 }
 
@@ -1390,6 +1553,11 @@ fn desktop_for_monitor(
         extra_mouse_buttons: true,
         encoder_presets: true,
         encoder_preset: options.encoder_preset,
+        // `TELEPORT_NETWORK_FEEDBACK=0`: the RTT-only controller, no step-down
+        // (for comparisons).
+        network_feedback: std::env::var_os("TELEPORT_NETWORK_FEEDBACK")
+            .is_none_or(|value| value != "0"),
+        stepped_down: options.stepped_down,
     })
 }
 
@@ -1513,7 +1681,10 @@ async fn while_starting<T: Send + 'static>(
     fn reorderable(event: &Event) -> bool {
         matches!(
             event,
-            Event::Feedback { .. } | Event::MonitorFeedback { .. } | Event::RequestKeyframe { .. }
+            Event::Feedback { .. }
+                | Event::NetworkFeedback { .. }
+                | Event::MonitorFeedback { .. }
+                | Event::RequestKeyframe { .. }
         )
     }
     let mut ordered = events.deferred.iter().any(|event| !reorderable(event));
