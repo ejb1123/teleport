@@ -1,0 +1,7 @@
+# Virtual gamepads for the Teleport host (docs/gamepad.md), as the NixOS
+# module's `gamepads` and `playstationGamepads` options set up: members of
+# the `uinput` group may create Xbox pads through /dev/uinput and DualShock 4
+# / DualSense pads through /dev/uhid. Either lets its users create any input
+# device, including keyboards: add only accounts that run the host.
+KERNEL=="uinput", SUBSYSTEM=="misc", GROUP="uinput", MODE="0660", OPTIONS+="static_node=uinput"
+KERNEL=="uhid", SUBSYSTEM=="misc", GROUP="uinput", MODE="0660", OPTIONS+="static_node=uhid"

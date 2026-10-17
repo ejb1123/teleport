@@ -1,0 +1,32 @@
+# Teleport host in the user's graphical session: the .deb/.rpm counterpart of
+# the NixOS module's `services.teleport-desktop` (nix/module.nix). Not enabled
+# by installing the package. Per user:
+#
+#   mkdir -p ~/.config/teleport
+#   echo 'TELEPORT_LISTEN=192.168.1.10:4443' >~/.config/teleport/host.env
+#   systemctl --user enable --now teleport-desktop
+#
+# host.env may also set TELEPORT_VIRTUAL_DISPLAY (never|fallback|always),
+# TELEPORT_PRIVACY_MODE (off|request|always) and TELEPORT_HOST_ARGS (extra
+# arguments, split on spaces). See docs/distribution.md.
+[Unit]
+Description=Teleport remote desktop host (graphical session)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Environment=TELEPORT_LISTEN=127.0.0.1:4443
+Environment=TELEPORT_VIRTUAL_DISPLAY=fallback
+Environment=TELEPORT_PRIVACY_MODE=off
+Environment=TELEPORT_HOST_ARGS=
+EnvironmentFile=-%h/.config/teleport/host.env
+ExecStart=/usr/bin/teleport host --listen ${TELEPORT_LISTEN} --identity-dir %h/.local/state/teleport/host --restore-token %h/.local/state/teleport/host/portal-restore.json --virtual-display ${TELEPORT_VIRTUAL_DISPLAY} --privacy-mode ${TELEPORT_PRIVACY_MODE} $TELEPORT_HOST_ARGS
+# However the host stopped, turn monitors left off by privacy mode back on.
+# "-": nothing to restore is not a failure.
+ExecStopPost=-/usr/bin/teleport privacy-restore --state %h/.local/state/teleport/host/privacy-restore.json
+Restart=on-failure
+RestartSec=10
+UMask=0077
+
+[Install]
+WantedBy=graphical-session.target

@@ -191,6 +191,14 @@
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           inherit bundle;
           appimage = import ./nix/appimage.nix { inherit pkgs bundle; };
+          deb = import ./nix/linux-packages.nix {
+            inherit pkgs bundle;
+            format = "deb";
+          };
+          rpm = import ./nix/linux-packages.nix {
+            inherit pkgs bundle;
+            format = "rpm";
+          };
         }
       );
       formatter = forAllSystems (system: nixpkgs.legacyPackages.${system}.nixfmt);
