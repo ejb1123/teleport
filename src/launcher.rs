@@ -174,6 +174,13 @@ const ENCODER_PRESETS: [(&str, &str); 4] = [
     ("Encoder: balanced", "balanced"),
     ("Encoder: best quality", "quality"),
 ];
+/// Host monitors for this session: as they are, off (privacy mode, on hosts
+/// that allow it) or plus a virtual monitor.
+const HOST_DISPLAY: [(&str, &str); 3] = [
+    ("Host screen: as is", ""),
+    ("Host screen: private", "--privacy"),
+    ("Host: + virtual monitor", "--virtual-monitor"),
+];
 
 #[derive(Default)]
 struct StreamPreferences {
@@ -402,7 +409,7 @@ pub fn run() -> Result<()> {
     let pref_rect = |index: usize| {
         Rect::new(
             304 + (index % 3) as i32 * 232,
-            456 + (index / 3) as i32 * 54,
+            456 + (index / 3) as i32 * 50,
             220,
             38,
         )
@@ -454,6 +461,7 @@ pub fn run() -> Result<()> {
     let mut codec = 0usize;
     let mut relative_mouse = 0usize;
     let mut encoder_preset = 0usize;
+    let mut host_display = 0usize;
     let mut hdr = false;
     let mut decoder = DecoderPreference::default();
     let mut clipboard = false;
@@ -1000,6 +1008,9 @@ pub fn run() -> Result<()> {
                                 if hit(pref_rect(11), x, y) {
                                     encoder_preset = (encoder_preset + 1) % ENCODER_PRESETS.len();
                                 }
+                                if hit(pref_rect(12), x, y) {
+                                    host_display = (host_display + 1) % HOST_DISPLAY.len();
+                                }
                                 if hit(pref_rect(3), x, y) {
                                     codec = (codec + 1) % CODECS.len();
                                     if CODECS[codec].1 != "h265" {
@@ -1159,6 +1170,9 @@ pub fn run() -> Result<()> {
                             command
                                 .arg("--encoder-preset")
                                 .arg(ENCODER_PRESETS[encoder_preset].1);
+                        }
+                        if !HOST_DISPLAY[host_display].1.is_empty() {
+                            command.arg(HOST_DISPLAY[host_display].1);
                         }
                         decoder.apply(&mut command);
                         apply_relay(profile, &mut command)?;
@@ -1623,6 +1637,7 @@ pub fn run() -> Result<()> {
                             },
                             RELATIVE_MOUSE[relative_mouse].0,
                             ENCODER_PRESETS[encoder_preset].0,
+                            HOST_DISPLAY[host_display].0,
                         ];
                         for (index, label) in labels.into_iter().enumerate() {
                             ui.button(
@@ -1636,7 +1651,7 @@ pub fn run() -> Result<()> {
                             &small_font,
                             "Match follows this window and display. VSync on stops tearing on fixed-refresh screens.",
                             304,
-                            676,
+                            700,
                             688,
                             MUTED,
                         )?;

@@ -1,7 +1,9 @@
 use crate::{
     capture::Capture,
     media,
+    privacy::PrivacyMode,
     protocol::{self, Desktop, Event, Input, Pairing, Update},
+    virtual_display::{Size, VirtualDisplay},
 };
 use anyhow::{Context, Result, ensure};
 use clap::Args;
@@ -41,6 +43,10 @@ const CONFIGURE_INTERVAL: Duration = Duration::from_millis(500);
 /// A portal session left in cursor-metadata mode by an earlier client goes
 /// back to an embedded pointer if the new client has not opted in by then.
 const CURSOR_CHOICE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How often privacy mode checks that the physical monitors are still off.
+const PRIVACY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+/// How often a fallback virtual display checks whether a monitor is back.
+const MONITORS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// Host pointer positions go to the client at most this often.
 const CURSOR_POSITION_INTERVAL: Duration = Duration::from_millis(33);
 
@@ -132,6 +138,27 @@ pub struct Options {
     /// so clients can draw it locally (docs/cursor.md).
     #[arg(long)]
     pub embedded_cursor: bool,
+    /// Virtual displays through the desktop portal (KDE Plasma 6; GNOME
+    /// untested): `fallback` streams one when no monitor is connected
+    /// (headless) and lets clients add one as an extra monitor; `always`
+    /// streams one sized to the client instead of the monitors; `never`
+    /// turns both off (docs/virtual-display.md).
+    #[arg(long, value_enum, default_value_t = VirtualDisplay::Fallback)]
+    pub virtual_display: VirtualDisplay,
+    /// Privacy mode (KDE): while a session lasts, turn the physical monitors
+    /// off and stream a virtual display instead; `request` when the client
+    /// asks (`teleport client --privacy`), `always` for every session. They
+    /// come back on disconnect, on any failure, and through a guard process
+    /// if the host dies (docs/virtual-display.md).
+    #[arg(long, value_enum, default_value_t = PrivacyMode::Off)]
+    pub privacy_mode: PrivacyMode,
+    /// Privacy mode works here (`--privacy-mode`, a virtual-capable portal
+    /// and KDE output control).
+    #[arg(skip)]
+    pub privacy_available: bool,
+    /// Where privacy mode saves the monitors it turned off.
+    #[arg(skip)]
+    pub privacy_state: PathBuf,
     /// Explicit PulseAudio/PipeWire output .monitor name; never records a microphone.
     #[arg(long)]
     pub audio_source: Option<String>,
@@ -158,7 +185,7 @@ pub struct Options {
     pub stepped_down: Option<protocol::SteppedDown>,
 }
 
-pub async fn run(options: Options) -> Result<()> {
+pub async fn run(mut options: Options) -> Result<()> {
     if let Some(helper) = &options.system_auth_helper {
         crate::system_pam::validate_helper(helper)?;
         ensure!(
@@ -175,13 +202,41 @@ pub async fn run(options: Options) -> Result<()> {
     if let Some(directory) = &options.identity_dir {
         crate::identity::open(directory)?;
     }
-    let mut capture = Capture::open_with_options(
+    // A host that died in privacy mode may have left the monitors off (its
+    // guard normally turns them back on).
+    options.privacy_state =
+        crate::privacy::state_path(options.identity_dir.as_deref(), &options.listen);
+    if options.privacy_state.exists() {
+        let state = options.privacy_state.clone();
+        match tokio::task::spawn_blocking(move || crate::privacy::restore(&state)).await? {
+            Ok(_) => tracing::warn!("restored monitors left off by an earlier privacy session"),
+            Err(error) => tracing::error!(
+                error = format!("{error:#}"),
+                "could not restore monitors left off by an earlier privacy session"
+            ),
+        }
+    }
+    let mut capture = Capture::open_host(
         &options.source,
         options.restore_token.as_deref(),
         options.monitor,
         !options.embedded_cursor,
+        options.virtual_display,
     )
     .await?;
+    // No monitor now: a virtual display only while a client is connected.
+    capture.release_fallback().await;
+    if options.privacy_mode != PrivacyMode::Off {
+        options.privacy_available = capture.virtual_available()
+            && tokio::task::spawn_blocking(crate::virtual_display::kscreen_available)
+                .await
+                .unwrap_or(false);
+        if !options.privacy_available {
+            tracing::warn!(
+                "privacy mode unavailable: it needs KDE Plasma (kscreen-doctor) and a portal with virtual displays"
+            );
+        }
+    }
     let result = serve(&options, &mut capture).await;
     capture.close().await;
     result
@@ -395,6 +450,7 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
                             _ = &mut shutdown => { capture.end_session().await; break; }
                         };
                         capture.end_session().await;
+                        leave_privacy(capture).await;
                         if let Err(error) = result {
                             tracing::warn!(%error, "relayed client disconnected");
                         }
@@ -461,6 +517,7 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
             _ = &mut shutdown => { capture.end_session().await; break; }
         };
         capture.end_session().await;
+        leave_privacy(capture).await;
         if let Err(error) = result {
             tracing::warn!(%error, "client disconnected");
         }
@@ -517,6 +574,83 @@ async fn restore_capture(capture: &mut Capture) {
                 );
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
+        }
+    }
+}
+
+/// After a session. Privacy mode (its monitors are already back on): stream
+/// the physical monitors again; a failure leaves the capture lost, and
+/// `restore_capture` retries before the next client. A fallback virtual
+/// display is given up until the next client.
+async fn leave_privacy(capture: &mut Capture) {
+    if capture.privacy()
+        && let Err(error) = capture.set_privacy(false, None).await
+    {
+        tracing::warn!(
+            error = format!("{error:#}"),
+            "desktop portal not ready after privacy mode"
+        );
+    }
+    capture.release_fallback().await;
+}
+
+/// Recreate the portal session, retrying while displays settle.
+async fn reopen_capture(capture: &mut Capture) -> Result<()> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match capture.reopen().await {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < PORTAL_REOPEN_ATTEMPTS => {
+                tracing::warn!(
+                    attempt,
+                    error = format!("{error:#}"),
+                    "desktop portal not ready yet; retrying"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => return Err(error.context("recreating the desktop portal session")),
+        }
+    }
+}
+
+/// A capture change applied while every pipeline is stopped.
+enum DisplayChange {
+    /// Privacy mode on: stream a virtual output, physical monitors off.
+    Privacy,
+    /// The primary virtual output follows the client's display.
+    Resize(Size),
+}
+
+/// Privacy mode on. Saves the monitors and starts the guard first, then
+/// switches capture to a virtual output, then turns the monitors off. On any
+/// failure the monitors are restored and capture returns to them.
+async fn enter_privacy(
+    capture: &mut Capture,
+    size: Option<Size>,
+    state: &std::path::Path,
+) -> Result<crate::privacy::Privacy> {
+    let mut privacy = crate::privacy::Privacy::begin(state.to_owned()).await?;
+    let result = match capture.set_privacy(true, size).await {
+        Ok(()) => privacy.enforce().await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(count) => {
+            tracing::info!(monitors = count, "privacy mode on: physical monitors off");
+            Ok(privacy)
+        }
+        Err(error) => {
+            if let Err(restore) = privacy.end().await {
+                tracing::error!(
+                    error = format!("{restore:#}"),
+                    "could not restore the monitors; the privacy guard retries"
+                );
+            }
+            if capture.set_privacy(false, None).await.is_err() {
+                reopen_capture(capture).await?;
+            }
+            Err(error)
         }
     }
 }
@@ -596,11 +730,14 @@ async fn run_session(
         ));
     }
     // Likewise for the per-monitor tracks, which clients may subscribe to
-    // before they send anything.
+    // before they send anything; one more for a virtual monitor the client
+    // may add.
+    let monitor_slots =
+        (capture.monitors.len() + usize::from(capture.virtual_monitors_available())).min(64);
     let mut monitor_codec_tracks = Vec::new();
     for codec in [protocol::VideoCodec::H264, protocol::VideoCodec::H265] {
         let mut tracks = Vec::new();
-        for index in 0..capture.monitors.len().min(64) {
+        for index in 0..monitor_slots {
             tracks.push(broadcast.create_track(
                 format!("monitor-{index}-{}", codec.track()),
                 moq_net::track::Info::default().with_latency_max(Duration::from_millis(500)),
@@ -809,8 +946,22 @@ async fn run_session(
     let mut display_pending = false;
     // Force feedback from the virtual pads, once the client plays rumble.
     let mut rumble: Option<tokio::sync::mpsc::UnboundedReceiver<crate::gamepad::Rumble>> = None;
+    // Privacy mode for this session: dropping it (however the session ends)
+    // turns the monitors back on while the virtual output still exists.
+    let mut privacy: Option<crate::privacy::Privacy> = None;
+    let mut privacy_check = Instant::now();
+    let mut monitors_check = Instant::now();
+    // Capture changes waiting for a full restart (privacy, virtual resize).
+    let mut display_change = (options.privacy_mode == PrivacyMode::Always
+        && options.privacy_available)
+        .then_some(DisplayChange::Privacy);
+    // The client asked for a virtual monitor: added (and kept at its display
+    // size) by the display handler.
+    let mut virtual_requested = false;
     loop {
-        if let Some(local) = cursor_restart.take() {
+        if cursor_restart.is_some() || display_change.is_some() {
+            let local = cursor_restart.take();
+            let change = display_change.take();
             // Restart capture as for a monitor switch: without the pointer
             // (X11), or in the other portal cursor mode (a new ScreenCast
             // session, so every stream stops first).
@@ -824,23 +975,69 @@ async fn run_session(
                 &mut updates,
             )
             .await?;
-            if capture.is_portal() {
-                let mut attempt = 0;
-                while let Err(error) = capture.set_cursor_metadata(local).await {
-                    attempt += 1;
-                    ensure!(
-                        attempt < PORTAL_REOPEN_ATTEMPTS,
-                        error.context("changing the portal cursor mode")
-                    );
-                    tracing::warn!(
-                        attempt,
-                        error = format!("{error:#}"),
-                        "desktop portal not ready yet; retrying"
-                    );
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Some(local) = local {
+                if capture.is_portal() {
+                    let mut attempt = 0;
+                    while let Err(error) = capture.set_cursor_metadata(local).await {
+                        attempt += 1;
+                        ensure!(
+                            attempt < PORTAL_REOPEN_ATTEMPTS,
+                            error.context("changing the portal cursor mode")
+                        );
+                        tracing::warn!(
+                            attempt,
+                            error = format!("{error:#}"),
+                            "desktop portal not ready yet; retrying"
+                        );
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                } else {
+                    capture.local_cursor = local;
                 }
-            } else {
-                capture.local_cursor = local;
+            }
+            let client_size = client_display.as_ref().map(Size::for_client);
+            match &change {
+                Some(DisplayChange::Privacy) => {
+                    let text =
+                        match enter_privacy(capture, client_size, &options.privacy_state).await {
+                            Ok(session) => {
+                                let text = format!(
+                                    "Privacy mode on: the host's monitors are off ({})",
+                                    session.monitors()
+                                );
+                                privacy = Some(session);
+                                privacy_check = Instant::now();
+                                text
+                            }
+                            Err(error) => {
+                                tracing::warn!(error = format!("{error:#}"), "privacy mode failed");
+                                format!("Privacy mode unavailable: {error:#}")
+                            }
+                        };
+                    publish_update(&mut updates, Update::Notice { text })?;
+                }
+                Some(DisplayChange::Resize(size)) => {
+                    if let Err(error) = capture.resize_virtual(0, *size).await {
+                        tracing::warn!(
+                            error = format!("{error:#}"),
+                            "virtual display resize failed"
+                        );
+                    }
+                }
+                None => {}
+            }
+            // A virtual output may have a new size: fit the client again.
+            if change.is_some()
+                && let Some(display) = &client_display
+            {
+                let choice = negotiate_stream(display, capture);
+                (options.width, options.fps, options.bitrate) =
+                    (choice.width, choice.fps, choice.bitrate);
+            }
+            // Recreating the portal session removed the client's virtual
+            // monitor: the display handler adds it again.
+            if virtual_requested && capture.virtual_monitor().is_none() {
+                display_pending = true;
             }
             rates.restore(options);
             video_start_group = video_barrier(&video)?;
@@ -904,13 +1101,17 @@ async fn run_session(
             last_feedback = Instant::now();
             publish_update(&mut updates, Update::Desktop { desktop: info })?;
             // Portal shapes arrive through the feed (`pw_cursor::subscribe`).
-            if local
+            if local == Some(true)
                 && let Some(CursorFeed::X11(watcher)) = cursor_watcher.as_mut()
                 && let Some(cursor) = watcher.shapes.borrow_and_update().clone()
             {
                 publish_update(&mut updates, Update::Cursor { cursor })?;
             }
-            tracing::info!(local, "capture restarted for the client's cursor choice");
+            tracing::info!(
+                ?local,
+                display = change.is_some(),
+                "capture restarted for the client's cursor or display"
+            );
         }
         if portal_lost {
             portal_lost = false;
@@ -988,6 +1189,14 @@ async fn run_session(
                     text: "Host displays changed; video restarted".into(),
                 },
             )?;
+            if virtual_requested && capture.virtual_monitor().is_none() {
+                display_pending = true;
+            }
+            // Still no monitor the portal would share: ask again in a minute,
+            // not every few seconds (each try restarts the video).
+            if capture.fallback_virtual() {
+                monitors_check = Instant::now() + Duration::from_secs(55);
+            }
             tracing::info!("desktop portal session recreated");
         }
         tokio::select! {
@@ -1040,6 +1249,53 @@ async fn run_session(
             },
             _ = tokio::time::sleep_until((last_configure + CONFIGURE_INTERVAL).into()), if display_pending => {
                 display_pending = false;
+                let size = client_display.as_ref().map(Size::for_client);
+                if virtual_requested && capture.virtual_monitor().is_none() {
+                    let text = match capture.add_virtual_monitor(size.unwrap_or(Size::DEFAULT)).await {
+                        Ok(index) => {
+                            publish_update(&mut updates, Update::Desktop { desktop: desktop(options, capture, video_start_group)? })?;
+                            format!("Virtual monitor added as monitor {}", index + 1)
+                        }
+                        Err(error) => {
+                            virtual_requested = false;
+                            tracing::warn!(error = format!("{error:#}"), "virtual monitor failed");
+                            format!("Virtual monitor unavailable: {error:#}")
+                        }
+                    };
+                    publish_update(&mut updates, Update::Notice { text })?;
+                } else if let (Some(size), Some(index)) = (size, capture.virtual_monitor())
+                    && capture.virtual_monitor_resizable()
+                    && (capture.monitors[index].width, capture.monitors[index].height) != (size.width, size.height)
+                {
+                    // Follow the client's display: stop its stream, resize, restart it.
+                    let running = monitor_streams.remove(&index);
+                    let was_running = running.is_some();
+                    if let Some(stream) = running { while_starting(retire(stream), &mut events, capture, &mut updates).await?; }
+                    if let Err(error) = capture.resize_virtual(index, size).await {
+                        tracing::warn!(error = format!("{error:#}"), "virtual monitor resize failed");
+                    }
+                    publish_update(&mut updates, Update::Desktop { desktop: desktop(options, capture, video_start_group)? })?;
+                    if was_running {
+                        match monitor_encoder(options, capture, index, &monitor_tracks[index], &mut events, &mut updates).await {
+                            Ok(stream) => {
+                                publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
+                                if long_gop { stream.pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
+                                monitor_streams.insert(index, stream);
+                            }
+                            Err(error) => publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor restart failed: {error}"), requested: false })?,
+                        }
+                    }
+                }
+                // A virtual primary display takes the client's size and
+                // refresh rate (a full restart, which negotiates again).
+                if let (Some(size), Some(current)) = (size, capture.primary_virtual())
+                    && size != current
+                    && display_change.is_none()
+                {
+                    last_configure = Instant::now();
+                    display_change = Some(DisplayChange::Resize(size));
+                    continue;
+                }
                 if let Some(requested) = client_display {
                     // The portal states no refresh rate, but the running
                     // screencast does (KWin caps it at the monitor's).
@@ -1066,6 +1322,35 @@ async fn run_session(
                     tracing::warn!(error = format!("{error:#}"), "capture pipeline failed");
                     portal_lost = true;
                     continue;
+                }
+                // Streaming a virtual display for lack of a monitor: switch
+                // to the monitors once one is back (KDE; elsewhere the
+                // session keeps the virtual display).
+                if capture.fallback_virtual() && monitors_check.elapsed() >= MONITORS_CHECK_INTERVAL {
+                    monitors_check = Instant::now();
+                    let back = tokio::task::spawn_blocking(|| !crate::virtual_display::enabled_physical().is_empty())
+                        .await
+                        .unwrap_or(false);
+                    if back {
+                        tracing::info!("a monitor is back; streaming it instead of the virtual display");
+                        portal_lost = true;
+                        continue;
+                    }
+                }
+                // Monitors that came back while private (plugged in, woken
+                // by a hotplug) go off again.
+                if let Some(session) = privacy.as_mut()
+                    && privacy_check.elapsed() >= PRIVACY_CHECK_INTERVAL
+                {
+                    privacy_check = Instant::now();
+                    match session.enforce().await {
+                        Ok(0) => {}
+                        Ok(count) => tracing::warn!(count, "privacy mode turned returning monitors off again"),
+                        Err(error) => {
+                            tracing::warn!(error = format!("{error:#}"), "privacy mode could not keep the monitors off");
+                            publish_update(&mut updates, Update::Notice { text: format!("Privacy mode could not keep a host monitor off: {error:#}") })?;
+                        }
+                    }
                 }
                 let failed: Vec<_> = monitor_streams.iter().filter_map(|(&index, stream)| stream.pipeline.error().err().map(|error| (index, error))).collect();
                 for (index, error) in failed {
@@ -1155,7 +1440,23 @@ async fn run_session(
                     // Auxiliary streams currently use fixed bitrate. Their
                     // congestion must never adapt the independent primary.
                     Event::MonitorFeedback { .. } => {}
-                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble, cursor_positions: wants_positions } => {
+                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble, cursor_positions: wants_positions, privacy: wants_privacy, virtual_monitor: wants_virtual } => {
+                        if wants_privacy && privacy.is_none() && !capture.privacy() {
+                            if options.privacy_available {
+                                display_change = Some(DisplayChange::Privacy);
+                            } else {
+                                publish_update(&mut updates, Update::Notice { text: "Privacy mode is off on this host (teleport host --privacy-mode request)".into() })?;
+                            }
+                        }
+                        if wants_virtual && !virtual_requested {
+                            if capture.virtual_monitors_available() {
+                                virtual_requested = true;
+                                // Added by the display handler, at the client's size.
+                                display_pending = true;
+                            } else {
+                                publish_update(&mut updates, Update::Notice { text: "This host cannot add a virtual monitor".into() })?;
+                            }
+                        }
                         if plays_rumble && rumble.is_none() {
                             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
                             capture.enable_rumble(sender);
@@ -1558,6 +1859,9 @@ fn desktop_for_monitor(
         network_feedback: std::env::var_os("TELEPORT_NETWORK_FEEDBACK")
             .is_none_or(|value| value != "0"),
         stepped_down: options.stepped_down,
+        virtual_monitor: capture.virtual_monitors_available(),
+        privacy_mode: options.privacy_available,
+        privacy_active: capture.privacy(),
     })
 }
 

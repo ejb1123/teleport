@@ -1,4 +1,7 @@
-use crate::protocol::{Event, Monitor};
+use crate::{
+    protocol::{Event, Monitor},
+    virtual_display::{MonitorFailure, Plan, Size, VirtualDisplay},
+};
 use anyhow::{Context, Result, ensure};
 use ashpd::desktop::{
     PersistMode, Session,
@@ -64,6 +67,329 @@ pub struct Capture {
     /// Portal: the open session sends the pointer as PipeWire cursor metadata
     /// (read by `crate::pw_cursor`) instead of drawing it into the video.
     cursor_metadata: bool,
+    /// Host `--virtual-display`.
+    virtual_mode: VirtualDisplay,
+    /// Portal: the compositor offers virtual outputs (ScreenCast VIRTUAL).
+    virtual_available: bool,
+    /// Privacy mode: the primary session may only stream a virtual output.
+    privacy: bool,
+    /// Mode for a primary virtual output (the client's display).
+    virtual_size: Option<Size>,
+    /// Portal: the primary session streams a virtual output (monitor 0).
+    primary_virtual: Option<VirtualOutput>,
+    /// A virtual monitor added for the client, in a portal session of its
+    /// own; always the last entry of `monitors`.
+    extra: Option<ExtraMonitor>,
+}
+
+/// A portal virtual output: its compositor output name (KDE; the stream's
+/// `mapping_id`) and mode.
+#[derive(Clone, Debug)]
+struct VirtualOutput {
+    name: Option<String>,
+    size: Size,
+    /// Its mode can be changed (KDE output control works for it).
+    resizable: bool,
+}
+
+struct ExtraMonitor {
+    proxy: RemoteDesktop<'static>,
+    session: Session<'static, RemoteDesktop<'static>>,
+    node: u32,
+    output: VirtualOutput,
+}
+
+/// The portal shared no monitor (or only virtual outputs).
+#[derive(Debug)]
+struct NoMonitor;
+
+impl std::fmt::Display for NoMonitor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("the desktop portal shared no monitor")
+    }
+}
+
+impl std::error::Error for NoMonitor {}
+
+fn monitor_failure(error: &anyhow::Error) -> MonitorFailure {
+    use ashpd::desktop::ResponseError;
+    if error.downcast_ref::<NoMonitor>().is_some() {
+        return MonitorFailure::NoMonitor;
+    }
+    match error.downcast_ref::<ashpd::Error>() {
+        Some(ashpd::Error::Response(ResponseError::Cancelled)) => MonitorFailure::Cancelled,
+        Some(ashpd::Error::Response(ResponseError::Other)) => MonitorFailure::PortalError,
+        _ => MonitorFailure::Other,
+    }
+}
+
+/// An open RemoteDesktop + ScreenCast portal session.
+struct PortalSession {
+    proxy: RemoteDesktop<'static>,
+    session: Session<'static, RemoteDesktop<'static>>,
+    monitors: Vec<Monitor>,
+    nodes: Vec<u32>,
+    /// Compositor output names (`mapping_id`, KDE).
+    outputs: Vec<Option<String>>,
+    cursor_metadata_available: bool,
+    cursor_metadata: bool,
+}
+
+/// Open a portal session sharing every monitor (`virtual_output` false) or a
+/// new virtual output. The restore token, when given, avoids the local
+/// dialog (only one live session may use it: tokens rotate).
+async fn open_portal(
+    virtual_output: bool,
+    restore_token_path: Option<&Path>,
+    cursor_metadata: bool,
+) -> Result<PortalSession> {
+    let proxy = RemoteDesktop::new()
+        .await
+        .context("RemoteDesktop portal unavailable; run inside your graphical session")?;
+    let cast = Screencast::new().await?;
+    let session = proxy.create_session().await?;
+    match start_portal(
+        &proxy,
+        &cast,
+        &session,
+        virtual_output,
+        restore_token_path,
+        cursor_metadata,
+    )
+    .await
+    {
+        Ok(started) => Ok(PortalSession {
+            proxy,
+            session,
+            monitors: started.monitors,
+            nodes: started.nodes,
+            outputs: started.outputs,
+            cursor_metadata_available: started.cursor_metadata_available,
+            cursor_metadata: started.cursor_metadata,
+        }),
+        Err(error) => {
+            // Never leave a session (and its virtual output) behind.
+            let _ = session.close().await;
+            Err(error)
+        }
+    }
+}
+
+struct Started {
+    monitors: Vec<Monitor>,
+    nodes: Vec<u32>,
+    outputs: Vec<Option<String>>,
+    cursor_metadata_available: bool,
+    cursor_metadata: bool,
+}
+
+async fn start_portal(
+    proxy: &RemoteDesktop<'static>,
+    cast: &Screencast<'static>,
+    session: &Session<'static, RemoteDesktop<'static>>,
+    virtual_output: bool,
+    restore_token_path: Option<&Path>,
+    cursor_metadata: bool,
+) -> Result<Started> {
+    let restore_token = restore_token_path
+        .map(read_restore_token)
+        .transpose()?
+        .flatten();
+    proxy
+        .select_devices(
+            session,
+            DeviceType::Keyboard | DeviceType::Pointer,
+            restore_token.as_deref(),
+            if restore_token_path.is_some() {
+                PersistMode::ExplicitlyRevoked
+            } else {
+                PersistMode::DoNot
+            },
+        )
+        .await?
+        .response()?;
+    // Portals before version 2 have no AvailableCursorModes and
+    // keep the pointer embedded.
+    let available = cast
+        .available_cursor_modes()
+        .await
+        .is_ok_and(|modes| modes.contains(CursorMode::Metadata));
+    let metadata = cursor_metadata && available;
+    cast.select_sources(
+        session,
+        if metadata {
+            CursorMode::Metadata
+        } else {
+            CursorMode::Embedded
+        },
+        if virtual_output {
+            SourceType::Virtual.into()
+        } else {
+            SourceType::Monitor.into()
+        },
+        !virtual_output,
+        None,
+        PersistMode::DoNot,
+    )
+    .await?
+    .response()?;
+    if !virtual_output {
+        tracing::info!(
+            "Select monitors and approve desktop control in the local portal dialog; persistence depends on your compositor"
+        );
+    }
+    let response = proxy.start(session, None).await?.response()?;
+    ensure!(
+        response.devices().contains(DeviceType::Keyboard)
+            && response.devices().contains(DeviceType::Pointer),
+        "keyboard and pointer permission are required"
+    );
+    let streams: Vec<_> = response
+        .streams()
+        .unwrap_or_default()
+        .iter()
+        // A monitor session shares every output, including virtual ones
+        // (ours or another app's); those are not monitors.
+        .filter(|stream| {
+            virtual_output
+                || !stream
+                    .mapping_id()
+                    .is_some_and(crate::virtual_display::is_portal_virtual)
+        })
+        .collect();
+    if streams.is_empty() {
+        return Err(NoMonitor.into());
+    }
+    let monitors = streams
+        .iter()
+        .enumerate()
+        .map(|(id, stream)| {
+            let (width, height) = stream
+                .size()
+                .context("portal did not report logical monitor size")?;
+            ensure!(width > 0 && height > 0, "invalid monitor size");
+            Ok(Monitor {
+                id,
+                name: if virtual_output {
+                    "Virtual display".into()
+                } else {
+                    stream
+                        .id()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Monitor {}", id + 1))
+                },
+                width: width as u32,
+                height: height as u32,
+                // The portal reports no refresh rate.
+                refresh_mhz: 0,
+                virtual_display: virtual_output,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let nodes = streams
+        .iter()
+        .map(|stream| stream.pipe_wire_node_id())
+        .collect();
+    let outputs = streams
+        .iter()
+        .map(|stream| stream.mapping_id().map(str::to_owned))
+        .collect();
+    if let Some(path) = restore_token_path {
+        if let Some(token) = response.restore_token() {
+            write_restore_token(path, token)?;
+        } else {
+            tracing::warn!(
+                "Portal did not grant persistent access; future starts may require local approval"
+            );
+        }
+    }
+    Ok(Started {
+        monitors,
+        nodes,
+        outputs,
+        cursor_metadata_available: available,
+        cursor_metadata: metadata,
+    })
+}
+
+/// Open a virtual-output session and give the output `size` (KDE). Unless
+/// for privacy mode, physical monitors that were on stay on.
+async fn open_virtual(
+    restore_token_path: Option<&Path>,
+    cursor_metadata: bool,
+    size: Size,
+    privacy: bool,
+) -> Result<(PortalSession, VirtualOutput)> {
+    let before = if privacy {
+        Vec::new()
+    } else {
+        tokio::task::spawn_blocking(crate::virtual_display::enabled_physical)
+            .await
+            .unwrap_or_default()
+    };
+    let mut session = open_portal(true, restore_token_path, cursor_metadata).await?;
+    // Elsewhere than KDE (GNOME) there is no output name or
+    // `kscreen-doctor`, and the portal's size stays.
+    let mut output = VirtualOutput {
+        resizable: session.outputs[0].is_some(),
+        name: session.outputs[0].clone(),
+        size: Size {
+            width: session.monitors[0].width,
+            height: session.monitors[0].height,
+            refresh_mhz: crate::virtual_display::Size::DEFAULT.refresh_mhz,
+        },
+    };
+    resize_output(&mut output, size).await;
+    session.monitors[0].width = output.size.width;
+    session.monitors[0].height = output.size.height;
+    session.monitors[0].refresh_mhz = output.size.refresh_mhz;
+    if !before.is_empty()
+        && let Err(error) =
+            tokio::task::spawn_blocking(move || crate::virtual_display::keep_enabled(&before))
+                .await
+                .map_err(anyhow::Error::from)
+                .and_then(|result| result)
+    {
+        tracing::warn!(
+            error = format!("{error:#}"),
+            "could not check the physical monitors"
+        );
+    }
+    tracing::info!(
+        output = output.name.as_deref().unwrap_or("unknown"),
+        width = output.size.width,
+        height = output.size.height,
+        refresh_mhz = output.size.refresh_mhz,
+        "virtual display created"
+    );
+    Ok((session, output))
+}
+
+/// Give a virtual output `size` through KDE's output management. Elsewhere
+/// (GNOME: no `kscreen-doctor`, no output name) it keeps the portal's size.
+async fn resize_output(output: &mut VirtualOutput, size: Size) {
+    let Some(name) = output.name.clone().filter(|_| output.resizable) else {
+        return;
+    };
+    if output.size == size {
+        return;
+    }
+    match tokio::task::spawn_blocking(move || crate::virtual_display::resize(&name, size)).await {
+        Ok(Ok(size)) => output.size = size,
+        result => {
+            // Not again for this output (no KDE output control, or refused).
+            output.resizable = false;
+            let error = match result {
+                Ok(Err(error)) => format!("{error:#}"),
+                Err(error) => error.to_string(),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            tracing::warn!(
+                error,
+                "could not resize the virtual display; keeping its size"
+            );
+        }
+    }
 }
 
 enum Backend {
@@ -101,7 +427,11 @@ impl Capture {
         let mut fd = None;
         let mut pipeline = match &self.backend {
             Backend::Test => format!("videotestsrc is-live=true pattern={}", test_pattern(index)),
-            Backend::Portal { session, nodes, .. } => {
+            Backend::Portal { .. } => {
+                // The socket must come from the session owning the node.
+                let (_, session, node) = self
+                    .portal_target(index)
+                    .context("monitor index is out of range")?;
                 let remote = Screencast::new()
                     .await?
                     .open_pipe_wire_remote(session)
@@ -110,7 +440,7 @@ impl Capture {
                     "pipewiresrc name={} fd={} path={} do-timestamp=true keepalive-time={KEEPALIVE_MS} ! {PIPEWIRE_SYSTEM_MEMORY}",
                     crate::pw_cursor::source_name(index),
                     remote.as_raw_fd(),
-                    nodes[index]
+                    node
                 );
                 fd = Some(remote);
                 source
@@ -144,14 +474,12 @@ impl Capture {
         let x = x * (monitor.width - 1) as f64;
         let y = y * (monitor.height - 1) as f64;
         match &self.backend {
-            Backend::Portal {
-                proxy,
-                session,
-                nodes,
-                ..
-            } => {
+            Backend::Portal { .. } => {
+                let (proxy, session, node) = self
+                    .portal_target(index)
+                    .context("monitor index is out of range")?;
                 proxy
-                    .notify_pointer_motion_absolute(session, nodes[index], x, y)
+                    .notify_pointer_motion_absolute(session, node, x, y)
                     .await?
             }
             Backend::X11 {
@@ -184,11 +512,53 @@ impl Capture {
     /// `cursor_metadata`: open a portal session with the pointer sent as
     /// PipeWire metadata when the compositor offers it (the client draws it,
     /// docs/cursor.md); otherwise the pointer is drawn into the video.
+    /// Physical monitors only (no virtual outputs).
+    #[cfg(test)]
     pub async fn open_with_options(
         source: &str,
         restore_token_path: Option<&Path>,
         monitor: usize,
         cursor_metadata: bool,
+    ) -> Result<Self> {
+        Self::open_host(
+            source,
+            restore_token_path,
+            monitor,
+            cursor_metadata,
+            VirtualDisplay::Never,
+        )
+        .await
+    }
+
+    /// As `open_with_options`, with the host's `--virtual-display` policy:
+    /// a virtual output when there is no monitor, or always.
+    pub async fn open_host(
+        source: &str,
+        restore_token_path: Option<&Path>,
+        monitor: usize,
+        cursor_metadata: bool,
+        virtual_mode: VirtualDisplay,
+    ) -> Result<Self> {
+        Self::open_inner(
+            source,
+            restore_token_path,
+            monitor,
+            cursor_metadata,
+            virtual_mode,
+            false,
+            None,
+        )
+        .await
+    }
+
+    async fn open_inner(
+        source: &str,
+        restore_token_path: Option<&Path>,
+        monitor: usize,
+        cursor_metadata: bool,
+        virtual_mode: VirtualDisplay,
+        privacy: bool,
+        virtual_size: Option<Size>,
     ) -> Result<Self> {
         let mut result = Self {
             width: 1280,
@@ -201,6 +571,7 @@ impl Capture {
                     width: 1280,
                     height: 720,
                     refresh_mhz: 0,
+                    virtual_display: false,
                 },
                 Monitor {
                     id: 1,
@@ -208,6 +579,7 @@ impl Capture {
                     width: 720,
                     height: 1280,
                     refresh_mhz: 0,
+                    virtual_display: false,
                 },
             ],
             active_monitor: 0,
@@ -222,6 +594,12 @@ impl Capture {
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
             gamepads: crate::gamepad::Gamepads::new(false),
+            virtual_mode,
+            virtual_available: false,
+            privacy,
+            virtual_size,
+            primary_virtual: None,
+            extra: None,
         };
         let source = match source {
             "auto"
@@ -234,111 +612,76 @@ impl Capture {
             value => value,
         };
         match source {
-            "test" => (),
+            "test" => ensure!(!privacy, "privacy mode needs a desktop portal"),
             "portal" => {
                 register_portal_app().await;
-                let proxy = RemoteDesktop::new().await.context(
-                    "RemoteDesktop portal unavailable; run inside your graphical session",
-                )?;
-                let cast = Screencast::new().await?;
-                let session = proxy.create_session().await?;
-                let restore_token = restore_token_path
-                    .map(read_restore_token)
-                    .transpose()?
-                    .flatten();
-                proxy
-                    .select_devices(
-                        &session,
-                        DeviceType::Keyboard | DeviceType::Pointer,
-                        restore_token.as_deref(),
-                        if restore_token_path.is_some() {
-                            PersistMode::ExplicitlyRevoked
-                        } else {
-                            PersistMode::DoNot
-                        },
-                    )
+                let virtual_available = Screencast::new()
                     .await?
-                    .response()?;
-                // Portals before version 2 have no AvailableCursorModes and
-                // keep the pointer embedded.
-                let available = cast
-                    .available_cursor_modes()
+                    .available_source_types()
                     .await
-                    .is_ok_and(|modes| modes.contains(CursorMode::Metadata));
-                let metadata = cursor_metadata && available;
-                cast.select_sources(
-                    &session,
-                    if metadata {
-                        CursorMode::Metadata
-                    } else {
-                        CursorMode::Embedded
-                    },
-                    SourceType::Monitor.into(),
-                    true,
-                    None,
-                    PersistMode::DoNot,
-                )
-                .await?
-                .response()?;
-                tracing::info!(
-                    "Select monitors and approve desktop control in the local portal dialog; persistence depends on your compositor"
-                );
-                let response = proxy.start(&session, None).await?.response()?;
-                ensure!(
-                    response.devices().contains(DeviceType::Keyboard)
-                        && response.devices().contains(DeviceType::Pointer),
-                    "keyboard and pointer permission are required"
-                );
-                let streams = response.streams().context("portal returned no monitor")?;
-                ensure!(!streams.is_empty(), "portal returned no monitor");
-                result.monitors = streams
-                    .iter()
-                    .enumerate()
-                    .map(|(id, stream)| {
-                        let (width, height) = stream
-                            .size()
-                            .context("portal did not report logical monitor size")?;
-                        ensure!(width > 0 && height > 0, "invalid monitor size");
-                        Ok(Monitor {
-                            id,
-                            name: stream
-                                .id()
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| format!("Monitor {}", id + 1)),
-                            width: width as u32,
-                            height: height as u32,
-                            // The portal reports no refresh rate.
-                            refresh_mhz: 0,
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let nodes = streams
-                    .iter()
-                    .map(|stream| stream.pipe_wire_node_id())
-                    .collect();
-                if let Some(path) = restore_token_path {
-                    if let Some(token) = response.restore_token() {
-                        write_restore_token(path, token)?;
-                    } else {
-                        tracing::warn!(
-                            "Portal did not grant persistent access; future starts may require local approval"
-                        );
+                    .is_ok_and(|types| types.contains(SourceType::Virtual));
+                let plan = crate::virtual_display::plan(virtual_mode, virtual_available, privacy)?;
+                let size = virtual_size.unwrap_or(Size::DEFAULT);
+                let (opened, primary_virtual) = match plan {
+                    Plan::Monitors => (
+                        open_portal(false, restore_token_path, cursor_metadata).await?,
+                        None,
+                    ),
+                    Plan::Virtual => {
+                        let (opened, output) =
+                            open_virtual(restore_token_path, cursor_metadata, size, privacy)
+                                .await?;
+                        (opened, Some(output))
                     }
-                }
-                let fd = cast.open_pipe_wire_remote(&session).await?;
-                result.cursor_metadata_available = available;
-                result.cursor_metadata = metadata;
+                    Plan::MonitorsOrVirtual => {
+                        match open_portal(false, restore_token_path, cursor_metadata).await {
+                            Ok(opened) => (opened, None),
+                            Err(error)
+                                if crate::virtual_display::falls_back(monitor_failure(&error)) =>
+                            {
+                                tracing::warn!(
+                                    error = format!("{error:#}"),
+                                    "no monitor to share; streaming a virtual display instead"
+                                );
+                                let (opened, output) =
+                                    open_virtual(restore_token_path, cursor_metadata, size, false)
+                                        .await?;
+                                (opened, Some(output))
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                };
+                let fd = Screencast::new()
+                    .await?
+                    .open_pipe_wire_remote(&opened.session)
+                    .await?;
+                result.monitors = opened.monitors;
+                result.cursor_metadata_available = opened.cursor_metadata_available;
+                result.cursor_metadata = opened.cursor_metadata;
+                result.virtual_available = virtual_available;
                 tracing::info!(
-                    cursor = if metadata { "metadata" } else { "embedded" },
-                    metadata_available = available,
+                    cursor = if opened.cursor_metadata {
+                        "metadata"
+                    } else {
+                        "embedded"
+                    },
+                    metadata_available = opened.cursor_metadata_available,
+                    virtual_display = primary_virtual.is_some(),
+                    virtual_available,
                     "desktop portal session started"
                 );
-                result.name = "Wayland portal";
+                result.name = if primary_virtual.is_some() {
+                    "Wayland portal (virtual display)"
+                } else {
+                    "Wayland portal"
+                };
+                result.primary_virtual = primary_virtual;
                 result.backend = Backend::Portal {
-                    proxy,
-                    session,
+                    proxy: opened.proxy,
+                    session: opened.session,
                     fd,
-                    nodes,
+                    nodes: opened.nodes,
                 };
             }
             "x11" => {
@@ -366,7 +709,11 @@ impl Capture {
             _ => anyhow::bail!("unknown capture source"),
         }
         result.gamepads = crate::gamepad::Gamepads::new(!matches!(result.backend, Backend::Test));
-        result.select_monitor(monitor).await?;
+        if let Err(error) = result.select_monitor(monitor).await {
+            // Never leave a portal session (and a virtual output) behind.
+            result.close().await;
+            return Err(error);
+        }
         Ok(result)
     }
 
@@ -381,11 +728,14 @@ impl Capture {
         // A new GStreamer pipeline creates a new PipeWire core. Obtain a fresh
         // authorized socket rather than replaying the core handshake on a socket
         // whose previous core has already disconnected.
-        if let Backend::Portal { session, fd, .. } = &mut self.backend {
-            *fd = Screencast::new()
+        if let Some((_, session, _)) = self.portal_target(index) {
+            let remote = Screencast::new()
                 .await?
                 .open_pipe_wire_remote(session)
                 .await?;
+            if let Backend::Portal { fd, .. } = &mut self.backend {
+                *fd = remote;
+            }
         }
         self.active_monitor = index;
         self.width = width;
@@ -399,11 +749,12 @@ impl Capture {
                 "videotestsrc is-live=true pattern={}",
                 test_pattern(self.active_monitor)
             ),
-            Backend::Portal { fd, nodes, .. } => format!(
+            Backend::Portal { fd, .. } => format!(
                 "pipewiresrc name={} fd={} path={} do-timestamp=true keepalive-time={KEEPALIVE_MS} ! {PIPEWIRE_SYSTEM_MEMORY}",
                 crate::pw_cursor::source_name(self.active_monitor),
                 fd.as_raw_fd(),
-                nodes[self.active_monitor]
+                self.portal_target(self.active_monitor)
+                    .map_or(0, |(_, _, node)| node)
             ),
             Backend::X11 { origins, .. } => {
                 let (x, y) = origins[self.active_monitor];
@@ -526,19 +877,12 @@ impl Capture {
                 let x = x * (self.width - 1) as f64;
                 let y = y * (self.height - 1) as f64;
                 match &self.backend {
-                    Backend::Portal {
-                        proxy,
-                        session,
-                        nodes,
-                        ..
-                    } => {
+                    Backend::Portal { .. } => {
+                        let (proxy, session, node) = self
+                            .portal_target(self.active_monitor)
+                            .context("monitor index is out of range")?;
                         proxy
-                            .notify_pointer_motion_absolute(
-                                session,
-                                nodes[self.active_monitor],
-                                x,
-                                y,
-                            )
+                            .notify_pointer_motion_absolute(session, node, x, y)
                             .await?
                     }
                     Backend::X11 {
@@ -675,10 +1019,186 @@ impl Capture {
         self.gamepads.neutralise();
     }
 
-    /// The client session ended: release everything and remove its pads.
+    /// The client session ended: release everything and remove its pads and
+    /// its virtual monitor.
     pub async fn end_session(&mut self) {
         self.release_all().await;
         self.gamepads.destroy_all();
+        self.remove_virtual_monitor().await;
+    }
+
+    /// The portal session, proxy and PipeWire node behind monitor `index`.
+    fn portal_target(
+        &self,
+        index: usize,
+    ) -> Option<(
+        &RemoteDesktop<'static>,
+        &Session<'static, RemoteDesktop<'static>>,
+        u32,
+    )> {
+        let Backend::Portal {
+            proxy,
+            session,
+            nodes,
+            ..
+        } = &self.backend
+        else {
+            return None;
+        };
+        if let Some(&node) = nodes.get(index) {
+            return Some((proxy, session, node));
+        }
+        self.extra
+            .as_ref()
+            .filter(|_| index == nodes.len())
+            .map(|extra| (&extra.proxy, &extra.session, extra.node))
+    }
+
+    /// Whether a client may add a virtual monitor here: next to physical
+    /// monitors only. KDE's portal names every virtual output of an app the
+    /// same, so a second one could not be told from (and sized apart from)
+    /// a virtual primary display.
+    pub fn virtual_monitors_available(&self) -> bool {
+        self.is_portal()
+            && self.virtual_available
+            && self.virtual_mode != VirtualDisplay::Never
+            && self.primary_virtual.is_none()
+    }
+
+    /// Whether the compositor can create virtual outputs (privacy mode).
+    pub fn virtual_available(&self) -> bool {
+        self.is_portal() && self.virtual_available
+    }
+
+    /// The primary session streams a virtual output (monitor 0) that can
+    /// follow the client's display: its size.
+    pub fn primary_virtual(&self) -> Option<Size> {
+        self.primary_virtual
+            .as_ref()
+            .filter(|output| output.resizable)
+            .map(|output| output.size)
+    }
+
+    /// The client's virtual monitor can follow its display.
+    pub fn virtual_monitor_resizable(&self) -> bool {
+        self.extra
+            .as_ref()
+            .is_some_and(|extra| extra.output.resizable)
+    }
+
+    /// Privacy mode: the primary session streams a virtual output only.
+    pub fn privacy(&self) -> bool {
+        self.privacy
+    }
+
+    /// The client's virtual monitor, if added: its index.
+    pub fn virtual_monitor(&self) -> Option<usize> {
+        self.extra.as_ref().map(|_| self.monitors.len() - 1)
+    }
+
+    /// Add a virtual monitor of `size` in a portal session of its own, as the
+    /// last monitor. Physical monitors stay as they are.
+    pub async fn add_virtual_monitor(&mut self, size: Size) -> Result<usize> {
+        ensure!(
+            self.virtual_monitors_available(),
+            "this host cannot create virtual displays"
+        );
+        ensure!(self.extra.is_none(), "a virtual monitor already exists");
+        let (opened, output) = open_virtual(None, self.cursor_metadata, size, false).await?;
+        let index = self.monitors.len();
+        let mut monitor = opened.monitors[0].clone();
+        monitor.id = index;
+        monitor.name = "Virtual monitor".into();
+        self.monitors.push(monitor);
+        self.extra = Some(ExtraMonitor {
+            proxy: opened.proxy,
+            session: opened.session,
+            node: opened.nodes[0],
+            output,
+        });
+        Ok(index)
+    }
+
+    /// Close the virtual monitor's session: the compositor removes the output.
+    pub async fn remove_virtual_monitor(&mut self) {
+        let Some(extra) = self.extra.take() else {
+            return;
+        };
+        let _ = extra.session.close().await;
+        self.monitors.pop();
+        tracing::info!("virtual monitor removed");
+        if self.active_monitor >= self.monitors.len() && !self.monitors.is_empty() {
+            let _ = self.select_monitor(0).await;
+        }
+    }
+
+    /// Resize the virtual output behind monitor `index` (KDE). Returns
+    /// whether its size changed; callers then restart its pipeline.
+    pub async fn resize_virtual(&mut self, index: usize, size: Size) -> Result<bool> {
+        let extra_index = self.virtual_monitor();
+        let output = if extra_index == Some(index) {
+            &mut self.extra.as_mut().context("virtual monitor gone")?.output
+        } else if index == 0 && self.primary_virtual.is_some() {
+            self.primary_virtual
+                .as_mut()
+                .context("virtual display gone")?
+        } else {
+            anyhow::bail!("monitor {index} is not a virtual display");
+        };
+        let before = output.size;
+        resize_output(output, size).await;
+        let after = output.size;
+        if after == before {
+            return Ok(false);
+        }
+        let monitor = &mut self.monitors[index];
+        (monitor.width, monitor.height, monitor.refresh_mhz) =
+            (after.width, after.height, after.refresh_mhz);
+        if self.active_monitor == index {
+            (self.width, self.height) = (after.width, after.height);
+        }
+        Ok(true)
+    }
+
+    /// Privacy mode on: the primary session becomes a virtual output of
+    /// `size` (the physical monitors are turned off by `crate::privacy`
+    /// afterwards). Off: back to the physical monitors. Recreates the
+    /// session; callers rebuild every capture pipeline first.
+    pub async fn set_privacy(&mut self, privacy: bool, size: Option<Size>) -> Result<()> {
+        let reopen = crate::virtual_display::privacy_reopens(
+            self.virtual_mode,
+            self.primary_virtual.is_some(),
+            self.privacy,
+            privacy,
+        );
+        self.privacy = privacy;
+        if size.is_some() {
+            self.virtual_size = size;
+        }
+        if !reopen && !self.lost {
+            return Ok(());
+        }
+        self.reopen().await
+    }
+
+    /// The primary session streams a virtual output only because no
+    /// monitor was there (`--virtual-display fallback`).
+    pub fn fallback_virtual(&self) -> bool {
+        self.primary_virtual.is_some()
+            && !self.privacy
+            && self.virtual_mode == VirtualDisplay::Fallback
+    }
+
+    /// Between sessions, give up a fallback virtual output: at the desk it
+    /// would be an invisible screen beside the real ones once they return.
+    /// The next client reopens capture (`is_lost`).
+    pub async fn release_fallback(&mut self) {
+        if self.fallback_virtual() {
+            self.close().await;
+            self.primary_virtual = None;
+            self.lost = true;
+            tracing::info!("virtual display released until the next client");
+        }
     }
 
     /// The client plays rumble: pads created from now on in this session
@@ -752,25 +1272,29 @@ impl Capture {
         self.close().await;
         self.gamepads = gamepads;
         self.lost = true;
-        let mut fresh = match Self::open_with_options(
-            &self.source,
-            self.restore_token_path.as_deref(),
-            monitor,
-            metadata,
-        )
-        .await
-        {
+        // A primary virtual output keeps its size (the client's display).
+        let size = self
+            .primary_virtual
+            .as_ref()
+            .map(|output| output.size)
+            .or(self.virtual_size);
+        let open = |monitor| {
+            Self::open_inner(
+                &self.source,
+                self.restore_token_path.as_deref(),
+                monitor,
+                metadata,
+                self.virtual_mode,
+                self.privacy,
+                size,
+            )
+        };
+        let mut fresh = match open(monitor).await {
             Ok(capture) => capture,
             // The monitor may be gone after an output change; start on the first.
             Err(error) if monitor != 0 => {
                 tracing::warn!(%error, monitor, "previous monitor unavailable; reopening on the first");
-                Self::open_with_options(
-                    &self.source,
-                    self.restore_token_path.as_deref(),
-                    0,
-                    metadata,
-                )
-                .await?
+                open(0).await?
             }
             Err(error) => return Err(error),
         };
@@ -882,6 +1406,7 @@ fn x11_monitors(
                 width: item.width.into(),
                 height: item.height.into(),
                 refresh_mhz: x11_refresh_mhz(connection, &item.outputs),
+                virtual_display: false,
             });
             origins.push((item.x, item.y));
         }
@@ -897,6 +1422,7 @@ fn x11_monitors(
                 width,
                 height,
                 refresh_mhz: 0,
+                virtual_display: false,
             }],
             vec![(0, 0)],
         )
@@ -1017,6 +1543,43 @@ mod tests {
         assert_eq!(evdev_button(crate::protocol::BUTTON_FORWARD), Some(276));
         assert_eq!(evdev_button(4), None);
     }
+    #[test]
+    fn missing_monitors_are_told_from_refusals() {
+        use ashpd::desktop::ResponseError;
+        let failure = |error: anyhow::Error| monitor_failure(&error.context("opening the portal"));
+        assert_eq!(failure(NoMonitor.into()), MonitorFailure::NoMonitor);
+        // KDE answers "Other" when it has no screen at all.
+        assert_eq!(
+            failure(ashpd::Error::Response(ResponseError::Other).into()),
+            MonitorFailure::PortalError
+        );
+        assert_eq!(
+            failure(ashpd::Error::Response(ResponseError::Cancelled).into()),
+            MonitorFailure::Cancelled
+        );
+        assert_eq!(
+            failure(anyhow::anyhow!(
+                "keyboard and pointer permission are required"
+            )),
+            MonitorFailure::Other
+        );
+    }
+
+    #[tokio::test]
+    async fn the_test_source_has_no_virtual_displays() {
+        let mut capture = Capture::open("test").await.unwrap();
+        assert!(!capture.virtual_monitors_available());
+        assert!(capture.add_virtual_monitor(Size::DEFAULT).await.is_err());
+        assert!(capture.resize_virtual(0, Size::DEFAULT).await.is_err());
+        assert_eq!(capture.monitors.len(), 2);
+        assert!(
+            Capture::open_inner("test", None, 0, false, VirtualDisplay::Fallback, true, None)
+                .await
+                .is_err(),
+            "privacy needs a portal"
+        );
+    }
+
     #[test]
     fn recognises_kde_lost_session_errors_only() {
         for text in [

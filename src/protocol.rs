@@ -229,6 +229,18 @@ pub struct Desktop {
     /// the link cannot carry it; `None` at the negotiated stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stepped_down: Option<SteppedDown>,
+    /// Host adds a virtual monitor sized to the client display when
+    /// `ClientFeatures::virtual_monitor` asks (docs/virtual-display.md).
+    #[serde(default)]
+    pub virtual_monitor: bool,
+    /// Host turns its physical monitors off for the session when
+    /// `ClientFeatures::privacy` asks (or always, by host setting).
+    #[serde(default)]
+    pub privacy_mode: bool,
+    /// Privacy mode is on: the host's physical monitors are off and the
+    /// session streams a virtual output.
+    #[serde(default)]
+    pub privacy_active: bool,
 }
 
 /// A network step-down: the negotiated stream, and the bitrate that made the
@@ -333,6 +345,11 @@ pub struct Monitor {
     /// when unknown (the desktop portal does not report it).
     #[serde(default)]
     pub refresh_mhz: u32,
+    /// A virtual output the compositor created for this host (headless
+    /// fallback, privacy mode or an extra monitor); it exists only while the
+    /// host streams it. Older hosts omit it.
+    #[serde(default)]
+    pub virtual_display: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -578,6 +595,15 @@ pub enum Event {
         /// there when it leaves relative mode). Older hosts ignore the field.
         #[serde(default)]
         cursor_positions: bool,
+        /// Turn the host's physical monitors off while this session lasts
+        /// (privacy mode). Only sent when `Desktop::privacy_mode`; older hosts
+        /// ignore the field.
+        #[serde(default)]
+        privacy: bool,
+        /// Add a virtual monitor sized to this client's display, streamed as
+        /// an extra monitor. Only sent when `Desktop::virtual_monitor`.
+        #[serde(default)]
+        virtual_monitor: bool,
     },
     /// The session's video codec. Sent as the very first input event to hosts
     /// advertising `Desktop::codec_selection`, which wait for it before
@@ -1199,6 +1225,8 @@ mod tests {
                 local_cursor: true,
                 rumble: true,
                 cursor_positions: true,
+                privacy: true,
+                virtual_monitor: true,
             },
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
@@ -1351,6 +1379,8 @@ mod tests {
                 local_cursor: false,
                 rumble: false,
                 cursor_positions: false,
+                privacy: false,
+                virtual_monitor: false,
             }
         ));
         let primary: Event = serde_json::from_str(r#"{"type":"request_keyframe"}"#).unwrap();

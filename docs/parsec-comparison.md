@@ -581,8 +581,8 @@ What is on `main`/this branch, from README, docs and code:
   kbps with 10 ms frames, no in-band FEC (M8). The client queue is ≤100 ms,
   leaky (`src/audio.rs`). No microphone.
 - **Displays:** select a monitor; multiple independent remote monitors map to
-  up to 4 extra local fullscreen windows, each with its own stream. No
-  virtual display, privacy mode or hotplug.
+  up to 4 extra local fullscreen windows, each with its own stream. Virtual
+  displays and privacy mode on KDE since 2026-10-17 (G17). No hotplug.
 - **Clipboard:** explicit text-only Send and Get, 64 KiB, opt-in on both
   ends. No file transfer.
 - **Stats (F8):** requested, accepted and current bitrate. Control RTT
@@ -647,8 +647,8 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Audio bitrate / raw PCM | 128–512, raw option | Fixed 128k Opus | Partial | |
 | Audio FEC / buffer tuning | 50–100 ms buffer | ≤100 ms leaky; tuning WIP | WIP | |
 | Multi-monitor | 3→5 screens (paid) | Up to 5 windows (1+4), free | **Parity / ahead (free)** | Per-screen settings partly |
-| Virtual displays / headless | VDD (paid), fallback (free) | No | Missing | |
-| Privacy mode | Paid | No | Missing | |
+| Virtual displays / headless | VDD (paid), fallback (free) | Portal virtual outputs (KDE): headless fallback, `always`, extra monitor sized to the client (2026-10-17) | **Parity (free)** | G17; GNOME and a connector-less machine untested |
+| Privacy mode | Paid | Physical outputs off + virtual output, opt-in, guarded restore (KDE, 2026-10-17) | Parity | G17 |
 | Login screen / after reboot | Windows, macOS | No (running session only) | Missing | |
 | Wake-on-LAN | Not documented | No | Parity | An opening |
 | Clipboard | Automatic text sync | Explicit text, 64 KiB | Partial (by design) | |
@@ -1060,6 +1060,26 @@ L.**
 
 **G17. Virtual display, headless hosting and privacy mode on Linux. Effort M.**
 
+- **Status (2026-10-17): implemented for KDE Plasma 6**
+  (docs/virtual-display.md, review tracker R13). The ScreenCast portal's
+  VIRTUAL source makes KWin create an output for the session's lifetime:
+  `--virtual-display fallback` (default) streams one when no monitor can be
+  shared and lets clients add one as an extra monitor (`--virtual-monitor`);
+  `always` streams one sized to the client (exact resolution matching). The
+  host resizes it to the client's display with `kscreen-doctor` custom
+  modes; input goes through the same RemoteDesktop session. Privacy mode
+  (`--privacy-mode request|always`, client `--privacy`, launcher toggle)
+  disables the physical outputs and streams a virtual one; DPMS was rejected
+  (input wakes it, and its wake hotplug destroys portal sessions). Restore is
+  layered: on session end, by a heartbeat guard process when the host dies or
+  hangs, by `ExecStopPost`/`teleport privacy-restore`, and by KWin's stored
+  layout. Verified in a nested headless KWin with its own portal (resize,
+  video, input on both kinds of virtual output, privacy on/off, hung and
+  killed host). Open: a real headless machine with no connector, GNOME
+  (`RecordVirtual`, same code path, untested), DRM virtual output into
+  NVENC/VA-API zero-copy, `loginctl lock-session` on last disconnect. KDE's
+  portal gives every virtual output of an app the same name, so a virtual
+  monitor is offered only beside physical monitors.
 - **Why:** Parsec charges for virtual displays and privacy mode (MM, PRIV) and
   needs a driver on Windows. On Linux the compositor can provide them.
 - **Steps:**
@@ -1252,9 +1272,11 @@ ships its own FFmpeg with CUDA and VA-API, and presents zero-copy.
 7. **Parsec extra mouse buttons (X1/X2).** Not documented; assumed supported.
 8. **Parsec "Always Relative" mouse mode (150-105a)**: only the changelog line
    exists; whether it auto-engages when a game hides the cursor is unknown.
-9. **Linux virtual-output support.** Which KDE (xdg-desktop-portal-kde) and
-   GNOME versions expose a virtual ScreenCast source or RecordVirtual, and
-   whether it works with the RemoteDesktop portal for input (G17).
+9. ~~Linux virtual-output support.~~ **Answered for KDE (G17):**
+   xdg-desktop-portal-kde 6.7.5 advertises VIRTUAL (`AvailableSourceTypes`
+   7), creates a 1920x1080 KWin output for a RemoteDesktop session with
+   source type VIRTUAL, and input reaches it. GNOME (`RecordVirtual`) is
+   still unverified.
 10. **Whether Teleport's QUIC endpoints listen on IPv6.** Not checked in code.
     Parsec supports IPv6 (STUN6, error codes 800097/6112).
 11. **Inputtino's use of uhid for DualSense (G13), Moonlight WoL, and

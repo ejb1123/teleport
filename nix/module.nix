@@ -6,6 +6,7 @@
 }:
 let
   cfg = config.services.teleport-desktop;
+  plasma = config.services.desktopManager.plasma6.enable or false;
   pamHelper =
     pkgs.runCommand "teleport-system-pam"
       {
@@ -52,6 +53,39 @@ in
         `lib.mkDefault`, so an explicit setting wins) so the QUIC socket gets
         the buffers it requests; smaller buffers drop packets during keyframe
         bursts on fast links.
+      '';
+    };
+    virtualDisplay = lib.mkOption {
+      type = lib.types.enum [
+        "never"
+        "fallback"
+        "always"
+      ];
+      default = "fallback";
+      description = ''
+        Virtual displays through the desktop portal (KDE Plasma 6; GNOME
+        untested), passed as `--virtual-display`: `fallback` streams one when
+        no monitor is connected (headless) and lets clients add one as an
+        extra monitor; `always` streams one sized to the client instead of
+        the monitors; `never` turns both off. Unattended use needs
+        `preauthorizeRemoteDesktop`. See docs/virtual-display.md.
+      '';
+    };
+    privacyMode = lib.mkOption {
+      type = lib.types.enum [
+        "off"
+        "request"
+        "always"
+      ];
+      default = "off";
+      description = ''
+        Privacy mode (KDE Plasma 6), passed as `--privacy-mode`: while a
+        session lasts the physical monitors are turned off and the session
+        streams a virtual display. `request` when the client asks
+        (`teleport client --privacy`, launcher "Host screen: private"),
+        `always` for every session. The monitors come back on disconnect,
+        on any failure, through a guard process if the host dies, and from
+        this unit's `ExecStopPost`. See docs/virtual-display.md.
       '';
     };
     preauthorizeRemoteDesktop = lib.mkOption {
@@ -112,8 +146,15 @@ in
       after = [ "graphical-session.target" ];
       partOf = [ "graphical-session.target" ];
       unitConfig.ConditionUser = map (user: "|${user}") cfg.users;
+      # kscreen-doctor sizes virtual displays and runs privacy mode (KDE).
+      path = lib.optional plasma pkgs.kdePackages.libkscreen;
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/teleport host --listen ${lib.escapeShellArg cfg.listen} --identity-dir %h/.local/state/teleport/host --restore-token %h/.local/state/teleport/host/portal-restore.json ${lib.optionalString cfg.systemLogin "--system-auth-helper ${pamHelper}/libexec/teleport-pam"} ${lib.escapeShellArgs cfg.extraArgs}";
+        ExecStart = "${cfg.package}/bin/teleport host --listen ${lib.escapeShellArg cfg.listen} --identity-dir %h/.local/state/teleport/host --restore-token %h/.local/state/teleport/host/portal-restore.json --virtual-display ${cfg.virtualDisplay} --privacy-mode ${cfg.privacyMode} ${lib.optionalString cfg.systemLogin "--system-auth-helper ${pamHelper}/libexec/teleport-pam"} ${lib.escapeShellArgs cfg.extraArgs}";
+        # However the host stopped (crash, kill, logout), turn monitors left
+        # off by privacy mode back on. "-": nothing to do is not a failure.
+        ExecStopPost =
+          lib.mkIf (cfg.privacyMode != "off")
+            "-${cfg.package}/bin/teleport privacy-restore --state %h/.local/state/teleport/host/privacy-restore.json";
         Restart = "on-failure";
         RestartSec = 10;
         UMask = "0077";

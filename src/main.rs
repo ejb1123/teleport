@@ -30,6 +30,8 @@ mod natpmp;
 mod p2p;
 mod pairing;
 mod presence;
+#[cfg(target_os = "linux")]
+mod privacy;
 mod profiles;
 mod protocol;
 #[cfg(target_os = "linux")]
@@ -43,6 +45,8 @@ mod stun;
 mod system_login;
 #[cfg(target_os = "linux")]
 mod system_pam;
+#[cfg(target_os = "linux")]
+mod virtual_display;
 mod windowing;
 #[cfg(target_os = "linux")]
 mod x11_cursor;
@@ -118,6 +122,28 @@ enum Command {
     /// Report whether a host is online through its relay (ONLINE, OFFLINE or
     /// UNKNOWN), from statements the host signs with its pinned identity.
     Presence(presence::Options),
+    /// Turn the host's monitors back on after privacy mode (the host and its
+    /// guard do this themselves; this is for a host killed without either).
+    /// Uses the NixOS module's identity directory unless --state is given.
+    #[cfg(target_os = "linux")]
+    PrivacyRestore {
+        /// The host's privacy-mode state file (`privacy-restore.json` in its
+        /// identity directory).
+        #[arg(long)]
+        state: Option<std::path::PathBuf>,
+        /// Without a state file, turn on every connected monitor that is off.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Internal: restores the monitors if the host ends while in privacy mode.
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    PrivacyGuard {
+        #[arg(long)]
+        state: std::path::PathBuf,
+        #[arg(long, default_value_t = 45)]
+        timeout_secs: u64,
+    },
     /// Check required media plugins without sharing the desktop.
     Doctor {
         /// Test synthetic HEVC Main 10 support; does not imply HDR desktop capture/display.
@@ -135,6 +161,32 @@ fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
+    // The privacy-mode restore paths must work with nothing but the
+    // compositor; they never touch media.
+    #[cfg(target_os = "linux")]
+    match &cli.command {
+        Some(Command::PrivacyGuard {
+            state,
+            timeout_secs,
+        }) => {
+            return privacy::guard(state, std::time::Duration::from_secs(*timeout_secs));
+        }
+        Some(Command::PrivacyRestore { state, all }) => {
+            let state = state.clone().unwrap_or_else(privacy::default_state_path);
+            if privacy::restore(&state)? {
+                println!("Monitors restored from {}", state.display());
+            } else if *all {
+                println!("Turned on {} monitor(s)", privacy::enable_all()?);
+            } else {
+                println!(
+                    "No privacy-mode state at {}; use --all to turn on every monitor",
+                    state.display()
+                );
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
     // Key diagnostics and enrollment do not use media or scan desktop plugins.
     // SDL is still linked: its load-time library selection is isolated by the
     // Linux package wrapper before this process starts.
@@ -204,6 +256,9 @@ fn main() -> Result<()> {
         Some(Command::Host(options)) => runtime.block_on(host::run(options)),
         #[cfg(target_os = "linux")]
         Some(Command::HostManager) => host_ui::run(),
+        // Handled before media initialisation.
+        #[cfg(target_os = "linux")]
+        Some(Command::PrivacyRestore { .. } | Command::PrivacyGuard { .. }) => Ok(()),
         #[cfg(target_os = "linux")]
         Some(Command::HostAdmin(options)) => host_admin::run(options),
         Some(Command::Login {

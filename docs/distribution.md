@@ -96,7 +96,9 @@ pre-authorize it once so lost or expired portal sessions are recreated
 without a local dialog, even while the screen is locked:
 `flatpak permission-set kde-authorized remote-desktop dev.teleport.Host yes`, or set
 `services.teleport-desktop.preauthorizeRemoteDesktop = true` and the NixOS module
-registers it every time the host starts.
+registers it every time the host starts. Virtual displays and privacy mode
+(`virtualDisplay`, `privacyMode`) rely on it for unattended use; see
+[virtual displays](virtual-display.md).
 Inspect with `systemctl --user status teleport-desktop` and
 `journalctl --user -u teleport-desktop`. Stop it with `systemctl --user stop teleport-desktop`.
 Do not enable user lingering expecting desktop capture to work before login.

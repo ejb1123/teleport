@@ -112,6 +112,14 @@ pub struct Options {
     /// Permit explicit text clipboard transfers using the toolbar.
     #[arg(long)]
     pub clipboard: bool,
+    /// Ask the host to turn its monitors off while connected (privacy mode;
+    /// hosts started with `--privacy-mode request`).
+    #[arg(long)]
+    pub privacy: bool,
+    /// Ask the host for an extra virtual monitor sized to this display; it
+    /// appears in the monitor list and goes away on disconnect.
+    #[arg(long)]
+    pub virtual_monitor: bool,
     /// Start with remote audio muted.
     #[arg(long)]
     pub mute: bool,
@@ -1290,8 +1298,16 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 rumble: desktop.gamepads,
                 // Where to put the pointer when relative mode ends.
                 cursor_positions: local_cursor,
+                privacy: options.privacy && desktop.privacy_mode,
+                virtual_monitor: options.virtual_monitor && desktop.virtual_monitor,
             },
         )?;
+    }
+    if options.privacy && !desktop.privacy_mode {
+        tracing::warn!("this host does not offer privacy mode; its monitors stay on");
+    }
+    if options.virtual_monitor && !desktop.virtual_monitor {
+        tracing::warn!("this host cannot add a virtual monitor");
     }
     if let Some(index) = options.monitor {
         send(&events, Event::SelectMonitor { index })?;
