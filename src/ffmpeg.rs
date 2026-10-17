@@ -914,6 +914,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires hardware encoder and at least one hardware decoder"]
     fn zero_copy_cuda_gl_presentation_matches_cpu_decode() -> Result<()> {
@@ -948,6 +949,7 @@ mod tests {
     /// export the surface as dma-bufs, import it on that node's EGL device
     /// and compare the offscreen readback with the CPU decode. Also prints
     /// import+draw vs plain download time per frame at 1080p and 4K.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires a VA-API decoder and an EGL device on the same GPU"]
     fn zero_copy_vaapi_egl_presentation_matches_cpu_decode() -> Result<()> {
@@ -1158,6 +1160,7 @@ mod tests {
     /// Host zero-copy capture: an RGBA DMA-BUF exported by the GPU is
     /// scaled/cropped and converted on that GPU straight into NVENC's CUDA
     /// frames or VA-API surfaces; a CPU decode must show the source colours.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires NVENC or a VA-API encoder and an EGL device exporting DMA-BUFs"]
     fn zero_copy_dmabuf_encode_matches_source_colours() -> Result<()> {
