@@ -153,8 +153,11 @@ Without `--identity-dir`, use `--pairing-file NEW_FILENAME` for ephemeral
 credentials. This mode rotates credentials each start and refuses overwrites.
 `--restore-token` requests remembered Wayland permission, **not** a bypass:
 your compositor may prompt again. Only already-authorized monitors can be
-switched. Monitor hotplug needs a host restart. Unattended operation is limited
-to an existing logged-in graphical session, not login-screen/reboot access.
+switched. Monitor hotplug needs a host restart. The host attaches to a
+logged-in graphical session; for access after a reboot, NixOS `unattended`
+logs in automatically and locks at once, and the launcher can wake a sleeping
+host (Wake-on-LAN) and put it to sleep. See
+[wake and unattended start](docs/wake-and-unattended.md).
 
 ## Audio, clipboard and quality
 
@@ -400,7 +403,12 @@ to separate networking/decoding problems from portal/capture problems.
   Other Wayland compositors may lack remote input support. This prototype uses
   portal input notification methods, not libei yet.
 - Initial local approval is required for Wayland. Saved permission is opt-in
-  and compositor-dependent. No login-screen access or unattended-access guarantee.
+  and compositor-dependent. No greeter (login screen) capture: unattended
+  start is automatic login plus an immediate lock (docs/wake-and-unattended.md).
+- Wake-on-LAN (launcher **Wake**, `teleport wake`) needs it armed on the
+  host's wired card and firmware; from outside the LAN, another always-on
+  Teleport host acts as wake relay (`--wake-relay`). Ctrl+Alt+End locks the
+  host session or shows its unlock prompt.
 - HDR requires the experimental patched-KWin/Mac path; see [its limitations](docs/hdr.md).
 - The client draws the remote pointer locally (no round trip) with X11 hosts
   and Wayland hosts whose portal sends cursor metadata (KDE Plasma 6);
@@ -484,6 +492,10 @@ cargo test --locked --test ui -- --ignored --nocapture
 cargo test --locked --bin teleport -- --ignored --nocapture
 # KDE hosts: a private headless KWin with its own portal (never your session)
 cargo test --locked --test virtual_display -- --ignored --test-threads=1
+# Wake-on-LAN and power requests in a private network namespace
+cargo test --locked --test wake -- --ignored --test-threads=1
+# NixOS module options (SDDM autologin, lock, WoL), evaluated only
+tools/check-module.sh
 nix build
 TELEPORT_TEST_BINARY=./result/bin/teleport cargo test --locked --test smoke -- --ignored --nocapture
 nix flake check --all-systems
