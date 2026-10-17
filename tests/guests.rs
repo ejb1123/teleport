@@ -255,10 +255,17 @@ impl Host {
                 .as_nanos()
         ));
         let file = std::fs::File::create(&log).unwrap();
+        // The configuration `pair` saved the credential in (its profile).
+        let config = credential
+            .ancestors()
+            .find(|path| path.parent() == Some(self.temp.path()))
+            .unwrap_or(self.temp.path())
+            .to_owned();
         let process = Process(
             teleport()
                 .args(["client", &self.address, "--pairing-file"])
                 .arg(credential)
+                .env("XDG_CONFIG_HOME", config)
                 .args(["--headless-frames", frames, "--software-decoder"])
                 .args(args)
                 .env("RUST_LOG", "teleport=info")
@@ -563,4 +570,218 @@ fn a_reconnect_replaces_its_own_session() {
     assert_eq!(host.count(&["session started the desktop"]), 2);
     let (status, _) = old.wait(Duration::from_secs(20));
     assert!(!status.success());
+}
+
+/// `teleport suspend` or `teleport wake --via` (owner commands, G23) with
+/// `credential` as the last argument: success and the combined output.
+fn command(host: &Host, credential: &Path, args: &[&str]) -> (bool, String) {
+    let output = teleport()
+        .args(args)
+        .arg(credential)
+        .env("XDG_CONFIG_HOME", host.temp.path().join("commands"))
+        .output()
+        .unwrap();
+    (
+        output.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    )
+}
+
+/// Power requests (G23) and secure attention (Ctrl+Alt+End, G24) are the
+/// owner's: a guest is refused whatever it was granted, an owner is not.
+/// (Wake relaying for an owner sends real packets; tests/wake.rs covers it,
+/// and a guest through the relay, inside a network namespace.)
+#[test]
+#[ignore = "requires local TCP/UDP sockets and GStreamer runtime plugins"]
+fn power_and_secure_attention_are_the_owners() {
+    let marker = tempfile::tempdir_in("/tmp").unwrap();
+    let suspended = marker.path().join("suspended");
+    let host = Host::start(&[
+        "--allow-suspend",
+        "--suspend-command",
+        &format!("touch {}", suspended.display()),
+        "--wake-relay",
+    ]);
+    let owner = host.owner("owner");
+    let everything = json!({
+        "gamepad": true, "keyboard_mouse": true, "clipboard": true, "microphone": true
+    });
+    let guest = host.guest("guest", "Mallory", everything);
+    let address = host.address.clone();
+    // The guest: refused suspend and wake relaying; the host does nothing.
+    let (ok, log) = command(&host, &guest, &["suspend", &address, "--pairing-file"]);
+    assert!(!ok && log.contains("only the owner's devices"), "{log}");
+    let (ok, log) = command(
+        &host,
+        &guest,
+        &[
+            "wake",
+            "--mac",
+            "00:1b:21:3c:4d:5e",
+            "--no-local",
+            "--via",
+            &address,
+            "--via-pairing-file",
+        ],
+    );
+    assert!(!ok && log.contains("only the owner's devices"), "{log}");
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!suspended.exists(), "a guest suspended the host");
+    assert_eq!(
+        host.count(&["host command", "owner=false", "ok=false"]),
+        2,
+        "{}",
+        host.log()
+    );
+    assert_eq!(host.count(&["as wake relay"]), 0);
+    // The owner may (the fake suspend command runs).
+    let (ok, log) = command(&host, &owner, &["suspend", &address, "--pairing-file"]);
+    assert!(ok && log.contains("suspending in 2 s"), "{log}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !suspended.exists() {
+        assert!(Instant::now() < deadline, "{}", host.log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(host.count(&["host command", "owner=true", "ok=true"]), 1);
+    // Secure attention: the guest (with keyboard and mouse) is refused
+    // before anything happens; the owner's reaches the host (a test host
+    // has no logind session to lock, and says so).
+    let mut owner_client = host.client(&owner, "150", &["--smoke-secure-attention"]);
+    host.wait_log(&["session started the desktop"]);
+    let mut guest_client = host.client(&guest, "90", &["--smoke-secure-attention"]);
+    let id = host.waiting();
+    host.admin(json!({ "AnswerGuest": { "id": id, "allow": true } }));
+    host.wait_log(&[
+        "refused input from session",
+        "Mallory",
+        "Only the host's owner can do that",
+    ]);
+    let guest_log = passed(&mut guest_client);
+    let log = passed(&mut owner_client);
+    assert!(log.contains("cannot lock or unlock its session"), "{log}");
+    // Only the owner is told how to wake the host (secure attention needs a
+    // logind session, absent here; the microphone test covers that offer).
+    assert!(log.contains("host offers"), "{log}");
+    assert!(log.contains("wake=true"), "{log}");
+    assert!(guest_log.contains("wake=false"), "{guest_log}");
+    assert!(guest_log.contains("secure_attention=false"), "{guest_log}");
+}
+
+/// One encoder and one desktop audio stream for every session: a guest
+/// joining an owner who chose PCM plays PCM too, and is told so.
+#[test]
+#[ignore = "requires local TCP/UDP sockets and GStreamer runtime plugins"]
+fn shared_audio_reaches_every_session_in_the_first_sessions_format() {
+    let host = Host::start(&["--audio-source", "test"]);
+    let owner = host.owner("owner");
+    let guest = host.guest("guest", "Listener", json!({}));
+    let id = host.device("Listener");
+    host.admin(json!({ "SetGuest": { "id": id, "permissions": null, "trusted": true } }));
+    let mut owner_client = host.client(&owner, "450", &["--smoke-audio", "--audio-format", "pcm"]);
+    host.wait_log(&["session desktop audio", "PCM"]);
+    let mut guest_client = host.client(
+        &guest,
+        "90",
+        &[
+            "--smoke-audio",
+            "--audio-format",
+            "opus",
+            "--audio-bitrate",
+            "64",
+        ],
+    );
+    host.wait_log(&["session joined the shared desktop", "Listener"]);
+    let log = passed(&mut guest_client);
+    assert!(
+        log.contains("Desktop audio is shared with another session: playing PCM"),
+        "{log}"
+    );
+    // One audio capture for both.
+    assert_eq!(host.count(&["session desktop audio"]), 1);
+    passed(&mut owner_client);
+}
+
+/// Waits until `client`'s log contains `text`.
+fn wait_client(client: &Client, text: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !client.log().contains(text) {
+        assert!(Instant::now() < deadline, "no {text:?}:\n{}", client.log());
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// One virtual microphone: an owner's by default, a guest's only with the
+/// microphone permission, one session at a time, stopped when the
+/// permission goes, and an owner takes it from a guest. Needs PipeWire
+/// (`pw-cli`) where the test runs; skipped otherwise.
+#[test]
+#[ignore = "requires local TCP/UDP sockets, GStreamer runtime plugins and PipeWire"]
+fn guests_send_a_microphone_only_when_allowed_and_one_at_a_time() {
+    let host = Host::start(&["--microphone"]);
+    if host.log().contains("microphone passthrough unavailable") {
+        eprintln!("skipped: no PipeWire for the virtual microphone");
+        return;
+    }
+    let owner = host.owner("owner");
+    let second_owner = host.owner("owner-2");
+    let quiet = host.guest("quiet", "Quiet", json!({ "gamepad": true }));
+    let singer = host.guest("singer", "Singer", json!({ "microphone": true }));
+    let duet = host.guest("duet", "Duet", json!({ "microphone": true }));
+    let encore = host.guest("encore", "Encore", json!({ "microphone": true }));
+    for name in ["Quiet", "Singer", "Duet", "Encore"] {
+        let id = host.device(name);
+        host.admin(json!({ "SetGuest": { "id": id, "permissions": null, "trusted": true } }));
+    }
+    let mic = ["--mic", "--mic-device", "test"];
+    let plays = "microphone plays into the virtual microphone";
+    let owner_client = host.client(&owner, "3000", &[]);
+    host.wait_log(&["session started the desktop"]);
+    // Not granted: the guest is not offered the microphone at all.
+    let mut quiet_client = host.client(&quiet, "60", &mic);
+    let log = passed(&mut quiet_client);
+    assert!(
+        log.contains("The host has not allowed you to send your microphone"),
+        "{log}"
+    );
+    assert_eq!(host.count(&[plays]), 0);
+    // Granted: its microphone plays on the host.
+    let singer_client = host.client(&singer, "3000", &mic);
+    host.wait_log(&["session joined the shared desktop", "Singer"]);
+    host.wait_log(&[plays]);
+    let session = host.session("Singer");
+    assert_eq!(
+        host.count(&[plays, &format!("session={session}")]),
+        1,
+        "{}",
+        host.log()
+    );
+    // Another guest's microphone is refused while it plays.
+    let duet_client = host.client(&duet, "3000", &mic);
+    wait_client(&duet_client, "only one at a time");
+    // The owner takes the permission away: the guest's microphone stops.
+    let id = host.device("Singer");
+    host.admin(
+        json!({ "SetGuest": { "id": id, "permissions": { "gamepad": true }, "trusted": null } }),
+    );
+    host.wait_log(&["client microphone stopped", "lost the permission"]);
+    wait_client(&singer_client, "no longer reaches the host");
+    // A later guest gets the free microphone; an owner takes it from them.
+    let encore_client = host.client(&encore, "3000", &mic);
+    host.wait_log(&["session joined the shared desktop", "Encore"]);
+    host.wait_more(&[plays], 1, Duration::from_secs(30));
+    let second = host.client(&second_owner, "3000", &mic);
+    host.wait_log(&["client microphone stopped", "an owner took"]);
+    wait_client(&encore_client, "The host's owner took the microphone");
+    host.wait_more(&[plays], 2, Duration::from_secs(30));
+    drop((
+        owner_client,
+        singer_client,
+        duet_client,
+        encore_client,
+        second,
+    ));
 }
