@@ -18,17 +18,19 @@ use std::{
 
 pub struct Pipeline(pub gst::Pipeline);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VideoFormat {
     pub codec: VideoCodec,
     pub dynamic_range: DynamicRange,
+    /// Full-resolution chroma (4:4:4), H.264/H.265 SDR only.
+    pub chroma444: bool,
 }
 
 impl From<VideoCodec> for VideoFormat {
     fn from(codec: VideoCodec) -> Self {
         Self {
             codec,
-            dynamic_range: DynamicRange::Sdr,
+            ..Default::default()
         }
     }
 }
@@ -38,6 +40,18 @@ impl VideoFormat {
         ensure!(
             self.dynamic_range != DynamicRange::Hdr10 || self.codec == VideoCodec::H265,
             "HDR10 requires H.265 Main 10"
+        );
+        ensure!(
+            !self.chroma444 || (self.codec.supports_444() && !self.hdr()),
+            "4:4:4 needs H.264 or H.265 SDR"
+        );
+        Ok(())
+    }
+    /// The legacy GStreamer backend streams 4:2:0 H.264 and H.265 only.
+    fn legacy_supported(self) -> Result<()> {
+        ensure!(
+            self.codec != VideoCodec::Av1 && !self.chroma444,
+            "AV1 and 4:4:4 need the direct FFmpeg backend (unset TELEPORT_VIDEO_BACKEND)"
         );
         Ok(())
     }
@@ -405,6 +419,7 @@ fn encoder_fragment(
             "nvh265enc name=video_encoder bitrate={bitrate} gop-size={gop} bframes=0 zerolatency=true rc-mode=cbr"
         ),
         (EncoderKind::Auto, _) => unreachable!("auto must be resolved first"),
+        (_, VideoCodec::Av1) => unreachable!("the legacy backend rejects AV1 first"),
     }
 }
 
@@ -412,6 +427,7 @@ fn parser(codec: VideoCodec) -> &'static str {
     match codec {
         VideoCodec::H264 => "h264parse",
         VideoCodec::H265 => "h265parse",
+        VideoCodec::Av1 => "av1parse",
     }
 }
 
@@ -419,6 +435,7 @@ fn compressed_caps(codec: VideoCodec) -> &'static str {
     match codec {
         VideoCodec::H264 => "video/x-h264",
         VideoCodec::H265 => "video/x-h265",
+        VideoCodec::Av1 => "video/x-av1",
     }
 }
 
@@ -613,6 +630,7 @@ pub fn encoder(
         return ffmpeg_media::encoder(source, size, fps, bitrate, track, kind, video_format);
     }
     // The legacy GStreamer backend has no presets.
+    video_format.legacy_supported()?;
     let kind = kind.kind;
     let codec = video_format.codec;
     let (width, height) = size;
@@ -887,19 +905,53 @@ pub fn hardware_decoder(format: impl Into<VideoFormat>) -> Result<Option<String>
 }
 
 /// Codecs this host encodes in hardware with `kind` (8-bit; probed once per
-/// process). Blocks for up to a few seconds on the first call.
+/// process), AV1 included. Blocks for up to a few seconds on the first call.
 #[cfg(target_os = "linux")]
 pub fn hardware_codecs(kind: EncoderKind) -> Vec<VideoCodec> {
-    [VideoCodec::H264, VideoCodec::H265]
+    VideoCodec::ALL
         .into_iter()
-        .filter(|&codec| hardware_encoder(kind, codec))
+        .filter(|&codec| hardware_encoder(kind, codec.into()))
         .collect()
 }
 
+/// Codecs this host encodes 4:4:4 in hardware with `kind` (probed once per
+/// process).
 #[cfg(target_os = "linux")]
-fn hardware_encoder(kind: EncoderKind, codec: VideoCodec) -> bool {
+pub fn hardware_444_codecs(kind: EncoderKind) -> Vec<VideoCodec> {
+    if !crate::ffmpeg::enabled().unwrap_or(false) {
+        return Vec::new();
+    }
+    [VideoCodec::H264, VideoCodec::H265]
+        .into_iter()
+        .filter(|&codec| {
+            hardware_encoder(
+                kind,
+                VideoFormat {
+                    codec,
+                    chroma444: true,
+                    ..Default::default()
+                },
+            )
+        })
+        .collect()
+}
+
+/// This build encodes AV1 at all (in hardware or with SVT-AV1): the direct
+/// FFmpeg backend with an AV1 encoder.
+#[cfg(target_os = "linux")]
+pub fn av1_available() -> bool {
+    crate::ffmpeg::enabled().unwrap_or(false)
+        && ["libsvtav1", "av1_nvenc", "av1_vaapi", "av1_qsv"]
+            .into_iter()
+            .any(|name| crate::ffmpeg::available(true, name))
+}
+
+#[cfg(target_os = "linux")]
+fn hardware_encoder(kind: EncoderKind, format: VideoFormat) -> bool {
+    let codec = format.codec;
     match crate::ffmpeg::enabled() {
-        Ok(true) => ffmpeg_media::hardware_encoder(kind, codec).is_some(),
+        Ok(true) => ffmpeg_media::hardware_encoder(kind, format).is_some(),
+        Ok(false) if format.legacy_supported().is_err() => false,
         Ok(false) => matches!(
             select_encoder(kind, 1280, 720, 60, 8000, codec),
             Ok(EncoderKind::Nvidia | EncoderKind::Qsv | EncoderKind::Vaapi)
@@ -1186,6 +1238,7 @@ mod native_surface_tests {
                 VideoFormat {
                     codec: VideoCodec::H265,
                     dynamic_range: range,
+                    chroma444: false,
                 },
                 false,
                 true,
@@ -2031,6 +2084,7 @@ mod tests {
         let hdr = super::VideoFormat {
             codec: VideoCodec::H265,
             dynamic_range: DynamicRange::Hdr10,
+            chroma444: false,
         };
         assert_eq!(
             decoder::output_fragment_for(hdr, true),
@@ -2550,7 +2604,7 @@ mod tests {
             let fragment = encoder_fragment(EncoderKind::Qsv, 60, 8000, codec);
             assert!(fragment.starts_with(match codec {
                 VideoCodec::H264 => "qsvh264enc ",
-                VideoCodec::H265 => "qsvh265enc ",
+                _ => "qsvh265enc ",
             }));
             for property in [
                 "bitrate=8000",
@@ -2567,13 +2621,14 @@ mod tests {
             }
             assert!(fragment.contains(match codec {
                 VideoCodec::H264 => "idr-interval=0",
-                VideoCodec::H265 => "idr-interval=1",
+                _ => "idr-interval=1",
             }));
             assert_eq!(encoder_pixel_format(EncoderKind::Qsv, codec), "NV12");
         }
         let hdr = VideoFormat {
             codec: VideoCodec::H265,
             dynamic_range: DynamicRange::Hdr10,
+            chroma444: false,
         };
         assert_eq!(encoder_pixel_format(EncoderKind::Qsv, hdr), "P010_10LE");
         assert!(encoder_fragment(EncoderKind::Qsv, 60, 8000, hdr).ends_with("profile=main-10"));
@@ -2587,7 +2642,8 @@ mod tests {
         assert!(
             VideoFormat {
                 codec: VideoCodec::H264,
-                dynamic_range: DynamicRange::Hdr10
+                dynamic_range: DynamicRange::Hdr10,
+                chroma444: false,
             }
             .validate()
             .is_err()
@@ -2614,6 +2670,7 @@ mod tests {
         let format = VideoFormat {
             codec: VideoCodec::H265,
             dynamic_range: DynamicRange::Hdr10,
+            chroma444: false,
         };
         for kind in TEST_ENCODERS {
             if !test_encoder_available(kind, format) {
@@ -2702,7 +2759,8 @@ mod tests {
         assert!(
             VideoFormat {
                 codec: VideoCodec::H264,
-                dynamic_range: DynamicRange::Hdr10
+                dynamic_range: DynamicRange::Hdr10,
+                chroma444: false,
             }
             .validate()
             .is_err()
@@ -2732,6 +2790,7 @@ mod tests {
         let format = VideoFormat {
             codec: VideoCodec::H265,
             dynamic_range: DynamicRange::Hdr10,
+            chroma444: false,
         };
         let result = encoder(
             "videotestsrc is-live=true ! capsfilter name=hdr_source caps=video/x-raw,format=RGB,width=320,height=180,framerate=30/1,colorimetry=sRGB",
@@ -3250,7 +3309,7 @@ mod tests {
                 let format = encoder_pixel_format(kind, codec);
                 let decoder = match codec {
                     VideoCodec::H264 => "avdec_h264",
-                    VideoCodec::H265 => "avdec_h265",
+                    _ => "avdec_h265",
                 };
                 let pipeline = Pipeline(gst::parse::launch(&format!(
             "videotestsrc is-live=true ! video/x-raw,format={format},width=640,height=480,framerate=30/1 ! {} ! {} ! {decoder} ! appsink name=decoded sync=false max-buffers=2 drop=true",

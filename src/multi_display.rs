@@ -490,6 +490,7 @@ impl Screen {
             media::VideoFormat {
                 codec: desktop.codec,
                 dynamic_range: desktop.dynamic_range,
+                chroma444: desktop.chroma_444,
             },
             nv12,
             native,

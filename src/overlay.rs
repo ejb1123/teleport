@@ -276,7 +276,7 @@ impl Warnings {
 
 /// Encoder names (`ffmpeg:<name>`) that run on the CPU.
 pub fn software_encoder(name: &str) -> bool {
-    ["libx264", "libx265", "x264enc", "x265enc"]
+    ["libx264", "libx265", "libsvtav1", "x264enc", "x265enc"]
         .iter()
         .any(|software| name.contains(software))
 }
@@ -570,6 +570,7 @@ mod tests {
         assert_eq!(max, 10.0);
         assert!(points[0].y() > rect.y() + 30);
         assert!(software_encoder("ffmpeg:libx264"));
+        assert!(software_encoder("ffmpeg:libsvtav1"));
         assert!(!software_encoder("ffmpeg:h264_nvenc DMA-BUF zero-copy"));
     }
 }

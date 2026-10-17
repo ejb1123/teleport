@@ -157,9 +157,20 @@ const QUALITIES: [(&str, &str); 5] = [
     ("40 Mbps cap", "40000"),
     ("80 Mbps cap", "80000"),
 ];
-/// Auto is H.265 when the host encodes and this client decodes it in
-/// hardware, otherwise H.264 (and always H.264 with older hosts).
-const CODECS: [(&str, &str); 3] = [("Auto codec", "auto"), ("H.264", "h264"), ("H.265", "h265")];
+/// Auto is AV1, else H.265, when the host encodes and this client decodes it
+/// in hardware, otherwise H.264 (and always H.264 with older hosts).
+const CODECS: [(&str, &str); 4] = [
+    ("Auto codec", "auto"),
+    ("H.264", "h264"),
+    ("H.265", "h265"),
+    ("AV1", "av1"),
+];
+/// `--chroma-444`: full-resolution chroma for sharp coloured text.
+const CHROMA_444: [(&str, &str); 3] = [
+    ("4:4:4 colour: off", "off"),
+    ("4:4:4 colour: auto", "auto"),
+    ("4:4:4 colour: on", "on"),
+];
 /// `--relative-mouse`: lock the pointer for games while the host hides it,
 /// always, or only by Ctrl+Alt+M.
 const RELATIVE_MOUSE: [(&str, &str); 3] = [
@@ -466,6 +477,7 @@ pub fn run() -> Result<()> {
     let mut settings = false;
     let mut stream = StreamPreferences::default();
     let mut codec = 0usize;
+    let mut chroma_444 = 0usize;
     let mut relative_mouse = 0usize;
     let mut encoder_preset = 0usize;
     let mut host_display = 0usize;
@@ -1032,6 +1044,9 @@ pub fn run() -> Result<()> {
                                 if hit(pref_rect(15), x, y) {
                                     gamepad_type = (gamepad_type + 1) % GAMEPAD_TYPES.len();
                                 }
+                                if hit(pref_rect(16), x, y) {
+                                    chroma_444 = (chroma_444 + 1) % CHROMA_444.len();
+                                }
                                 if hit(pref_rect(3), x, y) {
                                     codec = (codec + 1) % CODECS.len();
                                     if CODECS[codec].1 != "h265" {
@@ -1182,6 +1197,8 @@ pub fn run() -> Result<()> {
                             .arg(credential)
                             .arg("--codec")
                             .arg(CODECS[codec].1)
+                            .arg("--chroma-444")
+                            .arg(CHROMA_444[chroma_444].1)
                             .arg("--relative-mouse")
                             .arg(RELATIVE_MOUSE[relative_mouse].1)
                             .arg("--dynamic-range")
@@ -1686,6 +1703,7 @@ pub fn run() -> Result<()> {
                                 "Pacing: lowest latency"
                             },
                             GAMEPAD_TYPES[gamepad_type].0,
+                            CHROMA_444[chroma_444].0,
                         ];
                         for (index, label) in labels.into_iter().enumerate() {
                             ui.button(

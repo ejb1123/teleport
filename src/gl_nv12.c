@@ -63,15 +63,20 @@ static const char *VERTEX =
     "  gl_Position = vec4(position, 0.0, 1.0);\n"
     "}\n";
 
-/* Limited-range BT.709, matching the encoder's colour negotiation. */
+/* Limited-range BT.709, matching the encoder's colour negotiation. Chroma
+ * from NV12's RG plane, or (planar, 4:4:4) from separate Cb and Cr planes. */
 static const char *FRAGMENT =
     "#version 120\n"
     "uniform sampler2D y_plane;\n"
     "uniform sampler2D uv_plane;\n"
+    "uniform sampler2D v_plane;\n"
+    "uniform int planar;\n"
     "varying vec2 coord;\n"
     "void main() {\n"
     "  float y = (texture2D(y_plane, coord).r - 16.0 / 255.0) * (255.0 / 219.0);\n"
-    "  vec2 c = (texture2D(uv_plane, coord).rg - 128.0 / 255.0) * (255.0 / 224.0);\n"
+    "  vec2 uv = planar == 1 ? vec2(texture2D(uv_plane, coord).r, texture2D(v_plane, coord).r)\n"
+    "                        : texture2D(uv_plane, coord).rg;\n"
+    "  vec2 c = (uv - 128.0 / 255.0) * (255.0 / 224.0);\n"
     "  vec3 rgb = vec3(y + 1.5748 * c.y, y - 0.1873 * c.x - 0.4681 * c.y, y + 1.8556 * c.x);\n"
     "  gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);\n"
     "}\n";
@@ -88,10 +93,10 @@ static GLuint shader(TpGl *gl, GLenum type, const char *source) {
 
 void tp_nv12_gl_destroy(TpNv12Gl *g) {
     if (!g || !g->gl.DeleteTextures) return;
-    if (g->textures[0]) g->gl.DeleteTextures(2, g->textures);
+    if (g->textures[0]) g->gl.DeleteTextures(3, g->textures);
     if (g->vbo) g->gl.DeleteBuffers(1, &g->vbo);
     if (g->program) g->gl.DeleteProgram(g->program);
-    g->textures[0] = g->textures[1] = g->vbo = g->program = 0;
+    g->textures[0] = g->textures[1] = g->textures[2] = g->vbo = g->program = 0;
 }
 
 int tp_nv12_gl_init(TpNv12Gl *g, TpGetProc get) {
@@ -120,12 +125,14 @@ int tp_nv12_gl_init(TpNv12Gl *g, TpGetProc get) {
     if (g->program) {
         g->y_plane = gl->GetUniformLocation(g->program, "y_plane");
         g->uv_plane = gl->GetUniformLocation(g->program, "uv_plane");
+        g->v_plane = gl->GetUniformLocation(g->program, "v_plane");
+        g->planar_location = gl->GetUniformLocation(g->program, "planar");
         static const GLfloat quad[] = {-1, -1, 1, -1, -1, 1, 1, 1};
         gl->GenBuffers(1, &g->vbo);
         gl->BindBuffer(GL_ARRAY_BUFFER, g->vbo);
         gl->BufferData(GL_ARRAY_BUFFER, sizeof quad, quad, GL_STATIC_DRAW);
-        gl->GenTextures(2, g->textures);
-        for (int i = 0; i < 2; i++) {
+        gl->GenTextures(3, g->textures);
+        for (int i = 0; i < 3; i++) {
             gl->BindTexture(GL_TEXTURE_2D, g->textures[i]);
             gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -148,12 +155,12 @@ int tp_nv12_gl_draw(TpNv12Gl *g, TpNv12Upload upload, void *presenter, const AVF
     int x, int y, int width, int height, int framebuffer_height) {
     if (!g || !g->program || !frame || width <= 0 || height <= 0) return AVERROR(EINVAL);
     TpGl *gl = &g->gl;
-    GLint program, buffer, active, viewport[4], bound[2];
+    GLint program, buffer, active, viewport[4], bound[3];
     gl->GetIntegerv(GL_CURRENT_PROGRAM, &program);
     gl->GetIntegerv(GL_ARRAY_BUFFER_BINDING, &buffer);
     gl->GetIntegerv(GL_ACTIVE_TEXTURE, &active);
     gl->GetIntegerv(GL_VIEWPORT, viewport);
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         gl->ActiveTexture(GL_TEXTURE0 + i);
         gl->GetIntegerv(GL_TEXTURE_BINDING_2D, &bound[i]);
     }
@@ -172,12 +179,14 @@ int tp_nv12_gl_draw(TpNv12Gl *g, TpNv12Upload upload, void *presenter, const AVF
     int result = upload(presenter, frame);
     if (result == 0) {
         gl->UseProgram(g->program);
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < 3; i++) {
             gl->ActiveTexture(GL_TEXTURE0 + i);
             gl->BindTexture(GL_TEXTURE_2D, g->textures[i]);
         }
         gl->Uniform1i(g->y_plane, 0);
         gl->Uniform1i(g->uv_plane, 1);
+        gl->Uniform1i(g->v_plane, 2);
+        gl->Uniform1i(g->planar_location, g->planar);
         gl->Disable(GL_BLEND); gl->Disable(GL_SCISSOR_TEST);
         gl->Disable(GL_DEPTH_TEST); gl->Disable(GL_CULL_FACE);
         gl->Viewport(x, framebuffer_height - y - height, width, height);
@@ -199,7 +208,7 @@ int tp_nv12_gl_draw(TpNv12Gl *g, TpNv12Upload upload, void *presenter, const AVF
     if (depth) gl->Enable(GL_DEPTH_TEST);
     if (cull) gl->Enable(GL_CULL_FACE);
     gl->Viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
-    for (int i = 1; i >= 0; i--) {
+    for (int i = 2; i >= 0; i--) {
         gl->ActiveTexture(GL_TEXTURE0 + i);
         gl->BindTexture(GL_TEXTURE_2D, (GLuint)bound[i]);
     }

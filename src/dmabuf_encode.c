@@ -9,8 +9,9 @@
  * NVIDIA: the DMA-BUF is imported as an EGLImage on the NVIDIA EGL device of
  * the encoder's CUDA context, sampled as an external texture by a GLES 3
  * shader that scales and converts to NV12 (luma into an R8 texture, chroma
- * into a half-size RG8 texture), and CUDA copies those textures (registered
- * for interop) into a CUDA frame from NVENC's pool. NVENC also accepts RGB
+ * into a half-size RG8 texture), or to 4:4:4 (three full-size R8 textures)
+ * for a YUV444P encoder, and CUDA copies those textures (registered for
+ * interop) into a CUDA frame from NVENC's pool. NVENC also accepts RGB
  * input directly, but it converts with its own fixed matrix and cannot
  * scale; the shader keeps the colours identical to every other path.
  *
@@ -232,8 +233,9 @@ static const char *VERTEX =
     "}\n";
 
 /* Limited-range BT.709, the matrix every other path (encoder colour tags,
- * client shader, sws) uses. Chroma is drawn at half size, so one bilinear
- * sample at each output texel centre averages a 2x2 source block. */
+ * client shader, sws) uses. `chroma`: 0 luma, 1 NV12 chroma (drawn at half
+ * size, so one bilinear sample at each output texel centre averages a 2x2
+ * source block), 2 Cb and 3 Cr alone at full size (4:4:4). */
 static const char *FRAGMENT =
     "#version 300 es\n"
     "#extension GL_OES_EGL_image_external_essl3 : require\n"
@@ -248,8 +250,8 @@ static const char *FRAGMENT =
     "  if (chroma == 0) {\n"
     "    color = vec4(16.0 / 255.0 + y * (219.0 / 255.0), 0.0, 0.0, 1.0);\n"
     "  } else {\n"
-    "    vec2 c = vec2((rgb.b - y) / 1.8556, (rgb.r - y) / 1.5748);\n"
-    "    color = vec4(128.0 / 255.0 + c * (224.0 / 255.0), 0.0, 1.0);\n"
+    "    vec2 c = 128.0 / 255.0 + vec2((rgb.b - y) / 1.8556, (rgb.r - y) / 1.5748) * (224.0 / 255.0);\n"
+    "    color = chroma == 1 ? vec4(c, 0.0, 1.0) : vec4(chroma == 2 ? c.x : c.y, 0.0, 0.0, 1.0);\n"
     "  }\n"
     "}\n";
 
@@ -258,8 +260,9 @@ typedef struct {
     Gles gl;
     EGLDisplay display;
     EGLContext context;
-    GLuint program, vao, source, planes[2], framebuffers[2];
+    GLuint program, vao, source, planes[3], framebuffers[3];
     GLint crop, chroma, sampler;
+    int planar; /* 4:4:4: three full-size planes instead of NV12's two */
 } GlesContext;
 
 static void gles_release(GlesContext *g) {
@@ -276,8 +279,8 @@ static void gles_destroy(GlesContext *g) {
     if (!g->context) return;
     if (gles_acquire(g) == 0) {
         Gles *gl = &g->gl;
-        if (g->framebuffers[0]) gl->DeleteFramebuffers(2, g->framebuffers);
-        if (g->planes[0]) gl->DeleteTextures(2, g->planes);
+        if (g->framebuffers[0]) gl->DeleteFramebuffers(3, g->framebuffers);
+        if (g->planes[0]) gl->DeleteTextures(3, g->planes);
         if (g->source) gl->DeleteTextures(1, &g->source);
         if (g->vao) gl->DeleteVertexArrays(1, &g->vao);
         if (g->program) gl->DeleteProgram(g->program);
@@ -316,9 +319,9 @@ static GLuint compile(Gles *gl, GLenum type, const char *source) {
     return id;
 }
 
-/* Program, source texture and the two NV12 plane render targets (current
- * context). */
-static int gles_converter(GlesContext *g, int width, int height) {
+/* Program, source texture and the plane render targets (current context):
+ * NV12's two, or three full-size ones when `planar` (YUV444P). */
+static int gles_converter(GlesContext *g, int width, int height, int planar) {
     Gles *gl = &g->gl;
     GLuint vs = compile(gl, GL_VERTEX_SHADER, VERTEX), fs = compile(gl, GL_FRAGMENT_SHADER, FRAGMENT);
     if (vs && fs) {
@@ -343,14 +346,16 @@ static int gles_converter(GlesContext *g, int width, int height) {
     gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
     gl->TexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    gl->GenTextures(2, g->planes);
-    gl->GenFramebuffers(2, g->framebuffers);
-    for (int i = 0; i < 2; i++) {
+    g->planar = planar;
+    gl->GenTextures(3, g->planes);
+    gl->GenFramebuffers(3, g->framebuffers);
+    for (int i = 0; i < (planar ? 3 : 2); i++) {
+        int half = i && !planar;
         gl->BindTexture(GL_TEXTURE_2D, g->planes[i]);
         gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        gl->TexImage2D(GL_TEXTURE_2D, 0, i ? GL_RG8 : GL_R8, i ? width / 2 : width,
-            i ? height / 2 : height, 0, i ? GL_RG : GL_RED, GL_UNSIGNED_BYTE, NULL);
+        gl->TexImage2D(GL_TEXTURE_2D, 0, half ? GL_RG8 : GL_R8, half ? width / 2 : width,
+            half ? height / 2 : height, 0, half ? GL_RG : GL_RED, GL_UNSIGNED_BYTE, NULL);
         gl->BindFramebuffer(GL_FRAMEBUFFER, g->framebuffers[i]);
         gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g->planes[i], 0);
         if (gl->CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return AVERROR(ENOSYS);
@@ -393,7 +398,8 @@ struct TpImport {
     CudaFunctions *cu;
     CUcontext cuda;
     GlesContext gles;
-    CUgraphicsResource resources[2];
+    CUgraphicsResource resources[3];
+    int planes; /* 2 (NV12) or 3 (YUV444P) */
 };
 
 void tp_import_free(TpImport *import) {
@@ -405,7 +411,7 @@ void tp_import_free(TpImport *import) {
     if (import->cu) {
         CUcontext ignored;
         int pushed = import->cuda && import->cu->cuCtxPushCurrent(import->cuda) == CUDA_SUCCESS;
-        for (int i = 0; i < 2; i++)
+        for (int i = 0; i < 3; i++)
             if (import->resources[i]) import->cu->cuGraphicsUnregisterResource(import->resources[i]);
         if (pushed) import->cu->cuCtxPopCurrent(&ignored);
         gles_destroy(&import->gles);
@@ -427,9 +433,9 @@ static int cuda_setup(TpImport *import, AVHWFramesContext *frames) {
     EGLDisplay display = find_display(&import->egl, NULL, ordinal);
     if (!display) return AVERROR(ENODEV);
     int result = gles_create(&import->gles, &import->egl, display);
-    if (result == 0) result = gles_converter(&import->gles, import->width, import->height);
+    if (result == 0) result = gles_converter(&import->gles, import->width, import->height, import->planes == 3);
     if (result == 0 && cu->cuCtxPushCurrent(import->cuda) == CUDA_SUCCESS) {
-        for (int i = 0; i < 2 && result == 0; i++)
+        for (int i = 0; i < import->planes && result == 0; i++)
             if (cu->cuGraphicsGLRegisterImage(&import->resources[i], import->gles.planes[i], GL_TEXTURE_2D,
                     CU_GRAPHICS_REGISTER_FLAGS_READ_ONLY) != CUDA_SUCCESS) result = AVERROR_EXTERNAL;
         cu->cuCtxPopCurrent(&ignored);
@@ -454,10 +460,14 @@ static int import_open(TpImport **out, AVBufferRef *frames_ref) {
     if (*out) return 0;
     if (!frames_ref) return AVERROR(EINVAL);
     AVHWFramesContext *frames = (AVHWFramesContext *)frames_ref->data;
-    if (frames->sw_format != AV_PIX_FMT_NV12) return AVERROR(ENOSYS); /* HDR stays on the CPU path */
+    /* HDR stays on the CPU path; 4:4:4 only through CUDA (VA-API's video
+     * processor converts to NV12 here). */
+    int planar = frames->sw_format == AV_PIX_FMT_YUV444P && frames->device_ctx->type == AV_HWDEVICE_TYPE_CUDA;
+    if (frames->sw_format != AV_PIX_FMT_NV12 && !planar) return AVERROR(ENOSYS);
     TpImport *import = calloc(1, sizeof *import);
     if (!import) return AVERROR(ENOMEM);
     import->va_config = import->va_context = VA_INVALID_ID;
+    import->planes = planar ? 3 : 2;
     import->type = frames->device_ctx->type;
     import->width = frames->width;
     import->height = frames->height;
@@ -594,10 +604,11 @@ static int convert_cuda(TpImport *g, const TpDmabuf *source, AVFrame *output) {
         gl->Uniform1i(c->sampler, 0);
         gl->Uniform4f(c->crop, (GLfloat)source->crop_x / source->width, (GLfloat)source->crop_y / source->height,
             (GLfloat)source->crop_width / source->width, (GLfloat)source->crop_height / source->height);
-        for (int plane = 0; plane < 2; plane++) {
+        for (int plane = 0; plane < g->planes; plane++) {
+            int half = plane && !c->planar;
             gl->BindFramebuffer(GL_FRAMEBUFFER, c->framebuffers[plane]);
-            gl->Viewport(0, 0, plane ? g->width / 2 : g->width, plane ? g->height / 2 : g->height);
-            gl->Uniform1i(c->chroma, plane);
+            gl->Viewport(0, 0, half ? g->width / 2 : g->width, half ? g->height / 2 : g->height);
+            gl->Uniform1i(c->chroma, c->planar && plane ? plane + 1 : plane);
             gl->DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         }
         gl->BindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -609,9 +620,9 @@ static int convert_cuda(TpImport *g, const TpDmabuf *source, AVFrame *output) {
     else if (result == 0) {
         /* Mapping waits for the draws above; the synchronous copies finish
          * before unmapping, after which the source buffer is free. */
-        int mapped = cu->cuGraphicsMapResources(2, g->resources, 0) == CUDA_SUCCESS;
+        int mapped = cu->cuGraphicsMapResources(g->planes, g->resources, 0) == CUDA_SUCCESS;
         if (!mapped) result = AVERROR_EXTERNAL;
-        for (int plane = 0; plane < 2 && result == 0; plane++) {
+        for (int plane = 0; plane < g->planes && result == 0; plane++) {
             CUarray array;
             if (cu->cuGraphicsSubResourceGetMappedArray(&array, g->resources[plane], 0, 0) != CUDA_SUCCESS) {
                 result = AVERROR_EXTERNAL;
@@ -623,11 +634,11 @@ static int convert_cuda(TpImport *g, const TpDmabuf *source, AVFrame *output) {
             copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
             copy.dstDevice = (CUdeviceptr)output->data[plane];
             copy.dstPitch = output->linesize[plane];
-            copy.WidthInBytes = g->width; /* chroma: width/2 texels of 2 bytes */
-            copy.Height = plane ? g->height / 2 : g->height;
+            copy.WidthInBytes = g->width; /* NV12 chroma: width/2 texels of 2 bytes */
+            copy.Height = plane && g->planes == 2 ? g->height / 2 : g->height;
             if (cu->cuMemcpy2D(&copy) != CUDA_SUCCESS) result = AVERROR_EXTERNAL;
         }
-        if (mapped) cu->cuGraphicsUnmapResources(2, g->resources, 0);
+        if (mapped) cu->cuGraphicsUnmapResources(g->planes, g->resources, 0);
         cu->cuCtxPopCurrent(&ignored);
     }
     if (image) {

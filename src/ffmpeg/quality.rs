@@ -5,7 +5,7 @@
 //! (`TELEPORT_TEST_HARDWARE=1` adds NVENC and VA-API).
 
 use super::{Codec, Config};
-use crate::protocol::EncoderPreset;
+use crate::protocol::{EncoderPreset, VideoCodec};
 use anyhow::Result;
 use std::time::{Duration, Instant};
 
@@ -112,12 +112,19 @@ impl Pair {
     }
 
     fn open_at(name: &str, preset: EncoderPreset, kbps: u32) -> Result<Self> {
-        let hevc = name.starts_with("hevc") || name == "libx265";
+        let codec = if name.starts_with("hevc") || name == "libx265" {
+            VideoCodec::H265
+        } else if name.starts_with("av1") || name == "libsvtav1" {
+            VideoCodec::Av1
+        } else {
+            VideoCodec::H264
+        };
         let config = Config {
             encoder: true,
             name: name.into(),
-            hevc,
+            codec,
             hdr: false,
+            chroma444: false,
             width: WIDTH as u32,
             height: HEIGHT as u32,
             fps: FPS,

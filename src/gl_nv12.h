@@ -79,15 +79,18 @@ typedef struct {
 
 typedef struct {
     TpGl gl;
-    GLuint program, vbo, textures[2];
-    GLint y_plane, uv_plane;
+    /* NV12: textures 0 (R8 luma) and 1 (RG8 chroma). With `planar` set by
+     * the upload (4:4:4), three full-size R8 textures: Y, Cb, Cr. */
+    GLuint program, vbo, textures[3];
+    GLint y_plane, uv_plane, v_plane, planar_location;
+    int planar;
 } TpNv12Gl;
 
 /* Fills `textures` with the frame's planes. Called by tp_nv12_gl_draw after
  * GL state has been saved, so it may bind textures freely. */
 typedef int (*TpNv12Upload)(void *presenter, const AVFrame *frame);
 
-/* Resolve GL entry points, compile the shader and create two linear,
+/* Resolve GL entry points, compile the shader and create three linear,
  * edge-clamped textures in the current context. 0 on success. */
 int tp_nv12_gl_init(TpNv12Gl *nv12, TpGetProc get);
 void tp_nv12_gl_destroy(TpNv12Gl *nv12);

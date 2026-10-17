@@ -27,6 +27,7 @@ fn hardware_candidates(codec: VideoCodec, macos: bool) -> &'static [&'static str
     match codec {
         VideoCodec::H264 => &["nvh264dec", "vah264dec", "qsvh264dec"],
         VideoCodec::H265 => &["nvh265dec", "vah265dec", "qsvh265dec"],
+        VideoCodec::Av1 => &[],
     }
 }
 
@@ -37,6 +38,7 @@ pub(super) fn fragment(decoder: &str, codec: VideoCodec) -> String {
         let format = match codec {
             VideoCodec::H264 => "avc",
             VideoCodec::H265 => "hvc1",
+            VideoCodec::Av1 => "obu-stream",
         };
         format!(" ! {caps},stream-format={format},alignment=au")
     } else {
@@ -59,6 +61,7 @@ pub(super) fn fragment(decoder: &str, codec: VideoCodec) -> String {
 
 pub(super) fn select(force_software: bool, format: VideoFormat) -> Result<&'static str> {
     format.validate()?;
+    format.legacy_supported()?;
     let codec = format.codec;
     let mut cache = SELECTED.get_or_init(Mutex::default).lock().unwrap();
     let key = (codec.track(), force_software, format.hdr());
@@ -68,6 +71,7 @@ pub(super) fn select(force_software: bool, format: VideoFormat) -> Result<&'stat
     let software = match codec {
         VideoCodec::H264 => "avdec_h264",
         VideoCodec::H265 => "avdec_h265",
+        VideoCodec::Av1 => "dav1ddec",
     };
     let hardware = hardware_candidates(codec, cfg!(target_os = "macos"));
     if !force_software {
@@ -113,6 +117,7 @@ fn synthetic_encoder(format: VideoFormat) -> &'static str {
         VideoCodec::H265 => {
             "x265enc tune=zerolatency speed-preset=ultrafast option-string=pools=1:frame-threads=1:log-level=error ! video/x-h265,profile=main"
         }
+        VideoCodec::Av1 => unreachable!("the legacy backend rejects AV1 first"),
     }
 }
 
@@ -267,6 +272,7 @@ mod tests {
         let format = VideoFormat {
             codec: VideoCodec::H265,
             dynamic_range: crate::protocol::DynamicRange::Hdr10,
+            chroma444: false,
         };
         probe("avdec_h265", format)?;
         if let Err(error) = probe_inner("nvh265dec", format, false) {
@@ -330,6 +336,7 @@ mod tests {
                 formats.push(VideoFormat {
                     codec,
                     dynamic_range: crate::protocol::DynamicRange::Hdr10,
+                    chroma444: false,
                 });
             }
             for format in formats {

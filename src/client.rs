@@ -175,11 +175,19 @@ pub struct Options {
     /// PlayStation pads create Xbox pads.
     #[arg(long, value_enum, default_value = "auto")]
     pub gamepad_type: controllers::GamepadChoice,
-    /// Session video codec. `auto` uses H.265 when the host encodes and this
-    /// client decodes it in hardware, otherwise H.264 (always H.264 with
-    /// hosts that cannot negotiate). An explicit codec is always used.
+    /// Session video codec. `auto` uses AV1, else H.265, when the host
+    /// encodes and this client decodes it in hardware, otherwise H.264
+    /// (always H.264 with hosts that cannot negotiate). An explicit codec is
+    /// always used (`av1` needs a host that offers it).
     #[arg(long, value_enum, default_value = "auto")]
     pub codec: stream_settings::CodecChoice,
+    /// Full-resolution chroma (4:4:4) for sharper coloured text: `off`,
+    /// `auto` (H.265 4:4:4 when the host encodes and this client decodes it
+    /// in hardware) or `on` (whenever the host can, in software if need
+    /// be). H.264/H.265 SDR only; costs bitrate and, on the client, a CPU
+    /// conversion per frame.
+    #[arg(long = "chroma-444", value_enum, default_value = "off")]
+    pub chroma_444: stream_settings::ChromaChoice,
     /// Explicit experimental HDR10 requires patched capture and a macOS HDR display.
     #[arg(long, value_enum, default_value = "sdr")]
     pub dynamic_range: protocol::DynamicRange,
@@ -542,12 +550,19 @@ async fn connect_via(
     if options.smoke_legacy_host {
         // Behave like a client from before codec selection.
         desktop.codec_selection = false;
+        desktop.chroma_444_selection = false;
+        desktop.av1 = false;
     }
     let decision = stream_settings::choose_codec(
         options.codec,
+        options.chroma_444,
         options.dynamic_range,
         &desktop,
-        client_hevc_decoder(options).as_deref(),
+        &client_decoders(options),
+    );
+    ensure!(
+        decision.codec != protocol::VideoCodec::Av1 || (desktop.codec_selection && desktop.av1),
+        "host cannot stream AV1; update the host or choose another --codec"
     );
     let mut input = input;
     let mut input_sequence = 0;
@@ -561,6 +576,7 @@ async fn connect_via(
                 event: Event::SelectCodec {
                     codec: decision.codec,
                     encoder_preset: options.encoder_preset.filter(|_| desktop.encoder_presets),
+                    chroma_444: decision.chroma_444 && desktop.chroma_444_selection,
                 },
                 motion: None,
             })?,
@@ -568,6 +584,7 @@ async fn connect_via(
         group.finish()?;
         input_sequence = 1;
         desktop.codec = decision.codec;
+        desktop.chroma_444 = decision.chroma_444 && desktop.chroma_444_selection;
     }
     ensure!(
         desktop.codec == decision.codec,
@@ -576,6 +593,7 @@ async fn connect_via(
     );
     tracing::info!(
         codec = decision.codec.label(),
+        chroma_444 = desktop.chroma_444,
         reason = %decision.reason,
         host_hardware = ?desktop.hardware_codecs,
         "session video codec"
@@ -701,19 +719,32 @@ impl Drop for Network {
     }
 }
 
-/// This client's hardware H.265 decoder for `--codec auto` (SDR); probed
-/// once per process, so call it before connecting.
-fn client_hevc_decoder(options: &Options) -> Option<String> {
-    if options.codec != stream_settings::CodecChoice::Auto
-        || options.software_decoder
-        || options.dynamic_range != protocol::DynamicRange::Sdr
-    {
-        return None;
+/// This client's hardware decoders for `--codec auto` (H.265, AV1) and
+/// `--chroma-444 auto` (H.265 4:4:4), SDR only; probed once per process, so
+/// call it before connecting.
+fn client_decoders(options: &Options) -> stream_settings::ClientDecoders {
+    let mut decoders = stream_settings::ClientDecoders::default();
+    if options.software_decoder || options.dynamic_range != protocol::DynamicRange::Sdr {
+        return decoders;
     }
-    media::hardware_decoder(protocol::VideoCodec::H265).unwrap_or_else(|error| {
-        tracing::info!(%error, "no H.265 decoder for automatic codec choice");
-        None
-    })
+    let probe = |format: media::VideoFormat| {
+        media::hardware_decoder(format).unwrap_or_else(|error| {
+            tracing::info!(%error, codec = ?format.codec, chroma444 = format.chroma444, "no decoder for automatic codec choice");
+            None
+        })
+    };
+    if options.codec == stream_settings::CodecChoice::Auto {
+        decoders.hevc = probe(protocol::VideoCodec::H265.into());
+        decoders.av1 = probe(protocol::VideoCodec::Av1.into());
+    }
+    if options.chroma_444 == stream_settings::ChromaChoice::Auto {
+        decoders.hevc_444 = probe(media::VideoFormat {
+            codec: protocol::VideoCodec::H265,
+            chroma444: true,
+            ..Default::default()
+        });
+    }
+    decoders
 }
 
 pub fn run(options: Options, runtime: &Runtime) -> Result<()> {
@@ -738,9 +769,10 @@ pub fn run(options: Options, runtime: &Runtime) -> Result<()> {
         media::VideoFormat {
             codec: options.codec.requested(options.dynamic_range),
             dynamic_range: options.dynamic_range,
+            chroma444: false,
         },
     )?;
-    client_hevc_decoder(&options);
+    client_decoders(&options);
     let mut last_error = None;
     loop {
         let link = if options.headless_frames.is_some() {
@@ -1217,6 +1249,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let format = media::VideoFormat {
         codec: link.desktop.codec,
         dynamic_range: link.desktop.dynamic_range,
+        chroma444: link.desktop.chroma_444,
     };
     #[cfg(target_os = "linux")]
     let mut zero_copy = match window_state.as_mut() {
@@ -2866,8 +2899,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     desktop.codec.label()
                 ),
                 format!(
-                    "Codec                 {}   |   {codec_reason}",
-                    desktop.codec.label()
+                    "Codec                 {}{}   |   {codec_reason}",
+                    desktop.codec.label(),
+                    if desktop.chroma_444 {
+                        " 4:4:4"
+                    } else {
+                        " 4:2:0"
+                    }
                 ),
                 format!(
                     "Encoder preset        {}",
@@ -4746,7 +4784,19 @@ mod tests {
         let parsed =
             Arguments::try_parse_from(base.into_iter().chain(["--codec", "h265"])).unwrap();
         assert_eq!(parsed.options.codec, stream_settings::CodecChoice::H265);
-        assert!(Arguments::try_parse_from(base.into_iter().chain(["--codec", "av1"])).is_err());
+        let parsed = Arguments::try_parse_from(base.into_iter().chain(["--codec", "av1"])).unwrap();
+        assert_eq!(parsed.options.codec, stream_settings::CodecChoice::Av1);
+        assert!(Arguments::try_parse_from(base.into_iter().chain(["--codec", "vp9"])).is_err());
+        assert_eq!(
+            parsed.options.chroma_444,
+            stream_settings::ChromaChoice::Off
+        );
+        let parsed =
+            Arguments::try_parse_from(base.into_iter().chain(["--chroma-444", "auto"])).unwrap();
+        assert_eq!(
+            parsed.options.chroma_444,
+            stream_settings::ChromaChoice::Auto
+        );
     }
 
     #[test]

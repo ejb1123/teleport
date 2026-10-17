@@ -32,8 +32,9 @@ unsafe extern "C" {
     fn tp_codec_open(
         encoder: c_int,
         name: *const c_char,
-        hevc: c_int,
+        codec: c_int,
         hdr: c_int,
+        chroma444: c_int,
         width: c_int,
         height: c_int,
         fps: c_int,
@@ -60,14 +61,28 @@ unsafe extern "C" {
     fn tp_gpu_frame_free(frame: *mut c_void);
     fn tp_codec_set_bitrate(codec: *mut c_void, kbps: c_int) -> c_int;
     fn tp_codec_error(error: c_int, buffer: *mut c_char, length: c_int);
+    #[cfg(target_os = "linux")]
+    fn tp_codec_available(encoder: c_int, name: *const c_char) -> c_int;
+}
+
+/// Whether this FFmpeg build has an encoder (or decoder) called `name`.
+#[cfg(target_os = "linux")]
+pub fn available(encoder: bool, name: &str) -> bool {
+    let Ok(name) = CString::new(name) else {
+        return false;
+    };
+    unsafe { tp_codec_available(encoder.into(), name.as_ptr()) != 0 }
 }
 
 #[derive(Clone)]
 pub struct Config {
     pub encoder: bool,
     pub name: String,
-    pub hevc: bool,
+    pub codec: crate::protocol::VideoCodec,
     pub hdr: bool,
+    /// Encoders: take YUV444P input and encode full-resolution chroma
+    /// (H.264/H.265 SDR). Decoders decode whatever the stream carries.
+    pub chroma444: bool,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -168,8 +183,9 @@ impl Codec {
             tp_codec_open(
                 config.encoder.into(),
                 name.as_ptr(),
-                config.hevc.into(),
+                config.codec.ffmpeg_id(),
                 config.hdr.into(),
+                config.chroma444.into(),
                 config.width.try_into()?,
                 config.height.try_into()?,
                 config.fps.try_into()?,
@@ -550,8 +566,13 @@ mod tests {
         Config {
             encoder: true,
             name: if hevc { "libx265" } else { "libx264" }.into(),
-            hevc,
+            codec: if hevc {
+                crate::protocol::VideoCodec::H265
+            } else {
+                crate::protocol::VideoCodec::H264
+            },
             hdr: false,
+            chroma444: false,
             width: 64,
             height: 48,
             fps: 30,
@@ -561,6 +582,22 @@ mod tests {
             gpu_input: false,
             preset: Default::default(),
             intra_refresh: 0,
+        }
+    }
+    /// The software encoder's config for `codec` (libx264, libx265 or
+    /// SVT-AV1, which needs at least 64x64).
+    pub(super) fn codec_config(codec: crate::protocol::VideoCodec) -> Config {
+        use crate::protocol::VideoCodec;
+        Config {
+            name: match codec {
+                VideoCodec::H264 => "libx264",
+                VideoCodec::H265 => "libx265",
+                VideoCodec::Av1 => "libsvtav1",
+            }
+            .into(),
+            codec,
+            height: 64,
+            ..software_config(false)
         }
     }
     #[test]
@@ -672,7 +709,7 @@ mod tests {
                     encoder.submit_frame(&source(frame), frame as u64, frame == 90)?;
                     while let Some(packet) = encoder.receive()? {
                         let pts = packet.pts.unwrap_or_default() as usize;
-                        if crate::protocol::annexb_keyframe(codec, &packet.bytes) {
+                        if crate::protocol::keyframe(codec, &packet.bytes) {
                             idrs.push(pts);
                         }
                         // Lost in transit.
@@ -831,10 +868,16 @@ mod tests {
         }
     }
 
-    /// Four flat quadrants (limited-range NV12): grey, red-ish, green-ish,
-    /// blue-ish, encoded with libx264 (or libx265). Returns the config and packets.
+    /// Four flat quadrants (limited-range NV12, or YUV444P for
+    /// `chroma444`): grey, red-ish, green-ish, blue-ish, encoded with
+    /// libx264, libx265 or SVT-AV1. Returns the config and packets.
     #[cfg(target_os = "linux")]
-    fn quadrant_stream(width: usize, height: usize, hevc: bool) -> Result<(Config, Vec<Vec<u8>>)> {
+    fn quadrant_stream(
+        width: usize,
+        height: usize,
+        codec: crate::protocol::VideoCodec,
+        chroma444: bool,
+    ) -> Result<(Config, Vec<Vec<u8>>)> {
         let quadrants = [
             (126_u8, 128_u8, 128_u8),
             (81, 90, 240),
@@ -857,11 +900,23 @@ mod tests {
                 raw[width * height + y * width + x * 2 + 1] = v;
             }
         }
+        if chroma444 {
+            raw.truncate(width * height);
+            for plane in 0..2 {
+                for y in 0..height {
+                    for x in 0..width {
+                        let (_, u, v) = quadrant(x, y);
+                        raw.push(if plane == 0 { u } else { v });
+                    }
+                }
+            }
+        }
         let config = Config {
             width: width as u32,
             height: height as u32,
             kbps: 4000,
-            ..software_config(hevc)
+            chroma444,
+            ..codec_config(codec)
         };
         let mut encoder = Codec::new(config.clone())?;
         let mut packets = Vec::new();
@@ -923,9 +978,11 @@ mod tests {
             return Ok(());
         }
         let (width, height) = (640_usize, 360_usize);
-        // H.264 and H.265 (the automatic choice with hardware on both ends).
-        for hevc in [false, true] {
-            let (config, packets) = quadrant_stream(width, height, hevc)?;
+        // H.264, H.265 and AV1 (NVDEC through FFmpeg's AV1 decoder: the same
+        // NV12 CUDA surfaces), and H.265 4:4:4 (three planes).
+        use crate::protocol::VideoCodec::{Av1, H264, H265};
+        for (codec, chroma444) in [(H264, false), (H265, false), (Av1, false), (H265, true)] {
+            let (config, packets) = quadrant_stream(width, height, codec, chroma444)?;
             let cpu = decode_last(&config, &packets, "software", 0)?; // RGB24 reference
             let gpu = decode_last(&config, &packets, "cuda", 3)?;
             let gpu = gpu
@@ -939,8 +996,8 @@ mod tests {
             }
             check(result)?;
             compare_quadrants(&cpu, &rgba, width, height)
-                .with_context(|| format!("hevc={hevc}"))?;
-            eprintln!("PASS cuda hevc={hevc}");
+                .with_context(|| format!("{codec:?} 4:4:4={chroma444}"))?;
+            eprintln!("PASS cuda {codec:?} 4:4:4={chroma444}");
         }
         Ok(())
     }
@@ -964,13 +1021,15 @@ mod tests {
             .collect();
         nodes.sort();
         let mut passed = 0;
-        for (width, height, iterations, hevc) in [
-            (640_usize, 360_usize, 0, false),
-            (640, 360, 0, true),
-            (1920, 1080, 50, false),
-            (3840, 2160, 20, false),
+        use crate::protocol::VideoCodec::{Av1, H264, H265};
+        for (width, height, iterations, codec) in [
+            (640_usize, 360_usize, 0, H264),
+            (640, 360, 0, H265),
+            (640, 360, 0, Av1),
+            (1920, 1080, 50, H264),
+            (3840, 2160, 20, H264),
         ] {
-            let (config, packets) = quadrant_stream(width, height, hevc)?;
+            let (config, packets) = quadrant_stream(width, height, codec, false)?;
             let cpu = decode_last(&config, &packets, "software", 0)?;
             for node in &nodes {
                 let name = format!("vaapi@{node}");
@@ -1011,7 +1070,7 @@ mod tests {
                         download_ns as f64 / 1e6
                     );
                 }
-                eprintln!("PASS {name} {width}x{height} hevc={hevc}");
+                eprintln!("PASS {name} {width}x{height} {codec:?}");
                 passed += 1;
             }
         }
@@ -1083,6 +1142,161 @@ mod tests {
             }
             ensure!(passed > 0, "no hardware decoder tested");
         }
+        Ok(())
+    }
+
+    /// AV1 decoding in hardware (NVDEC, VA-API, QSV) of an SVT-AV1 stream,
+    /// and AV1 hardware encoders where present (RTX 40+, Arc / Meteor Lake;
+    /// skipped otherwise). Same checks as for H.264/H.265.
+    #[test]
+    #[ignore = "requires hardware encoder and at least one hardware decoder"]
+    fn direct_hardware_av1() -> Result<()> {
+        if std::env::var("TELEPORT_TEST_HARDWARE").as_deref() != Ok("1") {
+            eprintln!("SKIP: set TELEPORT_TEST_HARDWARE=1 on a machine with hardware decoding");
+            return Ok(());
+        }
+        let mut raw = vec![90; 640 * 360];
+        raw.extend(vec![128; 640 * 360 / 2]);
+        let (mut encoded, mut decoded) = (0, 0);
+        for name in ["libsvtav1", "av1_nvenc", "av1_vaapi", "av1_qsv"] {
+            let config = Config {
+                name: name.into(),
+                width: 640,
+                height: 360,
+                ..codec_config(crate::protocol::VideoCodec::Av1)
+            };
+            let mut encoder = match Codec::new(config.clone()) {
+                Ok(encoder) => encoder,
+                Err(error) => {
+                    eprintln!("SKIP {name} encoder: {error:#}");
+                    continue;
+                }
+            };
+            let mut packets = Vec::new();
+            for index in 0..30 {
+                encoder.submit_frame(&raw, index, index == 15)?;
+                while let Some(packet) = encoder.receive()? {
+                    ensure!(
+                        packet.key == crate::protocol::keyframe(config.codec, &packet.bytes),
+                        "{name}: key flag and OBU parse disagree at {:?}",
+                        packet.pts
+                    );
+                    packets.push(packet.bytes);
+                }
+            }
+            ensure!(
+                packets.len() == 30,
+                "{name} buffered too many frames: {} of 30 emitted",
+                packets.len()
+            );
+            encoded += 1;
+            for decoder_name in ["cuda", "vaapi", "qsv"] {
+                let mut decoder = match Codec::new(Config {
+                    encoder: false,
+                    name: decoder_name.into(),
+                    ..config.clone()
+                }) {
+                    Ok(decoder) => decoder,
+                    Err(error) => {
+                        eprintln!("SKIP {decoder_name}: {error:#}");
+                        continue;
+                    }
+                };
+                let mut count = 0;
+                for (index, packet) in packets.iter().enumerate() {
+                    if let Err(error) = decoder.submit(packet, index as u64 + 1) {
+                        eprintln!("SKIP {name} -> {decoder_name}: {error:#}");
+                        count = -1;
+                        break;
+                    }
+                    while let Some(frame) = decoder.receive()? {
+                        ensure!((frame.width, frame.height) == (640, 360));
+                        ensure!((frame.bytes[0] as i32 - 90).abs() < 12, "bad hardware luma");
+                        count += 1;
+                    }
+                }
+                if count < 0 {
+                    continue;
+                }
+                ensure!(
+                    count >= 28,
+                    "{decoder_name} buffered too many frames: {count}"
+                );
+                eprintln!("PASS {name} -> {decoder_name}: {count} frames");
+                decoded += 1;
+            }
+        }
+        ensure!(encoded > 0 && decoded > 0, "no AV1 hardware path tested");
+        Ok(())
+    }
+
+    /// 4:4:4 on NVENC (H.264 and H.265, Maxwell+) and Quick Sync / VA-API
+    /// (Ice Lake+; skipped otherwise), decoded by NVDEC (H.265 only) and in
+    /// software: single-pixel colour columns must survive.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a hardware encoder"]
+    fn direct_hardware_chroma_444() -> Result<()> {
+        if std::env::var("TELEPORT_TEST_HARDWARE").as_deref() != Ok("1") {
+            eprintln!("SKIP: set TELEPORT_TEST_HARDWARE=1 on a machine with hardware encoding");
+            return Ok(());
+        }
+        let (width, height) = (640_usize, 360_usize);
+        let raw = formats::colour_columns(width, height);
+        let mut passed = 0;
+        for name in [
+            "h264_nvenc",
+            "hevc_nvenc",
+            "h264_vaapi",
+            "hevc_vaapi",
+            "h264_qsv",
+            "hevc_qsv",
+        ] {
+            let config = Config {
+                name: name.into(),
+                codec: if name.starts_with("hevc") {
+                    crate::protocol::VideoCodec::H265
+                } else {
+                    crate::protocol::VideoCodec::H264
+                },
+                width: width as u32,
+                height: height as u32,
+                kbps: 20_000,
+                chroma444: true,
+                ..software_config(false)
+            };
+            let mut encoder = match Codec::new(config.clone()) {
+                Ok(encoder) => encoder,
+                Err(error) => {
+                    eprintln!("SKIP {name}: {error:#}");
+                    continue;
+                }
+            };
+            let mut packets = Vec::new();
+            for index in 0..10 {
+                encoder.submit(&raw, index)?;
+                while let Some(packet) = encoder.receive()? {
+                    packets.push(packet.bytes);
+                }
+            }
+            for decoder in ["cuda", "software"] {
+                let frame = match decode_last(&config, &packets, decoder, 0) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        eprintln!("SKIP {name} -> {decoder}: {error:#}");
+                        continue;
+                    }
+                };
+                let contrast = formats::column_contrast(&frame.bytes, width, height);
+                ensure!(
+                    contrast > 100.0,
+                    "{name} -> {decoder}: colour columns lost (contrast {contrast:.1})"
+                );
+                eprintln!("PASS {name} 4:4:4 -> {decoder}: column contrast {contrast:.1}");
+                passed += 1;
+            }
+        }
+        ensure!(passed > 0, "no 4:4:4 hardware encoder tested");
         Ok(())
     }
 
@@ -1169,7 +1383,13 @@ mod tests {
             return Ok(());
         }
         let colors = [[200, 40, 40], [40, 180, 60], [50, 60, 210], [230, 230, 230]];
-        let mut targets = vec![("h264_nvenc", None), ("hevc_nvenc", None)];
+        // (encoder, render node, 4:4:4)
+        let mut targets = vec![
+            ("h264_nvenc", None, false),
+            ("hevc_nvenc", None, false),
+            ("h264_nvenc", None, true),
+            ("hevc_nvenc", None, true),
+        ];
         let mut nodes: Vec<String> = std::fs::read_dir("/dev/dri")?
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path().to_string_lossy().into_owned())
@@ -1177,24 +1397,28 @@ mod tests {
             .collect();
         nodes.sort();
         for node in nodes {
-            targets.push(("h264_vaapi", Some(node.clone())));
-            targets.push(("hevc_vaapi", Some(node)));
+            targets.push(("h264_vaapi", Some(node.clone()), false));
+            targets.push(("hevc_vaapi", Some(node), false));
         }
         let mut passed = 0;
-        for (name, node) in targets {
+        for (name, node, chroma444) in targets {
             // Same size, 2x downscale, and a crop of the top-left quadrant.
             for (source_size, size, crop) in [
                 ((640, 360), (640, 360), false),
                 ((1280, 720), (640, 360), false),
                 ((1280, 720), (640, 360), true),
             ] {
-                let label = format!("{name} {node:?} {source_size:?} -> {size:?} crop={crop}");
+                let label = format!(
+                    "{name}{} {node:?} {source_size:?} -> {size:?} crop={crop}",
+                    if chroma444 { " 4:4:4" } else { "" }
+                );
                 let config = Config {
                     name: name.into(),
                     width: size.0,
                     height: size.1,
                     kbps: 4000,
                     gpu_input: true,
+                    chroma444,
                     ..software_config(name.starts_with("hevc"))
                 };
                 let mut encoder = match Codec::new(config.clone()) {
@@ -1261,5 +1485,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod formats;
 #[cfg(all(test, target_os = "linux"))]
 mod quality;

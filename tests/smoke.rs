@@ -397,10 +397,61 @@ fn automatic_codec_choice_and_clients_without_selection() {
         explicit.contains("codec=\"H.265\"") && explicit.contains("chosen with --codec"),
         "{explicit}"
     );
+    // AV1 (SVT-AV1 on this software host, dav1d here) only through
+    // SelectCodec; hosts without it are refused before video starts.
+    let av1 = client(&["--software-decoder", "--codec", "av1"]);
+    assert!(
+        av1.contains("codec=\"AV1\"") && av1.contains("chosen with --codec"),
+        "{av1}"
+    );
+    let refused = teleport()
+        .args(["client", &address, "--pairing-file"])
+        .arg(&pairing)
+        .args([
+            "--headless-frames",
+            "15",
+            "--codec",
+            "av1",
+            "--smoke-legacy-host",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !refused.status.success()
+            && String::from_utf8_lossy(&refused.stderr).contains("host cannot stream AV1"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    // 4:4:4 on request; never with older hosts.
+    let full_chroma = client(&[
+        "--software-decoder",
+        "--codec",
+        "h265",
+        "--chroma-444",
+        "on",
+    ]);
+    assert!(
+        full_chroma.contains("chroma_444=true") && full_chroma.contains("4:4:4 (on)"),
+        "{full_chroma}"
+    );
+    let legacy_chroma = client(&[
+        "--software-decoder",
+        "--smoke-legacy-host",
+        "--chroma-444",
+        "on",
+    ]);
+    assert!(
+        legacy_chroma.contains("chroma_444=false"),
+        "{legacy_chroma}"
+    );
     drop(host);
     let log = std::fs::read_to_string(&log).unwrap();
     assert!(
         log.contains("chosen_by_client=false") && log.contains("chosen_by_client=true"),
+        "{log}"
+    );
+    assert!(
+        log.contains("codec=\"AV1\"") && log.contains("chroma_444=true"),
         "{log}"
     );
 }
