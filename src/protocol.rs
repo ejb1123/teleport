@@ -403,6 +403,38 @@ pub struct Desktop {
     /// The host's desktop audio settings for clients that do not choose.
     #[serde(default)]
     pub audio_settings: AudioSettings,
+    /// How to wake this host and which power requests it takes (G23); the
+    /// client saves it in the desktop's profile. Absent from older hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<WakeInfo>,
+    /// The host maps `Event::SecureAttention` (the client's Ctrl+Alt+End)
+    /// to locking its session, or to the unlock prompt when it is locked.
+    #[serde(default)]
+    pub secure_attention: bool,
+}
+
+/// What a host tells its paired clients about waking it and its power
+/// requests (`Desktop::wake`, G23), saved in the client's profile. Parsing
+/// and checks are in `crate::wake`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WakeInfo {
+    /// Hardware address of the interface the host is reached on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    /// Wake-on-LAN by magic packet is armed on that interface (`ethtool`
+    /// "Wake-on: g"); `None` when the host could not tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_on_lan: Option<bool>,
+    /// The interface's IPv4 address and prefix: its subnet broadcast, and
+    /// which wake relays share its LAN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv4: Option<String>,
+    /// This host sends magic packets for its owner (`--wake-relay`).
+    #[serde(default)]
+    pub wake_relay: bool,
+    /// This host suspends at its owner's request (`--allow-suspend`).
+    #[serde(default)]
+    pub suspend: bool,
 }
 
 /// A network step-down: the negotiated stream, and the bitrate that made the
@@ -876,6 +908,11 @@ pub enum Event {
         #[serde(default)]
         microphone: bool,
     },
+    /// "Secure attention" (the client's Ctrl+Alt+End, Teleport's
+    /// Ctrl+Alt+Del): lock the host session, or show the lock screen's
+    /// password prompt when it is locked. Only sent when
+    /// `Desktop::secure_attention`.
+    SecureAttention,
     /// The session's video codec. Sent as the very first input event to hosts
     /// advertising `Desktop::codec_selection`, which wait for it before
     /// starting video; it overrides the connection's `codec` parameter.

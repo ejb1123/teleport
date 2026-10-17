@@ -65,6 +65,9 @@ pub enum Action {
     PointerLock,
     /// Ctrl+Alt+V: mute/unmute the microphone sent to the host.
     Microphone,
+    /// Ctrl+Alt+End: secure attention (Teleport's Ctrl+Alt+Del): lock the
+    /// host session, or show its unlock prompt.
+    SecureAttention,
     Disconnect,
     Stats,
     Swallow,
@@ -77,6 +80,7 @@ pub struct Shortcuts {
     lock_down: bool,
     microphone_down: bool,
     stats_down: bool,
+    attention_down: bool,
 }
 impl Shortcuts {
     pub fn event(&mut self, event: &Event, captured: bool) -> Option<Action> {
@@ -122,6 +126,15 @@ impl Shortcuts {
             self.microphone_down = down;
             return Some(if first {
                 Action::Microphone
+            } else {
+                Action::Swallow
+            });
+        }
+        if key == Keycode::End && (self.attention_down || (down && chord)) {
+            let first = down && !repeat && !self.attention_down;
+            self.attention_down = down;
+            return Some(if first {
+                Action::SecureAttention
             } else {
                 Action::Swallow
             });
@@ -230,6 +243,35 @@ mod tests {
             // Ctrl+V (paste) still goes to the remote desktop.
             assert_eq!(
                 shortcuts.event(&key(Keycode::V, true, Mod::LCTRLMOD, false), captured),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_alt_end_is_secure_attention_and_end_alone_goes_remote() {
+        for captured in [false, true] {
+            let mut shortcuts = Shortcuts::default();
+            let chord = Mod::RCTRLMOD | Mod::LALTMOD;
+            assert_eq!(
+                shortcuts.event(&key(Keycode::End, true, chord, false), captured),
+                Some(Action::SecureAttention)
+            );
+            assert_eq!(
+                shortcuts.event(&key(Keycode::End, true, chord, true), captured),
+                Some(Action::Swallow)
+            );
+            // Released after the modifiers: still consumed.
+            assert_eq!(
+                shortcuts.event(&key(Keycode::End, false, Mod::NOMOD, false), captured),
+                Some(Action::Swallow)
+            );
+            assert_eq!(
+                shortcuts.event(&key(Keycode::End, true, Mod::NOMOD, false), captured),
+                None
+            );
+            assert_eq!(
+                shortcuts.event(&key(Keycode::End, true, Mod::LCTRLMOD, false), captured),
                 None
             );
         }

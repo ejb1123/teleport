@@ -208,6 +208,35 @@ pub struct Options {
     /// The session's client strips `protocol::FrameTiming` headers.
     #[arg(skip)]
     pub frame_timing: bool,
+    /// Wake relay: send Wake-on-LAN packets on this host's networks when
+    /// the owner's devices ask (`teleport wake`, the launcher's Wake), to
+    /// wake their other machines here. Never at the MoQ relay's request
+    /// (docs/wake-and-unattended.md).
+    #[arg(long)]
+    pub wake_relay: bool,
+    /// With --wake-relay: only wake these hardware addresses (repeatable;
+    /// default: any device address).
+    #[arg(long, requires = "wake_relay")]
+    pub wake_relay_allow: Vec<crate::wake::Mac>,
+    /// Suspend this machine when the owner's device asks (`teleport
+    /// suspend`, the launcher's Sleep); wake it again with Wake-on-LAN.
+    #[arg(long)]
+    pub allow_suspend: bool,
+    /// Tests: run this instead of `systemctl suspend`.
+    #[arg(long, hide = true, default_value = "systemctl suspend")]
+    pub suspend_command: String,
+    /// Unlock the desktop session (logind) when a client signs in with this
+    /// account's Linux password (system login), which PAM has just
+    /// verified. The password is never stored. For unattended hosts that
+    /// log in automatically and lock at once.
+    #[arg(long, requires = "system_auth_helper")]
+    pub unlock_on_system_login: bool,
+    /// What clients are told about waking this host (`Desktop::wake`).
+    #[arg(skip)]
+    pub wake: Option<crate::wake::WakeInfo>,
+    /// The session's lock state can be read and changed (logind).
+    #[arg(skip)]
+    pub secure_attention: bool,
 }
 
 pub async fn run(mut options: Options) -> Result<()> {
@@ -284,9 +313,84 @@ pub async fn run(mut options: Options) -> Result<()> {
             tracing::warn!("microphone passthrough unavailable: it needs PipeWire (pw-cli)");
         }
     }
+    // Wake-on-LAN details and the session's lock control (G23, G24).
+    let (listen, wake_relay, suspend) = (
+        options.listen.clone(),
+        options.wake_relay,
+        options.allow_suspend,
+    );
+    let test_source = options.source == "test";
+    let (wake, secure_attention) = tokio::task::spawn_blocking(move || {
+        (
+            crate::wake::host::info(&listen, wake_relay, suspend),
+            !test_source && crate::session_lock::available(),
+        )
+    })
+    .await?;
+    tracing::info!(
+        mac = wake.mac.as_deref().unwrap_or("unknown"),
+        wake_on_lan = ?wake.wake_on_lan,
+        network = wake.ipv4.as_deref().unwrap_or("unknown"),
+        wake_relay,
+        suspend,
+        secure_attention,
+        "power and session control"
+    );
+    if wake.mac.is_some() && wake.wake_on_lan == Some(false) {
+        tracing::warn!(
+            "Wake-on-LAN is off on this network card; clients cannot wake this host (docs/wake-and-unattended.md)"
+        );
+    }
+    options.wake = Some(wake);
+    options.secure_attention = secure_attention;
     let result = serve(&options, &mut capture).await;
     capture.close().await;
     result
+}
+
+/// The client's Ctrl+Alt+End: lock the session, or show the lock screen's
+/// password prompt (a Shift tap wakes the screen and the prompt). Returns
+/// the notice for the client.
+async fn secure_attention(options: &Options, capture: &mut Capture) -> String {
+    if !options.secure_attention {
+        return "This host cannot lock or unlock its session (no logind session)".into();
+    }
+    match tokio::task::spawn_blocking(crate::session_lock::secure_attention).await {
+        Ok(Ok(crate::session_lock::Attention::Lock)) => {
+            tracing::info!("session locked at the client's request");
+            "Host session locked. Ctrl+Alt+End again shows the password prompt".into()
+        }
+        Ok(Ok(crate::session_lock::Attention::Prompt)) => {
+            for down in [true, false] {
+                // KEY_LEFTSHIFT: changes nothing in the password field.
+                let _ = capture.input(Event::Key { code: 42, down }).await;
+            }
+            "Host is locked: type the password to unlock".into()
+        }
+        Ok(Err(error)) => format!("Host session lock unavailable: {error:#}"),
+        Err(error) => format!("Host session lock unavailable: {error}"),
+    }
+}
+
+/// After a system login (PAM just checked the account password), unlock the
+/// session if the host is set to (`--unlock-on-system-login`).
+async fn unlock_after_system_login(options: &Options, system_login: bool) {
+    if !(options.unlock_on_system_login && system_login) {
+        return;
+    }
+    let result = tokio::task::spawn_blocking(|| {
+        let session = crate::session_lock::display_session()?;
+        crate::session_lock::unlock(&session)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => tracing::info!("session unlocked after system login"),
+        Ok(Err(error)) => tracing::warn!(
+            error = format!("{error:#}"),
+            "could not unlock the session after system login"
+        ),
+        Err(error) => tracing::warn!(%error, "could not unlock the session after system login"),
+    }
 }
 
 async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
@@ -393,6 +497,12 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
     }
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
+    let policy = crate::host_command::host::Policy::new(
+        options.wake_relay,
+        options.wake_relay_allow.clone(),
+        options.allow_suspend,
+        &options.suspend_command,
+    );
     let relay_identity = match (&relay_endpoint, &identity, &access) {
         (Some(_), Some(identity), Some(_)) => Some(Arc::new(identity.e2e()?)),
         (Some(_), _, _) => {
@@ -421,6 +531,8 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         Vec<crate::relay::AbortOnDrop>,
     )> = None;
     let mut relay_retry = Instant::now();
+    let mut idle_check = tokio::time::interval(Duration::from_secs(15));
+    idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if let (Some(endpoint), Some(e2e), Some(access)) =
             (&relay_endpoint, &relay_identity, &access)
@@ -491,6 +603,25 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
             }, if relay_endpoint.is_some() => {
                 match (accepted, &access, &relay) {
                     (Some(accepted), Some(access), Some((link, _, _))) => {
+                        // Owner commands need no desktop; they run beside
+                        // sessions.
+                        match crate::host_command::Command::parse(Some(&accepted.request)) {
+                            Ok(Some(command)) => {
+                                match access.begin_session_hash(accepted.credential.to_vec(), accepted.device_key.as_deref()).and_then(|lease| Ok((crate::relay::host(link, &accepted)?, lease))) {
+                                    Ok((bridged, lease)) => {
+                                        let owner = lease.owner();
+                                        tokio::spawn(crate::host_command::host::relayed(bridged, accepted, command, policy.clone(), owner, lease));
+                                    }
+                                    Err(error) => tracing::warn!(%error, "relayed command refused"),
+                                }
+                                continue;
+                            }
+                            Ok(None) => (),
+                            Err(error) => {
+                                tracing::warn!(%error, "relayed client sent a malformed command");
+                                continue;
+                            }
+                        }
                         restore_capture(capture).await;
                         let result = tokio::select! {
                             result = relayed(link, accepted, access, options, capture) => result,
@@ -508,6 +639,15 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
                         relay_retry = Instant::now() + Duration::from_secs(1);
                     }
                     _ => {}
+                }
+                continue;
+            }
+            // Between clients: a portal session the compositor closed (e.g.
+            // displays woke from power saving, or across a lock) is
+            // recreated now rather than when the next client arrives.
+            _ = idle_check.tick() => {
+                if capture.portal_closed() {
+                    restore_capture(capture).await;
                 }
                 continue;
             }
@@ -550,6 +690,33 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         } else {
             None
         };
+        // Owner commands (wake relay, suspend, ping): no desktop capture.
+        match crate::host_command::Command::parse(request.query()) {
+            Ok(Some(command)) => {
+                let owner = session_lease.as_ref().is_none_or(|lease| lease.owner());
+                tokio::spawn(crate::host_command::host::direct(
+                    request,
+                    command,
+                    policy.clone(),
+                    owner,
+                    session_lease,
+                ));
+                continue;
+            }
+            Ok(None) => (),
+            Err(error) => {
+                tracing::warn!(%error, "client sent a malformed command");
+                request.close().await;
+                continue;
+            }
+        }
+        unlock_after_system_login(
+            options,
+            session_lease
+                .as_ref()
+                .is_some_and(|lease| lease.system_login()),
+        )
+        .await;
         restore_capture(capture).await;
         let result = tokio::select! {
             result = connection(request, options, capture) => result,
@@ -587,6 +754,7 @@ async fn relayed(
     let lease = access
         .begin_session_hash(hash.to_vec(), accepted.device_key.as_deref())
         .context("relayed credential not usable")?;
+    unlock_after_system_login(options, lease.system_login()).await;
     let bridged = crate::relay::host(link, &accepted)?;
     let session = link.session.clone();
     tokio::select! {
@@ -1385,6 +1553,12 @@ async fn run_session(
                 }
             },
             _ = check.tick() => {
+                // The compositor closed the portal session (e.g. monitors
+                // woke from power saving): recreate it before input fails.
+                if capture.is_portal() && capture.is_lost() {
+                    portal_lost = true;
+                    continue;
+                }
                 if let Err(error) = pipeline.error() {
                     // On Wayland a capture failure is usually the portal stream
                     // going away with its outputs; try a fresh session first.
@@ -1736,6 +1910,10 @@ async fn run_session(
                         publish_update(&mut updates, update)?;
                     }
                     Event::Clipboard { .. } | Event::ClipboardRequest => publish_update(&mut updates, Update::Notice { text: "Host clipboard is disabled; start host with --clipboard to opt in".into() })?,
+                    Event::SecureAttention => {
+                        let text = secure_attention(options, capture).await;
+                        publish_update(&mut updates, Update::Notice { text })?;
+                    }
                     Event::Probe { id } => {
                         telemetry_enabled = true;
                         let host_us = options.frame_timing.then(|| protocol::clock_us(Instant::now()));
@@ -1983,6 +2161,8 @@ fn desktop_for_monitor(
             format: options.audio_format,
             bitrate: options.audio_bitrate,
         },
+        wake: options.wake.clone(),
+        secure_attention: options.secure_attention,
     })
 }
 
@@ -2135,7 +2315,8 @@ async fn while_starting<T: Send + 'static>(
                     | Event::SelectCodec { .. }
                     | Event::SelectMonitor { .. }
                     | Event::Clipboard { .. }
-                    | Event::ClipboardRequest => {
+                    | Event::ClipboardRequest
+                    | Event::SecureAttention => {
                         ordered = true;
                         events.deferred.push_back(event);
                     }

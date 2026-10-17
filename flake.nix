@@ -97,6 +97,8 @@
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           pipewire-hdr = import ./nix/pipewire-hdr-check.nix { inherit pkgs; };
+          # NixOS module options (SDDM autologin, lock, WoL), evaluated only.
+          module-eval = import ./nix/module-eval.nix { inherit nixpkgs system; };
         }
       );
       packages = forAllSystems (

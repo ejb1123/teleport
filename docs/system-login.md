@@ -109,6 +109,15 @@ reconnect is disabled for these tickets.
   fixtures and TLS tests cover authentication failures and credential lifecycle;
   actual distribution/account policy still needs a supervised acceptance test.
 
+## After a reboot: automatic login plus lock
+
+NixOS `unattended.enable` logs the user in at boot and locks the session at
+once, so the host runs before anyone is at the machine; a remote user then
+types the password into the lock screen. With `unattended.unlockOnSystemLogin`,
+a successful Linux account login (this PAM check) also unlocks the session
+(`loginctl unlock-session`), without storing the password. Trade-offs and
+setup: [wake and unattended start](wake-and-unattended.md).
+
 ## Before local login: not implemented
 
 The current unit is a graphical-session user service. Boot-time network presence

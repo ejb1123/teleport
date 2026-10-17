@@ -504,8 +504,9 @@ The installer holds the `parsecd.exe` launcher, the engine
   - checks signatures with WinVerifyTrust and carries an embedded RSA public
     key.
   This is how gap G24 is solved on Windows. On Linux the equivalent is a
-  system service with greeter/logind integration; Teleport's `systemLogin`
-  mode covers part of it.
+  system service with greeter/logind integration; Teleport instead logs in
+  automatically and locks at once, with remote unlock and Ctrl+Alt+End
+  (G24, 2026-10-17, docs/wake-and-unattended.md).
 - **Host features only in the Windows help text:**
   - virtual microphone for mic passthrough, plus echo cancellation for
     Discord and "certain apps" (G20);
@@ -655,8 +656,8 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Multi-monitor | 3→5 screens (paid) | Up to 5 windows (1+4), free | **Parity / ahead (free)** | Per-screen settings partly |
 | Virtual displays / headless | VDD (paid), fallback (free) | Portal virtual outputs (KDE): headless fallback, `always`, extra monitor sized to the client (2026-10-17) | **Parity (free)** | G17; GNOME and a connector-less machine untested |
 | Privacy mode | Paid | Physical outputs off + virtual output, opt-in, guarded restore (KDE, 2026-10-17) | Parity | G17 |
-| Login screen / after reboot | Windows, macOS | No (running session only) | Missing | |
-| Wake-on-LAN | Not documented | No | Parity | An opening |
+| Login screen / after reboot | Windows, macOS | Automatic login + immediate lock, unlock remotely (NixOS `unattended`, 2026-10-17); Ctrl+Alt+End secure attention; no greeter capture | Partial | G24 |
+| Wake-on-LAN | Not documented | Launcher Wake (LAN broadcast), remote wake through an opted-in Teleport wake relay, owner Sleep (2026-10-17) | **Ahead** | G23 |
 | Clipboard | Automatic text sync | Explicit text, 64 KiB | Partial (by design) | |
 | File transfer | No | No | Parity | |
 | Multiple guests / co-op | Up to 20, per-guest permissions | One client | **Missing** | Parsec's signature feature |
@@ -1235,6 +1236,20 @@ each.**
 
 **G23. Wake-on-LAN and "my PC is asleep". Effort S–M.**
 
+- **Status (2026-10-17): implemented** (review tracker R21,
+  docs/wake-and-unattended.md). Hosts share the MAC, IPv4 network and
+  Wake-on-LAN state (`ethtool`) of the interface they are reached on in
+  `Desktop.wake`; the client saves it in the pinned profile. The launcher
+  shows an offline desktop as "Asleep or off · Wake available", **Wake**
+  broadcasts the magic packet (UDP 9: limited and subnet broadcasts) and
+  waits for signed presence or a direct authenticated `ping`; `teleport
+  wake`/`wake-listen`. Remote wake: a host started with `--wake-relay`
+  (owner-only, opt-in, rate-limited, optional MAC allow list) on the
+  desktop's LAN sends the packet when asked over the end-to-end encrypted
+  relay (`command=wake` in the transcript-bound connection options); the MoQ
+  relay cannot issue it. `--allow-suspend` (launcher **Sleep**, `teleport
+  suspend`) is the owner-only suspend. NixOS `wakeOnLan.interface`,
+  `wakeRelay`, `allowSuspend`. Not verified: waking real hardware.
 - **Why:** neither Parsec nor Teleport documents WoL. Moonlight has it
   (unverified, from memory). Gamers leave the PC asleep.
 - **Steps:**
@@ -1247,6 +1262,22 @@ each.**
 
 **G24. Unattended start after reboot / login screen. Effort L.**
 
+- **Status (2026-10-17): the middle ground is implemented** (review tracker
+  R21, docs/wake-and-unattended.md). NixOS `unattended.enable`: SDDM logs
+  the user in at boot (`[Autologin]`), and `teleport lock-session
+  --only-automatic-login` locks that session at once (optionally KDE
+  `LockOnStart` via `lockEveryLogin`); requires `preauthorizeRemoteDesktop`.
+  Unlock remotely by typing into the lock screen, or with
+  `unlockOnSystemLogin` (`loginctl unlock-session` after a PAM-verified
+  Linux account login; the password is never stored). Client Ctrl+Alt+End
+  (`Event::SecureAttention`) locks an unlocked session or shows the unlock
+  prompt, Teleport's Ctrl+Alt+Del. The host now watches the portal's
+  `Closed` signal and recreates a session KDE closed (monitor wake) during
+  a session within 200 ms and between sessions within 15 s. Greeter capture
+  (option b) investigated, not built: SDDM's greeter KWin has no portal or
+  PipeWire and restricts screencast/fake input; KMS capture needs a
+  privileged pipeline. Not verified: a real boot in a VM, KDE's portal
+  under lock on hardware.
 - **Why:** Parsec reaches the Windows and macOS login screens (FM, LOGIN).
   Teleport attaches only to a running graphical session (README).
 - **Gamer-friendly middle ground:** document autologin plus the lock screen,
