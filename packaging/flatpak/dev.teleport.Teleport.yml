@@ -1,0 +1,104 @@
+# Flatpak of the Teleport client (docs/distribution.md, "Flatpak").
+#
+#   flatpak-builder --user --install-deps-from=flathub --force-clean \
+#     --repo=repo build packaging/flatpak/dev.teleport.Teleport.yml
+#   flatpak build-bundle repo Teleport.flatpak dev.teleport.Teleport
+#
+# Client only. The host needs the RemoteDesktop/ScreenCast portals with a
+# stable application ID, /dev/uinput and /dev/uhid for virtual gamepads, the
+# systemd user unit and KDE's kscreen-doctor: install it natively (.deb/.rpm,
+# AppImage) or with Nix instead. The binary still contains host mode; it is
+# just not supported from inside the sandbox.
+#
+# After changing Cargo.lock, regenerate cargo-sources.json with
+# flatpak-builder-tools' cargo/flatpak-cargo-generator.py Cargo.lock
+# -o packaging/flatpak/cargo-sources.json.
+id: dev.teleport.Teleport
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: teleport
+finish-args:
+  # QUIC to hosts and relays.
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  # Host audio playback, and the microphone when microphone passthrough is on.
+  - --socket=pulseaudio
+  # GPU for hardware decoding and presentation (VA-API, NVIDIA/CUDA), game
+  # controllers through SDL's HIDAPI driver (hidraw) and FIDO2 security keys.
+  # Flatpak has no narrower permission for hidraw.
+  - --device=all
+  # The client's clipboard goes through SDL (the wl-copy/xclip helpers are
+  # host-side), so no extra permission is needed for it.
+  - --env=TELEPORT_FONT=/usr/share/fonts/dejavu/DejaVuSans.ttf
+  - --env=TELEPORT_LIBFIDO2=/app/lib/libfido2.so.1
+  - --env=TELEPORT_PACKAGED=1
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+modules:
+  - name: SDL2_ttf
+    buildsystem: cmake-ninja
+    builddir: true
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DSDL2TTF_SAMPLES=OFF
+      - -DSDL2TTF_VENDORED=OFF
+      - -DSDL2TTF_HARFBUZZ=ON
+    cleanup:
+      - /include
+      - /lib/cmake
+      - /lib/pkgconfig
+      - '*.la'
+    sources:
+      - type: archive
+        url: https://github.com/libsdl-org/SDL_ttf/releases/download/release-2.24.0/SDL2_ttf-2.24.0.tar.gz
+        sha256: 0b2bf1e7b6568adbdbc9bb924643f79d9dedafe061fa1ed687d1d9ac4e453bfd
+
+  # The runtime's gst-plugins-good leaves out ximagesrc, which `teleport
+  # doctor` requires on Linux (X11 capture); only that plugin is built.
+  - name: gst-plugins-good-ximagesrc
+    buildsystem: meson
+    config-opts:
+      - -Dauto_features=disabled
+      - -Dximagesrc=enabled
+      - -Dximagesrc-xshm=enabled
+      - -Dximagesrc-xfixes=enabled
+      - -Dximagesrc-xdamage=enabled
+      - -Dximagesrc-navigation=enabled
+    sources:
+      - type: archive
+        url: https://gstreamer.freedesktop.org/src/gst-plugins-good/gst-plugins-good-1.28.6.tar.xz
+        sha256: b0c620a4b18b6ee931b4c43bbf1760d308666dc37f730a7e7f1ad327e59ce2df
+
+  - name: teleport
+    buildsystem: simple
+    build-options:
+      env:
+        CARGO_HOME: /run/build/teleport/cargo
+        CARGO_NET_OFFLINE: 'true'
+        # SDL2_ttf above, for the linker cargo runs.
+        LIBRARY_PATH: /app/lib
+    build-commands:
+      - cargo --offline build --release --locked
+      - install -Dm755 target/release/teleport /app/bin/teleport
+      # libfido2 comes from the runtime; Teleport loads it by absolute path.
+      - ln -s "/usr/lib/$(gcc -print-multiarch)/libfido2.so.1" /app/lib/libfido2.so.1
+      - install -Dm644 packaging/linux/dev.teleport.Teleport.desktop /app/share/applications/dev.teleport.Teleport.desktop
+      - install -Dm644 packaging/icons/dev.teleport.Teleport.svg /app/share/icons/hicolor/scalable/apps/dev.teleport.Teleport.svg
+      - install -Dm644 packaging/linux/dev.teleport.Teleport.metainfo.xml /app/share/metainfo/dev.teleport.Teleport.metainfo.xml
+    sources:
+      # A release build would use the tagged git repository instead:
+      #   - type: git
+      #     url: https://github.com/ejb1123/teleport.git
+      #     tag: v0.5.4
+      - type: dir
+        path: ../..
+        skip:
+          - target
+          - result
+          - .flatpak-builder
+      - cargo-sources.json
