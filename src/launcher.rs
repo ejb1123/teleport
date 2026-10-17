@@ -181,6 +181,13 @@ const HOST_DISPLAY: [(&str, &str); 3] = [
     ("Host screen: private", "--privacy"),
     ("Host: + virtual monitor", "--virtual-monitor"),
 ];
+/// `--mic` (G20): send this computer's microphone to hosts that take it,
+/// with echo cancellation unless turned off.
+const MICROPHONE: [(&str, &[&str]); 3] = [
+    ("Microphone off", &[]),
+    ("Microphone on", &["--mic"]),
+    ("Mic on, no echo cancel", &["--mic", "--no-echo-cancel"]),
+];
 
 #[derive(Default)]
 struct StreamPreferences {
@@ -406,12 +413,13 @@ pub fn run() -> Result<()> {
     let REJECT = Rect::new(764, 560, 228, 44);
     debug_assert!(!APPROVE.has_intersection(AUTH));
     let mode_rect = |index: usize| Rect::new(304 + index as i32 * 174, 220, 166, 38);
+    // Six rows of three fit above the status panel (y 716).
     let pref_rect = |index: usize| {
         Rect::new(
             304 + (index % 3) as i32 * 232,
-            456 + (index / 3) as i32 * 50,
+            452 + (index / 3) as i32 * 44,
             220,
-            38,
+            36,
         )
     };
     let (sdl, video) = crate::windowing::init()?;
@@ -462,6 +470,7 @@ pub fn run() -> Result<()> {
     let mut relative_mouse = 0usize;
     let mut encoder_preset = 0usize;
     let mut host_display = 0usize;
+    let mut microphone = 0usize;
     let mut hdr = false;
     let mut decoder = DecoderPreference::default();
     let mut clipboard = false;
@@ -1016,6 +1025,9 @@ pub fn run() -> Result<()> {
                                 if hit(pref_rect(13), x, y) {
                                     host_display = (host_display + 1) % HOST_DISPLAY.len();
                                 }
+                                if hit(pref_rect(14), x, y) {
+                                    microphone = (microphone + 1) % MICROPHONE.len();
+                                }
                                 if hit(pref_rect(3), x, y) {
                                     codec = (codec + 1) % CODECS.len();
                                     if CODECS[codec].1 != "h265" {
@@ -1179,6 +1191,7 @@ pub fn run() -> Result<()> {
                         if !HOST_DISPLAY[host_display].1.is_empty() {
                             command.arg(HOST_DISPLAY[host_display].1);
                         }
+                        command.args(MICROPHONE[microphone].1);
                         decoder.apply(&mut command);
                         apply_relay(profile, &mut command)?;
                         if clipboard {
@@ -1658,6 +1671,7 @@ pub fn run() -> Result<()> {
                                 "Warnings off"
                             },
                             HOST_DISPLAY[host_display].0,
+                            MICROPHONE[microphone].0,
                         ];
                         for (index, label) in labels.into_iter().enumerate() {
                             ui.button(
@@ -1667,14 +1681,6 @@ pub fn run() -> Result<()> {
                                 false,
                             )?;
                         }
-                        ui.text(
-                            &small_font,
-                            "Match follows this window and display. VSync on stops tearing on fixed-refresh screens.",
-                            304,
-                            700,
-                            688,
-                            MUTED,
-                        )?;
                     } else {
                         ui.text(
                             &font,

@@ -50,6 +50,8 @@ mod system_login;
 mod system_pam;
 #[cfg(target_os = "linux")]
 mod virtual_display;
+#[cfg(target_os = "linux")]
+mod virtual_mic;
 mod windowing;
 #[cfg(target_os = "linux")]
 mod x11_cursor;

@@ -579,7 +579,7 @@ What is on `main`/this branch, from README, docs and code:
   - Local cursor on X11 hosts only; on Wayland the cursor stays in the video.
 - **Audio:** desktop output only (an explicit `.monitor`). Opus stereo 128
   kbps with 10 ms frames, no in-band FEC (M8). The client queue is ≤100 ms,
-  leaky (`src/audio.rs`). No microphone.
+  leaky (`src/audio.rs`). Microphone passthrough since 2026-10-17 (G20).
 - **Displays:** select a monitor; multiple independent remote monitors map to
   up to 4 extra local fullscreen windows, each with its own stream. Virtual
   displays and privacy mode on KDE since 2026-10-17 (G17). No hotplug.
@@ -643,7 +643,7 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | DS4 / DualSense emulation, touchpad, motion, haptics | Yes (Windows host) | No | Missing | |
 | Pad remapping UI | Yes | SDL database only | Missing | Low |
 | Pen / tablet | Warp | No | Missing | Low for gamers |
-| Mic passthrough | Windows host | No | Missing | Voice chat in games |
+| Mic passthrough | Windows host, echo cancellation | Linux (PipeWire) host "Teleport Microphone", any client, WebRTC echo cancellation (2026-10-17) | **Parity** | G20; owner = every paired client (no guest roles) |
 | Multi-channel audio | 5.1/7.1 | Stereo | Missing | |
 | Audio bitrate / raw PCM | 128–512, raw option | Fixed 128k Opus | Partial | |
 | Audio FEC / buffer tuning | 50–100 ms buffer | ≤100 ms leaky; tuning WIP | WIP | |
@@ -1129,6 +1129,22 @@ L.**
 
 **G20. Microphone passthrough. Effort M.**
 
+- **Status (2026-10-17): implemented** (review tracker R17, docs/audio.md).
+  Client `--mic` (launcher **Microphone on**, Ctrl+Alt+V mutes, F8 shows the
+  state) captures the default input (`pulsesrc`, `osxaudiosrc` on macOS),
+  encodes 10 ms voice Opus with in-band FEC and sends it on a `microphone`
+  track to hosts started with `--microphone` (`Desktop.microphone`,
+  `ClientFeatures.microphone`). The host plays it with the M8 playout timeline
+  and PLC into a PipeWire null sink whose monitor a loopback exposes as the
+  `Audio/Source` "Teleport Microphone"; a `pw-cli` child owns both, so they go
+  at session end, host exit and crash (parent-death signal), and a host start
+  removes any left by a dead host. Echo cancellation: `webrtcdsp` against a
+  `webrtcechoprobe` in the client's desktop-audio player, on by default
+  (`--no-echo-cancel`). Measured: mic → virtual source p50 73–90 ms, 0–2
+  dropouts, also with 2% loss; echo −42 to −67 dB, but most near-end ticks
+  are lost while far-end audio plays (double talk). Owner-only means every
+  paired client today.
+  Not verified: a real macOS microphone, Discord on the host.
 - **Why:** in-game and Discord voice on the host (MIC). Parsec gates it to
   owner connections; do the same, or use per-device consent.
 - **Steps:**

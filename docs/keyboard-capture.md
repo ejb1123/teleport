@@ -5,6 +5,7 @@ any session window. On macOS this chord uses Control+Option, not Command.
 Capture is off by default and is not persisted across reconnects.
 
 - **Ctrl+Alt+K** toggles capture; **Ctrl+Alt+Q** always disconnects locally.
+  **Ctrl+Alt+V** mutes the microphone sent with `--mic` ([audio](audio.md)).
 - While bound, ordinary keys including Alt+Tab, Super and F8 are forwarded
   when the local OS delivers them. Use the **Stats** button for local statistics.
 - Keyboard capture follows focus between the session's monitor windows; it

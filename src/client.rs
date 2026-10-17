@@ -127,6 +127,23 @@ pub struct Options {
     /// Start with remote audio muted.
     #[arg(long)]
     pub mute: bool,
+    /// Send this computer's microphone to the host, where applications can
+    /// record it as "Teleport Microphone" (hosts started with --microphone).
+    /// Ctrl+Alt+V mutes and unmutes it.
+    #[arg(long)]
+    pub mic: bool,
+    /// Start with the microphone muted (Ctrl+Alt+V unmutes).
+    #[arg(long, requires = "mic")]
+    pub mic_muted: bool,
+    /// Microphone to send on Linux: a PulseAudio/PipeWire source name
+    /// (`pactl list short sources`), or `test` for a tone. Default: the
+    /// system's default input (on macOS always).
+    #[arg(long, requires = "mic", value_parser = crate::audio::parse_mic_device)]
+    pub mic_device: Option<String>,
+    /// Do not cancel the host's audio, played on this computer's speakers,
+    /// from the microphone (echo cancellation is on by default with --mic).
+    #[arg(long, requires = "mic")]
+    pub no_echo_cancel: bool,
     /// Select this monitor on connection (zero-based).
     #[arg(long)]
     pub monitor: Option<usize>,
@@ -273,6 +290,8 @@ struct Link {
     input_sequence: u64,
     updates: moq_net::track::Subscriber,
     audio: Option<moq_net::track::Subscriber>,
+    /// `--mic`: the microphone track, sent only to hosts that take it.
+    microphone: Option<moq_net::track::Producer>,
 }
 
 /// Connect along the configured route. `auto` tries the direct address for
@@ -419,6 +438,16 @@ async fn connect_via(
         protocol::POINTER_TRACK,
         moq_net::track::Info::default().with_priority(255),
     )?;
+    // Between input (255) and the host's video under congestion.
+    let microphone = options
+        .mic
+        .then(|| {
+            broadcast.create_track(
+                protocol::MICROPHONE_TRACK,
+                moq_net::track::Info::default().with_priority(media::AUDIO_PRIORITY),
+            )
+        })
+        .transpose()?;
     let agent_responses = if options.forward_ssh_agent {
         Some(crate::ssh_agent::create_track(
             &mut broadcast,
@@ -608,6 +637,7 @@ async fn connect_via(
         input_sequence,
         updates,
         audio,
+        microphone,
     })
 }
 
@@ -1272,13 +1302,16 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     );
     let (updates_sender, mut updates) = mpsc::channel(32);
     let mut decoded_audio = None;
+    // With a microphone, host audio coming out of the speakers can reach it:
+    // the player then feeds the microphone's echo canceller.
+    let echo_cancel = options.mic && !options.no_echo_cancel && desktop.microphone;
     let mut audio = if link.audio.is_some() {
         if options.headless_frames.is_some() {
             let (pipeline, source, counter) = crate::audio::decoder_for_headless()?;
             decoded_audio = Some(counter);
             Some((pipeline, source))
         } else {
-            Some(crate::audio::decoder()?)
+            Some(crate::audio::decoder(echo_cancel)?)
         }
     } else {
         None
@@ -1286,6 +1319,41 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     if let Some((pipeline, _)) = &audio {
         pipeline.set_audio_muted(options.mute)?;
     }
+    let mut link = link;
+    let mut microphone = match link.microphone.take() {
+        Some(track) if desktop.microphone => {
+            match crate::audio::Microphone::start(
+                options.mic_device.as_deref(),
+                echo_cancel && audio.is_some() && options.headless_frames.is_none(),
+                options.mic_muted,
+                track,
+            ) {
+                Ok(microphone) => {
+                    tracing::info!(
+                        echo_cancel = microphone.echo_cancel(),
+                        muted = microphone.muted(),
+                        "sending the microphone to the host"
+                    );
+                    Some(microphone)
+                }
+                Err(error) => {
+                    tracing::warn!(error = format!("{error:#}"), "microphone unavailable");
+                    let _ = updates_sender.try_send(Update::Notice {
+                        text: format!("Microphone unavailable: {error:#}"),
+                    });
+                    None
+                }
+            }
+        }
+        Some(_) => {
+            tracing::warn!("this host does not take a microphone (teleport host --microphone)");
+            let _ = updates_sender.try_send(Update::Notice {
+                text: "This host does not take a microphone (teleport host --microphone)".into(),
+            });
+            None
+        }
+        None => None,
+    };
     let audio_source = audio.as_ref().map(|(_, source)| source.clone());
     let audio_notices = updates_sender.clone();
     let local_notices = updates_sender.clone();
@@ -1345,6 +1413,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 frame_timing,
                 privacy: options.privacy && desktop.privacy_mode,
                 virtual_monitor: options.virtual_monitor && desktop.virtual_monitor,
+                microphone: microphone.is_some(),
             },
         )?;
     }
@@ -1431,6 +1500,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             pipeline.error()?;
             if let Some((pipeline, _)) = &audio {
                 pipeline.error()?;
+            }
+            if let Some(microphone) = &microphone {
+                microphone.error()?;
             }
             check_network(&mut network, runtime)?;
             ensure!(
@@ -2002,6 +2074,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             notice = "Audio output unavailable; reconnect to retry".into();
             audio = None;
         }
+        if let Some(Err(error)) = microphone.as_ref().map(crate::audio::Microphone::error) {
+            tracing::warn!(%error, "microphone stopped; desktop remains connected");
+            notice = "Microphone stopped; reconnect to retry".into();
+            microphone = None;
+        }
         check_network(&mut network, runtime)?;
         ensure!(
             !awaiting_initial || initial_settings_started.elapsed() < Duration::from_secs(15),
@@ -2198,6 +2275,21 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         } else {
                             "Mouse lock unavailable on this display".into()
                         };
+                    }
+                    Action::Microphone => {
+                        notice = match &microphone {
+                            Some(microphone) => {
+                                microphone.set_muted(!microphone.muted());
+                                if microphone.muted() {
+                                    "Microphone muted"
+                                } else {
+                                    "Microphone on"
+                                }
+                            }
+                            None if options.mic => "Microphone unavailable in this session",
+                            None => "Microphone off (start the client with --mic)",
+                        }
+                        .into();
                     }
                     Action::Disconnect => break 'running,
                     Action::Stats => show_stats = !show_stats,
@@ -2750,6 +2842,28 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         auto_lock.state(pointer_lock.active())
                     } else {
                         "host cannot lock"
+                    }
+                ),
+                format!(
+                    "Microphone            {}",
+                    match &microphone {
+                        Some(microphone) => format!(
+                            "{}{}   |   Ctrl+Alt+V {}",
+                            if microphone.muted() { "muted" } else { "on" },
+                            if microphone.echo_cancel() {
+                                ", echo cancellation"
+                            } else {
+                                ""
+                            },
+                            if microphone.muted() {
+                                "unmutes"
+                            } else {
+                                "mutes"
+                            }
+                        ),
+                        None if !options.mic => "off".into(),
+                        None if !desktop.microphone => "host does not take one".into(),
+                        None => "unavailable".into(),
                     }
                 ),
                 format!("Presented             {fps:.1} fps"),

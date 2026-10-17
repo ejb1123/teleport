@@ -1,11 +1,41 @@
 //! Opt-in desktop audio: explicitly selected PulseAudio/PipeWire monitor only.
 //! Each 10 ms Opus packet is independently delivered so stale audio is discarded.
+//!
+//! The client's microphone (G20, `teleport client --mic`) travels the other
+//! way the same way: 10 ms voice-tuned Opus packets, one per MoQ group, played
+//! on the host with the same sequence-timed playout into a virtual source
+//! (`crate::virtual_mic`).
 use crate::media::Pipeline;
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_app::{AppSink, AppSrc};
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
+
+/// Desktop audio: 48 kHz stereo Opus (CELT, restricted low delay).
+const DESKTOP_CAPS: &str = "audio/x-opus,rate=48000,channels=2,channel-mapping-family=0";
+/// Microphone audio: 48 kHz mono Opus (voice mode, in-band FEC).
+#[cfg(target_os = "linux")]
+const MICROPHONE_CAPS: &str = "audio/x-opus,rate=48000,channels=1,channel-mapping-family=0";
+/// The echo probe in the desktop audio player that the microphone's echo
+/// canceller reads (`webrtcechoprobe`/`webrtcdsp` find each other by name
+/// within one process).
+const ECHO_PROBE: &str = "teleport_echo_probe";
+
+/// A PulseAudio/PipeWire device name: no launch syntax, no quoting.
+fn valid_device_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 512
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-:".contains(&c))
+}
 
 #[cfg(target_os = "linux")]
 fn capture_description(source: &str) -> Result<String> {
@@ -14,11 +44,7 @@ fn capture_description(source: &str) -> Result<String> {
         return Ok("audiotestsrc is-live=true wave=sine volume=0.05".into());
     }
     ensure!(
-        source.ends_with(".monitor")
-            && source.len() <= 512
-            && source
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"._-:".contains(&c)),
+        source.ends_with(".monitor") && valid_device_name(source),
         "audio source must be an explicit PulseAudio/PipeWire .monitor name (use pactl list short sources), or test"
     );
     Ok(format!(
@@ -26,30 +52,24 @@ fn capture_description(source: &str) -> Result<String> {
     ))
 }
 
-#[cfg(target_os = "linux")]
-pub fn capture(source: &str, mut track: moq_net::track::Producer) -> Result<Pipeline> {
-    let source = capture_description(source)?;
-    let pipeline = Pipeline(
-        gst::parse::launch(&format!(
-            "{source} ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 \
-        ! opusenc bitrate=128000 frame-size=10 audio-type=restricted-lowdelay \
-        ! appsink name=encoded_audio sync=false max-buffers=4 drop=false"
-        ))?
-        .downcast::<gst::Pipeline>()
-        .map_err(|_| anyhow::anyhow!("not a pipeline"))?,
-    );
-    let sink = pipeline
-        .0
-        .by_name("encoded_audio")
-        .unwrap()
-        .downcast::<AppSink>()
-        .unwrap();
+/// Publish every encoded packet from `sink` as its own MoQ group (one 10 ms
+/// packet per group, so a late one never holds up the next). Codec headers
+/// are skipped: the receiver knows the format. Nothing is sent while `muted`.
+fn publish_packets(
+    sink: &AppSink,
+    mut track: moq_net::track::Producer,
+    muted: Option<Arc<AtomicBool>>,
+) {
     sink.set_callbacks(
         gstreamer_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
                 let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                 let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-                if buffer.flags().contains(gst::BufferFlags::HEADER) {
+                if buffer.flags().contains(gst::BufferFlags::HEADER)
+                    || muted
+                        .as_ref()
+                        .is_some_and(|muted| muted.load(Ordering::Relaxed))
+                {
                     return Ok(gst::FlowSuccess::Ok);
                 }
                 let bytes = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
@@ -65,11 +85,144 @@ pub fn capture(source: &str, mut track: moq_net::track::Producer) -> Result<Pipe
             })
             .build(),
     );
+}
+
+fn launch(description: &str) -> Result<Pipeline> {
+    Ok(Pipeline(
+        gst::parse::launch(description)?
+            .downcast::<gst::Pipeline>()
+            .map_err(|_| anyhow::anyhow!("not a pipeline"))?,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+pub fn capture(source: &str, track: moq_net::track::Producer) -> Result<Pipeline> {
+    let source = capture_description(source)?;
+    let pipeline = launch(&format!(
+        "{source} ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 \
+        ! opusenc bitrate=128000 frame-size=10 audio-type=restricted-lowdelay \
+        ! appsink name=encoded_audio sync=false max-buffers=4 drop=false"
+    ))?;
+    let sink = pipeline
+        .0
+        .by_name("encoded_audio")
+        .unwrap()
+        .downcast::<AppSink>()
+        .unwrap();
+    publish_packets(&sink, track, None);
     pipeline.0.set_state(gst::State::Playing)?;
     Ok(pipeline)
 }
 
-pub fn decoder() -> Result<(Pipeline, AppSrc)> {
+/// `--mic-device`: a PulseAudio/PipeWire source name, or `test` (a tone).
+pub fn parse_mic_device(value: &str) -> Result<String, String> {
+    if value == "test" || valid_device_name(value) {
+        Ok(value.to_owned())
+    } else {
+        Err("expected a PulseAudio/PipeWire source name (pactl list short sources) or test".into())
+    }
+}
+
+fn microphone_source(device: Option<&str>) -> Result<String> {
+    let found = |name: &str| gst::ElementFactory::find(name).is_some();
+    Ok(match device {
+        Some("test") => "audiotestsrc is-live=true wave=sine freq=330 volume=0.2".into(),
+        Some(name) => {
+            ensure!(
+                cfg!(target_os = "linux") && valid_device_name(name),
+                "--mic-device names a PulseAudio/PipeWire source (Linux); elsewhere the default input is used"
+            );
+            format!(
+                "pulsesrc device={name} provide-clock=false buffer-time=20000 latency-time=10000"
+            )
+        }
+        None if cfg!(target_os = "linux") && found("pulsesrc") => {
+            "pulsesrc provide-clock=false buffer-time=20000 latency-time=10000".into()
+        }
+        None if cfg!(target_os = "macos") && found("osxaudiosrc") => "osxaudiosrc".into(),
+        None => "autoaudiosrc".into(),
+    })
+}
+
+/// This client's microphone, captured and sent on `protocol::MICROPHONE_TRACK`.
+pub struct Microphone {
+    pipeline: Pipeline,
+    muted: Arc<AtomicBool>,
+    echo_cancel: bool,
+}
+
+impl Microphone {
+    /// Capture `device` (the default input when `None`), optionally through
+    /// WebRTC echo cancellation against the desktop audio this client plays
+    /// (`decoder(true)`), and send 10 ms voice-tuned Opus packets.
+    pub fn start(
+        device: Option<&str>,
+        echo_cancel: bool,
+        muted: bool,
+        track: moq_net::track::Producer,
+    ) -> Result<Self> {
+        let source = microphone_source(device)?;
+        let echo_cancel = echo_cancel && gst::ElementFactory::find("webrtcdsp").is_some();
+        // webrtcdsp works on 10 ms chunks of S16 or F32 audio; the probe
+        // tells it what the speakers play, delay included. The lowest
+        // suppression keeps the most near-end speech during double talk
+        // (delay-agnostic mode suppressed it almost entirely); noise
+        // suppression and gain control are left to the host application.
+        let dsp = if echo_cancel {
+            format!(
+                "webrtcdsp probe={ECHO_PROBE} echo-cancel=true echo-suppression-level=low \
+                 extended-filter=true noise-suppression=false gain-control=false \
+                 high-pass-filter=true ! audioconvert ! "
+            )
+        } else {
+            String::new()
+        };
+        let pipeline = launch(&format!(
+            "{source} ! audioconvert ! audioresample \
+             ! audio/x-raw,format=S16LE,rate=48000,channels=1,layout=interleaved ! {dsp}\
+             opusenc bitrate=48000 frame-size=10 audio-type=voice bandwidth=fullband inband-fec=true packet-loss-percentage=2 \
+             ! appsink name=encoded_microphone sync=false max-buffers=4 drop=false"
+        ))?;
+        let sink = pipeline
+            .0
+            .by_name("encoded_microphone")
+            .unwrap()
+            .downcast::<AppSink>()
+            .unwrap();
+        let muted = Arc::new(AtomicBool::new(muted));
+        publish_packets(&sink, track, Some(muted.clone()));
+        pipeline
+            .0
+            .set_state(gst::State::Playing)
+            .context("microphone unavailable")?;
+        Ok(Self {
+            pipeline,
+            muted,
+            echo_cancel,
+        })
+    }
+
+    pub fn error(&self) -> Result<()> {
+        self.pipeline.error()
+    }
+
+    pub fn muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
+
+    /// Muted, the microphone keeps running but sends nothing.
+    pub fn set_muted(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Relaxed);
+    }
+
+    pub fn echo_cancel(&self) -> bool {
+        self.echo_cancel
+    }
+}
+
+/// The desktop audio player. `echo_probe` lets a microphone cancel what it
+/// plays (`Microphone::start` with echo cancellation).
+pub fn decoder(echo_probe: bool) -> Result<(Pipeline, AppSrc)> {
     // pulsesink defaults to a 200 ms buffer; 40 ms keeps 4 packets queued
     // and cut measured playout latency by ~40 ms (docs/review-2026-10.md, M8).
     let sink = if cfg!(target_os = "linux") && gst::ElementFactory::find("pulsesink").is_some() {
@@ -77,7 +230,39 @@ pub fn decoder() -> Result<(Pipeline, AppSrc)> {
     } else {
         "autoaudiosink"
     };
-    decoder_with_sink(sink)
+    let sink = if echo_probe && gst::ElementFactory::find("webrtcechoprobe").is_some() {
+        format!(
+            "audioconvert ! audio/x-raw,format=S16LE,rate=48000,layout=interleaved \
+             ! webrtcechoprobe name={ECHO_PROBE} ! {sink}"
+        )
+    } else {
+        sink.to_owned()
+    };
+    decoder_with_sink(DESKTOP_CAPS, &sink)
+}
+
+/// Play the client's microphone into the host's virtual microphone sink
+/// (`crate::virtual_mic`), never anywhere else: PipeWire must not move the
+/// stream to another device if that sink goes away.
+#[cfg(target_os = "linux")]
+pub fn microphone_player(sink: &str) -> Result<(Pipeline, AppSrc)> {
+    ensure!(valid_device_name(sink), "invalid virtual microphone sink");
+    let (pipeline, source) = build_decoder(
+        MICROPHONE_CAPS,
+        &format!(
+            "audioconvert ! audio/x-raw,channels=2 ! pulsesink name=microphone_out device={sink} \
+             buffer-time=40000 latency-time=10000"
+        ),
+    )?;
+    pipeline.0.by_name("microphone_out").unwrap().set_property(
+        "stream-properties",
+        gst::Structure::builder("props")
+            .field("node.dont-reconnect", "true")
+            .field("node.dont-fallback", "true")
+            .build(),
+    );
+    pipeline.0.set_state(gst::State::Playing)?;
+    Ok((pipeline, source))
 }
 
 /// Decode without opening the client's audio device, while proving PCM delivery.
@@ -86,12 +271,11 @@ pub fn decoder_for_headless() -> Result<(
     AppSrc,
     std::sync::Arc<std::sync::atomic::AtomicU64>,
 )> {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    };
-    let (pipeline, source) =
-        decoder_with_sink("appsink name=audio_pcm sync=false max-buffers=4 drop=true")?;
+    use std::sync::atomic::AtomicU64;
+    let (pipeline, source) = decoder_with_sink(
+        DESKTOP_CAPS,
+        "appsink name=audio_pcm sync=false max-buffers=4 drop=true",
+    )?;
     let sink = pipeline
         .0
         .by_name("audio_pcm")
@@ -114,20 +298,25 @@ pub fn decoder_for_headless() -> Result<(
     Ok((pipeline, source, counter))
 }
 
-fn decoder_with_sink(sink: &str) -> Result<(Pipeline, AppSrc)> {
-    let pipeline = Pipeline(gst::parse::launch(&format!(
-        "appsrc name=audio_in is-live=true format=time max-bytes=65536 block=false \
-        caps=audio/x-opus,rate=48000,channels=2,channel-mapping-family=0 \
+fn decoder_with_sink(caps: &str, sink: &str) -> Result<(Pipeline, AppSrc)> {
+    let (pipeline, source) = build_decoder(caps, sink)?;
+    pipeline.0.set_state(gst::State::Playing)?;
+    Ok((pipeline, source))
+}
+
+/// A stopped player for 10 ms Opus packets pushed by `receive`.
+fn build_decoder(caps: &str, sink: &str) -> Result<(Pipeline, AppSrc)> {
+    let pipeline = launch(&format!(
+        "appsrc name=audio_in is-live=true format=time max-bytes=65536 block=false caps={caps} \
         ! opusdec name=opus plc=true ! audioconvert ! audioresample ! volume name=audio_volume \
         ! queue max-size-time=100000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! {sink}"
-    ))?.downcast::<gst::Pipeline>().map_err(|_| anyhow::anyhow!("not a pipeline"))?);
+    ))?;
     let source = pipeline
         .0
         .by_name("audio_in")
         .unwrap()
         .downcast::<AppSrc>()
         .unwrap();
-    pipeline.0.set_state(gst::State::Playing)?;
     Ok((pipeline, source))
 }
 
@@ -403,7 +592,7 @@ mod tests {
             .unwrap()
             .downcast::<AppSink>()
             .unwrap();
-        let (decoder, source) = decoder_with_sink("appsink name=pcm sync=false")?;
+        let (decoder, source) = decoder_with_sink(DESKTOP_CAPS, "appsink name=pcm sync=false")?;
         encoder.0.set_state(gst::State::Playing)?;
         let mut index = 0;
         while let Some(sample) = packets.try_pull_sample(gst::ClockTime::from_seconds(2)) {
@@ -476,7 +665,7 @@ mod tests {
             .unwrap()
             .downcast::<AppSink>()
             .unwrap();
-        let (decoder, source) = decoder_with_sink("appsink name=pcm sync=false")?;
+        let (decoder, source) = decoder_with_sink(DESKTOP_CAPS, "appsink name=pcm sync=false")?;
         let pcm = decoder
             .0
             .by_name("pcm")

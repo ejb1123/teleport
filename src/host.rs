@@ -167,6 +167,14 @@ pub struct Options {
     /// Explicit PulseAudio/PipeWire output .monitor name; never records a microphone.
     #[arg(long)]
     pub audio_source: Option<String>,
+    /// Offer clients a virtual microphone: while a client sends its
+    /// microphone (`teleport client --mic`), applications here can record it
+    /// from the "Teleport Microphone" input (PipeWire; docs/audio.md).
+    #[arg(long)]
+    pub microphone: bool,
+    /// `--microphone` works here (PipeWire's `pw-cli`).
+    #[arg(skip)]
+    pub microphone_available: bool,
     /// Allow explicit text clipboard send/fetch requests from the paired client.
     #[arg(long)]
     pub clipboard: bool,
@@ -250,6 +258,21 @@ pub async fn run(mut options: Options) -> Result<()> {
             tracing::warn!(
                 "privacy mode unavailable: it needs KDE Plasma (kscreen-doctor) and a portal with virtual displays"
             );
+        }
+    }
+    if options.microphone {
+        // Virtual microphones of an earlier host that did not exit cleanly.
+        options.microphone_available = tokio::task::spawn_blocking(|| {
+            let available = crate::virtual_mic::available();
+            if available {
+                crate::virtual_mic::cleanup_stale();
+            }
+            available
+        })
+        .await
+        .unwrap_or(false);
+        if !options.microphone_available {
+            tracing::warn!("microphone passthrough unavailable: it needs PipeWire (pw-cli)");
         }
     }
     let result = serve(&options, &mut capture).await;
@@ -973,6 +996,9 @@ async fn run_session(
     // The client asked for a virtual monitor: added (and kept at its display
     // size) by the display handler.
     let mut virtual_requested = false;
+    // The client's microphone, played into the virtual microphone (G20).
+    // Dropped (and the virtual microphone removed) when the session ends.
+    let mut microphone: Option<SessionMicrophone> = None;
     loop {
         if cursor_restart.is_some() || display_change.is_some() {
             let local = cursor_restart.take();
@@ -1374,6 +1400,11 @@ async fn run_session(
                     publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor stream stopped: {error}"), requested: false })?;
                 }
                 if let Some(audio) = &audio { audio.error()?; }
+                if let Some(Err(error)) = microphone.as_mut().map(SessionMicrophone::check) {
+                    microphone = None;
+                    tracing::warn!(error = format!("{error:#}"), "client microphone stopped");
+                    publish_update(&mut updates, Update::Notice { text: format!("Microphone stopped on the host: {error:#}") })?;
+                }
                 if adaptive {
                     let stats = session.stats();
                     // Clients sending NetworkFeedback are rate-controlled from it.
@@ -1455,7 +1486,26 @@ async fn run_session(
                     // Auxiliary streams currently use fixed bitrate. Their
                     // congestion must never adapt the independent primary.
                     Event::MonitorFeedback { .. } => {}
-                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble, cursor_positions: wants_positions, frame_timing, privacy: wants_privacy, virtual_monitor: wants_virtual } => {
+                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble, cursor_positions: wants_positions, frame_timing, privacy: wants_privacy, virtual_monitor: wants_virtual, microphone: wants_microphone } => {
+                        // Every paired client is an owner today (no guest
+                        // roles), so any of them may send its microphone.
+                        if wants_microphone && microphone.is_none() {
+                            let text = if !options.microphone_available {
+                                "This host does not take a microphone (teleport host --microphone)".to_owned()
+                            } else {
+                                match SessionMicrophone::start(controls.clone()).await {
+                                    Ok(started) => {
+                                        microphone = Some(started);
+                                        format!("Your microphone is \"{}\" on the host", crate::virtual_mic::DESCRIPTION)
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(error = format!("{error:#}"), "client microphone unavailable");
+                                        format!("Microphone unavailable on the host: {error:#}")
+                                    }
+                                }
+                            };
+                            publish_update(&mut updates, Update::Notice { text })?;
+                        }
                         if frame_timing && !options.frame_timing {
                             // Encoders started later inherit it from options.
                             options.frame_timing = true;
@@ -1897,6 +1947,7 @@ fn desktop_for_monitor(
         virtual_monitor: capture.virtual_monitors_available(),
         privacy_mode: options.privacy_available,
         privacy_active: capture.privacy(),
+        microphone: options.microphone_available,
     })
 }
 
@@ -2155,6 +2206,53 @@ struct AbortOnDrop(tokio::task::JoinHandle<Result<()>>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+/// A client's microphone playing into this host's virtual microphone (G20).
+/// Fields drop in order: playback stops before the virtual microphone goes.
+struct SessionMicrophone {
+    receive: AbortOnDrop,
+    player: media::Pipeline,
+    virtual_mic: crate::virtual_mic::VirtualMic,
+}
+
+impl SessionMicrophone {
+    async fn start(controls: moq_net::origin::Producer) -> Result<Self> {
+        let remote = tokio::time::timeout(
+            Duration::from_secs(10),
+            controls.consume().announced_broadcast("controls"),
+        )
+        .await
+        .context("client controls missing")?
+        .context("controls missing")?;
+        let track = remote
+            .track(protocol::MICROPHONE_TRACK)?
+            .subscribe(media::audio_subscription())
+            .await?;
+        let virtual_mic = tokio::task::spawn_blocking(crate::virtual_mic::VirtualMic::create)
+            .await
+            .context("virtual microphone task failed")??;
+        let (player, source) = crate::audio::microphone_player(virtual_mic.sink())?;
+        tracing::info!(
+            source = virtual_mic.source(),
+            "playing the client's microphone into the virtual microphone"
+        );
+        Ok(Self {
+            receive: AbortOnDrop(tokio::spawn(crate::audio::receive(track, source))),
+            player,
+            virtual_mic,
+        })
+    }
+
+    fn check(&mut self) -> Result<()> {
+        ensure!(self.virtual_mic.alive(), "the virtual microphone went away");
+        self.player.error()?;
+        ensure!(
+            !self.receive.0.is_finished(),
+            "the client stopped sending its microphone"
+        );
+        Ok(())
     }
 }
 

@@ -41,6 +41,9 @@ in
       description = "Additional host arguments. Clipboard and audio are opt-in.";
     };
     systemLogin = lib.mkEnableOption "existing Linux password login for allowed users' running desktops";
+    microphone = lib.mkEnableOption ''
+      a virtual "Teleport Microphone" input that plays a client's
+      microphone (`teleport client --mic`) while its session lasts (PipeWire)'';
     gamepads = lib.mkEnableOption ''
       virtual gamepads for clients' game controllers: enables
       `hardware.uinput` and adds the allowed users to the `uinput` group
@@ -149,7 +152,7 @@ in
       # kscreen-doctor sizes virtual displays and runs privacy mode (KDE).
       path = lib.optional plasma pkgs.kdePackages.libkscreen;
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/teleport host --listen ${lib.escapeShellArg cfg.listen} --identity-dir %h/.local/state/teleport/host --restore-token %h/.local/state/teleport/host/portal-restore.json --virtual-display ${cfg.virtualDisplay} --privacy-mode ${cfg.privacyMode} ${lib.optionalString cfg.systemLogin "--system-auth-helper ${pamHelper}/libexec/teleport-pam"} ${lib.escapeShellArgs cfg.extraArgs}";
+        ExecStart = "${cfg.package}/bin/teleport host --listen ${lib.escapeShellArg cfg.listen} --identity-dir %h/.local/state/teleport/host --restore-token %h/.local/state/teleport/host/portal-restore.json --virtual-display ${cfg.virtualDisplay} --privacy-mode ${cfg.privacyMode} ${lib.optionalString cfg.microphone "--microphone"} ${lib.optionalString cfg.systemLogin "--system-auth-helper ${pamHelper}/libexec/teleport-pam"} ${lib.escapeShellArgs cfg.extraArgs}";
         # However the host stopped (crash, kill, logout), turn monitors left
         # off by privacy mode back on. "-": nothing to do is not a failure.
         ExecStopPost =

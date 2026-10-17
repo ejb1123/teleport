@@ -246,6 +246,11 @@ pub struct Desktop {
     /// session streams a virtual output.
     #[serde(default)]
     pub privacy_active: bool,
+    /// Host plays the client's microphone into a virtual source ("Teleport
+    /// Microphone") once the client declares `ClientFeatures::microphone`
+    /// and publishes [`MICROPHONE_TRACK`] (host `--microphone`).
+    #[serde(default)]
+    pub microphone: bool,
 }
 
 /// A network step-down: the negotiated stream, and the bitrate that made the
@@ -461,6 +466,10 @@ pub struct Input {
 /// lost packet never stalls key events queued behind it on the input track.
 pub const POINTER_TRACK: &str = "pointer";
 
+/// Client→host track carrying the client's microphone: one 10 ms mono Opus
+/// packet per group, like desktop audio.
+pub const MICROPHONE_TRACK: &str = "microphone";
+
 /// Largest per-event pointer delta; clients split larger movements.
 pub const MAX_RELATIVE_MOTION: u32 = 4096;
 
@@ -618,6 +627,10 @@ pub enum Event {
         /// an extra monitor. Only sent when `Desktop::virtual_monitor`.
         #[serde(default)]
         virtual_monitor: bool,
+        /// The client sends its microphone on [`MICROPHONE_TRACK`]. Only
+        /// sent when `Desktop::microphone`; older hosts ignore the field.
+        #[serde(default)]
+        microphone: bool,
     },
     /// The session's video codec. Sent as the very first input event to hosts
     /// advertising `Desktop::codec_selection`, which wait for it before
@@ -1300,6 +1313,7 @@ mod tests {
                 frame_timing: true,
                 privacy: true,
                 virtual_monitor: true,
+                microphone: true,
             },
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
@@ -1455,6 +1469,7 @@ mod tests {
                 frame_timing: false,
                 privacy: false,
                 virtual_monitor: false,
+                microphone: false,
             }
         ));
         let primary: Event = serde_json::from_str(r#"{"type":"request_keyframe"}"#).unwrap();
@@ -1630,6 +1645,43 @@ mod tests {
         let invalid = serde_json::json!({ "type": "cursor", "cursor": { "width": 1, "height": 1,
             "hot_x": 0, "hot_y": 0, "rgba": "not base64!" } });
         assert!(serde_json::from_value::<Update>(invalid).is_err());
+    }
+
+    #[test]
+    fn microphone_is_negotiated_by_both_ends() {
+        // Older hosts and clients omit the fields: no microphone.
+        let old: Desktop = serde_json::from_value(serde_json::json!({ "version": 2,
+            "width": 1, "height": 1, "fps": 1, "source": "test", "monitors": [],
+            "active_monitor": 0, "audio": false, "clipboard": false }))
+        .unwrap();
+        assert!(!old.microphone);
+        assert!(matches!(
+            serde_json::from_str::<Event>(r#"{"type":"client_features","keyframe_requests":true}"#)
+                .unwrap(),
+            Event::ClientFeatures {
+                microphone: false,
+                ..
+            }
+        ));
+        let desktop = Desktop {
+            microphone: true,
+            ..old
+        };
+        let wire = serde_json::to_value(&desktop).unwrap();
+        assert_eq!(wire["microphone"], true);
+        let features: Event = serde_json::from_str(
+            r#"{"type":"client_features","keyframe_requests":true,"microphone":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            features,
+            Event::ClientFeatures {
+                microphone: true,
+                ..
+            }
+        ));
+        assert!(features.validate().is_ok() && !features.is_lossy());
+        assert_ne!(MICROPHONE_TRACK, POINTER_TRACK);
     }
 
     #[test]
