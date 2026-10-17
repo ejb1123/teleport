@@ -127,6 +127,16 @@ pub struct Options {
     /// Start with remote audio muted.
     #[arg(long)]
     pub mute: bool,
+    /// Keep this hotkey on this computer: never send it to the host, also
+    /// while keyboard capture is on (e.g. a voice chat push-to-talk key).
+    /// SDL key names with optional modifiers: `F13`, `ScrollLock`,
+    /// `Ctrl+Shift+M`. Repeat for more (docs/keyboard-capture.md).
+    #[arg(long, value_parser = crate::key_options::Hotkey::parse)]
+    pub keep_local: Vec<crate::key_options::Hotkey>,
+    /// Swap Ctrl and Command (Super) for the host: Command+C on a Mac
+    /// becomes Ctrl+C on a Linux host, and the other way around.
+    #[arg(long)]
+    pub swap_ctrl_cmd: bool,
     /// Desktop audio encoding: `opus`, or `pcm` (uncompressed 48 kHz
     /// stereo, ~1.5 Mbit/s, for fast, unconstrained links). Default: the
     /// host's `--audio-format`.
@@ -2011,6 +2021,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut auto_lock = AutoLock::new(options.relative_mouse);
     let mut host_pointer: Option<(usize, f64, f64)> = None;
     let mut shortcuts = crate::keyboard_capture::Shortcuts::default();
+    let mut key_options =
+        crate::key_options::KeyOptions::new(options.swap_ctrl_cmd, options.keep_local.clone());
     let mut chrome = crate::fullscreen::Chrome::new();
     let mut placement: Option<crate::fullscreen::Placement> = None;
     // Input-only redraws (pointer motion, hover) are capped so a 1000 Hz mouse
@@ -2280,6 +2292,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 }
                 auto_lock.focus_lost();
                 shortcuts = crate::keyboard_capture::Shortcuts::default();
+                key_options.reset();
                 // Also centres and releases every host gamepad.
                 send(&events, Event::ReleaseAll)?;
             }
@@ -2334,6 +2347,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 }
                 continue;
             }
+            // Kept hotkeys stay here; Ctrl and Command may swap (all windows).
+            let Some(event) = key_options.filter(event) else {
+                continue;
+            };
             // Flush primary motion before an auxiliary event, preserving the
             // cross-monitor drag order instead of dropping its last position.
             if event
@@ -2879,6 +2896,24 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         auto_lock.state(pointer_lock.active())
                     } else {
                         "host cannot lock"
+                    }
+                ),
+                format!(
+                    "Keys                  Ctrl/Command {}   |   kept here: {}",
+                    if key_options.swap_ctrl_cmd() {
+                        "swapped"
+                    } else {
+                        "as is"
+                    },
+                    if key_options.local().is_empty() {
+                        "none".to_owned()
+                    } else {
+                        key_options
+                            .local()
+                            .iter()
+                            .map(crate::key_options::Hotkey::label)
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     }
                 ),
                 format!(

@@ -25,6 +25,7 @@ mod host_ui;
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod identity;
+mod key_options;
 mod keyboard_capture;
 mod launcher;
 mod media;

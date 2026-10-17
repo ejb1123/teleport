@@ -262,7 +262,9 @@ its speakers; **Ctrl+Alt+V** mutes. See [audio](docs/audio.md).
 Keyboard shortcuts: **Bind keys** or **Ctrl+Alt+K** requests keyboard capture
 for Alt+Tab/Super and other shortcuts supported by the local OS. The same chord
 releases it; **Ctrl+Alt+Q** always disconnects locally. While bound, F8 goes
-remote; use the Stats button instead. See [keyboard capture and platform limits](docs/keyboard-capture.md)
+remote; use the Stats button instead. `--keep-local F13` keeps a hotkey (a
+push-to-talk key) on the client, and `--swap-ctrl-cmd` swaps Ctrl and
+Command for the host. See [keyboard capture and platform limits](docs/keyboard-capture.md)
 and the [remote-desktop feature audit](docs/remote-desktop-audit.md).
 
 The host defaults to `--encoder auto`: it probes NVIDIA, Intel Quick Sync (QSV),

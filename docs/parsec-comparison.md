@@ -569,9 +569,11 @@ What is on `main`/this branch, from README, docs and code:
   enrollment. Per-device Ed25519 keys, revocation in Host settings, no cloud
   account.
 - **Input:**
-  - Physical scancodes; Cmd→Super and Option→Alt (fixed). Keyboard capture
-    with Ctrl+Alt+K. Mouse lock (relative) with Ctrl+Alt+M.
-  - Disconnect with Ctrl+Alt+Q; hotkeys are fixed.
+  - Physical scancodes; Cmd→Super and Option→Alt, or Ctrl and Cmd swapped
+    (`--swap-ctrl-cmd`, 2026-10-17). Keyboard capture with Ctrl+Alt+K.
+    Mouse lock (relative) with Ctrl+Alt+M.
+  - Disconnect with Ctrl+Alt+Q; the chords are fixed. Chosen hotkeys can
+    stay on the client (`--keep-local`, 2026-10-17).
   - Mouse buttons left, middle, right and (since 2026-10-16, G14)
     back/forward. Precise wheel deltas are forwarded.
   - Gamepads: SDL to uinput Xbox 360, up to 4, with rumble (since 2026-10-16,
@@ -636,7 +638,7 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Pointer confinement / relative | Immersive mouse, "Always Relative" | Ctrl+Alt+M relative lock | Parity | Auto-lock on hidden cursor missing |
 | Local cursor | Yes (inferred) | X11 only | Partial | Wayland hosts are the main target |
 | Extra mouse buttons | Yes (unverified) | Back/forward (2026-10-16) | Parity | G14 |
-| Configurable hotkeys / ignore hotkey | Yes | Fixed chords | Missing | S |
+| Configurable hotkeys / ignore hotkey | Yes | Fixed chords; hotkeys kept on the client (`--keep-local`, 2026-10-17) | Partial | Chords not rebindable |
 | Cmd/Ctrl swap | Yes | Fixed Cmd→Super | Missing | S |
 | Gamepad (Xbox 360) | Yes (Windows host) | Yes (Linux host, 4 pads) | Parity | |
 | Rumble | Yes | Yes (2026-10-16) | Parity | G12 |
@@ -1252,9 +1254,11 @@ YubiKeys over libusb, 1.19), and display rotation.
 Found in Parsec's client (1.19), not in its manual:
 - **Uncompressed PCM audio option** for unconstrained links (S): done
   2026-10-17 (G21, `--audio-format pcm`).
-- **Per-hotkey exclusions** (S): keep chosen hotkeys (push-to-talk) on the
-  client while keyboard capture is on (`docs/keyboard-capture.md`).
-- **Ctrl/Command swap** between macOS and other systems (S).
+- **Per-hotkey exclusions** (S): done 2026-10-17, `--keep-local HOTKEY`
+  never sends chosen hotkeys (push-to-talk) to the host, also while keyboard
+  capture is on (review tracker R19, `docs/keyboard-capture.md`).
+- **Ctrl/Command swap** between macOS and other systems (S): done
+  2026-10-17, `--swap-ctrl-cmd` (R19).
 
 Where the inspection shows Teleport ahead on Linux: Parsec's Linux client is
 X11-only (XWayland on Wayland desktops) and decodes only through whatever

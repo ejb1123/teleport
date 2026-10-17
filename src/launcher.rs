@@ -217,6 +217,13 @@ const AUDIO_QUALITY: [(&str, &[&str]); 8] = [
     ),
     ("Audio: PCM 1.5 Mbps", &["--audio-format", "pcm"]),
 ];
+/// `--keep-local`: a push-to-talk key that stays on this computer.
+const KEEP_LOCAL: [(&str, &[&str]); 4] = [
+    ("Keep local: none", &[]),
+    ("Keep local: F13", &["--keep-local", "F13"]),
+    ("Keep local: Scroll Lock", &["--keep-local", "ScrollLock"]),
+    ("Keep local: Pause", &["--keep-local", "Pause"]),
+];
 
 #[derive(Default)]
 struct StreamPreferences {
@@ -501,6 +508,8 @@ pub fn run() -> Result<()> {
     let mut host_display = 0usize;
     let mut microphone = 0usize;
     let mut audio_quality = 0usize;
+    let mut swap_ctrl_cmd = false;
+    let mut keep_local = 0usize;
     let mut hdr = false;
     let mut decoder = DecoderPreference::default();
     let mut clipboard = false;
@@ -1061,6 +1070,12 @@ pub fn run() -> Result<()> {
                                 if hit(pref_rect(15), x, y) {
                                     audio_quality = (audio_quality + 1) % AUDIO_QUALITY.len();
                                 }
+                                if hit(pref_rect(16), x, y) {
+                                    swap_ctrl_cmd = !swap_ctrl_cmd;
+                                }
+                                if hit(pref_rect(17), x, y) {
+                                    keep_local = (keep_local + 1) % KEEP_LOCAL.len();
+                                }
                                 if hit(pref_rect(3), x, y) {
                                     codec = (codec + 1) % CODECS.len();
                                     if CODECS[codec].1 != "h265" {
@@ -1226,6 +1241,10 @@ pub fn run() -> Result<()> {
                         }
                         command.args(MICROPHONE[microphone].1);
                         command.args(AUDIO_QUALITY[audio_quality].1);
+                        if swap_ctrl_cmd {
+                            command.arg("--swap-ctrl-cmd");
+                        }
+                        command.args(KEEP_LOCAL[keep_local].1);
                         decoder.apply(&mut command);
                         apply_relay(profile, &mut command)?;
                         if clipboard {
@@ -1707,6 +1726,12 @@ pub fn run() -> Result<()> {
                             HOST_DISPLAY[host_display].0,
                             MICROPHONE[microphone].0,
                             AUDIO_QUALITY[audio_quality].0,
+                            if swap_ctrl_cmd {
+                                "Ctrl/Cmd swapped"
+                            } else {
+                                "Ctrl/Cmd as is"
+                            },
+                            KEEP_LOCAL[keep_local].0,
                         ];
                         for (index, label) in labels.into_iter().enumerate() {
                             ui.button(
