@@ -16,7 +16,8 @@ the full commands. Keep host and client on the same revision.
 ## macOS client
 
 Without a Mac, `tools/check-macos.sh` type-checks the macOS build from Linux
-(`cargo check -Zbuild-std --target aarch64-apple-darwin`, C code stubbed). It
+(`cargo check -Zbuild-std --target aarch64-apple-darwin --all-targets`, so
+the unit tests `nix build` runs are included; C code stubbed). It
 catches Rust code that only breaks on macOS, such as Linux-only items used
 from cross-platform code; it does not link or compile the C shim, so a real
 Mac build is still the final check. Run it before pushing changes that touch

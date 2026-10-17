@@ -4,7 +4,8 @@
 # only compiles on macOS; it does not link, and C code is not compiled (the C
 # compiler and archiver are stand-ins that produce empty outputs).
 #
-#   tools/check-macos.sh            # from the repository root
+#   tools/check-macos.sh            # from the repository root (all targets,
+#                                   # including unit tests, which nix build runs)
 #
 # Builds std for the target from the flake-pinned Rust sources (-Zbuild-std),
 # because prebuilt rust-std does not match Nix's rustc build.
@@ -39,4 +40,4 @@ RUSTC_BOOTSTRAP=1 \
   PKG_CONFIG_ALLOW_CROSS=1 CARGO_INCREMENTAL=0 \
   nix develop --command nice -n 19 ionice -c3 cargo check \
   -Zbuild-std=std,panic_abort --locked -j 2 \
-  --target aarch64-apple-darwin --target-dir "$work/target" "$@"
+  --target aarch64-apple-darwin --target-dir "$work/target" --all-targets "$@"
