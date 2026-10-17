@@ -335,7 +335,18 @@ pub async fn connect_with_keep_alive(
         url.query_pairs_mut().append_pair("key", key);
     }
     let mut config = moq_native::ClientConfig::default();
-    config.version = versions(&[])?;
+    // `TELEPORT_RELAY_VERSIONS=moq-transport-14,...` pins what is offered, for
+    // provider relays whose drafts differ in behaviour.
+    let pinned: Vec<String> = std::env::var("TELEPORT_RELAY_VERSIONS")
+        .map(|value| {
+            value
+                .split(',')
+                .map(|version| version.trim().to_owned())
+                .filter(|version| !version.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    config.version = versions(&pinned)?;
     config.quic.idle_timeout = Some(protocol::QUIC_IDLE_TIMEOUT);
     config.quic.keep_alive = Some(keep_alive);
     config.quic.mtu_discovery = Some(protocol::QUIC_MTU_DISCOVERY);
