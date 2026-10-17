@@ -13,6 +13,9 @@ changelog up to 150-105c (2026-10-08).
   (67 releases, 150-66 to 150-105c). The 240 FPS blog post and the Warp page
   were fetched directly. Every Parsec claim below cites the article it comes
   from. Anything taken from memory or a third party is marked **(unverified)**.
+- **Parsec's client.** The shipped Linux client (`parsec-bin` 150_97c from
+  nixpkgs) was inspected statically: libraries, embedded strings, its
+  configuration keys and settings help text. See section 1.19.
 - **Teleport.** README.md, docs/*.md (especially `docs/review-2026-10.md`),
   the clap structs in `src/host.rs`, `src/client.rs` and `src/main.rs`,
   `src/launcher.rs`, plus spot checks in `src/audio.rs`, `src/ffmpeg_codec.c`
@@ -390,6 +393,57 @@ not recommended. G-Sync/FreeSync on the host adds latency. Hybrid-GPU laptops
 must use the iGPU (-14003). Anti-cheat blocks input. A paid tier is needed for
 multi-monitor, 4:4:4, virtual displays and pen. A cloud backend is required
 for signalling and authentication. (HW, FM, E15106, NET, HPR, GSYNC, MKB.)
+
+### 1.19 The Linux client, inspected (2026-10-17)
+
+The manual was checked against Parsec's shipped Linux client: nixpkgs
+`parsec-bin` 150_97c, a small `parsecd` launcher plus the engine
+`parsecd-150-97c.so` (3.4 MB, entry `wx_main`). Static inspection only
+(linked and `dlopen`ed libraries, embedded strings and settings text); it was
+not run or connected.
+
+- **Display and input: X11 only.** The engine links `libX11`, `libXi`,
+  `libXfixes` and `libXcursor` and has no Wayland or SDL; on a Wayland desktop
+  it runs under XWayland. Renderers: OpenGL and Vulkan on Linux (D3D11/12 and
+  Metal elsewhere). The settings UI is Dear ImGui, plus an optional web UI.
+  The app layer is libmatoya (snowcone-ltd), Parsec's open-source
+  windowing/input/audio library.
+- **Decoding through the system's FFmpeg.** It `dlopen`s whichever
+  `libavcodec` 57–61 is installed, with no VA-API/VDPAU/NVDEC libraries of its
+  own, so hardware decoding is whatever that FFmpeg offers. 4:4:4, 10-bit and
+  H.265 are client feature flags (`client_decoder_444/10bit/h265`), with
+  H.265 "falling back to H.264 if both computers don't support it". No AV1
+  decoder strings were found.
+- **The cursor is drawn client-side** (answers open question 2): cached
+  cursor images (`_cache_cursor`), PNG cursors from the host
+  (`client_png_cursor`), applied as real X11 cursors
+  (`XCreatePixmapCursor`/`XDefineCursor`).
+- **Transport:** usrsctp (SCTP, as in WebRTC) strings throughout, i.e. SCTP
+  over UDP with OpenSSL DTLS; a user-selectable "Congestion Algorithm"
+  (`network_cg_level`: "behavior when network conditions deteriorate"). No
+  FEC, NACK or parity strings were found (open question 3: no visible FEC).
+  NAT traversal: STUN on `stun.parsec.app` and `stun6.parsec.app` (IPv6),
+  candidate exchange ("candex"), relay keys (`app_force_relay`,
+  `answer_relay`), and a SOAP client consistent with UPnP-IGD
+  (`network_upnp`). Backend hosts: `kessel-api`, `public`, `builds` and
+  `deps.parsec.app`.
+- **Settings:** the engine recognises about 148 configuration keys; the
+  manual's ADV list documents 83. Undocumented but shipped:
+  - encoder internals: `encoder_slices`, `encoder_idr_interval`,
+    `encoder_min_qp`/`max_qp`, `encoder_vbv_initial/max/multi`;
+  - `host_software_encode` and `host_encoder_min_bitrate`;
+  - `network_protocol` and `network_video_container`;
+  - client audio buffers (`client_audio_min/max_buffer_ms`) and
+    `client_bad_decoders`.
+- **Features visible only in the client's help text:**
+  - **Uncompressed audio:** 48 kHz stereo PCM instead of Opus, "when host
+    bandwidth is not limited" (`network_raw_audio`).
+  - **USB passthrough:** generation-5 YubiKeys via libusb, owner connections
+    only (`client_usb_passthrough`, `host_virtual_usb_passthrough`).
+  - **Per-hotkey exclusions:** keep a hotkey on the client ("Useful for your
+    Discord push-to-talk hotkey").
+  - **Ctrl/Command swap** between macOS and other systems.
+  - Extra client windows for multiple monitors.
 
 ---
 
@@ -1045,7 +1099,20 @@ each.**
 Pen/tablet with pressure and tilt (uinput tablet; SDL2 has no pen API, so
 SDL3 or native), the controller remapping UI, idle kick timer, host speaker
 mute on connect, camera passthrough (v4l2loopback), USB/YubiKey passthrough
-(see `docs/peripheral-forwarding.md`), and display rotation.
+(see `docs/peripheral-forwarding.md`; Parsec ships it for generation-5
+YubiKeys over libusb, 1.19), and display rotation.
+
+Found in Parsec's client (1.19), not in its manual:
+- **Uncompressed PCM audio option** for unconstrained links (S): an
+  alternative to Opus in `src/audio.rs`, capability-gated.
+- **Per-hotkey exclusions** (S): keep chosen hotkeys (push-to-talk) on the
+  client while keyboard capture is on (`docs/keyboard-capture.md`).
+- **Ctrl/Command swap** between macOS and other systems (S).
+
+Where the inspection shows Teleport ahead on Linux: Parsec's Linux client is
+X11-only (XWayland on Wayland desktops) and decodes only through whatever
+system FFmpeg it finds. Teleport's client runs native Wayland through SDL,
+ships its own FFmpeg with CUDA and VA-API, and presents zero-copy.
 
 ---
 
@@ -1089,10 +1156,12 @@ mute on connect, camera passthrough (v4l2loopback), USB/YubiKey passthrough
    may cause instability" and 240 is "not recommended" (ADV, B240). The 240 FPS
    test hardware (GTX 1070/1050 Ti) suggests a 2017–2018 post. No current
    144/240 Hz figures were found.
-2. **Whether Parsec renders the cursor client-side.** This is inferred from
-   changelog entries about cursor caching and scaling, not stated.
-3. **Whether Parsec uses FEC, and how BUD congestion control works.** Not
-   documented beyond "sensitive/relaxed" and "ultra-responsive".
+2. ~~Whether Parsec renders the cursor client-side.~~ **Answered (1.19):**
+   yes. Cached PNG cursors from the host are set as real X11 cursors.
+3. **Whether Parsec uses FEC, and how BUD congestion control works.** The
+   client (1.19) shows SCTP (usrsctp) transport and a selectable "Congestion
+   Algorithm", but no FEC, NACK or parity strings. That suggests no FEC; it
+   doesn't prove it.
 4. **Whether HPR relays DTLS end to end.** DTLS between peers implies yes, but
    the HPR docs do not say. It does see BUD packets on UDP 5000.
 5. **Parsec's macOS host encoder (VideoToolbox?) and its latency.** Not
