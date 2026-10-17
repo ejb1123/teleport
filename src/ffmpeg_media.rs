@@ -187,12 +187,14 @@ impl State {
     }
 }
 
-/// Probe frame size: SVT-AV1 encodes nothing smaller than 64x64.
+/// Probe frame size: NVDEC decodes no H.265 smaller than 144x144 (and no
+/// AV1 smaller than 128x128); at 64x48 its probe failed and H.265 sessions
+/// on NVIDIA fell back to VA-API or software.
 fn probe_size(format: VideoFormat) -> (u32, u32) {
-    if format.codec == VideoCodec::Av1 {
-        (64, 64)
-    } else {
+    if format.codec == VideoCodec::H264 {
         (64, 48)
+    } else {
+        (160, 160)
     }
 }
 
