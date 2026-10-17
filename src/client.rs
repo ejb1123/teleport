@@ -2474,6 +2474,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         }
                         .into();
                     }
+                    Action::SecureAttention => {
+                        if desktop.secure_attention {
+                            send(&events, Event::SecureAttention)?;
+                        } else {
+                            notice =
+                                "Host cannot lock or unlock its session (Ctrl+Alt+End); update it"
+                                    .into();
+                        }
+                    }
                     Action::Disconnect => break 'running,
                     Action::Stats => show_stats = !show_stats,
                     Action::Swallow => (),

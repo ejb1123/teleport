@@ -45,6 +45,8 @@ mod pw_cursor;
 mod relay;
 mod relay_enroll;
 mod security_key;
+#[cfg(target_os = "linux")]
+mod session_lock;
 mod ssh_agent;
 mod stats;
 mod stun;
@@ -161,6 +163,17 @@ enum Command {
     WakeListen(wake::ListenOptions),
     /// Ask a desktop to suspend (its host needs --allow-suspend).
     Suspend(host_command::SuspendOptions),
+    /// Lock this user's graphical session and wait until it is locked (used
+    /// after an automatic login; docs/wake-and-unattended.md).
+    #[cfg(target_os = "linux")]
+    LockSession {
+        /// Give up after this many seconds.
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+        /// Only lock a session the display manager logged in automatically.
+        #[arg(long)]
+        only_automatic_login: bool,
+    },
     /// Check required media plugins without sharing the desktop.
     Doctor {
         /// Test synthetic HEVC Main 10 support; does not imply HDR desktop capture/display.
@@ -203,6 +216,15 @@ fn main() -> Result<()> {
                 );
             }
             return Ok(());
+        }
+        Some(Command::LockSession {
+            timeout,
+            only_automatic_login,
+        }) => {
+            return session_lock::lock_and_wait(
+                std::time::Duration::from_secs(*timeout),
+                *only_automatic_login,
+            );
         }
         _ => {}
     }
@@ -292,7 +314,11 @@ fn run(command: Option<Command>) -> Result<()> {
         Some(Command::HostManager) => host_ui::run(),
         // Handled before media initialisation.
         #[cfg(target_os = "linux")]
-        Some(Command::PrivacyRestore { .. } | Command::PrivacyGuard { .. }) => Ok(()),
+        Some(
+            Command::PrivacyRestore { .. }
+            | Command::PrivacyGuard { .. }
+            | Command::LockSession { .. },
+        ) => Ok(()),
         // Handled before media initialisation.
         Some(Command::Wake(_) | Command::WakeListen(_) | Command::Suspend(_)) => Ok(()),
         #[cfg(target_os = "linux")]

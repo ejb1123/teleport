@@ -407,6 +407,10 @@ pub struct Desktop {
     /// client saves it in the desktop's profile. Absent from older hosts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wake: Option<WakeInfo>,
+    /// The host maps `Event::SecureAttention` (the client's Ctrl+Alt+End)
+    /// to locking its session, or to the unlock prompt when it is locked.
+    #[serde(default)]
+    pub secure_attention: bool,
 }
 
 /// What a host tells its paired clients about waking it and its power
@@ -904,6 +908,11 @@ pub enum Event {
         #[serde(default)]
         microphone: bool,
     },
+    /// "Secure attention" (the client's Ctrl+Alt+End, Teleport's
+    /// Ctrl+Alt+Del): lock the host session, or show the lock screen's
+    /// password prompt when it is locked. Only sent when
+    /// `Desktop::secure_attention`.
+    SecureAttention,
     /// The session's video codec. Sent as the very first input event to hosts
     /// advertising `Desktop::codec_selection`, which wait for it before
     /// starting video; it overrides the connection's `codec` parameter.

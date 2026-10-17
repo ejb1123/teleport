@@ -58,6 +58,11 @@ pub struct Capture {
     restore_token_path: Option<std::path::PathBuf>,
     /// The session was closed and not yet successfully recreated.
     lost: bool,
+    /// Portal: the compositor closed the session (its `Closed` signal),
+    /// e.g. when waking monitors replace their outputs.
+    portal_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Watches for that signal; stopped when the capture closes.
+    closed_watch: Option<tokio::task::JoinHandle<()>>,
     /// The client draws the pointer itself; leave it out of X11 video.
     pub local_cursor: bool,
     /// Portal: the host allows sending the pointer as metadata (the default).
@@ -587,6 +592,8 @@ impl Capture {
             source: source.to_owned(),
             restore_token_path: restore_token_path.map(Path::to_path_buf),
             lost: false,
+            portal_closed: Default::default(),
+            closed_watch: None,
             local_cursor: false,
             allow_cursor_metadata: cursor_metadata,
             cursor_metadata_available: false,
@@ -677,6 +684,8 @@ impl Capture {
                     "Wayland portal"
                 };
                 result.primary_virtual = primary_virtual;
+                result.closed_watch =
+                    watch_portal_closed(&opened.session, result.portal_closed.clone()).await;
                 result.backend = Backend::Portal {
                     proxy: opened.proxy,
                     session: opened.session,
@@ -997,6 +1006,7 @@ impl Capture {
             | Event::NetworkFeedback { .. }
             | Event::Clipboard { .. }
             | Event::ClipboardRequest
+            | Event::SecureAttention
             | Event::RequestKeyframe { .. }
             | Event::ClientFeatures { .. }
             | Event::SelectCodec { .. }
@@ -1224,9 +1234,19 @@ impl Capture {
         self.gamepads.types()
     }
 
-    /// A previous recreation failed: the capture must be reopened before use.
+    /// A previous recreation failed, or the compositor closed the portal
+    /// session: the capture must be reopened before use.
     pub fn is_lost(&self) -> bool {
         self.lost
+            || self
+                .portal_closed
+                .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The compositor closed the portal session (not a deliberate release).
+    pub fn portal_closed(&self) -> bool {
+        self.portal_closed
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether input and capture go through the desktop portal (Wayland).
@@ -1318,6 +1338,10 @@ impl Capture {
     }
 
     pub async fn close(&mut self) {
+        // Our own Close is not the compositor revoking the session.
+        if let Some(watch) = self.closed_watch.take() {
+            watch.abort();
+        }
         self.end_session().await;
         if let Backend::Portal { session, .. } = &self.backend {
             let _ = session.close().await;
@@ -1540,6 +1564,39 @@ pub fn portal_session_lost(error: &anyhow::Error) -> bool {
     ]
     .iter()
     .any(|pattern| text.contains(pattern))
+}
+
+/// Set `flag` when the portal emits `Closed` for `session`: KDE closes a
+/// RemoteDesktop session whose outputs disappear (monitors waking from
+/// DPMS hotplug them). Between clients nothing else would notice, so the
+/// next client would find a dead session; with the flag, `is_lost` makes
+/// the host recreate it first (and the idle check does it sooner).
+async fn watch_portal_closed(
+    session: &Session<'static, RemoteDesktop<'static>>,
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    use futures_util::StreamExt;
+    // ashpd keeps the object path private; it serializes as the path.
+    let path = serde_json::to_value(session).ok()?.as_str()?.to_owned();
+    let connection = ashpd::zbus::Connection::session().await.ok()?;
+    let proxy = ashpd::zbus::Proxy::new(
+        &connection,
+        "org.freedesktop.portal.Desktop",
+        path,
+        "org.freedesktop.portal.Session",
+    )
+    .await
+    .ok()?;
+    let mut closed = proxy.receive_signal("Closed").await.ok()?;
+    Some(tokio::spawn(async move {
+        let _proxy = proxy;
+        if closed.next().await.is_some() {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                "the desktop portal closed its session (displays changed or access revoked); recreating it before the next client"
+            );
+        }
+    }))
 }
 
 #[cfg(test)]

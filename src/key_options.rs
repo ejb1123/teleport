@@ -1,7 +1,7 @@
 //! Client key options found in Parsec's client: hotkeys kept on this
 //! computer (never sent to the host, e.g. a push-to-talk key), and swapping
 //! Ctrl and Command (Super) between macOS and other systems. Both apply to
-//! forwarded keys only; Teleport's own chords (Ctrl+Alt+K/M/Q/V) are handled
+//! forwarded keys only; Teleport's own chords (Ctrl+Alt+K/M/Q/V/End) are handled
 //! before them.
 use sdl2::{
     event::Event,

@@ -568,6 +568,8 @@ mod server {
         state: Arc<ServerState>,
         hash: Vec<u8>,
         proof: KeyProof,
+        /// Leased from a single-use system-login ticket.
+        ticket: bool,
     }
     impl SessionLease {
         /// Whether the credential is the desktop owner's, for owner-only
@@ -577,6 +579,12 @@ mod server {
         /// roles would narrow this.
         pub fn owner(&self) -> bool {
             true
+        }
+
+        /// The session came from a system login (PAM just verified the
+        /// account password).
+        pub fn system_login(&self) -> bool {
+            self.ticket
         }
 
         /// Whether the session may continue: its credential is still
@@ -1025,6 +1033,7 @@ mod server {
                 state: self.clone(),
                 hash,
                 proof,
+                ticket: !saved,
             })
         }
 
@@ -1512,7 +1521,9 @@ mod server {
             assert!(!reopened.authorized(&ticket.token));
             assert!(!fs::read_to_string(&state.path)?.contains(&ticket.token));
             let lease = state.begin_session(&ticket.token)?;
-            assert!(lease.owner());
+            // Only ticket sessions may unlock the desktop (--unlock-on-system-login).
+            assert!(lease.system_login() && lease.owner());
+            assert!(!state.begin_session(&state.legacy.token)?.system_login());
             assert!(state.begin_session(&ticket.token).is_err());
             assert!(state.authorized(&ticket.token));
             drop(lease);
