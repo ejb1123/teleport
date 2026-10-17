@@ -490,7 +490,12 @@ client can both connect out to a MoQ relay; every relayed session is end-to-end
 encrypted and authenticated against the pinned host identity. In the launcher,
 select a desktop and click **Relay** to save a relay URL, its fingerprint, key and a
 route (**Direct, then relay** by default). Desktops with a relay show signed
-online/offline presence. See [relay mode](docs/relay.md).
+online/offline presence. Besides the self-hosted `teleport relay`, Cloudflare's
+MoQ relay works, still end-to-end encrypted: the public
+`https://draft-14.cloudflare.mediaoverquic.com/` needs no account, and a
+provisioned relay takes its token in the URL path. See
+[relay mode](docs/relay.md) and its
+[provider relays](docs/relay.md#provider-relays-cloudflare) section.
 
 **Peer-to-peer through NATs** (development): with a relay and the default
 route, the client also tries a direct path between two NATed networks. Both

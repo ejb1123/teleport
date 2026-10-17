@@ -5,9 +5,9 @@ client can connect *out* to a MoQ relay instead. The relay forwards objects it
 cannot read or forge: every session is authenticated and encrypted end to end
 between the client and the host.
 
-Status (development, 2026-10): works with the self-hosted `teleport relay`.
-Provider relays such as Cloudflare's: the IETF MoQ Transport path is implemented and
-tested locally, but not yet verified against a provider (see below).
+Status (development, 2026-10): works with the self-hosted `teleport relay` and,
+verified live, with Cloudflare's public MoQ relay (no account needed); see
+[provider relays](#provider-relays-cloudflare).
 
 ## Quick start (self-hosted relay)
 
@@ -280,7 +280,8 @@ rendezvous, never from the code) and the sizes and timing of PAKE or TLS
 messages it cannot read. For peer-to-peer signalling it sees that an exchange
 took place, but not the addresses exchanged; as the default STUN server it
 sees the public address of each end's peer-to-peer socket (see
-[threat model](#threat-model-and-privacy)).
+[threat model](#threat-model-and-privacy)). For provider relays see
+[metadata exposure](#metadata-exposure).
 
 ## Peer-to-peer through NATs
 
@@ -459,18 +460,153 @@ relay.
 ## Provider relays (Cloudflare)
 
 Teleport offers `moq-lite-05` and IETF MoQ Transport drafts 16 and 14 to a
-relay. Provider relays such as Cloudflare's speak the IETF drafts only; that
-path is tested locally against `teleport relay --version moq-transport-16`
-(and `-14`), including the fallback of pointer motion to the ordered input
-track, because IETF sessions carry no datagrams.
+relay. Provider relays such as Cloudflare's speak the IETF drafts only.
 
-To use a provider relay, pass its WebTransport URL and token, e.g.
-`--relay "https://<relay host>/?jwt=<token>"` on both ends (no
-`--relay-fingerprint`: its public certificate is verified against system
-roots). Teleport replaces the URL path with the host's namespace, which the
-host logs when it connects (`namespace=`); mint the provider token for that
-path. Not yet verified against Cloudflare itself (no account was available
-for testing); report what you find.
+**Verified live (2026-10-17)** through Cloudflare's public draft-14 relay,
+`https://draft-14.cloudflare.mediaoverquic.com/`, no account: pairing through
+the relay link, end-to-end encrypted sessions (video and input), host
+commands (`teleport suspend`), peer-to-peer signalling (`--route auto` chose
+`p2p`), presence online and then offline after the host stopped. Guests
+(invite enrollment and a shared session) pass against a local relay that
+behaves like Cloudflare's (see [Tests](#tests)); password and system-login
+enrollment use the same relay stream as pairing. Against
+the draft-16 relay (`https://draft-16.cloudflare.mediaoverquic.com/<token>`)
+the token path and discovery were verified with Cloudflare's public demo
+token, which may only subscribe: a presence check connects and reports
+offline. A full draft-16 session needs a publishing token from an account
+and is not verified.
+
+### Setup
+
+The public relay is shared by everyone and needs nothing but the URL:
+
+```sh
+teleport host --identity-dir ~/.config/teleport/host \
+  --relay https://draft-14.cloudflare.mediaoverquic.com/
+teleport client <host> --relay https://draft-14.cloudflare.mediaoverquic.com/
+```
+
+No `--relay-fingerprint` (the certificate is checked against system roots)
+and no `--relay-key`. The launcher's **Relay** dialog takes the same URL.
+
+A *provisioned* relay (Cloudflare's provisioning API, July 2026) is an
+isolated scope that only holders of its tokens can use:
+
+```sh
+curl -X POST "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/moq/relays" \
+  -H "Authorization: Bearer $API_TOKEN" -H "Content-Type: application/json" \
+  -d '{"name": "Teleport"}'
+# → a relay id and two tokens: publish+subscribe, and subscribe only.
+curl -X POST "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/moq/relays/$RELAY_ID/tokens" \
+  -H "Authorization: Bearer $API_TOKEN" -H "Content-Type: application/json" \
+  -d '{"operations": ["publish", "subscribe"], "label": "laptop", "expires_at": "2027-01-01T00:00:00Z"}'
+```
+
+Cloudflare's tokens (JWTs) travel in the URL *path*:
+`--relay "https://draft-16.cloudflare.mediaoverquic.com/<token>"`. Teleport
+keeps a URL path it is given and carries the host namespace inside the MoQ
+track namespaces instead. Roles map as follows:
+
+- the host and every client need a token with **publish and subscribe**:
+  both sides publish (the host its replies, desktop and presence; a client
+  its hello, confirmation and controls) and subscribe to the other;
+- a **subscribe-only** token is enough for presence checks
+  (`teleport presence`, the launcher's online dot);
+- a token covers the whole relay, so mint one per device with an expiry and
+  revoke it to cut that device off. Tokens in the path appear in
+  Cloudflare's access logs; Teleport keeps them out of its own logs, but a
+  saved desktop stores the URL in `profiles.json`.
+
+A relay that takes its token as a query parameter instead
+(`https://<relay>/?jwt=<token>`, e.g. moq-relay) also works: with no path,
+Teleport puts the namespace in the path as for `teleport relay`.
+
+### How it works
+
+The first attempt failed because the draft-16 relay
+(`relay.cloudflare.mediaoverquic.com` behaves the same) refuses any
+session whose URL path is not a token: Teleport put the namespace there, and
+Cloudflare closed the session (`scope resolution failed`) right after the
+handshake, whatever was sent next. SUBSCRIBE_NAMESPACE, the last message in
+the log, was not the cause: the draft-16 relay answers it with a token,
+including the empty prefix. The token-free draft-14 relay accepts the
+session but implements no namespace discovery at all: SUBSCRIBE_NAMESPACE is
+never answered, so neither side would ever learn the other's broadcasts.
+
+On a moq-transport session (Teleport tells by the negotiated version; a
+moq-lite relay is unchanged) Teleport therefore:
+
+- puts the namespace in band, as the first element of every track
+  namespace, and leaves the URL path to the provider;
+- has the peers announce their broadcasts to each other over ordinary
+  tracks (`src/discovery.rs`): the host publishes a *door* broadcast at the
+  well-known `door`, every client connection one at `<random id>/door`. A
+  client reads the host's announcement stream (track
+  `announce/<its id>/<n>` on the host door), which also tells the host to
+  read the client's door back. Each announced path becomes a local broadcast
+  whose tracks are subscribed by name, so session code is the same as on
+  `teleport relay`. A side that leaves ends the other's subscription to its
+  door, which unannounces everything it announced (presence goes offline at
+  once). A new broadcast is announced only 300 ms after it appears, once
+  Cloudflare can route it (130–270 ms measured);
+- uses a `moq-net` fork: 0.2.20 with three small changes marked "Teleport
+  patch" (<https://github.com/ejb1123/moq>, branch `teleport/moq-net-0.2.20`,
+  pinned by commit in `Cargo.toml`; offered upstream from
+  <https://github.com/moq-dev/moq/compare/moq-net-v0.2.20...ejb1123:moq:teleport/moq-net-0.2.20>): a client session subscribes by name to broadcasts never
+  advertised to it; a moq-transport subscription is served from the oldest
+  cached group (Cloudflare subscribes upstream with *Next Object*, which
+  would skip a handshake message published before the request arrived); and
+  ordered tracks ask for ascending groups and send them one at a time
+  (Cloudflare otherwise dropped an older group that reached it a moment after
+  a newer one, breaking the ordered input track).
+
+Encryption and authentication are unchanged: every object is sealed end to
+end as on any relay, and the doors carry only broadcast paths, which the
+relay already sees as track namespaces. moq-transport sessions carry no
+datagrams, so pointer motion uses the ordered input track (the existing
+fallback, `link.session.version().is_lite()` in the client).
+
+### Measurements (2026-10-17, debug build, test source at 640x360)
+
+| Path | Connect (`elapsed_ms`) | Input round trip p50 / p95 |
+| --- | --- | --- |
+| `teleport relay` on loopback (moq-lite) | 66 ms | 4.9 / 10.8 ms |
+| Cloudflare public relay, draft-14 | 1.35–1.72 s (6 runs) | 12.0–15.4 / 22–49 ms |
+
+Pairing through Cloudflare took 0.8–1.0 s, a host command 1.5 s and a
+presence check 0.13–0.18 s; offline was reported 5 s after the host stopped.
+The connect time is mostly the four announce hops (hello, reply, confirm,
+desktop) at 300 ms each.
+
+### Metadata exposure
+
+Cloudflare (and, on the public relay, anyone who learns the namespace) can
+see: IP addresses; the namespace (a hash of the host fingerprint, so anyone
+who knows that fingerprint can compute it); track namespaces such as
+`<namespace>/<session>/hello|reply|confirm|controls|desktop`,
+`<namespace>/<attempt>/request|response`, `<namespace>/presence`,
+`<namespace>/door` and `<namespace>/<client id>/door`; track names (`input`,
+`h264`, `opus`, `updates`, `presence/<random>`, `announce/<id>/<n>`); and
+object sizes and timing (typing cadence). Session, attempt and client ids are
+128 random bits per connection, linked to no device or account. Contents,
+credentials, pairing codes and candidates are never visible.
+
+### Limits
+
+- **Request budget.** Cloudflare lets a connection make about 50 requests
+  (SUBSCRIBE and PUBLISH_NAMESPACE; request ids below 100, never raised). A
+  session costs the host about seven. The host counts them and, past 30,
+  reconnects once no session uses the connection and no peer has announced
+  anything for 10 s; a busy host can still run out, and then refuses new
+  sessions until it reconnects. Watchers of an offline host reconnect too.
+- **Anyone on the public relay** who knows a host's namespace can make it
+  spend its request budget or race its handshakes (availability only). Use a
+  provisioned relay, whose tokens decide who connects, for anything but
+  trying it out.
+- Connecting takes about 1.5 s (the announce delay above).
+- Two peers must agree on the transport: a `teleport relay` that negotiates
+  moq-lite with one side and moq-transport with the other (only possible when
+  pinning versions with `TELEPORT_RELAY_VERSIONS`) does not connect them.
 
 ## Tests
 
@@ -495,7 +631,18 @@ for testing); report what you find.
   relayed session decoding video); `--route auto` with an unreachable address
   connects through the relay after a peer-to-peer exchange that offers no
   usable (loopback) candidate, and directly when the address works; presence
-  online, then offline after the host stops.
+  online, then offline after the host stops. The pairing, auto-route and
+  presence, and guest tests also run against `teleport relay --version
+  moq-transport-14 --no-namespace-discovery` (hidden test flag: the relay
+  announces nothing but routes SUBSCRIBEs by exact name, like Cloudflare's),
+  and `relayed_session_works_over_ietf_moq_transport_like_provider_relays`
+  runs drafts 16 and 14 with discovery available.
+- `TELEPORT_TEST_CLOUDFLARE=1 cargo test --test relay -- --ignored cloudflare`
+  — live through Cloudflare's public relay (or `TELEPORT_TEST_CLOUDFLARE_URL`):
+  pairing through the relay, a session with input round trips, presence
+  online and then offline. Skipped without the variable.
+- `cargo test --bin teleport discovery:: relay::` — announced paths and door
+  requests validated; provider tokens kept in the URL path and out of logs.
 - `cargo test --bin teleport stun:: p2p:: natpmp::` — STUN encoding and
   decoding (RFC 5769 vectors, malformed and foreign messages, the relay's
   responder); candidate validation (unspecified, loopback, multicast,
@@ -555,6 +702,9 @@ for testing); report what you find.
   rejected; sign in again.
 - The launcher watches presence with one relay connection per desktop
   (keep-alive every 3 s); presence is not shown for *Direct only* desktops.
+- Provider relays: a request budget per connection, slower connects and
+  availability attacks on the shared public relay; see
+  [limits](#limits).
 
 The design and these limits were reviewed adversarially (2026-10-15): no
 confidentiality or integrity break was found; replay, intake and group
