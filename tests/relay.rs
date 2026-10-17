@@ -50,12 +50,24 @@ fn setup_with_versions(versions: &[&str]) -> Setup {
 }
 
 fn setup_with(versions: &[&str], host_args: &[&str]) -> Setup {
+    let relay_args: Vec<&str> = versions
+        .iter()
+        .flat_map(|version| ["--version", version])
+        .collect();
+    setup_relay(&relay_args, host_args)
+}
+
+/// A relay that behaves like Cloudflare's: moq-transport only, and no
+/// namespace discovery, so peers announce to each other (src/discovery.rs).
+const PROVIDER: &[&str] = &["--version", "moq-transport-14", "--no-namespace-discovery"];
+
+fn setup_relay(relay_args: &[&str], host_args: &[&str]) -> Setup {
     let temp = tempfile::tempdir().unwrap();
     let relay_address = free_udp();
     let mut relay = Process(
         teleport()
             .args(["relay", "--listen", &relay_address, "--key", RELAY_KEY])
-            .args(versions.iter().flat_map(|version| ["--version", version]))
+            .args(relay_args)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -485,7 +497,17 @@ fn presence(setup: &Setup, fingerprint: &str) -> String {
 #[test]
 #[ignore = "requires local UDP sockets and GStreamer plugins"]
 fn first_pairing_and_session_work_through_the_relay_alone() {
-    let setup = setup_with(&[], &["--pair"]);
+    first_pairing_and_session(&[]);
+}
+
+#[test]
+#[ignore = "requires local UDP sockets and GStreamer plugins"]
+fn first_pairing_and_session_work_without_namespace_discovery() {
+    first_pairing_and_session(PROVIDER);
+}
+
+fn first_pairing_and_session(relay: &[&str]) {
+    let setup = setup_relay(relay, &["--pair"]);
     let link = relay_pairing_link(&setup);
     let (prefix, code) = link.rsplit_once('/').unwrap();
     let config = setup.temp.path().join("config");
@@ -543,7 +565,19 @@ fn first_pairing_and_session_work_through_the_relay_alone() {
 #[test]
 #[ignore = "requires local UDP sockets and GStreamer plugins"]
 fn auto_route_falls_back_to_the_relay_and_presence_follows_the_host() {
-    let mut setup = setup();
+    auto_route_and_presence(&[]);
+}
+
+/// Peer-to-peer signalling, sessions and presence where the relay announces
+/// nothing, as on Cloudflare's.
+#[test]
+#[ignore = "requires local UDP sockets and GStreamer plugins"]
+fn auto_route_and_presence_work_without_namespace_discovery() {
+    auto_route_and_presence(PROVIDER);
+}
+
+fn auto_route_and_presence(relay: &[&str]) {
+    let mut setup = setup_relay(relay, &[]);
     let fingerprint = host_fingerprint(&setup);
     assert_eq!(presence(&setup, &fingerprint), "ONLINE");
     // Nothing vouches for another host identity in this namespace.
@@ -663,7 +697,17 @@ fn relayed_client(
 #[test]
 #[ignore = "requires local UDP sockets and GStreamer plugins"]
 fn guest_joins_through_the_relay_with_approval_and_permissions() {
-    let setup = setup();
+    guest_joins(&[]);
+}
+
+#[test]
+#[ignore = "requires local UDP sockets and GStreamer plugins"]
+fn guest_joins_without_namespace_discovery() {
+    guest_joins(PROVIDER);
+}
+
+fn guest_joins(relay: &[&str]) {
+    let setup = setup_relay(relay, &[]);
     let wait_log = |needles: &[&str]| {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !host_log(&setup)
@@ -762,4 +806,132 @@ fn guest_joins_through_the_relay_with_approval_and_permissions() {
     wait_log(&["refused input from session", "Remote", "keyboard and mouse"]);
     wait_log(&["gamepad connected", "pad=4"]);
     assert!(owner.0.try_wait().unwrap().is_none(), "owner session ended");
+}
+
+/// Live, through Cloudflare's public relay (draft-14, no account needed):
+/// pairing through the relay, an end-to-end encrypted session, and presence.
+/// Opt in with `TELEPORT_TEST_CLOUDFLARE=1`; `TELEPORT_TEST_CLOUDFLARE_URL`
+/// picks another relay (e.g. a provisioned draft-16 relay, its token in the
+/// path). The host shows the synthetic test source only.
+#[test]
+#[ignore = "uses the internet: set TELEPORT_TEST_CLOUDFLARE=1"]
+fn cloudflare_relay_pairs_streams_and_reports_presence() {
+    if std::env::var_os("TELEPORT_TEST_CLOUDFLARE").is_none() {
+        eprintln!("skipped: set TELEPORT_TEST_CLOUDFLARE=1 to test through Cloudflare");
+        return;
+    }
+    let url = std::env::var("TELEPORT_TEST_CLOUDFLARE_URL")
+        .unwrap_or_else(|_| "https://draft-14.cloudflare.mediaoverquic.com/".into());
+    // A fresh identity is a fresh namespace on the shared relay.
+    let temp = tempfile::tempdir().unwrap();
+    let host_log = temp.path().join("host.log");
+    let log = std::fs::File::create(&host_log).unwrap();
+    let mut host = Process(
+        teleport()
+            .args(["host", "--source", "test", "--encoder", "software"])
+            .args(["--listen", &free_udp(), "--width", "640", "--pair"])
+            .arg("--identity-dir")
+            .arg(temp.path().join("identity"))
+            .args(["--relay", &url])
+            .env_remove("TELEPORT_RELAY_KEY")
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
+    let read_log = || std::fs::read_to_string(&host_log).unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !read_log().contains("relay pairing open") {
+        assert!(
+            Instant::now() < deadline,
+            "no relay pairing:\n{}",
+            read_log()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let link = read_log()
+        .lines()
+        .find_map(|line| line.strip_prefix("Relay pairing link: "))
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("no relay pairing link")
+        .to_owned();
+    let config = temp.path().join("config");
+    let mut pair = teleport()
+        .args(["pair", "127.0.0.1:9", "--relay", &url])
+        .env("XDG_CONFIG_HOME", &config)
+        .env_remove("TELEPORT_RELAY_KEY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        writeln!(pair.stdin.take().unwrap(), "{link}").unwrap();
+    }
+    let output = pair.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "pairing through Cloudflare failed: {}\nhost log:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        read_log()
+    );
+    let profiles: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(config.join("teleport/profiles.json")).unwrap())
+            .unwrap();
+    let credential = profiles[0]["pairing_file"].as_str().unwrap().to_owned();
+    let output = teleport()
+        .args(["client", "127.0.0.1:9", "--pairing-file", &credential])
+        .args(["--relay", &url, "--route", "relay"])
+        .args(["--headless-frames", "60", "--software-decoder"])
+        .arg("--smoke-input-latency")
+        .env_remove("TELEPORT_RELAY_KEY")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("SMOKE PASS"),
+        "session through Cloudflare failed: {stdout}{}\nhost log:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        read_log()
+    );
+    assert!(stdout.contains("end-to-end encrypted relay session established"));
+    assert!(
+        !stdout.contains("probes=0 "),
+        "no input round trips: {stdout}"
+    );
+    let pairing: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(temp.path().join("identity/pairing.json")).unwrap())
+            .unwrap();
+    let fingerprint = pairing["fingerprint"].as_str().unwrap().to_owned();
+    let presence = || {
+        let output = teleport()
+            .args(["presence", "--relay", &url])
+            .args(["--host-fingerprint", &fingerprint, "--wait", "15"])
+            .env_remove("TELEPORT_RELAY_URL")
+            .env_remove("TELEPORT_RELAY_KEY")
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| ["ONLINE", "OFFLINE", "UNKNOWN"].contains(line))
+            .unwrap_or("none")
+            .to_owned()
+    };
+    assert_eq!(presence(), "ONLINE");
+    host.0.kill().unwrap();
+    host.0.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let state = presence();
+        if state == "OFFLINE" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "still {state} after the host stopped"
+        );
+        std::thread::sleep(Duration::from_secs(2));
+    }
 }

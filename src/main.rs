@@ -8,6 +8,7 @@ mod client;
 mod clipboard;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod congestion;
+mod discovery;
 mod e2e;
 mod ffmpeg;
 mod fullscreen;

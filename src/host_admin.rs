@@ -494,13 +494,13 @@ impl Control {
             let connected = tokio::select! {
                 connected = tokio::time::timeout(
                     Duration::from_secs(10),
-                    crate::relay::connect(&endpoint, &namespace),
+                    crate::relay::connect_host(&endpoint, &namespace),
                 ) => connected,
                 _ = &mut closed => return Ok(()),
             };
             match connected {
                 Ok(Ok(link)) => {
-                    tracing::info!(relay = %endpoint.url, "relay pairing open");
+                    tracing::info!(relay = %endpoint.display_url(), "relay pairing open");
                     let control = Arc::downgrade(&self);
                     let serve = crate::relay_enroll::serve(
                         link.session.clone(),
@@ -1076,6 +1076,7 @@ mod tests {
             versions: Vec::new(),
             key: Some("relay key".into()),
             stun_listen: Some("off".into()),
+            no_namespace_discovery: false,
         }));
         let endpoint = crate::relay::Endpoint {
             url: format!("moqt://{relay_address}").parse()?,
@@ -1104,7 +1105,7 @@ mod tests {
         )
         .await?;
         let namespace = crate::relay::namespace(&pairing.fingerprint)?;
-        let link = crate::relay::connect(&endpoint, &namespace).await?;
+        let link = crate::relay::connect_host(&endpoint, &namespace).await?;
         let _enrollment = tokio::spawn(control.clone().serve_relay(
             link.session.clone(),
             link.incoming.clone(),

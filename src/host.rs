@@ -645,12 +645,19 @@ async fn serve(options: &Options, idle: &mut Option<Capture>) -> Result<()> {
     let mut admissions = tokio::task::JoinSet::new();
     loop {
         while admissions.try_join_next().is_some() {}
+        // A provider relay grants each connection a fixed number of requests:
+        // replace a worn connection once nothing uses it.
+        if relay.as_ref().is_some_and(|(link, _, _)| link.renewable()) {
+            tracing::info!("renewing the relay connection (provider request limit)");
+            relay = None;
+            relay_retry = Instant::now();
+        }
         if let (Some(endpoint), Some(e2e), Some(access)) =
             (&relay_endpoint, &relay_identity, &access)
             && relay.is_none()
             && Instant::now() >= relay_retry
         {
-            match crate::relay::connect(endpoint, &relay_namespace).await {
+            match crate::relay::connect_host(endpoint, &relay_namespace).await {
                 Ok(link) => {
                     tracing::info!(relay = %endpoint.display_url(), namespace = %relay_namespace, "connected to relay; accepting end-to-end encrypted sessions");
                     // Signed "online" statements for launchers (see presence.rs).

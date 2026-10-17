@@ -564,8 +564,8 @@ What is on `main`/this branch, from README, docs and code:
     forward or VPN). (Since 2026-10-16, G1: with a relay, `auto` also hole
     punches a direct path through NATs, using STUN and opt-in NAT-PMP.)
   - Optional E2E-encrypted relay: self-hosted `teleport relay` or a provider
-    (Cloudflare not yet verified). Route `direct`/`relay`/`auto` (2.5 s
-    direct, then relay). Signed presence.
+    (Cloudflare verified live 2026-10-17, docs/relay.md). Route
+    `direct`/`relay`/`auto` (2.5 s direct, then relay). Signed presence.
   - QUIC idle 8 s and keep-alive 1 s, MTU discovery, keyframe on request, 4 s
     safety GOP, RTT/loss-based rate controller (H12). Pointer motion goes as
     latest-wins datagrams.
