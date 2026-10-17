@@ -753,6 +753,15 @@ refresh. Effort M.**
 
 **G10. Encoder quality preset. Effort S.**
 
+- **Status (2026-10-16): implemented** (docs/ffmpeg.md "Encoder presets").
+  `--encoder-preset latency|balanced|quality` on the host (default for its
+  clients) and the client/launcher (per session, in `SelectCodec`, gated on
+  `Desktop.encoder_presets`); F8 shows it. Default stays `latency`. At 1440p60
+  20 Mbps on desktop text, NVENC H.264 `quality` (p6, hq, two-pass) gained
+  3.5 dB PSNR for +5.5 ms per frame; H.265 `quality` (p6, hq) raised SSIM
+  0.987 → 0.992 at half the bits for +10 ms. VA-API levels changed encode
+  time, not quality, on the UHD 630.
+
 - **Why:** Parsec exposes Lowest Latency / Balanced / Highest Quality (QP).
   Teleport is fixed at NVENC `p1`/`ull` (`src/ffmpeg_codec.c:147-152`).
 - **Steps:** add `--quality latency|balanced|quality` mapping to NVENC

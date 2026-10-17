@@ -284,6 +284,25 @@ pub enum EncoderKind {
     Nvidia,
 }
 
+/// Encoder family plus its speed/quality preset (`--encoder-preset`). An
+/// `EncoderKind` alone means the lowest-latency preset.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EncoderChoice {
+    pub kind: EncoderKind,
+    pub preset: crate::protocol::EncoderPreset,
+}
+
+#[cfg(target_os = "linux")]
+impl From<EncoderKind> for EncoderChoice {
+    fn from(kind: EncoderKind) -> Self {
+        Self {
+            kind,
+            preset: Default::default(),
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 const AUTO_ENCODERS: &[EncoderKind] = &[EncoderKind::Nvidia, EncoderKind::Qsv, EncoderKind::Vaapi];
 
@@ -526,14 +545,17 @@ pub fn encoder(
     fps: u32,
     bitrate: u32,
     mut track: moq_net::track::Producer,
-    kind: EncoderKind,
+    kind: impl Into<EncoderChoice>,
     video_format: impl Into<VideoFormat>,
 ) -> Result<Pipeline> {
     let video_format = video_format.into();
     video_format.validate()?;
+    let kind = kind.into();
     if crate::ffmpeg::enabled()? {
         return ffmpeg_media::encoder(source, size, fps, bitrate, track, kind, video_format);
     }
+    // The legacy GStreamer backend has no presets.
+    let kind = kind.kind;
     let codec = video_format.codec;
     let (width, height) = size;
     let kind = select_encoder(kind, width, height, fps, bitrate, video_format)?;

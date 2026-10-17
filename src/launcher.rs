@@ -167,6 +167,13 @@ const RELATIVE_MOUSE: [(&str, &str); 3] = [
     ("Mouse: always relative", "always"),
     ("Mouse: lock by hotkey", "never"),
 ];
+/// `--encoder-preset`; the first keeps the host's choice.
+const ENCODER_PRESETS: [(&str, &str); 4] = [
+    ("Encoder: host default", ""),
+    ("Encoder: lowest latency", "latency"),
+    ("Encoder: balanced", "balanced"),
+    ("Encoder: best quality", "quality"),
+];
 
 #[derive(Default)]
 struct StreamPreferences {
@@ -446,6 +453,7 @@ pub fn run() -> Result<()> {
     let mut stream = StreamPreferences::default();
     let mut codec = 0usize;
     let mut relative_mouse = 0usize;
+    let mut encoder_preset = 0usize;
     let mut hdr = false;
     let mut decoder = DecoderPreference::default();
     let mut clipboard = false;
@@ -989,6 +997,9 @@ pub fn run() -> Result<()> {
                                 if hit(pref_rect(10), x, y) {
                                     relative_mouse = (relative_mouse + 1) % RELATIVE_MOUSE.len();
                                 }
+                                if hit(pref_rect(11), x, y) {
+                                    encoder_preset = (encoder_preset + 1) % ENCODER_PRESETS.len();
+                                }
                                 if hit(pref_rect(3), x, y) {
                                     codec = (codec + 1) % CODECS.len();
                                     if CODECS[codec].1 != "h265" {
@@ -1144,6 +1155,11 @@ pub fn run() -> Result<()> {
                             .arg("--dynamic-range")
                             .arg(if hdr { "hdr10" } else { "sdr" });
                         stream.apply(&mut command);
+                        if !ENCODER_PRESETS[encoder_preset].1.is_empty() {
+                            command
+                                .arg("--encoder-preset")
+                                .arg(ENCODER_PRESETS[encoder_preset].1);
+                        }
                         decoder.apply(&mut command);
                         apply_relay(profile, &mut command)?;
                         if clipboard {
@@ -1606,6 +1622,7 @@ pub fn run() -> Result<()> {
                                 "VSync off (VRR)"
                             },
                             RELATIVE_MOUSE[relative_mouse].0,
+                            ENCODER_PRESETS[encoder_preset].0,
                         ];
                         for (index, label) in labels.into_iter().enumerate() {
                             ui.button(

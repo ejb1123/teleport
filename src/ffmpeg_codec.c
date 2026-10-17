@@ -75,15 +75,42 @@ static int color_frame(AVFrame *frame, int hdr) {
     return 0;
 }
 
+/* Encoder speed/quality preset (parsec-comparison G10). 0 keeps the
+ * low-latency settings chosen per encoder family in tp_codec_open; 1 and 2
+ * trade encode time for quality. None of them adds frame delay: B-frames,
+ * look-ahead and NVENC's output delay stay off. Kept apart from the rate
+ * control options so both can change independently. */
+static void apply_preset(AVDictionary **opts, AVCodecContext *ctx, const char *name, int preset) {
+    if (preset <= 0) return;
+    int quality = preset >= 2;
+    if (strstr(name, "nvenc")) {
+        /* p1/ull -> p4/ull -> p6/hq. H.264 adds quarter-resolution two-pass
+         * (same frame, no look-ahead): +3.5 dB on desktop text. HEVC does
+         * not: with it the RTX 3080 undershot to 3 Mbps at -14 dB. */
+        av_dict_set(opts, "preset", quality ? "p6" : "p4", 0);
+        av_dict_set(opts, "tune", quality ? "hq" : "ull", 0);
+        if (quality && strstr(name, "h264")) av_dict_set(opts, "multipass", "qres", 0);
+    } else if (strstr(name, "vaapi")) {
+        /* Driver quality level (iHD: 1 best .. 7 fastest); unset by default. */
+        ctx->compression_level = quality ? 1 : 4;
+    } else if (strstr(name, "qsv")) {
+        av_dict_set(opts, "preset", quality ? "slower" : "medium", 0);
+    } else if (strstr(name, "libx")) {
+        av_dict_set(opts, "preset", quality ? "veryfast" : "superfast", 0);
+    }
+}
+
 /* name: an encoder name, or decoder device type ("software", "cuda",
  * "vaapi", "qsv", "videotoolbox", optionally "type@device"). output: 0 RGB24,
  * 1 NV12, 2 P010, 3 GPU frame reference (CUDA or VA-API, no download).
  * gpu_input (NVENC, VA-API encoders): also accept DMA-BUF frames
  * (tp_send_dmabuf); NVENC then takes CUDA frames and VA-API opens the first
- * render node with a VA driver, as FFmpeg's default does. */
+ * render node with a VA driver, as FFmpeg's default does.
+ * preset (encoders): 0 lowest latency (the historical settings), 1 balanced,
+ * 2 quality; see apply_preset. */
 TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
                        int width, int height, int fps, int kbps, int output, int gop,
-                       int gpu_input, int *error) {
+                       int gpu_input, int preset, int *error) {
     int result = AVERROR(ENOMEM);
     AVDictionary *opts = NULL;
     const AVCodec *implementation = encoder ? avcodec_find_encoder_by_name(name)
@@ -225,6 +252,7 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
         /* GPU presentation holds the newest frame until it is drawn. */
         if (output == 3) codec->ctx->extra_hw_frames = 3;
     }
+    if (encoder) apply_preset(&opts, codec->ctx, name, preset);
     result = avcodec_open2(codec->ctx, implementation, &opts);
     av_dict_free(&opts);
     if (result < 0) goto fail;

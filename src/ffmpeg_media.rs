@@ -181,6 +181,7 @@ fn config(name: &str, format: VideoFormat, output: i32) -> Config {
         output,
         gop: 0,
         gpu_input: false,
+        preset: Default::default(),
     }
 }
 
@@ -1443,9 +1444,10 @@ pub(super) fn encoder(
     fps: u32,
     bitrate: u32,
     track: moq_net::track::Producer,
-    kind: EncoderKind,
+    choice: impl Into<EncoderChoice>,
     format: VideoFormat,
 ) -> Result<Pipeline> {
+    let EncoderChoice { kind, preset } = choice.into();
     format.validate()?;
     crate::protocol::validate_video_size(size.0, size.1)?;
     // Zero-copy capture needs a DMA-BUF source, an 8-bit stream and an
@@ -1496,6 +1498,7 @@ pub(super) fn encoder(
             // The callback forces IDRs at the session interval (see State::
             // key_interval); this is only a ceiling the encoder never reaches.
             gop: fps.saturating_mul(10).max(1),
+            preset,
             ..config("", format, 1)
         };
         if let Some(cached) = &cached {
@@ -1588,9 +1591,13 @@ fn start(
     );
     let metrics = Arc::new(EncoderMetrics {
         encoder: format!(
-            "ffmpeg:{}{}",
+            "ffmpeg:{}{}{}",
             codec.config.name,
-            if zero_copy { " DMA-BUF zero-copy" } else { "" }
+            if zero_copy { " DMA-BUF zero-copy" } else { "" },
+            match codec.config.preset {
+                crate::protocol::EncoderPreset::Latency => String::new(),
+                preset => format!(", {} preset", preset.label()),
+            }
         ),
         pending: Mutex::default(),
         encode_us: std::sync::atomic::AtomicU64::new(0),

@@ -78,6 +78,10 @@ pub struct Options {
     /// `never` only by Ctrl+Alt+M.
     #[arg(long, value_enum, default_value_t = RelativeMouse::Auto)]
     pub relative_mouse: RelativeMouse,
+    /// Encoder speed/quality trade-off for this session: `latency`,
+    /// `balanced` or `quality`. Default: the host's `--encoder-preset`.
+    #[arg(long, value_enum)]
+    pub encoder_preset: Option<protocol::EncoderPreset>,
     /// Reach the host through this MoQ relay with end-to-end encryption
     /// (e.g. moqt://relay.example:4444). The host must run with the same --relay.
     /// The environment form keeps a provider token out of the process list.
@@ -528,6 +532,7 @@ async fn connect_via(
                 sequence: 0,
                 event: Event::SelectCodec {
                     codec: decision.codec,
+                    encoder_preset: options.encoder_preset.filter(|_| desktop.encoder_presets),
                 },
                 motion: None,
             })?,
@@ -2506,6 +2511,17 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 format!(
                     "Codec                 {}   |   {codec_reason}",
                     desktop.codec.label()
+                ),
+                format!(
+                    "Encoder preset        {}",
+                    if desktop.encoder_presets {
+                        options
+                            .encoder_preset
+                            .unwrap_or(desktop.encoder_preset)
+                            .label()
+                    } else {
+                        "host default (older host)"
+                    }
                 ),
                 format!(
                     "Relative mouse        {}   |   {}",

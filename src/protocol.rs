@@ -27,6 +27,37 @@ pub enum VideoCodec {
     H265,
 }
 
+/// Encoder speed/quality trade-off (parsec-comparison G10). None adds frame
+/// delay; slower presets spend more encode time per frame on quality.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum EncoderPreset {
+    /// Fastest encode (NVENC p1/ull, x264 ultrafast): the historical setting.
+    #[default]
+    Latency,
+    Balanced,
+    Quality,
+}
+
+impl EncoderPreset {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Latency => "lowest latency",
+            Self::Balanced => "balanced",
+            Self::Quality => "quality",
+        }
+    }
+
+    /// `tp_codec_open`'s preset number.
+    pub fn level(self) -> i32 {
+        match self {
+            Self::Latency => 0,
+            Self::Balanced => 1,
+            Self::Quality => 2,
+        }
+    }
+}
+
 /// HDR10 here specifies PQ/BT.2020 limited-range 10-bit video, not mastering metadata.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -184,6 +215,12 @@ pub struct Desktop {
     /// ([`BUTTON_BACK`], [`BUTTON_FORWARD`]); older hosts reject them.
     #[serde(default)]
     pub extra_mouse_buttons: bool,
+    /// Host applies `SelectCodec::encoder_preset`.
+    #[serde(default)]
+    pub encoder_presets: bool,
+    /// The host's preset for clients that do not choose one.
+    #[serde(default)]
+    pub encoder_preset: EncoderPreset,
 }
 
 impl Desktop {
@@ -530,6 +567,11 @@ pub enum Event {
     /// starting video; it overrides the connection's `codec` parameter.
     SelectCodec {
         codec: VideoCodec,
+        /// Encoder preset for this session, only to hosts advertising
+        /// `Desktop::encoder_presets` (older hosts ignore the field); `None`
+        /// keeps the host's `--encoder-preset`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        encoder_preset: Option<EncoderPreset>,
     },
     /// The client's display and stream choices; the host picks the stream
     /// size, rate and bitrate from them ([`negotiate`]) and answers with
@@ -1235,7 +1277,8 @@ mod tests {
         assert!(matches!(
             event,
             Event::SelectCodec {
-                codec: VideoCodec::H265
+                codec: VideoCodec::H265,
+                encoder_preset: None,
             }
         ));
         assert!(event.validate().is_ok() && !event.is_lossy());
@@ -1250,6 +1293,28 @@ mod tests {
             desktop.hardware_codecs,
             [VideoCodec::H264, VideoCodec::H265]
         );
+        // Encoder presets: optional on the wire, old hosts default to none.
+        assert!(!desktop.encoder_presets);
+        assert_eq!(desktop.encoder_preset, EncoderPreset::Latency);
+        let chosen = Event::SelectCodec {
+            codec: VideoCodec::H264,
+            encoder_preset: Some(EncoderPreset::Quality),
+        };
+        let wire = serde_json::to_string(&chosen).unwrap();
+        assert!(wire.contains(r#""encoder_preset":"quality""#), "{wire}");
+        assert!(matches!(
+            serde_json::from_str::<Event>(&wire).unwrap(),
+            Event::SelectCodec {
+                encoder_preset: Some(EncoderPreset::Quality),
+                ..
+            }
+        ));
+        let plain = serde_json::to_string(&Event::SelectCodec {
+            codec: VideoCodec::H264,
+            encoder_preset: None,
+        })
+        .unwrap();
+        assert!(!plain.contains("encoder_preset"), "{plain}");
     }
     #[test]
     fn rumble_updates_are_bounded_and_declared_by_the_client() {

@@ -119,6 +119,11 @@ pub struct Options {
     pub monitor: usize,
     #[arg(long, value_enum, default_value_t = media::EncoderKind::Auto)]
     pub encoder: media::EncoderKind,
+    /// Encoder speed/quality trade-off for clients that do not choose one:
+    /// `latency` (the fastest encode), `balanced` or `quality`. None adds
+    /// frame delay (docs/ffmpeg.md).
+    #[arg(long, value_enum, default_value_t = protocol::EncoderPreset::Latency)]
+    pub encoder_preset: protocol::EncoderPreset,
     /// Disable receiver-feedback bitrate adjustment.
     #[arg(long)]
     pub fixed_bitrate: bool,
@@ -704,7 +709,13 @@ async fn run_session(
     // codec from their connection request, as before.
     let first = tokio::time::timeout(protocol::INPUT_TIMEOUT, events.receiver.recv()).await;
     let chosen_by_client = match first {
-        Ok(Some(Event::SelectCodec { codec })) => {
+        Ok(Some(Event::SelectCodec {
+            codec,
+            encoder_preset,
+        })) => {
+            if let Some(preset) = encoder_preset {
+                options.encoder_preset = preset;
+            }
             ensure!(
                 options.dynamic_range != protocol::DynamicRange::Hdr10
                     || codec == protocol::VideoCodec::H265,
@@ -723,6 +734,7 @@ async fn run_session(
     tracing::info!(
         codec = options.codec.label(),
         chosen_by_client,
+        encoder_preset = options.encoder_preset.label(),
         hardware = ?options.hardware_codecs,
         "session video codec"
     );
@@ -1165,7 +1177,7 @@ async fn run_session(
                         display_pending = true;
                     }
                     // Only the first event chooses (see above); video is running now.
-                    Event::SelectCodec { codec } => ensure!(
+                    Event::SelectCodec { codec, .. } => ensure!(
                         codec == options.codec,
                         "the video codec is chosen before video starts; reconnect to change it"
                     ),
@@ -1376,6 +1388,8 @@ fn desktop_for_monitor(
         codec_selection: true,
         hardware_codecs: options.hardware_codecs.clone(),
         extra_mouse_buttons: true,
+        encoder_presets: true,
+        encoder_preset: options.encoder_preset,
     })
 }
 
@@ -1458,7 +1472,13 @@ fn start_encoder(
     bitrate: u32,
     track: &moq_net::track::Producer,
 ) -> tokio::task::JoinHandle<Result<media::Pipeline>> {
-    let (track, kind) = (track.clone(), options.encoder);
+    let (track, kind) = (
+        track.clone(),
+        media::EncoderChoice {
+            kind: options.encoder,
+            preset: options.encoder_preset,
+        },
+    );
     let format = media::VideoFormat {
         codec: options.codec,
         dynamic_range: options.dynamic_range,
