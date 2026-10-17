@@ -544,7 +544,8 @@ What is on `main`/this branch, from README, docs and code:
     (H10) is deferred.
   - The SDL canvas is created without `present_vsync`
     (`src/client.rs:765`, `src/multi_display.rs:156`); there is no VSync
-    setting.
+    setting. (Since R7: adaptive vsync by default and `--vsync`; since
+    2026-10-17, G4: `--pacing latency|smooth`.)
 - **Codecs:** H.264 or H.265. (Since 2026-10-16, G5: `--codec auto`, the
   default, picks H.265 when both ends have it in hardware.) HDR10: HEVC Main10 on the experimental patched-KWin
   path to a Mac Metal/EDR client (docs/hdr.md). No AV1, no 4:4:4.
@@ -621,7 +622,8 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Zero-copy decode→present | Windows D3D11 experimental | CUDA→GL, VA-API→EGL; Mac pending | Parity / ahead on Linux | |
 | FPS | 60 default, 240 possible but "not recommended" | 120 max, 180/240 WIP | WIP | |
 | Resolution matching | Changes host mode or VDD | Scales stream; matching WIP | WIP | Teleport's scaling is a bandwidth advantage |
-| VSync toggle | Yes (default on) | No setting | Missing (VRR WIP) | |
+| VSync toggle | Yes (default on) | `--vsync` / launcher; adaptive by default | Parity | G4 |
+| Frame pacing mode | None documented | Lowest latency or smooth (adaptive jitter buffer), 2026-10-17 | **Teleport ahead** | G4 |
 | VRR | None (advises disabling G-Sync) | WIP | WIP | Chance to lead |
 | Quality preset (QP / multi-pass) | Yes | Bitrate only | Missing | S |
 | Constant FPS / static refinement | Yes | Keepalive frame only | Missing | |
@@ -802,6 +804,17 @@ blocked on Mac hardware.**
 **G4. Presentation controls: VSync toggle and frame-pacing mode. Effort S.
 VRR itself is WIP.**
 
+- **Status (2026-10-17): implemented** (review tracker R7 for VSync, R15
+  for pacing). `--vsync` (launcher **VSync on**) and adaptive
+  late-tearing presentation by default were already in. New: `--pacing
+  latency|smooth` (launcher **Pacing**), default lowest latency. Smooth
+  holds frames in an adaptive jitter buffer (95th percentile of their
+  lateness, at most 3 frames or 50 ms) and shows them at their capture
+  cadence. On the netem Wi-Fi-like profile (720p30) it brings the p95
+  frame time from ~50 to ~34 ms (standard deviation 13–14 → 9–10 ms) for
+  +17–22 ms p50 latency. F8 shows the mode, buffer and frame-time spread.
+  Open: per-present late/dropped stats against vsync on real displays,
+  VRR verification.
 - **Why:** Parsec ships VSync on by default with an off switch (VSYNC).
   Moonlight has pacing modes (a fork exposes a VRR pacing buffer of 2.5, 4.5 or
   6 ms; https://newreleases.io/project/github/Nonary/moonlight-qt/release/v6.1.0-vrr18,

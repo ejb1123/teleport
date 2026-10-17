@@ -147,6 +147,12 @@ pub struct Options {
     /// frames are shown as they arrive, which variable-refresh displays follow.
     #[arg(long)]
     pub vsync: bool,
+    /// Frame pacing: `latency` shows each frame as soon as it is decoded;
+    /// `smooth` holds frames in a small adaptive buffer (at most 3 frames
+    /// or 50 ms) and shows them as evenly as they were captured. Smooth
+    /// needs a host that sends frame timing.
+    #[arg(long, value_enum, default_value_t = crate::pacing::Pacing::Latency)]
+    pub pacing: crate::pacing::Pacing,
     /// Headless runs: pretend to show video on a WxH display at R mHz
     /// (`1280x720@60000`); a second one is switched to halfway through.
     #[arg(long, hide = true, requires = "headless_frames", value_parser = stream_settings::parse_display)]
@@ -1302,6 +1308,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let frame_timing = desktop.frame_timing;
     let mut clock = crate::stats::ClockSync::default();
     let mut e2e_latency = crate::stats::LatencyStats::default();
+    // G4: frames go through the pacer between the decoder and the screen.
+    // Smooth pacing needs the host's capture times.
+    let pacing = if frame_timing {
+        options.pacing
+    } else {
+        crate::pacing::Pacing::Latency
+    };
+    let mut pacer = crate::pacing::Pacer::new(pacing);
+    let mut pace = crate::pacing::PaceStats::default();
     let mut network = Network(runtime.spawn(async move {
         let mut ssh_agent = link.ssh_agent;
         let _origin = link._origin;
@@ -1456,6 +1471,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                             .stream_fps
                             .store(desktop.fps.into(), Ordering::Relaxed);
                         *image.lock().unwrap() = None;
+                        pacer.clear();
                         initial_updates = initial_updates.saturating_sub(1);
                         if initial_updates == 0
                             && configuration_matches(&desktop, requested_configuration)
@@ -1500,7 +1516,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             }
             // Never hold the decoder's latest-frame lock during rendering or
             // subsequent network work: it would backpressure raw frame delivery.
-            let next_frame = { image.lock().unwrap().take() };
+            let decoded = { image.lock().unwrap().take() };
+            if let Some(frame) = decoded {
+                let capture = frame.latency.map(|latency| latency.host.capture_us);
+                pacer.push(frame, Instant::now(), capture, desktop.fps);
+            }
+            let next_frame = pacer.pop(Instant::now()).map(|(frame, held)| {
+                pace.presented(Instant::now(), held);
+                frame
+            });
             if let Some(frame) = next_frame.filter(|frame| {
                 initial_ready
                     && frame.decoder_recovery
@@ -1706,7 +1730,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     tracing::warn!(%text, "session warning");
                 }
             }
-            std::thread::sleep(Duration::from_millis(2));
+            // Wake for the next paced frame on time.
+            std::thread::sleep(pacer.next_due().map_or(Duration::from_millis(2), |due| {
+                due.saturating_duration_since(Instant::now())
+                    .min(Duration::from_millis(2))
+            }));
         }
         ensure!(
             !options.smoke_switch_monitor || switched,
@@ -1744,6 +1772,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let stage = |index: usize| format!("{}/{}", stages[index].0, stages[index].1);
         let (clock_offset_us, clock_rtt_us) = clock.offset().unwrap_or_default();
         let (clock_checked, clock_error_p50_us, clock_error_max_us) = e2e_latency.clock_error();
+        let (frame_time_mean_us, frame_time_sd_us, frame_time_p95_us) = pace.frame_time_us();
+        let (paced_held_p50_us, paced_held_p95_us) = pace.held_us();
         let (flash_presses, flash_p50_us, flash_p95_us) =
             flash.as_ref().map_or((0, 0, 0), FlashTimer::summary);
         let span_ms = first_frame_at
@@ -1785,6 +1815,14 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             flash_p50_us,
             flash_p95_us,
             warnings = warning_count,
+            pacing = ?pacer.mode(),
+            frame_time_mean_us,
+            frame_time_sd_us,
+            frame_time_p95_us,
+            paced_held_p50_us,
+            paced_held_p95_us,
+            paced_late = pacer.late,
+            paced_dropped = pacer.dropped,
             probes = probe_rtts.len(),
             probe_p50_us,
             probe_p95_us,
@@ -1927,6 +1965,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut bitrate_sample = (Instant::now(), 0_u64);
     // Refreshed with the stats lines, once a second.
     let mut graph_labels: [String; 3] = Default::default();
+    // How long the frame drawn next waited in the pacer.
+    let mut frame_held = Duration::ZERO;
     'running: loop {
         present_timer.iterations += 1;
         WAKE_QUEUED.store(false, Ordering::Release);
@@ -2103,6 +2143,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     );
                     wheel = WheelAccumulator::default();
                     *image.lock().unwrap() = None;
+                    pacer.clear();
                     hdr_frame = None;
                     hdr_frame_pending = false;
                     initial_updates = initial_updates.saturating_sub(1);
@@ -2500,7 +2541,17 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             notice = text;
             redraw = true;
         }
-        let next_frame = { image.lock().unwrap().take() };
+        // Decoded frames go through the pacer (G4): at once for lowest
+        // latency, or held until their even-cadence slot.
+        let decoded = { image.lock().unwrap().take() };
+        if let Some(frame) = decoded {
+            let capture = frame.latency.map(|latency| latency.host.capture_us);
+            pacer.push(frame, Instant::now(), capture, desktop.fps);
+        }
+        let next_frame = pacer.pop(Instant::now()).map(|(frame, held)| {
+            frame_held = held;
+            frame
+        });
         if let Some(mut frame) = next_frame.filter(|frame| {
             frame.decoder_recovery
                 == stream_stats
@@ -2606,6 +2657,22 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 IDLE_WAIT
             }
             .min(Duration::from_secs(1).saturating_sub(stats.elapsed()));
+            // A paced frame due within ~2 ms: sleep exactly instead of
+            // SDL's millisecond wait, so the cadence stays even.
+            if let Some(due) = pacer.next_due() {
+                let until = due.saturating_duration_since(Instant::now());
+                if until < Duration::from_millis(2) {
+                    std::thread::sleep(until);
+                    continue;
+                }
+                if until < wait {
+                    let wait_ms = (until.as_micros() / 1000) as i32 - 1;
+                    unsafe {
+                        sdl2::sys::SDL_WaitEventTimeout(std::ptr::null_mut(), wait_ms.max(1));
+                    }
+                    continue;
+                }
+            }
             let wait_ms = wait.as_micros().div_ceil(1000).clamp(1, 1000) as i32;
             unsafe {
                 sdl2::sys::SDL_WaitEventTimeout(std::ptr::null_mut(), wait_ms);
@@ -2785,6 +2852,24 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         mhz => format!("{} Hz", protocol::refresh_hz(mhz)),
                     }
                 ),
+                {
+                    let (_, deviation, _) = pace.frame_time_us();
+                    let detail = if pacer.mode() != options.pacing {
+                        " (smooth needs an updated host)".to_owned()
+                    } else if pacer.mode() == crate::pacing::Pacing::Smooth {
+                        format!(
+                            ", buffer {:.1} ms",
+                            pacer.buffer_us(desktop.fps) as f64 / 1000.0
+                        )
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        "Frame pacing          {}{detail}   |   frame time ±{:.1} ms",
+                        pacer.mode().label(),
+                        deviation as f64 / 1000.0
+                    )
+                },
                 format!("Video payload (main)  {mbps:.2} Mbps (not wire bitrate)"),
                 format!(
                     "Request / accepted cap {} / {:.2} Mbps",
@@ -3251,6 +3336,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             let now = Instant::now();
             let stages = frame_latency.and_then(|frame| e2e_latency.presented(&frame, now, &clock));
             health.frame(now, frame_latency.as_ref());
+            pace.presented(now, frame_held);
             if let Some(last) = last_video_present {
                 graph.frame(
                     now.saturating_duration_since(last).as_secs_f32() * 1000.0,
@@ -3279,6 +3365,19 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     }
     present_timer.log();
     log_end_to_end(&e2e_latency, &clock);
+    let (frame_time_mean_us, frame_time_sd_us, frame_time_p95_us) = pace.frame_time_us();
+    let (held_p50_us, held_p95_us) = pace.held_us();
+    tracing::info!(
+        pacing = ?pacer.mode(),
+        frame_time_mean_us,
+        frame_time_sd_us,
+        frame_time_p95_us,
+        held_p50_us,
+        held_p95_us,
+        late = pacer.late,
+        dropped = pacer.dropped,
+        "frame pacing summary"
+    );
     let _ = events.try_send(Event::ReleaseAll);
     // Disconnect also triggers host-side release of every held key/button.
     Ok(reconnect)

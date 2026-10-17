@@ -233,7 +233,10 @@ not in it; `teleport host --source test --flash-on-input` and a photodiode
 or high-speed camera time input to photon. F8 opens with a rolling graph of
 frame time, latency and bitrate, and short warnings appear over the video
 when the network, decoder or host degrades (`--no-warnings` or the
-launcher's **Warnings off** hides them). See
+launcher's **Warnings off** hides them). `--pacing smooth` (launcher
+**Pacing: smooth**) trades a little latency (a buffer of at most 3 frames
+or 50 ms) for frames shown at the even cadence they were captured; the
+default shows each frame as soon as it is decoded. See
 [performance diagnostics](docs/performance.md).
 
 Clipboard transfers are explicit text-only actions, limited to 64 KiB. Enable

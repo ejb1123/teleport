@@ -196,3 +196,29 @@ warning is also logged (`session warning`), including in headless runs, so
 F8 starts with a rolling graph of the last 240 presented frames: frame time
 (present to present), capture→present latency (hosts with frame timing) and
 video bitrate in quarter seconds. The labels show the window's mean.
+
+## Frame pacing
+
+`--pacing latency` (the default; launcher **Pacing: lowest latency**) shows
+each frame the moment it is decoded. On a jittery link frames then reach
+the screen unevenly, even though the host captured them evenly.
+
+`--pacing smooth` (launcher **Pacing: smooth**) puts a small jitter buffer
+between the decoder and the screen. For every frame it knows the host's
+capture time (frame timing, see above) and when the frame was decoded here;
+the difference minus the fastest recent one is that frame's lateness. The
+buffer is the 95th percentile of that lateness over the last 120 frames,
+capped at three frame intervals and 50 ms. Each frame is shown at its
+capture time plus the fastest transit plus the buffer, so frames come out
+at the cadence they were captured, whatever the stream's rate. A frame that
+arrives after its slot is shown at once and counted as late. The render
+loop sleeps until the next slot (sub-millisecond, not SDL's 1 ms wait).
+Smooth pacing needs a host with frame timing; with older hosts it falls
+back to lowest latency and F8 says so. It applies to the main window, not
+to extra monitor windows, and it works with or without `--vsync`.
+
+F8 shows the mode, the current buffer and the standard deviation of frame
+times (present to present). Window close logs a `frame pacing summary`;
+headless runs report `frame_time_*_us` and `paced_held_*_us`, which
+`tests/network.rs` prints as `PACE` lines (`wifi_like_link` against
+`wifi_like_link_with_smooth_pacing`).
