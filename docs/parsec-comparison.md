@@ -743,6 +743,15 @@ refresh. Effort M.**
 
 **G9. Static-scene refinement ("Constant FPS" equivalent). Effort S.**
 
+- **Status (2026-10-16): implemented** (docs/ffmpeg.md "Static-scene
+  refinement"), as a burst of 8 repeated frames 200 ms after the screen
+  stops rather than a low-QP frame: per-frame QP or bitrate boosts gained
+  little (VA-API, x264) or forced an IDR (NVENC). At 1440p60 5 Mbps on
+  NVENC the still frame gains 1.6 dB (H.264) / 3.9 dB (H.265) within
+  ~130 ms for 95 kB, what the keepalive alone takes two seconds to reach.
+  Only below 0.05 bits per pixel; not on Intel VA-API/Quick Sync, where
+  repeats did not refine. Not verified on a real still KDE desktop.
+
 - **Why:** Parsec offers Constant FPS because damage-driven capture leaves the
   last, motion-quality frame on screen (ADV, QUAL). Teleport's capture is also
   damage-driven, with only a 250 ms keepalive.

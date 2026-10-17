@@ -96,6 +96,45 @@ RTX 3080 and Intel UHD 630, debug test build, load average 9-11):
 - x264: `balanced` is the sweet spot (+4.8 dB for +4.5 ms).
 - Not measured: Quick Sync (no working runtime here), AMD, real games.
 
+## Static-scene refinement
+
+Capture is damage-driven, so when the screen stops the last frame stays at
+motion quality; only the 250 ms capture keepalive repeats it, and each
+repeat (a P-frame at the frame budget) sharpens it a little. Once the screen
+has been still for 200 ms (the first keepalive repeat), the encoder thread
+encodes the still frame 8 more times back to back, then waits for the next
+change. The burst stops as soon as a new frame is captured (the capture
+queue is checked before each repeat), so a change waits at most one encode.
+Repeats are ordinary P-frames at the frame budget: the burst spends what the
+idle link would have carried (~133 ms of the configured bitrate).
+
+- A frame counts as unchanged when it is a keepalive repeat: zero-copy
+  capture compares the memory address and the compositor's frame sequence
+  (no reference is held; holding the compositor's buffer starved capture),
+  CPU capture a hash of every fourth row.
+- Only below 0.05 bits per pixel and frame (e.g. under ~11 Mbps at 1440p60):
+  above, the still frame is already sharp. Not on VA-API or Quick Sync:
+  repeats did not change the picture on the UHD 630.
+
+Measured (`ffmpeg::quality::static_refinement_burst`, desktop text at
+2560x1440 60 FPS, NVENC on the RTX 3080, load average 4-6). PSNR of the still
+frame after the first keepalive, after the 8-frame burst (~130 ms later), and
+two seconds later:
+
+| Encoder, bitrate | Keepalive only | Burst | +2 s without burst | +2 s with burst | Burst cost |
+| --- | --- | --- | --- | --- | --- |
+| h264_nvenc 5 Mbps | 25.64 dB | 27.24 dB | 27.24 dB | 29.04 dB | 95 kB |
+| hevc_nvenc 5 Mbps | 28.63 dB | 32.51 dB | 32.51 dB | 36.27 dB | 95 kB |
+| libx264 5 Mbps | 14.05 dB | 14.91 dB | 14.97 dB | 15.85 dB | 45 kB |
+| h264_nvenc 20 Mbps (not refined) | 50.05 dB | 50.25 dB | 50.25 dB | 50.25 dB | 375 kB |
+
+The burst reaches in ~130 ms what keepalives alone reach in two seconds, and
+the picture keeps improving from there. Rejected (docs/review-2026-10.md):
+a per-frame quality boost instead of repeats (VA-API region-of-interest QP
+offsets: +0.2 dB on H.264, a worse frame at -18 QP; libx264 bitrate and VBV
+boost: under +1 dB; NVENC bitrate boost: FFmpeg turns it into an IDR, which
+lost 8-12 dB).
+
 ## Important limits
 
 **Zero-copy on Linux with NVIDIA (2026-10-16):** when the session window uses

@@ -260,3 +260,56 @@ fn static_repeats_baseline() -> Result<()> {
     }
     Ok(())
 }
+
+/// G9: what a refinement burst buys. Scrolling stops; the first keepalive
+/// repeat (250 ms later) is followed by `burst` repeats back to back. Prints
+/// quality after the keepalive alone and after the burst, the burst's
+/// bytes, and the quality the keepalives alone reach two seconds later.
+/// `TELEPORT_TEST_KBPS` overrides 20 Mbps.
+#[test]
+#[ignore = "measurement; TELEPORT_TEST_HARDWARE=1 adds NVENC and VA-API"]
+fn static_refinement_burst() -> Result<()> {
+    const MOVING: u64 = 60;
+    let kbps = std::env::var("TELEPORT_TEST_KBPS")
+        .ok()
+        .and_then(|kbps| kbps.parse().ok())
+        .unwrap_or(KBPS);
+    let page = page(HEIGHT + MOVING as usize * 3);
+    let still = frame(&page, (MOVING as usize - 1) * 3);
+    for name in encoders() {
+        for burst in [0u64, 4, 8] {
+            let mut pair = Pair::open_at(name, EncoderPreset::Latency, kbps)?;
+            for index in 0..MOVING {
+                pair.round_trip(&frame(&page, index as usize * 3), index)?;
+            }
+            let mut pts = MOVING + 14;
+            let mut bytes = 0;
+            let mut last = None;
+            // Keepalive, burst, then keepalives for two seconds.
+            let schedule = std::iter::once(15)
+                .chain(std::iter::repeat_n(1, burst as usize))
+                .chain(std::iter::repeat_n(15, 8));
+            let mut line = format!("BURST {name} {kbps} kbps burst {burst}:");
+            for (step, gap) in schedule.enumerate() {
+                pts += gap;
+                let encoded = pair.round_trip(&still, pts)?;
+                if step <= burst as usize {
+                    bytes += encoded.bytes;
+                }
+                for (_, image) in encoded.decoded {
+                    last = Some(luma_quality(&still, &image));
+                }
+                if (step == 0 || step == burst as usize)
+                    && let Some((psnr, ssim)) = last
+                {
+                    line += &format!(" | after {step} {psnr:.2} dB {ssim:.4}");
+                }
+            }
+            if let Some((psnr, ssim)) = last {
+                line += &format!(" | +2 s {psnr:.2} dB {ssim:.4} | burst {} kB", bytes / 1000);
+            }
+            eprintln!("{line}");
+        }
+    }
+    Ok(())
+}

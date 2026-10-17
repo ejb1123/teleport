@@ -268,6 +268,67 @@ mod tests {
         Ok(())
     }
 
+    /// G9: a still screen gets one refinement burst after it settles, a
+    /// moving one none; high bitrates and Intel encoders are left alone.
+    #[tokio::test]
+    #[ignore = "requires GStreamer capture plugins; codecs are direct FFmpeg"]
+    async fn still_screen_is_refined_once_at_low_bitrate() -> Result<()> {
+        gst::init()?;
+        // 640x360 at 30 FPS and 250 kbit/s: 0.036 bits per pixel.
+        let run = |pattern: &str| -> Result<u64> {
+            let before = REFINED.load(Ordering::Relaxed);
+            let encode = encoder(
+                &format!("videotestsrc is-live=true pattern={pattern}"),
+                (640, 360),
+                30,
+                250,
+                moq_net::broadcast::Info::new()
+                    .produce()
+                    .create_track(VideoCodec::H264.track(), None)?,
+                EncoderKind::Software,
+                VideoCodec::H264.into(),
+            )?;
+            std::thread::sleep(Duration::from_millis(1200));
+            encode.error()?;
+            drop(encode);
+            Ok(REFINED.load(Ordering::Relaxed) - before)
+        };
+        let moving = run("ball")?;
+        // (smpte has a noise patch, so it never stands still.)
+        let still = run("colors")?;
+        eprintln!("refinement frames: moving {moving}, still {still}");
+        ensure!(moving == 0, "a moving screen was refined");
+        ensure!(
+            (1..=u64::from(REFINE_FRAMES)).contains(&still),
+            "a still screen got {still} refinement frames"
+        );
+        let config = |name: &str, kbps| Config {
+            encoder: true,
+            name: name.into(),
+            width: 2560,
+            height: 1440,
+            fps: 60,
+            kbps,
+            ..config("", VideoCodec::H264.into(), 1)
+        };
+        let due = |config: &Config| {
+            let mut refiner = Refiner::new();
+            refiner.changed_at -= REFINE_AFTER;
+            refiner.due(true, config)
+        };
+        assert!(due(&config("h264_nvenc", 5000)));
+        assert!(!due(&config("h264_nvenc", 20_000)));
+        assert!(!due(&config("h264_vaapi", 5000)));
+        let mut refiner = Refiner::new();
+        refiner.changed_at -= REFINE_AFTER;
+        assert!(refiner.due(true, &config("libx264", 5000)));
+        assert!(
+            !refiner.due(true, &config("libx264", 5000)),
+            "refined twice"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     #[ignore = "requires GStreamer capture plugins; codecs are direct FFmpeg"]
     async fn direct_pipeline_bitrate_reopen_reset_and_generation() -> Result<()> {
@@ -759,7 +820,11 @@ mod tests {
             &capture.pipeline_source(),
             size,
             fps,
-            crate::protocol::auto_bitrate(size.0, size.1, fps),
+            // TELEPORT_BENCH_KBPS: e.g. 5000 to see refinement (G9).
+            std::env::var("TELEPORT_BENCH_KBPS")
+                .ok()
+                .and_then(|kbps| kbps.parse().ok())
+                .unwrap_or_else(|| crate::protocol::auto_bitrate(size.0, size.1, fps)),
             moq_net::broadcast::Info::new()
                 .produce()
                 .create_track(VideoCodec::H264.track(), None)?,
@@ -767,6 +832,7 @@ mod tests {
             VideoCodec::H264.into(),
         )?;
         *PIPELINE_HOOK.lock().unwrap() = None;
+        let refined = REFINED.load(Ordering::Relaxed);
         let metrics = encode.encoder_metrics()?;
         tokio::time::sleep(Duration::from_millis(500)).await;
         if let Some(caps) = source
@@ -801,6 +867,10 @@ mod tests {
             (cpu_after - cpu_before).as_secs_f64() * 1000.0 / frames as f64,
             per_frame(after.3 - before.3),
             per_frame(after.1 - before.1),
+        );
+        eprintln!(
+            "REFINED {} frames (still-screen refinement)",
+            REFINED.load(Ordering::Relaxed) - refined
         );
         drop(encode);
         capture.close().await;
@@ -1253,6 +1323,104 @@ static ZERO_COPY_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 #[cfg(target_os = "linux")]
 const DMABUF_VERIFY: Duration = Duration::from_secs(2);
 
+/// Static-scene refinement (parsec-comparison G9): once the screen has been
+/// still this long (the first capture keepalive, 250 ms after the last
+/// change, qualifies), the still frame is encoded again back to back...
+#[cfg(target_os = "linux")]
+const REFINE_AFTER: Duration = Duration::from_millis(200);
+/// ...this many times. Each repeat is an ordinary P-frame at the frame
+/// budget, so the burst spends what the idle link would have carried, and
+/// stops at once when a new frame is captured.
+#[cfg(target_os = "linux")]
+const REFINE_FRAMES: u32 = 8;
+/// Only below this many bits per pixel and frame: above it the still frame
+/// is already sharp (NVENC: ~50 dB at 1440p60 20 Mbps, where a burst bought
+/// 0.2 dB for 375 kB).
+#[cfg(target_os = "linux")]
+const REFINE_MAX_BITS_PER_PIXEL: f64 = 0.05;
+
+/// Tests: refinement frames encoded by this process.
+#[cfg(test)]
+static REFINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Tracks whether captured frames change, to refine a still screen once.
+#[cfg(target_os = "linux")]
+struct Refiner {
+    /// Zero-copy capture: the previous frame's memory address and buffer
+    /// offset (pipewiresrc: the compositor's frame sequence). PipeWire
+    /// keepalive repeats (and the cursor probe's) share both. No reference
+    /// is kept: holding the compositor's buffer starved capture (KWin
+    /// delivered 6 instead of ~260 frames in 5 s).
+    last_memory: Option<(usize, u64)>,
+    /// CPU capture: a hash of every fourth row of the previous frame. A
+    /// change it misses only costs a needless refinement.
+    last_hash: u64,
+    changed_at: Instant,
+    refined: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl Refiner {
+    fn new() -> Self {
+        Self {
+            last_memory: None,
+            last_hash: 0,
+            changed_at: Instant::now(),
+            refined: false,
+        }
+    }
+
+    /// Whether this frame (`raw` for CPU capture) repeats the previous one.
+    fn unchanged(&mut self, sample: &gst::Sample, raw: &[u8], width: usize) -> bool {
+        let unchanged = if raw.is_empty() {
+            let Some(frame) = sample
+                .buffer()
+                .filter(|buffer| buffer.n_memory() > 0)
+                .map(|buffer| (buffer.peek_memory(0).as_ptr() as usize, buffer.offset()))
+            else {
+                return false;
+            };
+            let same = self.last_memory == Some(frame);
+            self.last_memory = Some(frame);
+            same
+        } else {
+            let hash = raw
+                .chunks(width.max(1))
+                .step_by(4)
+                .flat_map(|row| row.chunks(8))
+                .fold(0xcbf2_9ce4_8422_2325_u64, |hash, word| {
+                    let mut bytes = [0; 8];
+                    bytes[..word.len()].copy_from_slice(word);
+                    (hash ^ u64::from_ne_bytes(bytes)).wrapping_mul(0x0100_0000_01b3)
+                });
+            let same = hash == self.last_hash;
+            self.last_hash = hash;
+            same
+        };
+        if !unchanged {
+            self.changed_at = Instant::now();
+            self.refined = false;
+        }
+        unchanged
+    }
+
+    /// Whether to refine now: still for `REFINE_AFTER`, not yet refined, an
+    /// encoder that gains from repeats (Intel's VA-API and Quick Sync did
+    /// not, see docs/ffmpeg.md) and a low bitrate for the frame size.
+    fn due(&mut self, unchanged: bool, config: &Config) -> bool {
+        let bits_per_pixel = f64::from(config.kbps) * 1000.0
+            / (f64::from(config.width) * f64::from(config.height) * f64::from(config.fps.max(1)));
+        let due = unchanged
+            && !self.refined
+            && self.changed_at.elapsed() >= REFINE_AFTER
+            && !config.name.contains("vaapi")
+            && !config.name.contains("qsv")
+            && bits_per_pixel < REFINE_MAX_BITS_PER_PIXEL;
+        self.refined |= due;
+        due
+    }
+}
+
 /// RGB DRM formats offered for DMA-BUF capture (KWin, Mutter and wlroots
 /// share 8-bit desktops as one of these).
 #[cfg(target_os = "linux")]
@@ -1619,7 +1787,7 @@ fn start(
     // capture. Rate-limit before converting so dropped frames cost nothing.
     // CPU capture then converts and scales in one multithreaded pass; DMA-BUF
     // capture leaves both to the encoder's GPU.
-    let queue = "queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! videorate drop-only=true";
+    let queue = "queue name=capture_queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! videorate drop-only=true";
     let description = if zero_copy {
         format!(
             "{source} ! {queue} ! video/x-raw(memory:DMABuf),framerate={fps}/1 ! appsink name=captured sync=false max-buffers=1 drop=false"
@@ -1673,6 +1841,12 @@ fn start(
     let mut since_key = u32::MAX;
     // When each pending frame was captured (its running-time timestamp).
     let mut captured: BTreeMap<u64, Instant> = BTreeMap::new();
+    // Static-scene refinement (G9); a frame waiting here ends a burst.
+    let mut refiner = Refiner::new();
+    let capture_queue = pipeline
+        .0
+        .by_name("capture_queue")
+        .map(|queue| queue.downgrade());
     sink.set_callbacks(
         gstreamer_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -1730,6 +1904,7 @@ fn start(
                             }
                         }
                     }
+                    let unchanged = refiner.unchanged(&sample, &raw, size.0 as usize);
                     let start = Instant::now();
                     let prepare_us = start.duration_since(pulled).as_micros() as u64;
                     let mut codec = state.codec.lock().unwrap();
@@ -1761,7 +1936,7 @@ fn start(
                         Some(dmabuf) => codec.submit_dmabuf(dmabuf, frame_id, force_key),
                         None => codec.submit_frame(&raw, frame_id, force_key),
                     };
-                    drop(sample);
+                    // The sample stays alive for a refinement burst below.
                     let encoded = submitted.and_then(|()| {
                         while let Some(packet) = codec.receive()? {
                             packets.push(packet);
@@ -1836,6 +2011,57 @@ fn start(
                             let _ = tx.send(Ok(()));
                         }
                     }
+                    // G9: the screen settled; encode the still frame again
+                    // a few times so the encoder refines it with the bits
+                    // an idle link would not use. A new capture ends it.
+                    if ready_tx.is_none() && refiner.due(unchanged, &codec.config) {
+                        let mut repeats = 0;
+                        while repeats < REFINE_FRAMES
+                            && !capture_queue
+                                .as_ref()
+                                .and_then(|queue| queue.upgrade())
+                                .is_some_and(|queue| {
+                                    queue.property::<u32>("current-level-buffers") > 0
+                                })
+                        {
+                            frame_id += 1;
+                            since_key = since_key.saturating_add(1);
+                            let submitted = match &dmabuf {
+                                Some(dmabuf) => codec.submit_dmabuf(dmabuf, frame_id, false),
+                                None => codec.submit_frame(&raw, frame_id, false),
+                            };
+                            let mut packets = Vec::new();
+                            if let Err(error) = submitted.and_then(|()| {
+                                while let Some(packet) = codec.receive()? {
+                                    packets.push(packet);
+                                }
+                                Ok(())
+                            }) {
+                                tracing::debug!(%error, "refinement frame failed; stopping the burst");
+                                break;
+                            }
+                            for packet in packets {
+                                if packet.key {
+                                    since_key = 1;
+                                    if let Some(mut old) = group.take() {
+                                        let _ = old.finish();
+                                    }
+                                    group = Some(track.append_group()?);
+                                }
+                                if let Some(group) = &mut group {
+                                    group.write_frame(
+                                        moq_net::Timestamp::now(),
+                                        bytes::Bytes::from(packet.bytes),
+                                    )?;
+                                }
+                            }
+                            repeats += 1;
+                        }
+                        #[cfg(test)]
+                        REFINED.fetch_add(u64::from(repeats), Ordering::Relaxed);
+                        tracing::debug!(repeats, "refined the still frame");
+                    }
+                    drop(sample);
                     Ok(())
                 };
                 process().map(|()| gst::FlowSuccess::Ok).map_err(|error| {

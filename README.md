@@ -195,7 +195,9 @@ wins. Stats (F8) shows the codec and why it was chosen.
 the client; launcher **Encoder:**) trades host encode time for quality without
 adding frame delay; `latency` is the default. See
 [encoder presets](docs/ffmpeg.md#encoder-presets) for what each maps to and
-measurements.
+measurements. On low-bitrate links the host sharpens a still screen with a
+short burst of repeated frames 200 ms after it stops changing
+([static-scene refinement](docs/ffmpeg.md#static-scene-refinement)).
 `--width match --fps match --bitrate auto` negotiate as above. `--width 0` means native; a positive width requests scaling, with a supported
 ceiling of 7680 pixels wide, 8192 high and 33,554,432 total pixels. Actual encoder
 hardware may have lower limits. Host CLI defaults remain 1280 wide for older
