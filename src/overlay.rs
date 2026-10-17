@@ -431,9 +431,300 @@ impl GuestPanel {
     }
 }
 
+use sdl2::rect::Rect;
+
+/// F8 line height, and the panel's padding (title margin and bottom).
+pub const STATS_LINE: u32 = 24;
+pub const STATS_PADDING: u32 = 28;
+/// Overlay row height of the warnings, guest and toast panels.
+pub const PANEL_LINE: u32 = 26;
+
+/// Lines on F8's first page (the rest are on the second): what a stream
+/// looks like now. Matched by label prefix; end-to-end stage lines start
+/// with two spaces.
+const SUMMARY: &[&str] = &[
+    "Capture to present",
+    "  ",
+    "Video  ",
+    "Stream ",
+    "Network step-down",
+    "Path ",
+    "Control round trip",
+    "Presented ",
+    "Video payload",
+    "Frame pacing",
+    "Local display",
+    "Display refreshes",
+    "HDR display headroom",
+];
+
+/// F8 pages: 1 summary (with the graph), 2 session, 3 pipeline; title first. `lines`
+/// is the full list, its title first.
+pub fn stats_page(lines: &[String], page: u8, captured: bool) -> Vec<String> {
+    let summary = |line: &String| SUMMARY.iter().any(|prefix| line.starts_with(prefix));
+    let key = if captured { "Stats" } else { "F8" };
+    let next = if page < STATS_PAGES { "more" } else { "hide" };
+    let title = format!(
+        "STATS FOR NERDS  {page}/{STATS_PAGES}{:>44}",
+        format!("{key}: {next}")
+    );
+    // Details: the session (page 2), then the video pipeline (page 3).
+    let mut pipeline = false;
+    std::iter::once(title)
+        .chain(
+            lines
+                .iter()
+                .skip(1)
+                .filter(|line| {
+                    pipeline |= line.starts_with(PIPELINE_START);
+                    match page {
+                        1 => summary(line),
+                        2 => !summary(line) && !pipeline,
+                        _ => !summary(line) && pipeline,
+                    }
+                })
+                .cloned(),
+        )
+        .collect()
+}
+
+/// F8 pages before it hides again.
+pub const STATS_PAGES: u8 = 3;
+/// The first line of the third page (encoder, decoder and timings).
+const PIPELINE_START: &str = "Host encoder";
+
+/// Where the session overlays go (window logical coordinates).
+#[derive(Debug, Default, PartialEq)]
+pub struct Layout {
+    pub toast: Option<Rect>,
+    pub guests: Option<Rect>,
+    pub stats: Option<Rect>,
+    /// F8 has room for its graph.
+    pub stats_graph: bool,
+    /// Lines of the F8 page that fit (title included).
+    pub stats_lines: usize,
+    pub warnings: Option<Rect>,
+}
+
+/// What to place: line counts, zero when the overlay is hidden.
+pub struct Overlays {
+    pub toast: bool,
+    pub guest_lines: usize,
+    pub stats_lines: usize,
+    /// Extra F8 height (the graph on the first page).
+    pub stats_extra: u32,
+    pub warning_lines: usize,
+}
+
+/// Lays out the overlays so none covers another: an optional notice toast
+/// at the top centre (toolbar hidden), the guest panel top right with F8
+/// below it, warnings top left, or bottom left when F8 would hit them. F8
+/// is cut to the lines that fit the window.
+pub fn layout(window: (u32, u32), video: Rect, inset: u32, overlays: &Overlays) -> Layout {
+    let width = window.0;
+    let mut layout = Layout::default();
+    let mut top = video.y().max(inset as i32) + 12;
+    if overlays.toast {
+        let toast_width = 720.min(width.saturating_sub(24)).max(1);
+        let toast = Rect::new(
+            (width.saturating_sub(toast_width) / 2) as i32,
+            inset as i32 + 12,
+            toast_width,
+            PANEL_LINE + 8,
+        );
+        top = top.max(toast.bottom() + 8);
+        layout.toast = Some(toast);
+    }
+    // Priority: guest prompts, then warnings; F8 (asked for) gives way.
+    let mut right_top = top;
+    if overlays.guest_lines > 0 {
+        let guest_width = 640.min(width.saturating_sub(24)).max(1);
+        let guests = Rect::new(
+            (video.x() + video.width() as i32 - guest_width as i32 - 12).max(0),
+            top,
+            guest_width,
+            overlays.guest_lines as u32 * PANEL_LINE + 8,
+        );
+        right_top = guests.bottom() + 12;
+        layout.guests = Some(guests);
+    }
+    if overlays.warning_lines > 0 {
+        let warning_width = 460.min(width.saturating_sub(24)).max(1);
+        let height = overlays.warning_lines as u32 * PANEL_LINE + 8;
+        let mut warnings = Rect::new(video.x() + 12, top, warning_width, height);
+        if let Some(guests) = layout.guests
+            && guests.has_intersection(warnings)
+        {
+            warnings.set_y(guests.bottom() + 12);
+        }
+        layout.warnings = Some(warnings);
+    }
+    if overlays.stats_lines > 0 {
+        let panel_width = 520.min(width.saturating_sub(24)).max(1);
+        let x = width as i32 - panel_width as i32 - 12;
+        if let Some(warnings) = layout.warnings
+            && warnings.right() > x
+        {
+            right_top = right_top.max(warnings.bottom() + 12);
+        }
+        let available = (window.1 as i32 - right_top - 12).max(0) as u32;
+        // Without room for the graph and a line, the graph goes.
+        layout.stats_graph = available >= STATS_PADDING + STATS_LINE + overlays.stats_extra;
+        let extra = if layout.stats_graph {
+            overlays.stats_extra
+        } else {
+            0
+        };
+        let wanted = overlays.stats_lines as u32 * STATS_LINE + STATS_PADDING + extra;
+        let height = wanted.min(available.max(STATS_PADDING + STATS_LINE));
+        layout.stats_lines = (height.saturating_sub(STATS_PADDING + extra) / STATS_LINE)
+            .clamp(1, overlays.stats_lines as u32) as usize;
+        layout.stats = Some(Rect::new(x, right_top, panel_width, height));
+    }
+    layout
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn full_stats() -> Vec<String> {
+        // The client's full F8 list (labels only), as built once a second.
+        [
+            "STATS FOR NERDS",
+            "Capture to present    1 / 2 ms",
+            "  capture→encode      1 / 2 ms",
+            "  encode→send         1 / 2 ms",
+            "  network             1 / 2 ms",
+            "  receive→decode      1 / 2 ms",
+            "  decode→present      1 / 2 ms",
+            "Video                 1 x 1",
+            "Codec                 H.264",
+            "Encoder preset        x",
+            "Relative mouse        x",
+            "Scrolling             x",
+            "Keys                  x",
+            "Audio                 x",
+            "Microphone            x",
+            "Presented             60 fps",
+            "Stream                x",
+            "Network step-down     x",
+            "Local display         x",
+            "Window                x",
+            "Layers (last frame)   x",
+            "Frame pacing          x",
+            "Video payload (main)  x",
+            "Request / accepted cap x",
+            "Path                  x",
+            "Access                x",
+            "Control round trip    x",
+            "Host encoder          x",
+            "Client decoder        x",
+            "Renderer              x",
+            "Graphics device       x",
+            "Pixel path            x",
+            "Encoder target        x",
+            "Host encode           x",
+            "Receive to ready      x",
+            "Compressed queue      x",
+            "Parse/decode/download x",
+            "Convert / copy        x",
+            "Decoded frame wait    x",
+            "Decoder queue         x",
+            "Received / decoded    x",
+            "Skipped groups        x",
+            "Unmatched timestamps  x",
+            "Decoder recoveries    x",
+            "Decode includes scheduling/download, not pure GPU time.",
+            "RTT includes control scheduling, not just network transit.",
+            "Present = buffer swap; scanout and display lag unmeasured.",
+            "Display refreshes at 30 Hz, below the 60 fps stream",
+            "HDR display headroom  2.00 × SDR white",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    #[test]
+    fn stats_pages_split_every_line_once_and_the_summary_fits_720p() {
+        let lines = full_stats();
+        let one = stats_page(&lines, 1, false);
+        let two = stats_page(&lines, 2, true);
+        let three = stats_page(&lines, 3, false);
+        assert!(one[0].contains("1/3") && one[0].ends_with("F8: more"));
+        assert!(two[0].contains("2/3") && two[0].ends_with("Stats: more"));
+        assert!(three[0].contains("3/3") && three[0].ends_with("F8: hide"));
+        assert_eq!(
+            one.len() + two.len() + three.len() - 3,
+            lines.len() - 1,
+            "every line on exactly one page"
+        );
+        assert!(one.iter().any(|line| line.starts_with("Video  ")));
+        assert!(one.iter().any(|line| line.starts_with("Video payload")));
+        assert!(two.iter().any(|line| line.starts_with("Window ")));
+        assert!(two.iter().any(|line| line.starts_with("Codec ")));
+        assert!(three.iter().any(|line| line.starts_with("Host encoder")));
+        assert!(
+            three
+                .iter()
+                .any(|line| line.starts_with("Decoder recoveries"))
+        );
+        // Pages 2 and 3 fit a 720p window without the graph.
+        for page in [&two, &three] {
+            assert!(
+                page.len() as u32 * STATS_LINE + STATS_PADDING <= 720 - 94 - 12,
+                "{page:?}"
+            );
+        }
+        // 1280x720 window, toolbar shown, graph on: every summary line fits.
+        let layout = layout(
+            (1280, 720),
+            Rect::new(0, 82, 1280, 638),
+            82,
+            &Overlays {
+                toast: false,
+                guest_lines: 0,
+                stats_lines: one.len(),
+                stats_extra: 128,
+                warning_lines: 0,
+            },
+        );
+        assert_eq!(layout.stats_lines, one.len(), "{:?}", layout.stats);
+        assert!(layout.stats.unwrap().bottom() <= 720);
+    }
+
+    #[test]
+    fn overlays_never_cover_each_other() {
+        for window in [(700, 400), (1000, 720), (1280, 720), (2560, 1440)] {
+            let video = Rect::new(0, 82, window.0, window.1 - 82);
+            let layout = layout(
+                window,
+                video,
+                82,
+                &Overlays {
+                    toast: true,
+                    guest_lines: 2,
+                    stats_lines: 40,
+                    stats_extra: 128,
+                    warning_lines: 2,
+                },
+            );
+            let rects: Vec<_> = [layout.toast, layout.guests, layout.stats, layout.warnings]
+                .into_iter()
+                .flatten()
+                .collect();
+            assert_eq!(rects.len(), 4);
+            for (index, a) in rects.iter().enumerate() {
+                assert!(a.bottom() <= window.1 as i32, "{window:?} {a:?}");
+                for b in &rects[index + 1..] {
+                    assert!(!a.has_intersection(*b), "{window:?}: {a:?} {b:?}");
+                }
+            }
+            // F8 is cut to what fits, never below one line.
+            assert!((1..=40).contains(&layout.stats_lines), "{window:?}");
+            assert_eq!(layout.stats_lines == 40, window.1 >= 1440, "{window:?}");
+        }
+    }
 
     fn quiet() -> Sample {
         Sample {

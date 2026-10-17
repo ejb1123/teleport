@@ -7,8 +7,10 @@ interval covers Rust-side frame publication; these are not pure GPU timings.
 The raw-output-pad descriptions below apply to the legacy GStreamer backend.
 
 Open **Stats** in the session toolbar, press **F8**, or pass `client --stats`.
-The overlay is local. F8 toggles it while keys are unbound; with keyboard capture
-enabled F8 goes remote, and the Stats button still controls the overlay.
+The overlay is local. F8 (or Stats) steps through three pages, summary with
+the graph, session and pipeline, then hides it; each page fits the window and
+says when lines are cut. With keyboard capture enabled F8 goes remote, and the
+Stats button still controls the overlay.
 Measurements reset on reconnect. Rates warm up for one second before reporting.
 The overlay also reports codec, actual encoder/decoder names, configured bitrate,
 and stream dimensions. H.265 is available independently of the experimental HDR
@@ -135,8 +137,8 @@ GPU/CPU can sustain the requested resolution or FPS. Repeated recoveries mean
 reduce those settings and compare the same-frame timing stages. A hardware decoder
 name does not imply that color conversion, downloads or texture upload are free.
 Mac HEVC builds additionally patch VideoToolbox's output buffering to use SPS
-reordering requirements. The native session title is deliberately stable; use F8
-for changing diagnostics.
+reordering requirements. The native session title names the desktop and is
+otherwise stable; use F8 for changing diagnostics.
 
 In 0.5.3, Linux VA/QSV startup and each restart get up to 750 ms from their first
 input frame to initialize, with recovery thresholds of 60 queued frames and
