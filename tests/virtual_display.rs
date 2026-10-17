@@ -264,6 +264,7 @@ impl Client {
             privacy,
             virtual_monitor,
             gamepad_lights: false,
+            guests: false,
         })
     }
 

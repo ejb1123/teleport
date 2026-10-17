@@ -1000,9 +1000,41 @@ impl Capture {
             | Event::RequestKeyframe { .. }
             | Event::ClientFeatures { .. }
             | Event::SelectCodec { .. }
+            | Event::TakeControl { .. }
+            | Event::ApproveGuest { .. }
             | Event::ClientDisplay(_) => (),
         }
         Ok(())
+    }
+
+    /// A `Gamepad*` event from the session owning pad `block` (docs/guests.md).
+    pub fn gamepad_input(&mut self, block: u8, event: &Event) -> Result<()> {
+        self.gamepads.input_block(block, event)
+    }
+
+    /// One session's release: its pads only.
+    pub fn neutralise_pads(&mut self, block: u8) {
+        self.gamepads.neutralise_block(block);
+    }
+
+    /// One session left: remove its pads only.
+    pub fn destroy_pads(&mut self, block: u8) {
+        self.gamepads.destroy_block(block);
+    }
+
+    /// Release held keys and mouse buttons (they belong to the session that
+    /// held keyboard and mouse control), not gamepads.
+    pub async fn release_keyboard_mouse(&mut self) {
+        for code in std::mem::take(&mut self.keys) {
+            if let Err(error) = self.key(code, false).await {
+                tracing::warn!(%error, "key release failed");
+            }
+        }
+        for button in std::mem::take(&mut self.buttons) {
+            if let Err(error) = self.button(button, false).await {
+                tracing::warn!(%error, "button release failed");
+            }
+        }
     }
 
     pub async fn release_all(&mut self) {

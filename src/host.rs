@@ -191,6 +191,55 @@ pub struct Options {
     /// The session's client strips `protocol::FrameTiming` headers.
     #[arg(skip)]
     pub frame_timing: bool,
+    /// Most sessions at once, owners and guests together (1-8). Sessions
+    /// share one encoder and the host's input (docs/guests.md).
+    #[arg(long, default_value_t = crate::guests::MAX_SESSIONS, value_parser = parse_sessions)]
+    pub max_sessions: usize,
+    /// Keep guests connected when the last owner session leaves (by
+    /// default they are disconnected with it).
+    #[arg(long)]
+    pub keep_guests_without_owner: bool,
+    /// Lock the host's desktop (`loginctl lock-session`) when the last
+    /// session disconnects.
+    #[arg(long)]
+    pub lock_on_last_disconnect: bool,
+    /// Disconnect a guest that sent no keyboard, mouse or gamepad input for
+    /// this many minutes (0: never).
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u64).range(0..=1440))]
+    pub guest_idle_minutes: u64,
+    /// Total video bitrate for all sessions in kbit/s (0: no cap). The
+    /// shared encoder runs at most at this divided by the number of
+    /// sessions, so each gets an equal share.
+    #[arg(long, default_value_t = 0, value_parser = parse_bitrate)]
+    pub bandwidth_cap: u32,
+    /// Seconds a guest waits for the host's approval before it is denied.
+    #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(5..=600))]
+    pub guest_approval_timeout: u64,
+}
+
+impl Options {
+    /// Session policy for several sessions (docs/guests.md).
+    fn policy(&self) -> crate::guests::Policy {
+        crate::guests::Policy {
+            max_sessions: self.max_sessions,
+            kick_guests_with_owner: !self.keep_guests_without_owner,
+            lock_on_last_disconnect: self.lock_on_last_disconnect,
+            guest_idle_kick: (self.guest_idle_minutes > 0)
+                .then(|| Duration::from_secs(self.guest_idle_minutes * 60)),
+            bandwidth_cap: (self.bandwidth_cap > 0).then_some(self.bandwidth_cap),
+            approval_timeout: Duration::from_secs(self.guest_approval_timeout),
+        }
+    }
+}
+
+fn parse_sessions(value: &str) -> std::result::Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(count) if (1..=crate::guests::MAX_SESSIONS).contains(&count) => Ok(count),
+        _ => Err(format!(
+            "sessions must be 1-{}",
+            crate::guests::MAX_SESSIONS
+        )),
+    }
 }
 
 pub async fn run(mut options: Options) -> Result<()> {
@@ -252,12 +301,17 @@ pub async fn run(mut options: Options) -> Result<()> {
             );
         }
     }
-    let result = serve(&options, &mut capture).await;
-    capture.close().await;
+    // The session engine owns the capture while sessions run; it is back
+    // here whenever serve() returns.
+    let mut idle = Some(capture);
+    let result = serve(&options, &mut idle).await;
+    if let Some(mut capture) = idle {
+        capture.close().await;
+    }
     result
 }
 
-async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
+async fn serve(options: &Options, idle: &mut Option<Capture>) -> Result<()> {
     // Warm the hardware encoder probe so the first client does not wait for it.
     let kind = options.encoder;
     if options.smoke_hardware_codecs.is_none() {
@@ -319,6 +373,8 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         fingerprint: options.relay_fingerprint.clone(),
         key: options.relay_key.clone(),
     });
+    // Sessions, approvals and policy, shared with the admin socket.
+    let hub = crate::guests::Hub::new(options.policy());
     let admin = if let (Some(directory), Some(access)) =
         (options.identity_dir.as_deref(), access.as_ref())
     {
@@ -330,6 +386,7 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
                 access.clone(),
                 options.system_auth_helper.clone(),
                 relay_endpoint.clone(),
+                hub.clone(),
             )
             .await?,
         )
@@ -389,7 +446,18 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         Vec<crate::relay::AbortOnDrop>,
     )> = None;
     let mut relay_retry = Instant::now();
+    // Authenticated connections (approved, if they needed it) wait here for
+    // the session engine, which holds the receiver while sessions run.
+    let (join_sender, join_receiver) =
+        tokio::sync::mpsc::channel::<Member>(crate::guests::MAX_SESSIONS * 2);
+    let mut joins = Some(join_receiver);
+    // The session engine: owns the capture while at least one session runs.
+    let mut engine: Option<std::pin::Pin<Box<dyn std::future::Future<Output = EngineExit> + '_>>> =
+        None;
+    // Connections finishing their handshake or waiting for approval.
+    let mut admissions = tokio::task::JoinSet::new();
     loop {
+        while admissions.try_join_next().is_some() {}
         if let (Some(endpoint), Some(e2e), Some(access)) =
             (&relay_endpoint, &relay_identity, &access)
             && relay.is_none()
@@ -459,15 +527,11 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
             }, if relay_endpoint.is_some() => {
                 match (accepted, &access, &relay) {
                     (Some(accepted), Some(access), Some((link, _, _))) => {
-                        restore_capture(capture).await;
-                        let result = tokio::select! {
-                            result = relayed(link, accepted, access, options, capture) => result,
-                            _ = &mut shutdown => { capture.end_session().await; break; }
-                        };
-                        capture.end_session().await;
-                        leave_privacy(capture).await;
-                        if let Err(error) = result {
-                            tracing::warn!(%error, "relayed client disconnected");
+                        match relayed_member(link, accepted, access, &hub) {
+                            Ok(member) => {
+                                admissions.spawn(admit(member, hub.clone(), join_sender.clone()));
+                            }
+                            Err(error) => tracing::warn!(error = format!("{error:#}"), "relayed client refused"),
                         }
                     }
                     (None, _, Some(_)) => {
@@ -479,7 +543,64 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
                 }
                 continue;
             }
-            _ = &mut shutdown => break,
+            // The last session left (or the engine failed): the capture is
+            // idle again.
+            exit = async {
+                match engine.as_mut() {
+                    Some(running) => running.await,
+                    None => std::future::pending().await,
+                }
+            }, if engine.is_some() => {
+                engine = None;
+                let EngineExit { mut capture, joins: receiver, result, carry } = exit;
+                capture.end_session().await;
+                leave_privacy(&mut capture).await;
+                if let Err(error) = result {
+                    tracing::warn!(error = format!("{error:#}"), "client disconnected");
+                }
+                // A reconnect replaced the last session: start over with it.
+                if let Some(member) = carry {
+                    restore_capture(&mut capture).await;
+                    engine = Some(Box::pin(engine_run(options, &hub, capture, member, receiver)));
+                    continue;
+                }
+                if hub.policy.lock_on_last_disconnect {
+                    match crate::guests::lock_session().await {
+                        Ok(()) => tracing::info!("desktop locked after the last session left"),
+                        Err(error) => tracing::warn!(error = format!("{error:#}"), "could not lock the desktop"),
+                    }
+                }
+                *idle = Some(capture);
+                joins = Some(receiver);
+                continue;
+            }
+            // The first session: start the engine.
+            member = async {
+                match joins.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            }, if engine.is_none() => {
+                match (member, joins.take(), idle.take()) {
+                    (Some(member), Some(receiver), Some(mut capture)) => {
+                        restore_capture(&mut capture).await;
+                        engine = Some(Box::pin(engine_run(options, &hub, capture, member, receiver)));
+                    }
+                    (_, receiver, capture) => (joins, *idle) = (receiver, capture),
+                }
+                continue;
+            }
+            _ = &mut shutdown => {
+                if let Some(running) = engine.take() {
+                    hub.poke(crate::guests::Command::Shutdown);
+                    let exit = running.await;
+                    let mut capture = exit.capture;
+                    capture.end_session().await;
+                    leave_privacy(&mut capture).await;
+                    *idle = Some(capture);
+                }
+                break;
+            }
         };
         let supplied = request
             .path()
@@ -500,7 +621,7 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
             tracing::warn!("rejected unauthorized client");
             continue;
         }
-        let session_lease = if let Some(access) = &access {
+        let lease = if let Some(access) = &access {
             // Peer-to-peer: lease with the key proof of the signalling
             // exchange, so stored device keys bind it as on the relay.
             let lease = match &grant {
@@ -518,56 +639,279 @@ async fn serve(options: &Options, capture: &mut Capture) -> Result<()> {
         } else {
             None
         };
-        restore_capture(capture).await;
-        let result = tokio::select! {
-            result = connection(request, options, capture) => result,
-            _ = async { loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let revoked = match (&session_lease, &grant) {
-                    (Some(lease), Some(_)) => !lease.authorized(),
-                    _ => access.as_ref().is_some_and(|access| !access.authorized(&supplied)),
-                };
-                if revoked { break; }
-            } } => Err(anyhow::anyhow!("device access revoked")),
-            _ = &mut shutdown => { capture.end_session().await; break; }
+        // Who it is: an owner, or a guest with what it was granted.
+        let role = match &lease {
+            Some(lease) => match lease.access() {
+                Some(role) => role,
+                None => {
+                    request.close().await;
+                    continue;
+                }
+            },
+            None => crate::access::SessionRole::owner("Host pairing file", None),
         };
-        capture.end_session().await;
-        leave_privacy(capture).await;
-        if let Err(error) = result {
-            tracing::warn!(%error, "client disconnected");
-        }
+        let kind = if grant.is_some() { "p2p" } else { "direct" };
+        let credential = crate::e2e::credential_hash(&supplied);
+        let member = Member::direct(hub.next_id(), request, lease, role, kind, credential);
+        admissions.spawn(admit(member, hub.clone(), join_sender.clone()));
     }
     server.close().await;
     Ok(())
 }
 
-/// Run a relayed client that has already proven the session keys (see
-/// `relay::intake`). Only now is the credential leased (claiming a single-use
-/// ticket) and the desktop captured.
-async fn relayed(
+/// How a session's connection is closed.
+enum Transport {
+    /// Direct QUIC or peer-to-peer: `connecting` until the handshake is done.
+    Direct {
+        session: Option<moq_net::Session>,
+        connecting: Option<
+            std::pin::Pin<Box<dyn std::future::Future<Output = Result<moq_net::Session>> + Send>>,
+        >,
+    },
+    /// Through the relay: `session` is the relay connection other relayed
+    /// sessions share, so only dropping the bridges ends this one.
+    Relayed {
+        session: moq_net::Session,
+        bridge: Box<(crate::relay::HostSession, crate::relay::Accepted)>,
+    },
+}
+
+/// An authenticated connection on its way to (or in) the session engine.
+pub struct Member {
+    id: crate::guests::SessionId,
+    /// As leased; the engine re-reads it (permission changes, revocation).
+    role: crate::access::SessionRole,
+    /// `None` without an access database (only the host pairing file).
+    lease: Option<crate::access::SessionLease>,
+    query: Option<String>,
+    /// The session publishes `desktop` here and receives `controls` from
+    /// `incoming`: the QUIC session's own origins, or plaintext origins
+    /// bridged to a relay (see `crate::relay`).
+    outgoing: moq_net::origin::Producer,
+    incoming: moq_net::origin::Producer,
+    transport: Transport,
+    /// `direct`, `relay` or `p2p`.
+    kind: &'static str,
+    /// `SHA-256(token)` of the credential it presented: a new connection
+    /// with the same credential replaces this one (a reconnect).
+    credential: [u8; 32],
+}
+
+impl Member {
+    fn direct(
+        id: crate::guests::SessionId,
+        request: crate::p2p::Incoming,
+        lease: Option<crate::access::SessionLease>,
+        role: crate::access::SessionRole,
+        kind: &'static str,
+        credential: [u8; 32],
+    ) -> Self {
+        let query = request.query().map(str::to_owned);
+        let outgoing = moq_net::Origin::random().produce();
+        let incoming = moq_net::Origin::random().produce();
+        let connecting = Box::pin(request.ok(&outgoing, incoming.clone()));
+        Self {
+            id,
+            role,
+            lease,
+            query,
+            outgoing,
+            incoming,
+            transport: Transport::Direct {
+                session: None,
+                connecting: Some(connecting),
+            },
+            kind,
+            credential,
+        }
+    }
+
+    /// Finish a direct session's handshake.
+    async fn connect(&mut self) -> Result<()> {
+        if let Transport::Direct {
+            session,
+            connecting,
+        } = &mut self.transport
+            && let Some(connecting) = connecting.take()
+        {
+            *session = Some(connecting.await?);
+        }
+        Ok(())
+    }
+
+    /// The transport whose closure and statistics apply.
+    fn session(&self) -> Option<&moq_net::Session> {
+        match &self.transport {
+            Transport::Direct { session, .. } => session.as_ref(),
+            Transport::Relayed { session, .. } => Some(session),
+        }
+    }
+
+    /// Resolves (with the reason) when the client has left: its direct
+    /// connection closed, or its relayed controls ended (the relay
+    /// connection is shared with other sessions).
+    fn departure(&self) -> impl std::future::Future<Output = String> + Send + 'static {
+        let (direct, relayed) = match &self.transport {
+            Transport::Direct { session, .. } => (session.clone(), None),
+            Transport::Relayed { session, bridge } => {
+                (None, Some((session.clone(), bridge.0.gone.clone())))
+            }
+        };
+        async move {
+            if let Some(session) = direct {
+                return format!("connection closed: {}", session.closed().await);
+            }
+            if let Some((link, mut gone)) = relayed {
+                return tokio::select! {
+                    error = link.closed() => format!("relay connection closed: {error}"),
+                    _ = gone.wait_for(|left| *left) => "left the relay".to_owned(),
+                };
+            }
+            std::future::pending().await
+        }
+    }
+
+    /// The current role, or `None` once the device is revoked.
+    fn current_role(&self) -> Option<crate::access::SessionRole> {
+        match &self.lease {
+            Some(lease) => lease.access(),
+            None => Some(self.role.clone()),
+        }
+    }
+
+    /// Disconnect (denied, kicked, revoked, refused).
+    fn close(self) {
+        if let Transport::Direct {
+            session: Some(session),
+            ..
+        } = &self.transport
+        {
+            session.abort(moq_net::Error::Unauthorized);
+        }
+        // A relayed session ends when its bridges drop, here.
+    }
+}
+
+/// A relayed client that has already proven the session keys (see
+/// `relay::intake`). Only now is the credential leased (claiming a
+/// single-use ticket); the desktop is captured once it joins.
+fn relayed_member(
     link: &crate::relay::Link,
     accepted: crate::relay::Accepted,
     access: &Arc<crate::access::ServerState>,
-    options: &Options,
-    capture: &mut Capture,
-) -> Result<()> {
-    let hash = accepted.credential;
+    hub: &crate::guests::Hub,
+) -> Result<Member> {
     let lease = access
-        .begin_session_hash(hash.to_vec(), accepted.device_key.as_deref())
+        .begin_session_hash(accepted.credential.to_vec(), accepted.device_key.as_deref())
         .context("relayed credential not usable")?;
+    let role = lease.access().context("relayed credential not usable")?;
     let bridged = crate::relay::host(link, &accepted)?;
-    let session = link.session.clone();
-    tokio::select! {
-        result = run_session(
-            Some(accepted.request.as_str()),
-            bridged.outgoing.clone(),
-            bridged.incoming.clone(),
-            async { Ok(session) },
-            options,
-            capture,
-        ) => result,
-        // Also ends if the device's stored key no longer is the one proven.
-        _ = async { loop { tokio::time::sleep(Duration::from_secs(1)).await; if !lease.authorized() { break; } } } => Err(anyhow::anyhow!("device access revoked")),
+    let credential = accepted.credential;
+    Ok(Member {
+        id: hub.next_id(),
+        role,
+        lease: Some(lease),
+        query: Some(accepted.request.clone()),
+        outgoing: bridged.outgoing.clone(),
+        incoming: bridged.incoming.clone(),
+        transport: Transport::Relayed {
+            session: link.session.clone(),
+            bridge: Box::new((bridged, accepted)),
+        },
+        kind: "relay",
+        credential,
+    })
+}
+
+/// Finish the handshake and, for a guest that is not trusted, wait for the
+/// host's approval (denied on timeout) before the session may join.
+async fn admit(
+    mut member: Member,
+    hub: Arc<crate::guests::Hub>,
+    joins: tokio::sync::mpsc::Sender<Member>,
+) {
+    if let Err(error) = member.connect().await {
+        tracing::warn!(error = format!("{error:#}"), "client connection failed");
+        return;
+    }
+    // The role now, not when the connection was leased.
+    let Some(role) = member.current_role() else {
+        member.close();
+        return;
+    };
+    member.role = role;
+    let guest = !member.role.is_owner();
+    if guest
+        && let Some(device) = &member.role.device
+        && hub.blocked(device)
+    {
+        tracing::info!(session = member.id, guest = %member.role.name, "guest refused for now (recently denied or kicked)");
+        member.close();
+        return;
+    }
+    // Trusted guests skip approval only while an owner is there, unless the
+    // host keeps guests without an owner (`--keep-guests-without-owner`).
+    let approval = guest
+        && (!member.role.trusted || (hub.policy.kick_guests_with_owner && !hub.owner_connected()));
+    if approval {
+        tracing::info!(session = member.id, guest = %member.role.name, "guest asks to join; waiting for approval");
+        // The guest leaving withdraws its request.
+        let departure = member.departure();
+        let gone = async move {
+            departure.await;
+        };
+        let (name, device) = (member.role.name.clone(), member.role.device.clone());
+        let outcome =
+            crate::guests::await_approval(&hub, member.id, &name, device.clone(), gone).await;
+        use crate::guests::Approval;
+        if matches!(outcome, Approval::Denied | Approval::TimedOut)
+            && let Some(device) = &device
+        {
+            hub.block(device, crate::guests::DENIED_FOR);
+        }
+        // Revoked while it waited: never admitted.
+        if outcome != Approval::Allowed || member.current_role().is_none() {
+            tracing::info!(session = member.id, guest = %member.role.name, ?outcome, "guest not admitted");
+            member.close();
+            return;
+        }
+        tracing::info!(session = member.id, guest = %member.role.name, "guest approved");
+    }
+    if let Err(error) = joins.send(member).await {
+        error.0.close();
+    }
+}
+
+/// The session engine finished: the capture and the joins receiver go back
+/// to the accept loop.
+struct EngineExit {
+    capture: Capture,
+    joins: tokio::sync::mpsc::Receiver<Member>,
+    result: Result<()>,
+    /// A reconnect that replaced the last session: the next engine's first.
+    carry: Option<Member>,
+}
+
+async fn engine_run(
+    options: &Options,
+    hub: &crate::guests::Hub,
+    mut capture: Capture,
+    first: Member,
+    mut joins: tokio::sync::mpsc::Receiver<Member>,
+) -> EngineExit {
+    let (sender, mut commands) = tokio::sync::mpsc::unbounded_channel();
+    hub.attach(Some(sender));
+    let (result, carry) =
+        match run_session(options, hub, &mut capture, first, &mut joins, &mut commands).await {
+            Ok(carry) => (Ok(()), carry),
+            Err(error) => (Err(error), None),
+        };
+    hub.attach(None);
+    EngineExit {
+        capture,
+        joins,
+        result,
+        carry,
     }
 }
 
@@ -679,47 +1023,922 @@ async fn shutdown_signal() -> Result<()> {
     Ok(())
 }
 
-async fn connection(
-    request: crate::p2p::Incoming,
-    options: &Options,
-    capture: &mut Capture,
-) -> Result<()> {
-    let query = request.query().map(str::to_owned);
-    let outgoing = moq_net::Origin::random().produce();
-    let incoming = moq_net::Origin::random().produce();
-    let session = request.ok(&outgoing, incoming.clone());
-    run_session(
-        query.as_deref(),
-        outgoing,
-        incoming,
-        session,
-        options,
-        capture,
-    )
-    .await
+/// How often a session may be told that something it sent was refused.
+const REFUSAL_NOTICE_INTERVAL: Duration = Duration::from_secs(5);
+/// A removed session's connection closes this long after its last notice,
+/// so the notice can still reach the client.
+const CLOSE_GRACE: Duration = Duration::from_millis(300);
+/// How often running sessions' roles and permissions are re-read (also at
+/// once on revocation or a permission change).
+const ACCESS_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+/// Guests' keyframe requests at most this often (each costs every session).
+const GUEST_KEYFRAME_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The stream every session shares: tracks the encoders write once. The
+/// first session's broadcast holds them; later sessions' broadcasts forward
+/// them (`forward_track`).
+struct Shared {
+    codec: protocol::VideoCodec,
+    video: moq_net::track::Producer,
+    monitors: Vec<moq_net::track::Producer>,
+    audio: Option<moq_net::track::Producer>,
 }
 
-/// One authenticated client session. `outgoing`/`incoming` are the origins the
-/// session publishes `desktop` to and receives `controls` from: the QUIC
-/// session's own origins on a direct connection, or plaintext origins bridged
-/// to a relay (see `crate::relay`). `session` resolves to the transport whose
-/// closure and statistics apply.
-async fn run_session(
-    query: Option<&str>,
-    outgoing: moq_net::origin::Producer,
-    incoming: moq_net::origin::Producer,
-    session: impl std::future::Future<Output = Result<moq_net::Session>>,
-    options: &Options,
-    capture: &mut Capture,
+/// What a session's client declared (`Event::ClientFeatures`).
+#[derive(Default, Clone, Copy)]
+struct Features {
+    declared: bool,
+    guests: bool,
+    rumble: bool,
+    lights: bool,
+    frame_timing: bool,
+}
+
+/// One session inside the engine.
+struct Session {
+    member: Member,
+    role: crate::access::SessionRole,
+    updates: moq_net::track::Producer,
+    metadata: moq_net::track::Producer,
+    /// The session's `desktop` broadcast (for the first session it also
+    /// holds the shared tracks, see [`Members::primary`]).
+    broadcast: Option<moq_net::broadcast::Producer>,
+    /// Tracks it announces but never gets data on (the other codec).
+    _idle: Vec<moq_net::track::Producer>,
+    /// Input, connection watcher, pointer datagrams, forwarders.
+    tasks: Vec<AbortOnDrop>,
+    pointer: bool,
+    last_motion: Arc<AtomicU64>,
+    /// Its host pad slots: `pad_block * MAX_GAMEPADS ..` (`crate::gamepad`).
+    pad_block: u8,
+    features: Features,
+    /// Rate control from this session's own feedback; the leader's feedback
+    /// drives the engine's controllers and step-down ladder instead.
+    rates: Option<Rates>,
+    /// Its latest display (applied when it leads the stream).
+    display: Option<protocol::ClientDisplay>,
+    joined: Instant,
+    last_input: Instant,
+    last_feedback: Instant,
+    /// Its last keyframe request (guests are rate limited).
+    last_keyframe: Option<Instant>,
+    last_refusal: Option<Instant>,
+    sent_access: Option<protocol::SessionAccess>,
+    /// Joined after the stream started: it takes the session's codec.
+    shared: bool,
+    /// Forwards its SSH agent (the first session only).
+    ssh_agent: bool,
+}
+
+/// Whether an event may go on, and what to release first.
+enum Screen {
+    Pass { release: bool },
+    Drop,
+}
+
+/// Every session on the desktop, keyboard/mouse arbitration and the
+/// session policy (docs/guests.md).
+struct Members {
+    sessions: BTreeMap<crate::guests::SessionId, Session>,
+    /// Join order: the stream leader is the first owner, else the first
+    /// session.
+    order: Vec<crate::guests::SessionId>,
+    arbiter: crate::guests::Arbiter,
+    policy: crate::guests::Policy,
+    /// Approval requests shown to owners' clients.
+    announced: std::collections::BTreeSet<crate::guests::SessionId>,
+    /// Sessions whose updates track failed: removed by the loop.
+    failed: Vec<crate::guests::SessionId>,
+    /// The first session's broadcast, kept (with the shared tracks) after it
+    /// leaves.
+    primary: Option<moq_net::broadcast::Producer>,
+}
+
+impl Members {
+    fn new(policy: crate::guests::Policy) -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+            order: Vec::new(),
+            arbiter: crate::guests::Arbiter::default(),
+            policy,
+            announced: Default::default(),
+            failed: Vec::new(),
+            primary: None,
+        }
+    }
+
+    fn leader(&self) -> Option<crate::guests::SessionId> {
+        self.order
+            .iter()
+            .copied()
+            .find(|id| self.sessions.get(id).is_some_and(|s| s.role.is_owner()))
+            .or_else(|| self.order.first().copied())
+    }
+
+    fn is_leader(&self, id: crate::guests::SessionId) -> bool {
+        self.leader() == Some(id)
+    }
+
+    /// The transport whose statistics drive rate control without client
+    /// feedback.
+    fn leader_session(&self) -> Option<moq_net::Session> {
+        self.leader()
+            .and_then(|id| self.sessions.get(&id))
+            .and_then(|session| session.member.session().cloned())
+    }
+
+    fn role_of(&self, id: crate::guests::SessionId) -> Option<protocol::Role> {
+        self.sessions.get(&id).map(|session| session.role.role)
+    }
+
+    fn send(session: &mut Session, update: Update, failed: &mut Vec<crate::guests::SessionId>) {
+        if let Err(error) = publish_update(&mut session.updates, update) {
+            tracing::debug!(%error, session = session.member.id, "session updates closed");
+            failed.push(session.member.id);
+        }
+    }
+
+    /// To every session. A session whose track failed leaves; the others
+    /// go on, so this never fails the engine.
+    fn all(&mut self, update: Update) -> Result<()> {
+        for session in self.sessions.values_mut() {
+            Self::send(session, update.clone(), &mut self.failed);
+        }
+        Ok(())
+    }
+
+    fn to(&mut self, id: crate::guests::SessionId, update: Update) -> Result<()> {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            Self::send(session, update, &mut self.failed);
+        }
+        Ok(())
+    }
+
+    /// Answers to the stream leader's own requests (monitor streams,
+    /// privacy, video settings).
+    fn leader_update(&mut self, update: Update) -> Result<()> {
+        match self.leader() {
+            Some(id) => self.to(id, update),
+            None => Ok(()),
+        }
+    }
+
+    fn notice(&mut self, id: crate::guests::SessionId, text: impl Into<String>) {
+        let _ = self.to(id, Update::Notice { text: text.into() });
+    }
+
+    fn notice_owners(&mut self, text: &str) {
+        for id in self.order.clone() {
+            if self.sessions.get(&id).is_some_and(|s| s.role.is_owner()) {
+                self.notice(id, text);
+            }
+        }
+    }
+
+    /// `Update::Desktop` to every session, as each may see it.
+    fn desktop(&mut self, info: &Desktop) -> Result<()> {
+        for id in self.order.clone() {
+            let desktop = self.customize(id, info);
+            self.to(id, Update::Desktop { desktop })?;
+        }
+        Ok(())
+    }
+
+    /// `info` as session `id` sees it: its role and permissions, and only
+    /// the stream leader is offered privacy mode and a virtual monitor.
+    fn customize(&self, id: crate::guests::SessionId, info: &Desktop) -> Desktop {
+        let mut desktop = info.clone();
+        let Some(session) = self.sessions.get(&id) else {
+            return desktop;
+        };
+        desktop.ssh_agent = info.ssh_agent && session.ssh_agent;
+        desktop.clipboard = info.clipboard && session.role.permissions.clipboard;
+        if !session.role.is_owner() {
+            // Xbox pads only (`crate::guests::guest_pad`).
+            desktop.gamepad_types.clear();
+        }
+        desktop.guests = true;
+        desktop.access = Some(self.access(id));
+        desktop.shared_stream = session.shared;
+        desktop.codec_selection = info.codec_selection && !session.shared;
+        if !self.is_leader(id) || !session.role.is_owner() {
+            desktop.privacy_mode = false;
+            desktop.virtual_monitor = false;
+        }
+        desktop
+    }
+
+    fn access(&self, id: crate::guests::SessionId) -> protocol::SessionAccess {
+        let (role, permissions) = self.sessions.get(&id).map_or(
+            (protocol::Role::Guest, protocol::Permissions::default()),
+            |s| (s.role.role, s.role.permissions),
+        );
+        protocol::SessionAccess {
+            role,
+            permissions,
+            control: self.arbiter.view(id, |other| self.role_of(other)),
+            others: self.sessions.len().saturating_sub(1) as u32,
+        }
+    }
+
+    /// `Update::Access` to sessions whose view changed (clients that read it).
+    fn send_access(&mut self) {
+        for id in self.order.clone() {
+            let access = self.access(id);
+            if let Some(session) = self.sessions.get_mut(&id)
+                && session.features.guests
+                && session.sent_access != Some(access)
+            {
+                session.sent_access = Some(access);
+                Self::send(session, Update::Access { access }, &mut self.failed);
+            }
+        }
+    }
+
+    /// A refusal notice, at most one per session every few seconds (also
+    /// logged then).
+    fn refuse(&mut self, id: crate::guests::SessionId, text: &str) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        if session
+            .last_refusal
+            .is_some_and(|at| at.elapsed() < REFUSAL_NOTICE_INTERVAL)
+        {
+            return;
+        }
+        session.last_refusal = Some(Instant::now());
+        tracing::info!(session = id, name = %session.role.name, role = session.role.role.label(), reason = text, "refused input from session");
+        Self::send(
+            session,
+            Update::Notice { text: text.into() },
+            &mut self.failed,
+        );
+    }
+
+    /// Whether `from` may send `event` now: permissions, keyboard/mouse
+    /// control and stream leadership, decided here before anything is
+    /// injected or changed.
+    fn screen(&mut self, from: crate::guests::SessionId, event: &Event, now: Instant) -> Screen {
+        use crate::guests::{Admission, Need, need};
+        let Some(session) = self.sessions.get(&from) else {
+            // Left (or removed) while this was queued.
+            return Screen::Drop;
+        };
+        let (role, permissions) = (session.role.role, session.role.permissions);
+        let holder = self.arbiter.holder_session();
+        if !crate::guests::permitted(role, permissions, event) {
+            let text = match need(event) {
+                Need::KeyboardMouse => "The host has not allowed you keyboard and mouse",
+                Need::Gamepad => "The host has not allowed you gamepads",
+                Need::Clipboard => "The host has not allowed you the clipboard",
+                _ => "Only the host's owner can do that",
+            };
+            self.refuse(from, text);
+            return Screen::Drop;
+        }
+        match need(event) {
+            Need::KeyboardMouse => match self.arbiter.admit(from, role, now) {
+                Admission::Allowed { taken_from } => {
+                    let changed = holder != Some(from);
+                    if let Some(session) = self.sessions.get_mut(&from) {
+                        session.last_input = now;
+                    }
+                    if changed {
+                        let name = self.sessions[&from].role.name.clone();
+                        tracing::info!(session = from, name = %name, role = role.label(), previous = ?taken_from, "session took keyboard and mouse control");
+                        if let Some(previous) = taken_from {
+                            self.notice(
+                                previous,
+                                format!("{name} took keyboard and mouse control"),
+                            );
+                        }
+                        self.send_access();
+                    }
+                    Screen::Pass {
+                        release: taken_from.is_some(),
+                    }
+                }
+                Admission::Busy => {
+                    self.refuse(from, "Another session has keyboard and mouse control");
+                    Screen::Drop
+                }
+            },
+            Need::Gamepad => {
+                if let Some(session) = self.sessions.get_mut(&from) {
+                    session.last_input = now;
+                }
+                Screen::Pass { release: false }
+            }
+            Need::Stream if !self.is_leader(from) => {
+                match event {
+                    // Kept for when it leads the stream.
+                    Event::ClientDisplay(display) => {
+                        if let Some(session) = self.sessions.get_mut(&from) {
+                            session.display = Some(*display);
+                        }
+                    }
+                    // Joined sessions take the stream's codec.
+                    Event::SelectCodec { .. } => (),
+                    _ => self.refuse(from, "Only the session that leads the stream can change it"),
+                }
+                Screen::Drop
+            }
+            _ => Screen::Pass { release: false },
+        }
+    }
+
+    /// The host's session list (settings window, `host-admin sessions`).
+    fn publish(&self, hub: &crate::guests::Hub) {
+        let now = Instant::now();
+        hub.set_sessions(
+            self.order
+                .iter()
+                .filter_map(|id| self.sessions.get(id))
+                .map(|session| crate::guests::SessionSummary {
+                    id: session.member.id,
+                    name: session.role.name.clone(),
+                    device: session.role.device.clone(),
+                    role: session.role.role,
+                    permissions: session.role.permissions,
+                    control: self.arbiter.holder_session() == Some(session.member.id),
+                    transport: session.member.kind.into(),
+                    connected_s: now.duration_since(session.joined).as_secs(),
+                    idle_s: now.duration_since(session.last_input).as_secs(),
+                })
+                .collect(),
+        );
+    }
+
+    /// Tell owners' clients about guests waiting for approval.
+    fn sync_approvals(&mut self, hub: &crate::guests::Hub) {
+        let pending = hub.approvals();
+        let current: std::collections::BTreeSet<_> = pending.iter().map(|p| p.id).collect();
+        let fresh: Vec<_> = pending
+            .into_iter()
+            .filter(|p| !self.announced.contains(&p.id))
+            .collect();
+        for request in &fresh {
+            for id in self.order.clone() {
+                let Some(session) = self.sessions.get(&id) else {
+                    continue;
+                };
+                if !session.role.is_owner() {
+                    continue;
+                }
+                let update = if session.features.guests {
+                    Update::GuestRequest {
+                        id: request.id,
+                        name: request.name.clone(),
+                        timeout_s: request.remaining_s.min(3600) as u32,
+                    }
+                } else {
+                    Update::Notice {
+                        text: format!(
+                            "Guest \u{201c}{}\u{201d} asks to join: approve it in the host settings",
+                            request.name
+                        ),
+                    }
+                };
+                let _ = self.to(id, update);
+            }
+        }
+        for closed in self
+            .announced
+            .difference(&current)
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            for id in self.order.clone() {
+                if self
+                    .sessions
+                    .get(&id)
+                    .is_some_and(|s| s.role.is_owner() && s.features.guests)
+                {
+                    let _ = self.to(id, Update::GuestRequestClosed { id: closed });
+                }
+            }
+        }
+        self.announced = current;
+    }
+
+    /// Requests still pending, for an owner's client that just declared it
+    /// reads them.
+    fn announce_to(&mut self, id: crate::guests::SessionId, hub: &crate::guests::Hub) {
+        for request in hub.approvals() {
+            let _ = self.to(
+                id,
+                Update::GuestRequest {
+                    id: request.id,
+                    name: request.name.clone(),
+                    timeout_s: request.remaining_s.min(3600) as u32,
+                },
+            );
+        }
+    }
+
+    /// The encoder bitrate allowed for `target` (the leader's): every other
+    /// session's own rate control, each pulling it down to a quarter at
+    /// most (one bad link must not ruin everyone's picture; that session
+    /// skips frames instead), and the bandwidth cap's share.
+    fn limit(&self, target: u32) -> u32 {
+        let leader = self.leader();
+        let mut limit = target;
+        for (id, session) in &self.sessions {
+            if Some(*id) != leader
+                && let Some(rates) = &session.rates
+            {
+                limit = limit.min(rates.target().max(target / 4));
+            }
+        }
+        if let Some(share) = self.policy.share(self.sessions.len()) {
+            limit = limit.min(share);
+        }
+        limit.max(protocol::MIN_BITRATE.min(target))
+    }
+
+    /// The lowest pad block no session uses.
+    fn free_pad_block(&self) -> Option<u8> {
+        (0..crate::guests::MAX_SESSIONS as u8)
+            .find(|block| !self.sessions.values().any(|s| s.pad_block == *block))
+    }
+
+    /// Route a virtual pad's feedback to the session owning its block, with
+    /// its own pad number.
+    fn pad_feedback(&mut self, feedback: crate::gamepad::PadFeedback) {
+        let mut update = pad_feedback_update(feedback);
+        let (block, rumble) = match &mut update {
+            Update::Rumble { pad, .. } => {
+                let block = *pad / protocol::MAX_GAMEPADS;
+                *pad %= protocol::MAX_GAMEPADS;
+                (block, true)
+            }
+            Update::GamepadLights { pad, .. } | Update::GamepadTriggers { pad, .. } => {
+                let block = *pad / protocol::MAX_GAMEPADS;
+                *pad %= protocol::MAX_GAMEPADS;
+                (block, false)
+            }
+            _ => return,
+        };
+        let target = self.sessions.values().find(|s| {
+            s.pad_block == block
+                && if rumble {
+                    s.features.rumble
+                } else {
+                    s.features.lights
+                }
+        });
+        if let Some(id) = target.map(|s| s.member.id) {
+            let _ = self.to(id, update);
+        }
+    }
+
+    /// Take session `id` out: release what it held, remove its pads and
+    /// close its connection shortly after `notice`.
+    async fn detach(
+        &mut self,
+        id: crate::guests::SessionId,
+        reason: &str,
+        notice: Option<String>,
+        capture: &mut Capture,
+    ) -> Option<crate::access::SessionRole> {
+        let mut session = self.sessions.remove(&id)?;
+        self.order.retain(|other| *other != id);
+        if let Some(text) = notice {
+            let _ = publish_update(&mut session.updates, Update::Notice { text });
+        }
+        if self.arbiter.forget(id) {
+            capture.release_keyboard_mouse().await;
+        }
+        capture.destroy_pads(session.pad_block);
+        tracing::info!(session = id, name = %session.role.name, role = session.role.role.label(), transport = session.member.kind, reason, "session left");
+        // Its streams stop now; the first session's broadcast (holding the
+        // shared tracks) stays with the engine.
+        session.tasks.clear();
+        if let Some(mut broadcast) = session.broadcast.take() {
+            if session.shared {
+                broadcast.finish();
+            } else {
+                self.primary = Some(broadcast);
+            }
+        }
+        let role = session.role.clone();
+        let member = session.member;
+        tokio::spawn(async move {
+            tokio::time::sleep(CLOSE_GRACE).await;
+            member.close();
+        });
+        Some(role)
+    }
+
+    /// [`Self::detach`], then the session policy: guests leave with the
+    /// last owner (unless kept).
+    async fn remove(
+        &mut self,
+        id: crate::guests::SessionId,
+        reason: &str,
+        notice: Option<String>,
+        capture: &mut Capture,
+    ) {
+        let Some(role) = self.detach(id, reason, notice, capture).await else {
+            return;
+        };
+        if role.is_owner()
+            && self.policy.kick_guests_with_owner
+            && !self.sessions.values().any(|s| s.role.is_owner())
+        {
+            for guest in self.order.clone() {
+                self.detach(
+                    guest,
+                    "the last owner left",
+                    Some("The host's owner left; guests are disconnected".into()),
+                    capture,
+                )
+                .await;
+            }
+        }
+        if !self.sessions.is_empty() {
+            let name = role.name.clone();
+            for other in self.order.clone() {
+                if self.sessions.get(&other).is_some_and(|s| s.role.is_owner()) && !role.is_owner()
+                {
+                    self.notice(other, format!("{name} left"));
+                }
+            }
+        }
+        self.send_access();
+    }
+
+    /// Before injecting during an encoder restart, when the loop's checks
+    /// and commands wait: whether `id` is still authorized, with its
+    /// current role.
+    async fn recheck(&mut self, id: crate::guests::SessionId, capture: &mut Capture) -> bool {
+        let Some(session) = self.sessions.get(&id) else {
+            return false;
+        };
+        match session.member.current_role() {
+            Some(role) if role == session.role => true,
+            _ => {
+                self.refresh(capture).await;
+                self.sessions.contains_key(&id)
+            }
+        }
+    }
+
+    /// Re-read every session's role and permissions: revoked devices leave,
+    /// changed permissions apply at once.
+    async fn refresh(&mut self, capture: &mut Capture) {
+        let mut revoked = Vec::new();
+        for id in self.order.clone() {
+            let Some(session) = self.sessions.get(&id) else {
+                continue;
+            };
+            let Some(role) = session.member.current_role() else {
+                revoked.push(id);
+                continue;
+            };
+            if role == session.role {
+                continue;
+            }
+            let before = session.role.clone();
+            let block = session.pad_block;
+            if let Some(session) = self.sessions.get_mut(&id) {
+                session.role = role.clone();
+            }
+            if !role.is_owner() && !role.permissions.keyboard_mouse && self.arbiter.forget(id) {
+                capture.release_keyboard_mouse().await;
+            }
+            if !role.is_owner() && !role.permissions.gamepad {
+                capture.destroy_pads(block);
+            }
+            if (before.role, before.permissions) != (role.role, role.permissions) {
+                tracing::info!(session = id, name = %role.name, permissions = %role.permissions.label(), "session permissions changed");
+                self.notice(
+                    id,
+                    format!(
+                        "The host changed what you may do: {}",
+                        role.permissions.label()
+                    ),
+                );
+            }
+        }
+        for id in revoked {
+            self.remove(
+                id,
+                "device access revoked",
+                Some("This device's access was revoked".into()),
+                capture,
+            )
+            .await;
+        }
+        self.send_access();
+    }
+}
+
+/// Copy a shared track into a session's own track, group by group, from
+/// the latest group on (later sessions' video and audio).
+async fn forward_track(
+    source: moq_net::track::Producer,
+    mut destination: moq_net::track::Producer,
 ) -> Result<()> {
+    let mut groups = source.subscribe(None);
+    if let Some(latest) = source.latest() {
+        groups.start_at(latest);
+    }
+    let mut copies = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            group = groups.recv_group() => {
+                let Some(mut group) = group? else { break };
+                let mut copy = match destination.create_group(group.sequence.into()) {
+                    Ok(copy) => copy,
+                    // A sequence the session's track already has: skip it.
+                    Err(_) => continue,
+                };
+                copies.spawn(async move {
+                    while let Some(frame) = group.read_frame().await? {
+                        copy.write_frame(frame.timestamp, frame.payload)?;
+                    }
+                    copy.finish()?;
+                    Ok::<_, anyhow::Error>(())
+                });
+            }
+            Some(_) = copies.join_next(), if !copies.is_empty() => (),
+        }
+    }
+    Ok(())
+}
+
+/// Subscribe to a session's input track (it announces `controls` first).
+async fn subscribe_input(
+    incoming: &moq_net::origin::Producer,
+) -> Result<moq_net::track::Subscriber> {
+    let remote = incoming
+        .consume()
+        .announced_broadcast("controls")
+        .await
+        .context("input broadcast missing")?;
+    Ok(remote
+        .track("input")?
+        .subscribe(
+            moq_net::track::Subscription::default()
+                .with_ordered(true)
+                .with_priority(255)
+                .with_latency_max(protocol::INPUT_TIMEOUT)
+                .with_group_start(0),
+        )
+        .await?)
+}
+
+/// Departure reports from sessions' input and connection watchers.
+type Departures = tokio::sync::mpsc::UnboundedSender<(crate::guests::SessionId, String)>;
+
+/// Watch a session's connection and run its input task; either ending
+/// reports a departure.
+fn session_tasks(
+    member: &Member,
+    input: Option<moq_net::track::Subscriber>,
+    events: &tokio::sync::mpsc::Sender<(crate::guests::SessionId, Event)>,
+    departures: &Departures,
+    last_motion: &Arc<AtomicU64>,
+) -> Vec<AbortOnDrop> {
+    let id = member.id;
+    let mut tasks = Vec::new();
+    {
+        let (incoming, events, departures, last_motion) = (
+            member.incoming.clone(),
+            events.clone(),
+            departures.clone(),
+            last_motion.clone(),
+        );
+        tasks.push(AbortOnDrop(tokio::spawn(async move {
+            let result = async {
+                let input = match input {
+                    Some(input) => input,
+                    None => {
+                        tokio::time::timeout(Duration::from_secs(10), subscribe_input(&incoming))
+                            .await
+                            .context("client did not open input track")??
+                    }
+                };
+                receive_input(id, input, events, last_motion).await
+            }
+            .await;
+            let reason = match &result {
+                Ok(()) => "input ended".to_owned(),
+                Err(error) => format!("{error:#}"),
+            };
+            let _ = departures.send((id, reason));
+            Ok(())
+        })));
+    }
+    {
+        let (departure, departures) = (member.departure(), departures.clone());
+        tasks.push(AbortOnDrop(tokio::spawn(async move {
+            let reason = departure.await;
+            let _ = departures.send((id, reason));
+            Ok(())
+        })));
+    }
+    tasks
+}
+
+impl Members {
+    /// A session joining a running stream: its own broadcast forwards the
+    /// shared tracks, with its own metadata and updates. Refused (and
+    /// closed) when the host is full, the device was revoked, or it asks
+    /// for something the shared stream cannot give it.
+    #[allow(clippy::too_many_arguments)]
+    fn join(
+        &mut self,
+        member: Member,
+        shared: &Shared,
+        info: &Desktop,
+        options: &Options,
+        hub: &crate::guests::Hub,
+        events: &tokio::sync::mpsc::Sender<(crate::guests::SessionId, Event)>,
+        departures: &Departures,
+    ) -> Option<crate::guests::SessionId> {
+        let refuse = |member: Member, reason: &str| {
+            tracing::warn!(session = member.id, name = %member.role.name, reason, "session refused");
+            member.close();
+            None
+        };
+        if self.sessions.len() >= self.policy.max_sessions {
+            return refuse(member, "the host's session limit is reached");
+        }
+        let Some(role) = member.current_role() else {
+            return refuse(member, "device access revoked");
+        };
+        let query = member.query.clone().unwrap_or_default();
+        let format = match requested_format(Some(&query), options.codec) {
+            Ok(format) => format,
+            Err(_) => return refuse(member, "invalid connection request"),
+        };
+        if url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == "ssh-agent") {
+            return refuse(member, "SSH agent forwarding is only for the first session");
+        }
+        if format.dynamic_range != options.dynamic_range {
+            return refuse(member, "the shared stream's dynamic range differs");
+        }
+        let Some(pad_block) = self.free_pad_block() else {
+            return refuse(member, "no gamepad slots left");
+        };
+        let built = (|| -> Result<_> {
+            let mut broadcast = member.outgoing.create_broadcast(
+                "desktop",
+                moq_net::broadcast::Route::new().with_announce(true),
+            )?;
+            let mut idle = Vec::new();
+            let mut tasks = Vec::new();
+            for codec in [protocol::VideoCodec::H264, protocol::VideoCodec::H265] {
+                let track = broadcast.create_track(
+                    codec.track(),
+                    moq_net::track::Info::default().with_latency_max(Duration::from_millis(500)),
+                )?;
+                if codec == shared.codec {
+                    tasks.push(AbortOnDrop(tokio::spawn(forward_track(
+                        shared.video.clone(),
+                        track,
+                    ))));
+                } else {
+                    idle.push(track);
+                }
+            }
+            for (index, source) in shared.monitors.iter().enumerate() {
+                let track = broadcast.create_track(
+                    format!("monitor-{index}-{}", shared.codec.track()),
+                    moq_net::track::Info::default().with_latency_max(Duration::from_millis(500)),
+                )?;
+                tasks.push(AbortOnDrop(tokio::spawn(forward_track(
+                    source.clone(),
+                    track,
+                ))));
+            }
+            let metadata = broadcast.create_track("desktop", None)?;
+            let updates = broadcast.create_track(
+                "updates",
+                moq_net::track::Info::default().with_ordered(true),
+            )?;
+            if let Some(audio) = &shared.audio {
+                let track = broadcast.create_track("opus", None)?;
+                tasks.push(AbortOnDrop(tokio::spawn(forward_track(
+                    audio.clone(),
+                    track,
+                ))));
+            }
+            Ok((broadcast, idle, tasks, metadata, updates))
+        })();
+        let (broadcast, idle, mut tasks, metadata, updates) = match built {
+            Ok(built) => built,
+            Err(error) => {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "could not publish to a joining session"
+                );
+                return refuse(member, "publishing failed");
+            }
+        };
+        let id = member.id;
+        let last_motion = Arc::new(AtomicU64::new(0));
+        tasks.extend(session_tasks(
+            &member,
+            None,
+            events,
+            departures,
+            &last_motion,
+        ));
+        let now = Instant::now();
+        let mut session = Session {
+            member,
+            role: role.clone(),
+            updates,
+            metadata,
+            broadcast: Some(broadcast),
+            _idle: idle,
+            tasks,
+            pointer: false,
+            last_motion,
+            pad_block,
+            features: Features::default(),
+            rates: None,
+            display: None,
+            joined: now,
+            last_input: now,
+            last_feedback: now,
+            last_keyframe: None,
+            last_refusal: None,
+            sent_access: None,
+            shared: true,
+            ssh_agent: false,
+        };
+        let mut rates_options = options.clone();
+        session.rates = Some(Rates::new(&mut rates_options, info));
+        self.sessions.insert(id, session);
+        self.order.push(id);
+        let desktop = self.customize(id, info);
+        if let Some(session) = self.sessions.get_mut(&id) {
+            let written = (|| -> Result<()> {
+                let mut group = session.metadata.append_group()?;
+                group.write_frame(moq_net::Timestamp::now(), serde_json::to_vec(&desktop)?)?;
+                group.finish()?;
+                Ok(())
+            })();
+            if let Err(error) = written {
+                tracing::warn!(%error, session = id, "could not send the joining session its desktop");
+                self.failed.push(id);
+            }
+        }
+        tracing::info!(session = id, name = %role.name, role = role.role.label(), permissions = %role.permissions.label(), transport = self.sessions[&id].member.kind, "session joined the shared desktop");
+        if !role.is_owner() {
+            self.notice_owners(&format!(
+                "{} joined as a guest ({})",
+                role.name,
+                role.permissions.label()
+            ));
+        }
+        self.send_access();
+        self.publish(hub);
+        Some(id)
+    }
+}
+
+/// The session engine: one capture and one encoder (per stream) for every
+/// session on the desktop (docs/guests.md). `first` chooses the codec and
+/// leads the stream (size, monitor, privacy) until an owner is there to.
+/// Sessions join through `joins`; the engine ends when the last one leaves.
+async fn run_session(
+    options: &Options,
+    hub: &crate::guests::Hub,
+    capture: &mut Capture,
+    first: Member,
+    joins: &mut tokio::sync::mpsc::Receiver<Member>,
+    commands: &mut tokio::sync::mpsc::UnboundedReceiver<crate::guests::Command>,
+) -> Result<Option<Member>> {
+    use crate::guests::Command;
+    // Revoked while it waited for the engine: never started.
+    let mut first = first;
+    first.role = match first.current_role() {
+        Some(role) => role,
+        None => {
+            first.close();
+            anyhow::bail!("device access revoked");
+        }
+    };
     // Stream preferences belong to this connection, not the next paired client.
     let mut negotiated = options.clone();
-    let requested = requested_format(query, options.codec)?;
-    let ssh_requested = url::form_urlencoded::parse(query.unwrap_or_default().as_bytes())
-        .any(|(key, value)| key == "ssh-agent" && value == "1");
+    let query = first.query.clone();
+    let requested = requested_format(query.as_deref(), options.codec)?;
+    let ssh_requested =
+        url::form_urlencoded::parse(query.as_deref().unwrap_or_default().as_bytes())
+            .any(|(key, value)| key == "ssh-agent" && value == "1");
     ensure!(
         !ssh_requested || options.allow_ssh_agent,
         "SSH agent forwarding is disabled; host requires explicit --allow-ssh-agent"
+    );
+    ensure!(
+        !ssh_requested || first.role.is_owner(),
+        "guests cannot forward an SSH agent"
     );
     negotiated.allow_ssh_agent = ssh_requested && options.allow_ssh_agent;
     negotiated.codec = requested.codec;
@@ -728,7 +1947,7 @@ async fn run_session(
     // Each client opts in again; a new session starts with the pointer in video.
     capture.local_cursor = false;
     capture.select_monitor(capture.active_monitor).await?;
-    let mut broadcast = outgoing.create_broadcast(
+    let mut broadcast = first.outgoing.create_broadcast(
         "desktop",
         moq_net::broadcast::Route::new().with_announce(true),
     )?;
@@ -761,8 +1980,8 @@ async fn run_session(
         monitor_codec_tracks.push((codec, tracks));
     }
     let mut monitor_streams: BTreeMap<usize, MonitorEncoder> = BTreeMap::new();
-    let mut metadata = broadcast.create_track("desktop", None)?;
-    let mut updates = broadcast.create_track(
+    let metadata = broadcast.create_track("desktop", None)?;
+    let updates = broadcast.create_track(
         "updates",
         moq_net::track::Info::default().with_ordered(true),
     )?;
@@ -779,31 +1998,14 @@ async fn run_session(
     } else {
         None
     };
-    let session = session.await?;
-    let input = tokio::time::timeout(Duration::from_secs(10), async {
-        let remote = incoming
-            .consume()
-            .announced_broadcast("controls")
-            .await
-            .context("input broadcast missing")?;
-        Ok::<_, anyhow::Error>(
-            remote
-                .track("input")?
-                .subscribe(
-                    moq_net::track::Subscription::default()
-                        .with_ordered(true)
-                        .with_priority(255)
-                        .with_latency_max(protocol::INPUT_TIMEOUT)
-                        .with_group_start(0),
-                )
-                .await?,
-        )
-    })
-    .await
-    .context("client did not open input track")??;
+    let input = tokio::time::timeout(Duration::from_secs(10), subscribe_input(&first.incoming))
+        .await
+        .context("client did not open input track")??;
+    let first_id = first.id;
     let mut ssh_agent = if let Some(requests) = agent_requests {
         let responses = tokio::time::timeout(Duration::from_secs(10), async {
-            let remote = incoming
+            let remote = first
+                .incoming
                 .consume()
                 .announced_broadcast("controls")
                 .await
@@ -835,40 +2037,83 @@ async fn run_session(
             .await
             .context("hardware encoder probe failed")?,
     };
-    // The metadata goes out before video starts: a client that chooses the
-    // codec (Desktop::codec_selection) needs it to decide.
-    let info = desktop(options, capture, video_start_group)?;
-    let mut group = metadata.append_group()?;
-    group.write_frame(moq_net::Timestamp::now(), serde_json::to_vec(&info)?)?;
-    group.finish()?;
-    let mut check = tokio::time::interval(Duration::from_millis(200));
     let (sender, receiver) = tokio::sync::mpsc::channel(256);
     let mut events = SessionEvents {
         receiver,
         deferred: Default::default(),
     };
-    // Highest pointer motion ID applied from either the ordered input track or
-    // pointer datagrams; older or duplicate positions are dropped.
-    let last_motion = Arc::new(AtomicU64::new(0));
-    let controls = incoming.clone();
-    let pointer_sender = sender.clone();
-    let mut pointer_task: Option<AbortOnDrop> = None;
-    // A task of its own, so input keeps arriving while the session loop waits
-    // for an encoder to start or stop (see while_starting).
-    let mut incoming = AbortOnDrop(tokio::spawn(receive_input(
-        input,
-        sender,
-        last_motion.clone(),
-    )));
+    let (departures_sender, mut departures) = tokio::sync::mpsc::unbounded_channel();
+    let mut members = Members::new(hub.policy.clone());
+    {
+        let last_motion = Arc::new(AtomicU64::new(0));
+        // A task of its own, so input keeps arriving while the session loop
+        // waits for an encoder to start or stop (see while_starting).
+        let tasks = session_tasks(
+            &first,
+            Some(input),
+            &sender,
+            &departures_sender,
+            &last_motion,
+        );
+        let now = Instant::now();
+        let role = first.role.clone();
+        members.sessions.insert(
+            first_id,
+            Session {
+                member: first,
+                role: role.clone(),
+                updates,
+                metadata,
+                broadcast: Some(broadcast),
+                _idle: Vec::new(),
+                tasks,
+                pointer: false,
+                last_motion,
+                pad_block: 0,
+                features: Features::default(),
+                rates: None,
+                display: None,
+                joined: now,
+                last_input: now,
+                last_feedback: now,
+                last_keyframe: None,
+                last_refusal: None,
+                sent_access: None,
+                shared: false,
+                ssh_agent: options.allow_ssh_agent,
+            },
+        );
+        members.order.push(first_id);
+        tracing::info!(session = first_id, name = %role.name, role = role.role.label(), "session started the desktop");
+        members.publish(hub);
+        members.sync_approvals(hub);
+    }
+    // The metadata goes out before video starts: a client that chooses the
+    // codec (Desktop::codec_selection) needs it to decide.
+    let info = desktop(options, capture, video_start_group)?;
+    {
+        let desktop = members.customize(first_id, &info);
+        let session = members
+            .sessions
+            .get_mut(&first_id)
+            .context("first session missing")?;
+        let mut group = session.metadata.append_group()?;
+        group.write_frame(moq_net::Timestamp::now(), serde_json::to_vec(&desktop)?)?;
+        group.finish()?;
+    }
+    let mut check = tokio::time::interval(Duration::from_millis(200));
     // A client choosing the codec sends SelectCodec first. Older clients send
     // something else (at least a heartbeat within INPUT_TIMEOUT) and get the
     // codec from their connection request, as before.
-    let first = tokio::time::timeout(protocol::INPUT_TIMEOUT, events.receiver.recv()).await;
-    let chosen_by_client = match first {
-        Ok(Some(Event::SelectCodec {
-            codec,
-            encoder_preset,
-        })) => {
+    let first_event = tokio::time::timeout(protocol::INPUT_TIMEOUT, events.receiver.recv()).await;
+    let chosen_by_client = match first_event {
+        Ok(Some((
+            _,
+            Event::SelectCodec {
+                codec,
+                encoder_preset,
+            },
+        ))) => {
             if let Some(preset) = encoder_preset {
                 options.encoder_preset = preset;
             }
@@ -880,8 +2125,8 @@ async fn run_session(
             options.codec = codec;
             true
         }
-        Ok(Some(event)) => {
-            events.deferred.push_back(event);
+        Ok(Some(tagged)) => {
+            events.deferred.push_back(tagged);
             false
         }
         // The input task reports a closed or silent input stream.
@@ -902,12 +2147,18 @@ async fn run_session(
         .into_iter()
         .find_map(|(codec, tracks)| (codec == options.codec).then_some(tracks))
         .context("no monitor tracks for the session codec")?;
+    let shared = Shared {
+        codec: options.codec,
+        video: video.clone(),
+        monitors: monitor_tracks.clone(),
+        audio: audio_track.clone(),
+    };
     let mut pipeline = start_encoder(
         options,
         capture.pipeline_source_for_range(options.dynamic_range)?,
         (info.width, info.height),
         options.fps,
-        options.bitrate,
+        members.limit(options.bitrate),
         &video,
     )
     .await
@@ -955,14 +2206,19 @@ async fn run_session(
         .then(|| Instant::now() + CURSOR_CHOICE_TIMEOUT);
     let mut position_tick = tokio::time::interval(CURSOR_POSITION_INTERVAL);
     position_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // The client's latest display (size, refresh, choices). Applied once the
-    // video-settings rate limit allows, coalescing bursts into the newest.
+    // The leading client's latest display (size, refresh, choices). Applied
+    // once the video-settings rate limit allows, coalescing bursts into the
+    // newest.
     let mut client_display: Option<protocol::ClientDisplay> = None;
     let mut display_pending = false;
     // Feedback from the virtual pads (rumble, PlayStation lights and trigger
-    // effects), once the client plays it.
+    // effects), once a client plays it.
     let mut rumble: Option<tokio::sync::mpsc::UnboundedReceiver<crate::gamepad::PadFeedback>> =
         None;
+    let mut feedback_sender: Option<crate::gamepad::FeedbackSender> = None;
+    // The session that asked for the auxiliary monitor streams (the leader
+    // when it did): their restarts are reported to it.
+    let mut monitor_viewer = first_id;
     // Privacy mode for this session: dropping it (however the session ends)
     // turns the monitors back on while the virtual output still exists.
     let mut privacy: Option<crate::privacy::Privacy> = None;
@@ -975,7 +2231,48 @@ async fn run_session(
     // The client asked for a virtual monitor: added (and kept at its display
     // size) by the display handler.
     let mut virtual_requested = false;
+    // The stream leader, to notice when another session takes over.
+    let mut leader = members.leader();
+    let mut access_check = Instant::now();
     loop {
+        // Sessions whose updates failed, then the end of the engine.
+        for id in std::mem::take(&mut members.failed) {
+            members
+                .remove(id, "session updates closed", None, capture)
+                .await;
+        }
+        if members.sessions.is_empty() {
+            tracing::info!("last session left");
+            return Ok(None);
+        }
+        // A guest who may type could use the forwarded agent like any
+        // program of the host user: forwarding ends.
+        if ssh_agent.is_some()
+            && members
+                .sessions
+                .values()
+                .any(|s| !s.role.is_owner() && s.role.permissions.keyboard_mouse)
+        {
+            ssh_agent = None;
+            tracing::warn!("SSH agent forwarding stopped: a guest may use the keyboard and mouse");
+            members.notice(
+                first_id,
+                "SSH agent forwarding stopped: a guest with keyboard and mouse could use it",
+            );
+        }
+        if members.leader() != leader {
+            leader = members.leader();
+            // The new leader's display decides the stream from now on.
+            if let Some(display) = leader
+                .and_then(|id| members.sessions.get_mut(&id))
+                .and_then(|session| session.display.take())
+            {
+                client_display = Some(display);
+                display_pending = true;
+            }
+            tracing::info!(leader = ?leader, "another session leads the stream now");
+            members.send_access();
+        }
         if cursor_restart.is_some() || display_change.is_some() {
             let local = cursor_restart.take();
             let change = display_change.take();
@@ -983,13 +2280,13 @@ async fn run_session(
             // (X11), or in the other portal cursor mode (a new ScreenCast
             // session, so every stream stops first).
             capture.release_all().await;
-            while_starting(retire(pipeline), &mut events, capture, &mut updates).await?;
+            while_starting(retire(pipeline), &mut events, capture, &mut members).await?;
             let active: Vec<_> = monitor_streams.keys().copied().collect();
             while_starting(
                 retire(std::mem::take(&mut monitor_streams)),
                 &mut events,
                 capture,
-                &mut updates,
+                &mut members,
             )
             .await?;
             if let Some(local) = local {
@@ -1031,7 +2328,7 @@ async fn run_session(
                                 format!("Privacy mode unavailable: {error:#}")
                             }
                         };
-                    publish_update(&mut updates, Update::Notice { text })?;
+                    members.leader_update(Update::Notice { text })?;
                 }
                 Some(DisplayChange::Resize(size)) => {
                     if let Err(error) = capture.resize_virtual(0, *size).await {
@@ -1065,12 +2362,12 @@ async fn run_session(
                     capture.pipeline_source_for_range(options.dynamic_range)?,
                     (info.width, info.height),
                     options.fps,
-                    options.bitrate,
+                    members.limit(options.bitrate),
                     &video,
                 ),
                 &mut events,
                 capture,
-                &mut updates,
+                &mut members,
             )
             .await?;
             if long_gop {
@@ -1083,13 +2380,13 @@ async fn run_session(
                     index,
                     &monitor_tracks[index],
                     &mut events,
-                    &mut updates,
+                    &mut members,
                 )
                 .await
                 {
                     Ok(stream) => {
-                        publish_update(
-                            &mut updates,
+                        members.to(
+                            monitor_viewer,
                             Update::MonitorStream {
                                 index,
                                 desktop: stream.desktop.clone(),
@@ -1102,8 +2399,8 @@ async fn run_session(
                         }
                         monitor_streams.insert(index, stream);
                     }
-                    Err(error) => publish_update(
-                        &mut updates,
+                    Err(error) => members.to(
+                        monitor_viewer,
                         Update::MonitorStreamStopped {
                             index,
                             reason: format!("Monitor restart failed: {error}"),
@@ -1116,13 +2413,13 @@ async fn run_session(
             encoder_metrics = pipeline.encoder_metrics()?;
             adaptive = !options.fixed_bitrate;
             last_feedback = Instant::now();
-            publish_update(&mut updates, Update::Desktop { desktop: info })?;
+            members.desktop(&info)?;
             // Portal shapes arrive through the feed (`pw_cursor::subscribe`).
             if local == Some(true)
                 && let Some(CursorFeed::X11(watcher)) = cursor_watcher.as_mut()
                 && let Some(cursor) = watcher.shapes.borrow_and_update().clone()
             {
-                publish_update(&mut updates, Update::Cursor { cursor })?;
+                members.all(Update::Cursor { cursor })?;
             }
             tracing::info!(
                 ?local,
@@ -1144,10 +2441,10 @@ async fn run_session(
             );
             capture.release_all().await;
             // Stop the dead PipeWire stream before opening the new session.
-            while_starting(retire(pipeline), &mut events, capture, &mut updates).await?;
+            while_starting(retire(pipeline), &mut events, capture, &mut members).await?;
             for index in std::mem::take(&mut monitor_streams).into_keys() {
-                publish_update(
-                    &mut updates,
+                members.to(
+                    monitor_viewer,
                     Update::MonitorStreamStopped {
                         index,
                         reason: "Host display changed".into(),
@@ -1185,12 +2482,12 @@ async fn run_session(
                     capture.pipeline_source_for_range(options.dynamic_range)?,
                     (info.width, info.height),
                     options.fps,
-                    options.bitrate,
+                    members.limit(options.bitrate),
                     &video,
                 ),
                 &mut events,
                 capture,
-                &mut updates,
+                &mut members,
             )
             .await?;
             session_video(&pipeline, options.fps, long_gop);
@@ -1199,13 +2496,10 @@ async fn run_session(
             adaptive = !options.fixed_bitrate;
             last_feedback = Instant::now();
             input_failures = 0;
-            publish_update(&mut updates, Update::Desktop { desktop: info })?;
-            publish_update(
-                &mut updates,
-                Update::Notice {
-                    text: "Host displays changed; video restarted".into(),
-                },
-            )?;
+            members.desktop(&info)?;
+            members.all(Update::Notice {
+                text: "Host displays changed; video restarted".into(),
+            })?;
             if virtual_requested && capture.virtual_monitor().is_none() {
                 display_pending = true;
             }
@@ -1217,18 +2511,98 @@ async fn run_session(
             tracing::info!("desktop portal session recreated");
         }
         tokio::select! {
-            result = crate::ssh_agent::closed(&mut ssh_agent) => return result,
-            result = &mut incoming.0 => return result.context("input task failed")?,
+            result = crate::ssh_agent::closed(&mut ssh_agent) => {
+                // The agent belongs to the first session: it leaves with it.
+                ssh_agent = None;
+                let reason = match result { Ok(()) => "SSH agent forwarding ended".to_owned(), Err(error) => format!("{error:#}") };
+                members.remove(first_id, &reason, None, capture).await;
+            },
             effect = async {
                 match rumble.as_mut() {
                     Some(receiver) => receiver.recv().await,
                     None => std::future::pending().await,
                 }
             } => match effect {
-                Some(feedback) => publish_update(&mut updates, pad_feedback_update(feedback))?,
+                Some(feedback) => members.pad_feedback(feedback),
                 None => rumble = None,
             },
-            error = session.closed() => anyhow::bail!("{error}"),
+            departure = departures.recv() => {
+                if let Some((id, reason)) = departure {
+                    members.remove(id, &reason, None, capture).await;
+                    members.publish(hub);
+                    // Its share and its rate control no longer bound the rest.
+                    if !members.sessions.is_empty() {
+                        let target = members.limit(rates.target());
+                        if target != pipeline.video_bitrate()? {
+                            let _ = pipeline.set_video_bitrate(target);
+                        }
+                    }
+                }
+            },
+            member = joins.recv() => {
+                if let Some(member) = member {
+                    // A new connection with a session's credential is that
+                    // device reconnecting: the old session (often already
+                    // dead, not yet timed out) gives way.
+                    let stale: Vec<_> = members.order.iter().copied().filter(|id| {
+                        members.sessions.get(id).is_some_and(|s| s.member.credential == member.credential)
+                    }).collect();
+                    for id in stale {
+                        members.detach(id, "replaced by a new connection with the same credential", None, capture).await;
+                    }
+                    if members.sessions.is_empty() {
+                        // It was the only one: start over with the new
+                        // connection as the first session (it chooses the
+                        // codec and leads), as for a fresh connection.
+                        return Ok(Some(member));
+                    }
+                    members.send_access();
+                    let info = desktop(options, capture, video_start_group)?;
+                    if members.join(member, &shared, &info, options, hub, &sender, &departures_sender).is_some() {
+                        // The new session starts at the next keyframe, not
+                        // at the end of a long GOP.
+                        let _ = pipeline.request_keyframe();
+                        for stream in monitor_streams.values() {
+                            let _ = stream.pipeline.request_keyframe();
+                        }
+                        let target = members.limit(rates.target());
+                        if target != pipeline.video_bitrate()? {
+                            let _ = pipeline.set_video_bitrate(target);
+                        }
+                    }
+                }
+            },
+            command = commands.recv() => match command {
+                Some(Command::Kick(id)) => {
+                    // A kicked guest cannot simply reconnect at once.
+                    if let Some(device) = members.sessions.get(&id).filter(|s| !s.role.is_owner()).and_then(|s| s.role.device.clone()) {
+                        hub.block(&device, crate::guests::KICKED_FOR);
+                    }
+                    members.remove(id, "disconnected by the host", Some("The host disconnected this session".into()), capture).await;
+                    members.publish(hub);
+                }
+                Some(Command::Refresh) => {
+                    members.refresh(capture).await;
+                    members.publish(hub);
+                }
+                Some(Command::TakeControl) => {
+                    if let Some(previous) = members.arbiter.take_for_host(Instant::now()) {
+                        capture.release_keyboard_mouse().await;
+                        members.notice(previous, "The host took keyboard and mouse control");
+                    }
+                    tracing::info!("the host took keyboard and mouse control");
+                    members.send_access();
+                    members.publish(hub);
+                }
+                Some(Command::ReleaseControl) => {
+                    members.arbiter.release();
+                    tracing::info!("guests may take keyboard and mouse control again");
+                    members.send_access();
+                    members.publish(hub);
+                }
+                Some(Command::Approvals) => members.sync_approvals(hub),
+                Some(Command::Shutdown) | None => return Ok(None),
+            },
             shape = async {
                 match cursor_watcher.as_mut() {
                     Some(feed) => feed.shapes().changed().await,
@@ -1240,12 +2614,12 @@ async fn run_session(
                     _ => {
                         // The pointer stays out of the video; the client keeps its last shape.
                         cursor_watcher = None;
-                        publish_update(&mut updates, Update::Notice { text: "Host cursor updates stopped".into() })?;
+                        members.all(Update::Notice { text: "Host cursor updates stopped".into() })?;
                         None
                     }
                 };
                 if let Some(cursor) = shape {
-                    publish_update(&mut updates, Update::Cursor { cursor })?;
+                    members.all(Update::Cursor { cursor })?;
                 }
             },
             // Latest host pointer position, rate limited (portal metadata).
@@ -1253,7 +2627,7 @@ async fn run_session(
                 if let Some(CursorFeed::Portal(feed)) = cursor_watcher.as_mut()
                     && feed.positions.has_changed().unwrap_or(false)
                     && let Some(position) = *feed.positions.borrow_and_update() {
-                    publish_update(&mut updates, Update::CursorPosition { monitor: position.monitor, x: position.x, y: position.y })?;
+                    members.all(Update::CursorPosition { monitor: position.monitor, x: position.x, y: position.y })?;
                 }
             },
             // The client never opted in: draw the pointer into the video again.
@@ -1270,7 +2644,7 @@ async fn run_session(
                 if virtual_requested && capture.virtual_monitor().is_none() {
                     let text = match capture.add_virtual_monitor(size.unwrap_or(Size::DEFAULT)).await {
                         Ok(index) => {
-                            publish_update(&mut updates, Update::Desktop { desktop: desktop(options, capture, video_start_group)? })?;
+                            members.desktop(&desktop(options, capture, video_start_group)?)?;
                             format!("Virtual monitor added as monitor {}", index + 1)
                         }
                         Err(error) => {
@@ -1279,7 +2653,7 @@ async fn run_session(
                             format!("Virtual monitor unavailable: {error:#}")
                         }
                     };
-                    publish_update(&mut updates, Update::Notice { text })?;
+                    members.leader_update(Update::Notice { text })?;
                 } else if let (Some(size), Some(index)) = (size, capture.virtual_monitor())
                     && capture.virtual_monitor_resizable()
                     && (capture.monitors[index].width, capture.monitors[index].height) != (size.width, size.height)
@@ -1287,19 +2661,19 @@ async fn run_session(
                     // Follow the client's display: stop its stream, resize, restart it.
                     let running = monitor_streams.remove(&index);
                     let was_running = running.is_some();
-                    if let Some(stream) = running { while_starting(retire(stream), &mut events, capture, &mut updates).await?; }
+                    if let Some(stream) = running { while_starting(retire(stream), &mut events, capture, &mut members).await?; }
                     if let Err(error) = capture.resize_virtual(index, size).await {
                         tracing::warn!(error = format!("{error:#}"), "virtual monitor resize failed");
                     }
-                    publish_update(&mut updates, Update::Desktop { desktop: desktop(options, capture, video_start_group)? })?;
+                    members.desktop(&desktop(options, capture, video_start_group)?)?;
                     if was_running {
-                        match monitor_encoder(options, capture, index, &monitor_tracks[index], &mut events, &mut updates).await {
+                        match monitor_encoder(options, capture, index, &monitor_tracks[index], &mut events, &mut members).await {
                             Ok(stream) => {
-                                publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
+                                members.to(monitor_viewer, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
                                 if long_gop { stream.pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
                                 monitor_streams.insert(index, stream);
                             }
-                            Err(error) => publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor restart failed: {error}"), requested: false })?,
+                            Err(error) => members.to(monitor_viewer, Update::MonitorStreamStopped { index, reason: format!("Monitor restart failed: {error}"), requested: false })?,
                         }
                     }
                 }
@@ -1328,7 +2702,9 @@ async fn run_session(
                     // retargets the encoder in place, anything else restarts
                     // it off the session loop; either way the client gets
                     // `Update::Desktop`.
-                    events.deferred.push_back(Event::ConfigureVideo { width: choice.width, fps: choice.fps, bitrate: choice.bitrate });
+                    if let Some(leader) = members.leader() {
+                        events.deferred.push_back((leader, Event::ConfigureVideo { width: choice.width, fps: choice.fps, bitrate: choice.bitrate }));
+                    }
                 }
             },
             _ = check.tick() => {
@@ -1339,6 +2715,21 @@ async fn run_session(
                     tracing::warn!(error = format!("{error:#}"), "capture pipeline failed");
                     portal_lost = true;
                     continue;
+                }
+                // Revocation, permission changes, idle guests; the session list.
+                if access_check.elapsed() >= ACCESS_CHECK_INTERVAL {
+                    access_check = Instant::now();
+                    members.refresh(capture).await;
+                    if let Some(idle) = members.policy.guest_idle_kick {
+                        let now = Instant::now();
+                        let idle_guests: Vec<_> = members.order.iter().copied().filter(|id| {
+                            members.sessions.get(id).is_some_and(|s| !s.role.is_owner() && now.duration_since(s.last_input) >= idle)
+                        }).collect();
+                        for id in idle_guests {
+                            members.remove(id, "idle", Some(format!("Disconnected after {} minutes without input", idle.as_secs() / 60)), capture).await;
+                        }
+                    }
+                    members.publish(hub);
                 }
                 // Streaming a virtual display for lack of a monitor: switch
                 // to the monitors once one is back (KDE; elsewhere the
@@ -1365,7 +2756,7 @@ async fn run_session(
                         Ok(count) => tracing::warn!(count, "privacy mode turned returning monitors off again"),
                         Err(error) => {
                             tracing::warn!(error = format!("{error:#}"), "privacy mode could not keep the monitors off");
-                            publish_update(&mut updates, Update::Notice { text: format!("Privacy mode could not keep a host monitor off: {error:#}") })?;
+                            members.leader_update(Update::Notice { text: format!("Privacy mode could not keep a host monitor off: {error:#}") })?;
                         }
                     }
                 }
@@ -1373,16 +2764,16 @@ async fn run_session(
                 for (index, error) in failed {
                     monitor_streams.remove(&index);
                     capture.release_all().await;
-                    publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor stream stopped: {error}"), requested: false })?;
+                    members.to(monitor_viewer, Update::MonitorStreamStopped { index, reason: format!("Monitor stream stopped: {error}"), requested: false })?;
                 }
                 if let Some(audio) = &audio { audio.error()?; }
-                if adaptive {
+                if adaptive && let Some(session) = members.leader_session() {
                     let stats = session.stats();
                     // Clients sending NetworkFeedback are rate-controlled from it.
                     if rates.delay.is_none()
                         && let (Some(rtt), Some(sent), Some(lost)) = (stats.rtt, stats.packets_sent, stats.packets_lost)
                         && rates.network.observe(Instant::now(), rtt, sent, lost).is_some() {
-                        let bitrate = rates.target();
+                        let bitrate = members.limit(rates.target());
                         if bitrate != pipeline.video_bitrate()? {
                             match pipeline.set_video_bitrate(bitrate) {
                                 Ok(()) => tracing::info!(bitrate, rtt_ms = rtt.as_millis() as u64, "adapted video bitrate to network"),
@@ -1400,50 +2791,62 @@ async fn run_session(
                         (options.width, options.fps) = if rates.ladder.level() == 0 { rates.negotiated } else { (step.width, step.fps) };
                         tracing::info!(width = step.width, fps = step.fps, kbps, level = rates.ladder.level(), "stepped video for the network");
                         capture.release_all().await;
-                        while_starting(retire(pipeline), &mut events, capture, &mut updates).await?;
+                        while_starting(retire(pipeline), &mut events, capture, &mut members).await?;
                         video_start_group = video_barrier(&video)?;
                         let info = desktop(options, capture, video_start_group)?;
                         capture.select_monitor(capture.active_monitor).await?;
-                        pipeline = while_starting(start_encoder(options, capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, kbps, &video), &mut events, capture, &mut updates).await?;
+                        pipeline = while_starting(start_encoder(options, capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, members.limit(kbps), &video), &mut events, capture, &mut members).await?;
                         session_video(&pipeline, options.fps, long_gop);
                         encoder_metrics = pipeline.encoder_metrics()?;
                         (rates.encoded_bytes, rates.key_bytes) = (0, 0);
-                        publish_update(&mut updates, Update::Desktop { desktop: info })?;
+                        members.desktop(&info)?;
                     }
                 }
                 if telemetry_enabled && last_telemetry.elapsed() >= Duration::from_secs(1) {
                     last_telemetry = Instant::now();
-                    publish_update(&mut updates, Update::Telemetry {
+                    members.all(Update::Telemetry {
                         encode_us: encoder_metrics.encode_us.load(std::sync::atomic::Ordering::Relaxed),
                         bitrate: pipeline.video_bitrate()?,
                         encoder: encoder_metrics.encoder.clone(),
                     })?;
                 }
             },
-            event = events.next() => {
-                match event.context("input stream closed")? {
+            tagged = events.next() => {
+                let (from, event) = tagged.context("input stream closed")?;
+                let release = match members.screen(from, &event, Instant::now()) {
+                    Screen::Drop => continue,
+                    Screen::Pass { release } => release,
+                };
+                if release {
+                    // Control changed hands: what the previous holder held
+                    // is released before the new holder's input.
+                    capture.release_keyboard_mouse().await;
+                }
+                match event {
                     Event::MonitorStream { index, enabled } => {
+                        monitor_viewer = from;
                         if !enabled {
-                            if let Some(stream) = monitor_streams.remove(&index) { while_starting(retire(stream), &mut events, capture, &mut updates).await?; }
+                            if let Some(stream) = monitor_streams.remove(&index) { while_starting(retire(stream), &mut events, capture, &mut members).await?; }
                             capture.release_all().await;
-                            publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: "Monitor stream disabled".into(), requested: true })?;
+                            members.to(from, Update::MonitorStreamStopped { index, reason: "Monitor stream disabled".into(), requested: true })?;
                             continue;
                         }
                         if let Some(stream) = monitor_streams.get(&index) {
-                            publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
+                            let update = Update::MonitorStream { index, desktop: stream.desktop.clone() };
+                            members.to(from, update)?;
                             continue;
                         }
                         if monitor_streams.len() >= 4 || index >= monitor_tracks.len() {
-                            publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: "Monitor unavailable or four additional streams already active".into(), requested: false })?;
+                            members.to(from, Update::MonitorStreamStopped { index, reason: "Monitor unavailable or four additional streams already active".into(), requested: false })?;
                             continue;
                         }
-                        match monitor_encoder(options, capture, index, &monitor_tracks[index], &mut events, &mut updates).await {
+                        match monitor_encoder(options, capture, index, &monitor_tracks[index], &mut events, &mut members).await {
                             Ok(stream) => {
-                                publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
+                                members.to(from, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
                                 if long_gop { stream.pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
                                 monitor_streams.insert(index, stream);
                             }
-                            Err(error) => publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor unavailable: {error}"), requested: false })?,
+                            Err(error) => members.to(from, Update::MonitorStreamStopped { index, reason: format!("Monitor unavailable: {error}"), requested: false })?,
                         }
                     }
                     Event::MonitorMotion { index, x, y } => {
@@ -1451,24 +2854,76 @@ async fn run_session(
                             && let Err(error) = capture.monitor_motion(index, x, y).await {
                             monitor_streams.remove(&index);
                             capture.release_all().await;
-                            publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor input unavailable: {error}"), requested: false })?;
+                            members.to(monitor_viewer, Update::MonitorStreamStopped { index, reason: format!("Monitor input unavailable: {error}"), requested: false })?;
                         }
                     }
                     // Auxiliary streams currently use fixed bitrate. Their
                     // congestion must never adapt the independent primary.
                     Event::MonitorFeedback { .. } => {}
-                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble, cursor_positions: wants_positions, frame_timing, privacy: wants_privacy, virtual_monitor: wants_virtual, gamepad_lights } => {
+                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble, cursor_positions: wants_positions, frame_timing, privacy: wants_privacy, virtual_monitor: wants_virtual, gamepad_lights, guests } => {
+                        let is_leader = members.is_leader(from);
+                        let first_declaration = members.sessions.get(&from).is_some_and(|s| !s.features.declared);
+                        if let Some(session) = members.sessions.get_mut(&from) {
+                            session.features = Features {
+                                declared: true,
+                                guests: session.features.guests || guests,
+                                rumble: session.features.rumble || plays_rumble,
+                                lights: session.features.lights || gamepad_lights,
+                                frame_timing: session.features.frame_timing || frame_timing,
+                            };
+                        }
+                        if guests && first_declaration {
+                            members.send_access();
+                            if members.sessions.get(&from).is_some_and(|s| s.role.is_owner()) {
+                                members.announce_to(from, hub);
+                            }
+                        }
+                        if plays_rumble || gamepad_lights {
+                            // One channel for every session's pads; later
+                            // declarations only widen what new pads offer.
+                            let sender = match &feedback_sender {
+                                Some(sender) => sender.clone(),
+                                None => {
+                                    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+                                    rumble = Some(receiver);
+                                    feedback_sender = Some(sender.clone());
+                                    sender
+                                }
+                            };
+                            capture.enable_pad_feedback(sender, plays_rumble, gamepad_lights);
+                        }
+                        if pointer_datagrams
+                            && let Some(session) = members.sessions.get_mut(&from)
+                            && !session.pointer
+                        {
+                            session.pointer = true;
+                            let task = AbortOnDrop(tokio::spawn(receive_pointer(from, session.member.incoming.clone(), sender.clone(), session.last_motion.clone())));
+                            session.tasks.push(task);
+                        }
+                        // A shared stream already stamped for others cannot
+                        // be read by a client that cannot strip the stamps.
+                        if !is_leader && options.frame_timing && !frame_timing {
+                            members.remove(from, "client cannot read the shared stream", Some("Update Teleport to join this shared desktop".into()), capture).await;
+                            continue;
+                        }
+                        if !is_leader {
+                            // The rest belongs to the session leading the stream.
+                            continue;
+                        }
                         if frame_timing && !options.frame_timing {
                             // Encoders started later inherit it from options.
                             options.frame_timing = true;
                             pipeline.set_frame_timing();
                             for stream in monitor_streams.values() { stream.pipeline.set_frame_timing(); }
                         }
+                        // The host's monitors are the owner's business.
+                        let owner = members.sessions.get(&from).is_some_and(|s| s.role.is_owner());
+                        let (wants_privacy, wants_virtual) = (wants_privacy && owner, wants_virtual && owner);
                         if wants_privacy && privacy.is_none() && !capture.privacy() {
                             if options.privacy_available {
                                 display_change = Some(DisplayChange::Privacy);
                             } else {
-                                publish_update(&mut updates, Update::Notice { text: "Privacy mode is off on this host (teleport host --privacy-mode request)".into() })?;
+                                members.to(from, Update::Notice { text: "Privacy mode is off on this host (teleport host --privacy-mode request)".into() })?;
                             }
                         }
                         if wants_virtual && !virtual_requested {
@@ -1477,16 +2932,8 @@ async fn run_session(
                                 // Added by the display handler, at the client's size.
                                 display_pending = true;
                             } else {
-                                publish_update(&mut updates, Update::Notice { text: "This host cannot add a virtual monitor".into() })?;
+                                members.to(from, Update::Notice { text: "This host cannot add a virtual monitor".into() })?;
                             }
-                        }
-                        if (plays_rumble || gamepad_lights) && rumble.is_none() {
-                            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-                            capture.enable_pad_feedback(sender, plays_rumble, gamepad_lights);
-                            rumble = Some(receiver);
-                        }
-                        if pointer_datagrams && pointer_task.is_none() {
-                            pointer_task = Some(AbortOnDrop(tokio::spawn(receive_pointer(controls.clone(), pointer_sender.clone(), last_motion.clone()))));
                         }
                         if keyframe_requests && !long_gop {
                             long_gop = true;
@@ -1524,15 +2971,26 @@ async fn run_session(
                         display_pending = true;
                     }
                     // Only the first event chooses (see above); video is running now.
-                    Event::SelectCodec { codec, .. } => ensure!(
-                        codec == options.codec,
-                        "the video codec is chosen before video starts; reconnect to change it"
-                    ),
+                    Event::SelectCodec { codec, .. } => if codec != options.codec {
+                        members.remove(from, "asked for another codec", Some("The video codec is chosen before video starts; reconnect to change it".into()), capture).await;
+                    },
                     Event::RequestKeyframe { monitor } => {
                         // Bound IDR bursts: a lossy link must not turn every
                         // request into a full keyframe and deepen congestion.
+                        // A guest's requests are spaced further apart (they
+                        // cost every session bitrate).
                         let now = Instant::now();
-                        if last_keyframe.get(&monitor).is_none_or(|at| now.duration_since(*at) >= KEYFRAME_REQUEST_INTERVAL) {
+                        let guest_ready = members.sessions.get_mut(&from).is_none_or(|session| {
+                            if session.role.is_owner() {
+                                return true;
+                            }
+                            let ready = session.last_keyframe.is_none_or(|at| now.duration_since(at) >= GUEST_KEYFRAME_INTERVAL);
+                            if ready {
+                                session.last_keyframe = Some(now);
+                            }
+                            ready
+                        });
+                        if guest_ready && last_keyframe.get(&monitor).is_none_or(|at| now.duration_since(*at) >= KEYFRAME_REQUEST_INTERVAL) {
                             last_keyframe.insert(monitor, now);
                             let target = match monitor {
                                 None => Some(&pipeline),
@@ -1546,7 +3004,7 @@ async fn run_session(
                     }
                     Event::ConfigureVideo { width, fps, bitrate } => {
                         if last_configure.elapsed() < CONFIGURE_INTERVAL {
-                            publish_update(&mut updates, Update::Notice { text: "Video settings changed too quickly; try again".into() })?;
+                            members.to(from, Update::Notice { text: "Video settings changed too quickly; try again".into() })?;
                             continue;
                         }
                         let mut requested = options.clone();
@@ -1556,7 +3014,7 @@ async fn run_session(
                         let mut info = match desktop(&requested, capture, video_start_group) {
                             Ok(info) => info,
                             Err(error) => {
-                                publish_update(&mut updates, Update::Notice { text: format!("Unsupported video settings: {error}") })?;
+                                members.to(from, Update::Notice { text: format!("Unsupported video settings: {error}") })?;
                                 continue;
                             }
                         };
@@ -1564,49 +3022,50 @@ async fn run_session(
                         // A bitrate-only change retargets the running encoder (in
                         // place, or reopened in the background): no capture restart,
                         // no gap. Auxiliary monitors keep their fixed bitrate.
-                        if width == options.width && fps == options.fps && pipeline.set_video_bitrate(bitrate).is_ok() {
+                        if width == options.width && fps == options.fps && pipeline.set_video_bitrate(members.limit(bitrate)).is_ok() {
                             *options = requested;
                             rates = Rates::new(options, &info);
                             adaptive = !options.fixed_bitrate;
                             last_feedback = Instant::now();
-                            publish_update(&mut updates, Update::Desktop { desktop: info })?;
+                            members.desktop(&info)?;
                             continue;
                         }
                         capture.release_all().await;
-                        while_starting(retire(pipeline), &mut events, capture, &mut updates).await?;
+                        while_starting(retire(pipeline), &mut events, capture, &mut members).await?;
                         video_start_group = video_barrier(&video)?;
                         info.video_start_group = video_start_group;
                         capture.select_monitor(capture.active_monitor).await?;
-                        pipeline = while_starting(start_encoder(options, capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), fps, bitrate, &video), &mut events, capture, &mut updates).await?;
+                        pipeline = while_starting(start_encoder(options, capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), fps, members.limit(bitrate), &video), &mut events, capture, &mut members).await?;
                         session_video(&pipeline, fps, long_gop);
                         *options = requested;
                         let active: Vec<_> = monitor_streams.keys().copied().collect();
-                        while_starting(retire(std::mem::take(&mut monitor_streams)), &mut events, capture, &mut updates).await?;
+                        while_starting(retire(std::mem::take(&mut monitor_streams)), &mut events, capture, &mut members).await?;
                         for index in active {
-                            match monitor_encoder(options, capture, index, &monitor_tracks[index], &mut events, &mut updates).await {
+                            match monitor_encoder(options, capture, index, &monitor_tracks[index], &mut events, &mut members).await {
                                 Ok(stream) => {
-                                    publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
+                                    members.to(monitor_viewer, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
                                     if long_gop { stream.pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
                                     monitor_streams.insert(index, stream);
                                 }
-                                Err(error) => publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor reconfiguration failed: {error}"), requested: false })?,
+                                Err(error) => members.to(monitor_viewer, Update::MonitorStreamStopped { index, reason: format!("Monitor reconfiguration failed: {error}"), requested: false })?,
                             }
                         }
                         encoder_metrics = pipeline.encoder_metrics()?;
                         rates = Rates::new(options, &info);
                         adaptive = !options.fixed_bitrate;
                         last_feedback = Instant::now();
-                        publish_update(&mut updates, Update::Desktop { desktop: info })?;
+                        members.desktop(&info)?;
                     }
                     Event::SelectMonitor { index } => {
                         if index >= capture.monitors.len() || last_switch.elapsed() < Duration::from_millis(500) {
-                            publish_update(&mut updates, Update::Desktop { desktop: desktop(options, capture, video_start_group)? })?;
+                            let desktop = members.customize(from, &desktop(options, capture, video_start_group)?);
+                            members.to(from, Update::Desktop { desktop })?;
                             continue;
                         }
                         last_switch = Instant::now();
                         capture.release_all().await;
                         // Stop the old source before opening another PipeWire node.
-                        while_starting(retire(pipeline), &mut events, capture, &mut updates).await?;
+                        while_starting(retire(pipeline), &mut events, capture, &mut members).await?;
                         video_start_group = video_barrier(&video)?;
                         capture.select_monitor(index).await?;
                         rates.restore(options);
@@ -1616,33 +3075,50 @@ async fn run_session(
                             (options.width, options.fps, options.bitrate) = (choice.width, choice.fps, choice.bitrate);
                         }
                         let info = desktop(options, capture, video_start_group)?;
-                        pipeline = while_starting(start_encoder(options, capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, options.bitrate, &video), &mut events, capture, &mut updates).await?;
+                        pipeline = while_starting(start_encoder(options, capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, members.limit(options.bitrate), &video), &mut events, capture, &mut members).await?;
                         session_video(&pipeline, options.fps, long_gop);
                         rates = Rates::new(options, &info);
                         encoder_metrics = pipeline.encoder_metrics()?;
                         adaptive = !options.fixed_bitrate;
                         last_feedback = Instant::now();
-                        publish_update(&mut updates, Update::Desktop { desktop: info })?;
+                        members.desktop(&info)?;
                     }
                     Event::Feedback { queue_ms, dropped_groups } => {
-                        if adaptive && last_feedback.elapsed() >= Duration::from_millis(900) {
-                            last_feedback = Instant::now();
-                            if rates.adaptation.observe(queue_ms, dropped_groups).is_some()
-                                && rates.target() != pipeline.video_bitrate()? {
-                                let bitrate = rates.target();
-                                match pipeline.set_video_bitrate(bitrate) {
-                                    Ok(()) => { tracing::info!(bitrate, queue_ms, dropped_groups, "adapted video bitrate"); },
-                                    Err(error) => { adaptive = false; tracing::warn!(%error, "encoder does not support live bitrate changes; retaining fixed bitrate"); }
+                        let changed = if members.is_leader(from) {
+                            adaptive && last_feedback.elapsed() >= Duration::from_millis(900) && {
+                                last_feedback = Instant::now();
+                                rates.adaptation.observe(queue_ms, dropped_groups).is_some()
+                            }
+                        } else {
+                            // Its own controller bounds the shared bitrate.
+                            adaptive && members.sessions.get_mut(&from).is_some_and(|session| {
+                                session.last_feedback.elapsed() >= Duration::from_millis(900) && {
+                                    session.last_feedback = Instant::now();
+                                    session.rates.as_mut().is_some_and(|rates| rates.adaptation.observe(queue_ms, dropped_groups).is_some())
                                 }
+                            })
+                        };
+                        let bitrate = members.limit(rates.target());
+                        if changed && bitrate != pipeline.video_bitrate()? {
+                            match pipeline.set_video_bitrate(bitrate) {
+                                Ok(()) => { tracing::info!(bitrate, queue_ms, dropped_groups, "adapted video bitrate"); },
+                                Err(error) => { adaptive = false; tracing::warn!(%error, "encoder does not support live bitrate changes; retaining fixed bitrate"); }
                             }
                         }
                     }
                     Event::NetworkFeedback { delay_ms, received_kbps } => {
                         if adaptive {
-                            let stats = session.stats();
                             let sizes = *encoder_metrics.sizes.lock().unwrap();
-                            if let Some(bitrate) = rates.feedback(Instant::now(), delay_ms, received_kbps, sizes, stats.packets_sent.zip(stats.packets_lost))
-                                && bitrate != pipeline.video_bitrate()? {
+                            let changed = if members.is_leader(from) {
+                                let stats = members.leader_session().map(|session| session.stats());
+                                let packets = stats.and_then(|stats| stats.packets_sent.zip(stats.packets_lost));
+                                rates.feedback(Instant::now(), delay_ms, received_kbps, sizes, packets).is_some()
+                            } else {
+                                let packets = members.sessions.get(&from).and_then(|s| s.member.session()).map(|session| session.stats()).and_then(|stats| stats.packets_sent.zip(stats.packets_lost));
+                                members.sessions.get_mut(&from).and_then(|s| s.rates.as_mut()).is_some_and(|rates| rates.feedback(Instant::now(), delay_ms, received_kbps, sizes, packets).is_some())
+                            };
+                            let bitrate = members.limit(rates.target());
+                            if changed && bitrate != pipeline.video_bitrate()? {
                                 match pipeline.set_video_bitrate(bitrate) {
                                     Ok(()) => tracing::info!(bitrate, ?delay_ms, received_kbps, capacity = ?rates.delay.as_ref().and_then(|rate| rate.capacity()), "adapted video bitrate to network"),
                                     Err(error) => { adaptive = false; tracing::warn!(%error, "encoder does not support live bitrate changes; retaining fixed bitrate"); }
@@ -1652,23 +3128,73 @@ async fn run_session(
                     }
                     Event::Clipboard { text } if options.clipboard => {
                         let text = match crate::clipboard::write(&text).await { Ok(()) => "Clipboard sent to host".into(), Err(error) => format!("Clipboard unavailable: {error}") };
-                        publish_update(&mut updates, Update::Notice { text })?;
+                        members.to(from, Update::Notice { text })?;
                     }
                     Event::ClipboardRequest if options.clipboard => {
                         let update = match crate::clipboard::read().await { Ok(text) => Update::Clipboard { text }, Err(error) => Update::Notice { text: format!("Clipboard unavailable: {error}") } };
-                        publish_update(&mut updates, update)?;
+                        members.to(from, update)?;
                     }
-                    Event::Clipboard { .. } | Event::ClipboardRequest => publish_update(&mut updates, Update::Notice { text: "Host clipboard is disabled; start host with --clipboard to opt in".into() })?,
+                    Event::Clipboard { .. } | Event::ClipboardRequest => members.to(from, Update::Notice { text: "Host clipboard is disabled; start host with --clipboard to opt in".into() })?,
                     Event::Probe { id } => {
                         telemetry_enabled = true;
                         let host_us = options.frame_timing.then(|| protocol::clock_us(Instant::now()));
-                        publish_update(&mut updates, Update::Pong { id, host_us })?;
+                        members.to(from, Update::Pong { id, host_us })?;
                     },
+                    Event::TakeControl { take } => {
+                        // Owners only (screened).
+                        if take {
+                            if let Some(previous) = members.arbiter.take(from, Instant::now()) {
+                                capture.release_keyboard_mouse().await;
+                                members.notice(previous, "The host's owner took keyboard and mouse control");
+                            }
+                            members.notice(from, "You have keyboard and mouse control; guests cannot take it until you release it");
+                        } else {
+                            members.arbiter.release();
+                            members.notice(from, "Guests may take keyboard and mouse control again");
+                        }
+                        members.send_access();
+                        members.publish(hub);
+                    }
+                    Event::ApproveGuest { id, allow } => {
+                        // Owners only (screened).
+                        let text = match hub.answer(id, allow) {
+                            Ok(()) => if allow { "Guest approved" } else { "Guest denied" }.to_owned(),
+                            Err(error) => format!("{error}"),
+                        };
+                        tracing::info!(session = from, request = id, allow, "guest request answered by an owner's client");
+                        members.notice(from, text);
+                    }
+                    Event::ReleaseAll => {
+                        // What this session holds: keys and buttons if it has
+                        // control, and its own pads.
+                        if members.arbiter.holder_session() == Some(from) {
+                            capture.release_keyboard_mouse().await;
+                        }
+                        if let Some(session) = members.sessions.get(&from) {
+                            capture.neutralise_pads(session.pad_block);
+                        }
+                    }
+                    event @ (Event::GamepadConnected { .. }
+                    | Event::GamepadDisconnected { .. }
+                    | Event::GamepadButton { .. }
+                    | Event::GamepadAxis { .. }
+                    | Event::GamepadTouch { .. }
+                    | Event::GamepadMotion { .. }) => {
+                        let Some((block, role)) = members.sessions.get(&from).map(|s| (s.pad_block, s.role.role)) else { continue };
+                        // Guests: Xbox pads, no touchpad pointer.
+                        let Some(event) = crate::guests::guest_pad(role, event) else { continue };
+                        if let Err(error) = capture.gamepad_input(block, &event) {
+                            tracing::warn!(%error, session = from, "dropping gamepad event that could not be injected");
+                        }
+                    }
                     event => {
                         // Invalid events still fail closed. An injection error
                         // (portal/D-Bus hiccup) drops that one event; only a
                         // persistently broken input path ends the session.
-                        event.validate()?;
+                        if event.validate().is_err() {
+                            members.remove(from, "invalid input", None, capture).await;
+                            continue;
+                        }
                         flash_on_input(&event);
                         match capture.input(event).await {
                             Ok(()) => input_failures = 0,
@@ -1686,7 +3212,7 @@ async fn run_session(
                                 );
                                 tracing::warn!(%error, input_failures, "dropping input event that could not be injected");
                                 if input_failures == 1 {
-                                    publish_update(&mut updates, Update::Notice { text: format!("Host could not inject input: {error}") })?;
+                                    members.to(from, Update::Notice { text: format!("Host could not inject input: {error}") })?;
                                 }
                             }
                         }
@@ -1900,6 +3426,10 @@ fn desktop_for_monitor(
         virtual_monitor: capture.virtual_monitors_available(),
         privacy_mode: options.privacy_available,
         privacy_active: capture.privacy(),
+        // Each session gets its own view (`Members::customize`).
+        guests: true,
+        access: None,
+        shared_stream: false,
     })
 }
 
@@ -1931,7 +3461,7 @@ async fn monitor_encoder(
     index: usize,
     track: &moq_net::track::Producer,
     events: &mut SessionEvents,
-    updates: &mut moq_net::track::Producer,
+    members: &mut Members,
 ) -> Result<MonitorEncoder> {
     let info = desktop_for_monitor(options, capture, index, video_barrier(track)?)?;
     let source = capture.monitor_source(index, options.dynamic_range).await?;
@@ -1946,7 +3476,7 @@ async fn monitor_encoder(
         ),
         events,
         capture,
-        updates,
+        members,
     )
     .await?;
     Ok(MonitorEncoder {
@@ -1956,17 +3486,18 @@ async fn monitor_encoder(
     })
 }
 
-/// Input events from the client, plus control events set aside while an
-/// encoder was starting (handled first, in arrival order).
+/// Input events from every session, tagged with the session that sent them,
+/// plus control events set aside while an encoder was starting (handled
+/// first, in arrival order).
 struct SessionEvents {
-    receiver: tokio::sync::mpsc::Receiver<Event>,
-    deferred: std::collections::VecDeque<Event>,
+    receiver: tokio::sync::mpsc::Receiver<(crate::guests::SessionId, Event)>,
+    deferred: std::collections::VecDeque<(crate::guests::SessionId, Event)>,
 }
 
 impl SessionEvents {
-    async fn next(&mut self) -> Option<Event> {
+    async fn next(&mut self) -> Option<(crate::guests::SessionId, Event)> {
         match self.deferred.pop_front() {
-            Some(event) => Some(event),
+            Some(tagged) => Some(tagged),
             None => self.receiver.recv().await,
         }
     }
@@ -2014,12 +3545,13 @@ fn retire<T: Send + 'static>(old: T) -> tokio::task::JoinHandle<Result<()>> {
 /// session loop. Rate feedback and keyframe requests do not hold up input;
 /// anything else (clipboard, monitor and video changes) does, to keep order.
 /// An input event that fails to inject is also left to the loop, which
-/// retries it with its error handling.
+/// retries it with its error handling. Input is screened here exactly as in
+/// the loop (permissions, keyboard/mouse control).
 async fn while_starting<T: Send + 'static>(
     work: tokio::task::JoinHandle<Result<T>>,
     events: &mut SessionEvents,
     capture: &mut Capture,
-    updates: &mut moq_net::track::Producer,
+    members: &mut Members,
 ) -> Result<T> {
     fn reorderable(event: &Event) -> bool {
         matches!(
@@ -2030,20 +3562,20 @@ async fn while_starting<T: Send + 'static>(
                 | Event::RequestKeyframe { .. }
         )
     }
-    let mut ordered = events.deferred.iter().any(|event| !reorderable(event));
+    let mut ordered = events.deferred.iter().any(|(_, event)| !reorderable(event));
     tokio::pin!(work);
     loop {
         tokio::select! {
             result = &mut work => return result.context("encoder task failed")?,
-            event = events.receiver.recv(), if !ordered => {
-                let Some(event) = event else {
+            tagged = events.receiver.recv(), if !ordered => {
+                let Some((from, event)) = tagged else {
                     // The session loop reports the closed stream.
                     return work.await.context("encoder task failed")?;
                 };
                 match event {
                     // No host clock here; the client's next probe gets one.
-                    Event::Probe { id } => publish_update(updates, Update::Pong { id, host_us: None })?,
-                    event if reorderable(&event) => events.deferred.push_back(event),
+                    Event::Probe { id } => members.to(from, Update::Pong { id, host_us: None })?,
+                    event if reorderable(&event) => events.deferred.push_back((from, event)),
                     Event::MonitorStream { .. }
                     | Event::MonitorMotion { .. }
                     | Event::ClientFeatures { .. }
@@ -2052,16 +3584,52 @@ async fn while_starting<T: Send + 'static>(
                     | Event::SelectCodec { .. }
                     | Event::SelectMonitor { .. }
                     | Event::Clipboard { .. }
-                    | Event::ClipboardRequest => {
-                        ordered = true;
-                        events.deferred.push_back(event);
+                    | Event::ClipboardRequest
+                    | Event::TakeControl { .. }
+                    | Event::ApproveGuest { .. } => {
+                        // Only the leader's controls hold up everyone's
+                        // input (another session cannot freeze it).
+                        ordered |= members.is_leader(from);
+                        events.deferred.push_back((from, event));
                     }
                     event => {
-                        if event.validate().is_err() || capture.input(event.clone()).await.is_err() {
-                            ordered = true;
-                            events.deferred.push_back(event);
-                        } else {
+                        if !members.recheck(from, capture).await {
+                            continue;
+                        }
+                        let release = match members.screen(from, &event, Instant::now()) {
+                            Screen::Drop => continue,
+                            Screen::Pass { release } => release,
+                        };
+                        if release {
+                            capture.release_keyboard_mouse().await;
+                        }
+                        let session = members.sessions.get(&from).map(|s| (s.pad_block, s.role.role));
+                        let injected = match (&event, session) {
+                            (_, None) => continue,
+                            (Event::ReleaseAll, Some((block, _))) => {
+                                if members.arbiter.holder_session() == Some(from) {
+                                    capture.release_keyboard_mouse().await;
+                                }
+                                capture.neutralise_pads(block);
+                                true
+                            }
+                            (
+                                Event::GamepadConnected { .. }
+                                | Event::GamepadDisconnected { .. }
+                                | Event::GamepadButton { .. }
+                                | Event::GamepadAxis { .. }
+                                | Event::GamepadTouch { .. }
+                                | Event::GamepadMotion { .. },
+                                Some((block, role)),
+                            ) => crate::guests::guest_pad(role, event.clone())
+                                .is_none_or(|event| capture.gamepad_input(block, &event).is_ok()),
+                            _ => event.validate().is_ok() && capture.input(event.clone()).await.is_ok(),
+                        };
+                        if injected {
                             flash_on_input(&event);
+                        } else {
+                            ordered = true;
+                            events.deferred.push_back((from, event));
                         }
                     }
                 }
@@ -2198,8 +3766,9 @@ fn newer_motion(last_motion: &AtomicU64, motion: u64) -> bool {
 /// positions are dropped by ID and anything but motion is ignored. A full
 /// session queue drops the sample; the next one supersedes it.
 async fn receive_pointer(
+    id: crate::guests::SessionId,
     controls: moq_net::origin::Producer,
-    sender: tokio::sync::mpsc::Sender<Event>,
+    sender: tokio::sync::mpsc::Sender<(crate::guests::SessionId, Event)>,
     last_motion: Arc<AtomicU64>,
 ) -> Result<()> {
     let remote = tokio::time::timeout(
@@ -2228,15 +3797,16 @@ async fn receive_pointer(
             continue;
         }
         if newer_motion(&last_motion, pointer.motion) {
-            let _ = sender.try_send(pointer.event);
+            let _ = sender.try_send((id, pointer.event));
         }
     }
     Ok(())
 }
 
 async fn receive_input(
+    id: crate::guests::SessionId,
     mut track: moq_net::track::Subscriber,
-    sender: tokio::sync::mpsc::Sender<Event>,
+    sender: tokio::sync::mpsc::Sender<(crate::guests::SessionId, Event)>,
     last_motion: Arc<AtomicU64>,
 ) -> Result<()> {
     let mut sequence = 0;
@@ -2271,7 +3841,7 @@ async fn receive_input(
                 continue; // a datagram already delivered this or a later position
             }
             sender
-                .send(input.event)
+                .send((id, input.event))
                 .await
                 .context("input handler closed")?;
         }

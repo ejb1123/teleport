@@ -357,6 +357,28 @@ pub async fn pair(endpoint: &Endpoint, invite: &Invite) -> Result<Pairing> {
     .await
 }
 
+/// Guest enrollment with an invite through a relay, on the host's own
+/// namespace (the link's relay host id). SPAKE2 authenticates the host; the
+/// id must match the identity it proves.
+pub async fn join(endpoint: &Endpoint, invite: &pairing::InviteLink) -> Result<Pairing> {
+    let host = invite.relay_host.clone().context(
+        "this invite link has no relay host id; ask the host for a link made with a relay",
+    )?;
+    let stream = open(endpoint, &host).await?;
+    let pairing = run(stream, PAIR_TIMEOUT, "invite", async |stream| {
+        pairing::join_over(stream, invite).await.context(
+            "no invite enrollment through the relay; check the link, that it is still valid, \
+             and that both use the same relay",
+        )
+    })
+    .await?;
+    ensure!(
+        relay::namespace(&pairing.fingerprint)? == host,
+        "the authenticated host does not match the invite's relay host id"
+    );
+    Ok(pairing)
+}
+
 /// Password (OPAQUE) enrollment through a relay. `host` is the host's relay id
 /// (its namespace, shown by `teleport host-admin status`); OPAQUE
 /// authenticates the host, and the id must match the identity it proves.

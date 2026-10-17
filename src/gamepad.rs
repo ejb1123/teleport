@@ -726,9 +726,29 @@ impl Pad {
     }
 }
 
-/// The session's pads, indexed by the client's slot number.
+/// Host-wide pad slots: every session gets a block of [`MAX_GAMEPADS`]
+/// (block 0 for the first session, so a single client sees slots 0..=3 as
+/// before). Slot = block * MAX_GAMEPADS + the client's pad number.
+pub const HOST_PADS: usize = MAX_GAMEPADS as usize * crate::guests::MAX_SESSIONS;
+
+/// `event` with its pad number moved up by `base` (a session's block).
+fn with_slot(event: &Event, base: u8) -> Event {
+    let mut event = event.clone();
+    match &mut event {
+        Event::GamepadConnected { pad, .. }
+        | Event::GamepadDisconnected { pad }
+        | Event::GamepadButton { pad, .. }
+        | Event::GamepadAxis { pad, .. }
+        | Event::GamepadTouch { pad, .. }
+        | Event::GamepadMotion { pad, .. } => *pad += base,
+        _ => (),
+    }
+    event
+}
+
+/// The host's virtual pads, indexed by host slot ([`HOST_PADS`]).
 pub struct Gamepads {
-    pads: [Option<Pad>; MAX_GAMEPADS as usize],
+    pads: [Option<Pad>; HOST_PADS],
     /// Create real uinput/uhid devices (false for `--source test`).
     virtual_devices: bool,
     /// Where feedback goes once the client plays it: new uinput pads offer
@@ -875,12 +895,24 @@ impl Gamepads {
         }
     }
 
-    /// Apply one validated `Gamepad*` event. Events for a slot that was never
-    /// connected (or failed to connect) are ignored rather than failing the
-    /// session.
+    /// Apply one validated `Gamepad*` event of the session owning pad block 0.
     pub fn input(&mut self, event: &Event) -> Result<()> {
+        self.input_block(0, event)
+    }
+
+    /// Apply one `Gamepad*` event of the session owning pad `block`: its pad
+    /// numbers (validated, below [`MAX_GAMEPADS`]) map to that block's host
+    /// slots, so sessions never reach each other's pads. Events for a slot
+    /// that was never connected (or failed to connect) are ignored rather
+    /// than failing the session.
+    pub fn input_block(&mut self, block: u8, event: &Event) -> Result<()> {
         event.validate()?;
-        match *event {
+        ensure!(
+            usize::from(block) < crate::guests::MAX_SESSIONS,
+            "invalid gamepad block"
+        );
+        let event = with_slot(event, block * MAX_GAMEPADS);
+        match event {
             Event::GamepadConnected {
                 pad,
                 ref name,
@@ -959,6 +991,32 @@ impl Gamepads {
         }
     }
 
+    fn block_slots(block: u8) -> std::ops::Range<usize> {
+        let first = usize::from(block) * usize::from(MAX_GAMEPADS);
+        first.min(HOST_PADS)..(first + usize::from(MAX_GAMEPADS)).min(HOST_PADS)
+    }
+
+    /// One session's `ReleaseAll`: release and centre its pads only.
+    pub fn neutralise_block(&mut self, block: u8) {
+        for pad in self.pads[Self::block_slots(block)].iter_mut().flatten() {
+            if let Err(error) = pad.neutral() {
+                tracing::warn!(%error, "gamepad release failed");
+            }
+        }
+    }
+
+    /// One session left: neutralise and destroy its pads, not the others'.
+    pub fn destroy_block(&mut self, block: u8) {
+        self.neutralise_block(block);
+        let mut count = 0;
+        for pad in &mut self.pads[Self::block_slots(block)] {
+            count += usize::from(pad.take().is_some());
+        }
+        if count > 0 {
+            tracing::info!(count, block, "virtual gamepads of a session removed");
+        }
+    }
+
     /// Session end: neutralise and destroy every pad.
     pub fn destroy_all(&mut self) {
         self.neutralise();
@@ -1021,6 +1079,39 @@ mod tests {
         assert_eq!(pad.axis(4, i16::MAX)[0], raw(EV_ABS, ABS_Z, 255));
         assert_eq!(pad.axis(5, 16384)[0], raw(EV_ABS, ABS_RZ, 128));
         assert!(pad.axis(6, 0).is_empty());
+    }
+
+    #[test]
+    fn sessions_get_separate_pad_blocks() {
+        let mut pads = Gamepads::new(false);
+        let connect = |pad| Event::GamepadConnected {
+            pad,
+            name: "Pad".into(),
+            kind: crate::protocol::GamepadType::Xbox,
+        };
+        // The first session keeps slots 0..=3; a guest's pad 0 is slot 4.
+        pads.input_block(0, &connect(0)).unwrap();
+        pads.input_block(1, &connect(0)).unwrap();
+        pads.input_block(1, &connect(3)).unwrap();
+        let occupied = |pads: &Gamepads| {
+            pads.pads
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, pad)| pad.as_ref().map(|_| slot))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(occupied(&pads), [0, 4, 7]);
+        // Wire pad numbers stay below MAX_GAMEPADS: no reaching another block.
+        assert!(pads.input_block(1, &connect(4)).is_err());
+        assert!(
+            pads.input_block(crate::guests::MAX_SESSIONS as u8, &connect(0))
+                .is_err()
+        );
+        // One session leaving removes its pads only.
+        pads.destroy_block(1);
+        assert_eq!(occupied(&pads), [0]);
+        pads.neutralise_block(0);
+        assert_eq!(occupied(&pads), [0]);
     }
 
     #[test]
