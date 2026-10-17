@@ -167,7 +167,62 @@ enum Command {
     },
 }
 
+/// A self-contained macOS `Teleport.app` (tools/macos-app.sh) has no wrapper
+/// script to point Teleport at its bundled GStreamer plugins, font and
+/// libfido2, so derive them from the bundle layout:
+/// `Contents/MacOS/teleport` next to `Contents/PlugIns/gstreamer-1.0`.
+/// Must run before any thread starts (it sets environment variables).
+#[cfg(target_os = "macos")]
+fn app_bundle_environment() {
+    let Some(contents) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.canonicalize().ok())
+        .and_then(|exe| Some(exe.parent()?.parent()?.to_path_buf()))
+    else {
+        return;
+    };
+    let plugins = contents.join("PlugIns/gstreamer-1.0");
+    if !plugins.is_dir() {
+        return;
+    }
+    let registry = std::env::var_os("HOME").map(|home| {
+        std::path::PathBuf::from(home).join(format!(
+            "Library/Caches/Teleport/gstreamer-registry-{}.bin",
+            env!("CARGO_PKG_VERSION")
+        ))
+    });
+    let set = |name: &str, value: std::ffi::OsString, replace: bool| {
+        if replace || std::env::var_os(name).is_none() {
+            // SAFETY: called first thing in main, before any other thread.
+            unsafe { std::env::set_var(name, value) };
+        }
+    };
+    // Only bundled plugins: Homebrew's or another GStreamer's would not load.
+    set("GST_PLUGIN_SYSTEM_PATH_1_0", plugins.into(), true);
+    set(
+        "GST_PLUGIN_SCANNER_1_0",
+        contents.join("MacOS/gst-plugin-scanner").into(),
+        true,
+    );
+    if let Some(registry) = registry {
+        set("GST_REGISTRY_1_0", registry.into(), false);
+    }
+    set(
+        "TELEPORT_FONT",
+        contents.join("Resources/fonts/DejaVuSans.ttf").into(),
+        false,
+    );
+    set(
+        "TELEPORT_LIBFIDO2",
+        contents.join("Frameworks/libfido2.dylib").into(),
+        false,
+    );
+    set("TELEPORT_PACKAGED", "1".into(), true);
+}
+
 fn main() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    app_bundle_environment();
     // Start the frame-timing clock before any instant it may be asked about.
     protocol::clock_us(std::time::Instant::now());
     tracing_subscriber::fmt()
