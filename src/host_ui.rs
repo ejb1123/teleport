@@ -114,6 +114,7 @@ pub fn run() -> Result<()> {
         (Rect::new(1098, 524, 146, 36), "Keys+mouse"),
         (Rect::new(940, 568, 146, 36), "Clipboard"),
         (Rect::new(1098, 568, 146, 36), "Trusted"),
+        (Rect::new(940, 612, 146, 34), "Microphone"),
     ];
     let mut values = [String::new(), String::new(), String::new()];
     let mut focused = 0;
@@ -297,7 +298,7 @@ pub fn run() -> Result<()> {
                         if !rect.contains_point((x, y)) {
                             continue;
                         }
-                        let needs_confirmation = [1, 3, 6, 7, 15].contains(&index)
+                        let needs_confirmation = [1, 3, 6, 7, 15, 18].contains(&index)
                             || (index == 2
                                 && status.as_ref().is_some_and(|s| s.username.is_some()));
                         if needs_confirmation
@@ -306,6 +307,8 @@ pub fn run() -> Result<()> {
                             confirm_action = Some((index, Instant::now()));
                             message = if index == 15 {
                                 "Keyboard and mouse let a guest act as you on this computer (run programs, open these settings). Click again to confirm."
+                            } else if index == 18 {
+                                "A guest's microphone plays as this computer's \"Teleport Microphone\": voice apps here hear the guest as you. Click again to confirm."
                             } else {
                                 "Click that button again to confirm. Revocation disconnects affected devices."
                             }
@@ -369,7 +372,7 @@ pub fn run() -> Result<()> {
                                 seconds: 3600,
                                 permissions: crate::protocol::Permissions::GUEST_DEFAULT,
                             })),
-                            14..=17 => {
+                            14..=18 => {
                                 let request = status.as_ref().and_then(|status| {
                                     toggled(status, chosen, |permissions, trusted| match index {
                                         14 => permissions.gamepad = !permissions.gamepad,
@@ -377,7 +380,8 @@ pub fn run() -> Result<()> {
                                             permissions.keyboard_mouse = !permissions.keyboard_mouse
                                         }
                                         16 => permissions.clipboard = !permissions.clipboard,
-                                        _ => *trusted = !*trusted,
+                                        17 => *trusted = !*trusted,
+                                        _ => permissions.microphone = !permissions.microphone,
                                     })
                                 });
                                 if request.is_none() {

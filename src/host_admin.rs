@@ -54,7 +54,7 @@ pub enum AdminCommand {
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=10080))]
         minutes: u64,
         /// What the guests may do besides watching: view, gamepad,
-        /// keyboard-mouse, clipboard (comma separated).
+        /// keyboard-mouse, clipboard, microphone (comma separated).
         #[arg(long, default_value = "view,gamepad", value_parser = crate::protocol::Permissions::parse)]
         permissions: crate::protocol::Permissions,
     },
