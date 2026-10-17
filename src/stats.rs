@@ -146,10 +146,14 @@ pub struct LatencyStats {
 
 impl LatencyStats {
     /// A frame was presented (or taken by a headless client) at `presented`.
-    pub fn presented(&mut self, latency: &FrameLatency, presented: Instant, clock: &ClockSync) {
-        let Some((offset, _)) = clock.offset() else {
-            return;
-        };
+    /// Returns the frame's stages, once the clock offset is known.
+    pub fn presented(
+        &mut self,
+        latency: &FrameLatency,
+        presented: Instant,
+        clock: &ClockSync,
+    ) -> Option<Stages> {
+        let (offset, _) = clock.offset()?;
         let presented_us = clock_us(presented);
         let stages = latency.stages(presented_us, offset);
         self.recent.push_back(stages);
@@ -162,6 +166,7 @@ impl LatencyStats {
                 self.clock_errors.push(error);
             }
         }
+        Some(stages)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -239,6 +244,11 @@ pub struct StreamStats {
     /// Frame rate the host is streaming at (0 until known); bounds how many
     /// queued frames count as a decoder backlog.
     pub stream_fps: AtomicU64,
+    /// Queueing delay last reported to the host in `NetworkFeedback`, ms;
+    /// `u64::MAX` when none was (older hosts, no frames).
+    pub queue_delay_ms: AtomicU64,
+    /// The hardware decoder was replaced by software this session.
+    pub software_fallback: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -281,6 +291,8 @@ impl Default for StreamStats {
             stale_frames: AtomicU64::new(0),
             decode_errors: AtomicU64::new(0),
             stream_fps: AtomicU64::new(0),
+            queue_delay_ms: AtomicU64::new(u64::MAX),
+            software_fallback: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }

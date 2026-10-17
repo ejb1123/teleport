@@ -167,3 +167,32 @@ timestamp preserves receive identity separately from decoder-adjusted presentati
 timestamps; the decoder probe verifies that metadata survives conversion. Old clients remain on
 their existing SDR path; old hosts do not support the new quality controls or
 host telemetry. Re-pairing is not required when retaining host identity.
+
+## Warnings and the graph
+
+The client puts a short warning over the top-left of the video when
+something degrades, like Parsec's overlay warnings. It decides once a second
+from the same data as F8:
+
+| Warning | Raised when |
+| --- | --- |
+| Network: video lost, expect stutter | MoQ groups skipped (one in two seconds running, or two or more in one), or a decoder reset within a second of lost groups |
+| Network: video stalled for N ms | no frame for 500 ms or more, and the frame that ended the gap was held up on the way, came after lost groups, or the host sends no timing |
+| Network: delay rising (N ms queued) | the queueing delay the client reports to the host is 50 ms or more for two seconds (100 ms or more at once) |
+| Network: stream lowered (link ~N Mbps) | the host steps the resolution or frame rate down |
+| Decoder fell behind and skipped ahead | a decoder reset (backlog or decode error) with no network trouble around it |
+| Decoding takes N ms per frame, over the F fps budget | receive→ready above the frame interval for two seconds |
+| Hardware decoder failed: decoding in software | the mid-session software fallback |
+| Host encoder overloaded | the host's encode time above 90% of the frame interval for two seconds |
+| Host is encoding in software: higher latency | the host's encoder is x264/x265 |
+| Host capture stalled for N ms | no frame for 500 ms or more, but the next one came through as fast as usual and nothing was lost |
+
+A warning stays for 6 s, at most two show at once, a new one appears at
+most every 2 s, and the same one repeats at most every 30 s. Every raised
+warning is also logged (`session warning`), including in headless runs, so
+`tests/network.rs` prints them per profile (`WARN` lines). `--no-warnings`
+(launcher: **Warnings off**) hides them; they are still logged.
+
+F8 starts with a rolling graph of the last 240 presented frames: frame time
+(present to present), capture→present latency (hosts with frame timing) and
+video bitrate in quarter seconds. The labels show the window's mean.

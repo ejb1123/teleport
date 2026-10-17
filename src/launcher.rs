@@ -458,6 +458,8 @@ pub fn run() -> Result<()> {
     let mut decoder = DecoderPreference::default();
     let mut clipboard = false;
     let mut mute = false;
+    // On-screen network, decoder and host warnings (`--no-warnings` when off).
+    let mut overlay_warnings = true;
     let mut agent_consent = AgentConsent::default();
     let mut relay_url = String::new();
     let mut relay_pin = String::new();
@@ -1000,6 +1002,9 @@ pub fn run() -> Result<()> {
                                 if hit(pref_rect(11), x, y) {
                                     encoder_preset = (encoder_preset + 1) % ENCODER_PRESETS.len();
                                 }
+                                if hit(pref_rect(12), x, y) {
+                                    overlay_warnings = !overlay_warnings;
+                                }
                                 if hit(pref_rect(3), x, y) {
                                     codec = (codec + 1) % CODECS.len();
                                     if CODECS[codec].1 != "h265" {
@@ -1167,6 +1172,9 @@ pub fn run() -> Result<()> {
                         }
                         if mute {
                             command.arg("--mute");
+                        }
+                        if !overlay_warnings {
+                            command.arg("--no-warnings");
                         }
                         // A Linux-password sign-in yields a single-use ticket
                         // (kept in the ephemeral directory): retrying it after a
@@ -1585,7 +1593,14 @@ pub fn run() -> Result<()> {
                         false,
                     )?;
                     if settings {
-                        ui.text(&small_font, "STREAM SETTINGS", 304, 420, 688, MUTED)?;
+                        ui.text(
+                            &small_font,
+                            "STREAM SETTINGS · Match follows this window and display. VSync on stops tearing on fixed-refresh screens.",
+                            304,
+                            420,
+                            688,
+                            MUTED,
+                        )?;
                         let [resolution_label, frame_rate_label, quality_label] = stream.labels();
                         let labels = [
                             resolution_label,
@@ -1623,6 +1638,11 @@ pub fn run() -> Result<()> {
                             },
                             RELATIVE_MOUSE[relative_mouse].0,
                             ENCODER_PRESETS[encoder_preset].0,
+                            if overlay_warnings {
+                                "Warnings on"
+                            } else {
+                                "Warnings off"
+                            },
                         ];
                         for (index, label) in labels.into_iter().enumerate() {
                             ui.button(
@@ -1632,14 +1652,6 @@ pub fn run() -> Result<()> {
                                 false,
                             )?;
                         }
-                        ui.text(
-                            &small_font,
-                            "Match follows this window and display. VSync on stops tearing on fixed-refresh screens.",
-                            304,
-                            676,
-                            688,
-                            MUTED,
-                        )?;
                     } else {
                         ui.text(
                             &font,

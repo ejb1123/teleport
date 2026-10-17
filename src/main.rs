@@ -27,6 +27,7 @@ mod keyboard_capture;
 mod launcher;
 mod media;
 mod natpmp;
+mod overlay;
 mod p2p;
 mod pairing;
 mod presence;

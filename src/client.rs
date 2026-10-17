@@ -151,6 +151,10 @@ pub struct Options {
     /// Show the streaming performance overlay immediately (F8 toggles it).
     #[arg(long)]
     pub stats: bool,
+    /// Do not show on-screen warnings when the network, decoder or host
+    /// degrades (they are still logged).
+    #[arg(long)]
+    pub no_warnings: bool,
     /// Session video codec. `auto` uses H.265 when the host encodes and this
     /// client decodes it in hardware, otherwise H.264 (always H.264 with
     /// hosts that cannot negotiate). An explicit codec is always used.
@@ -1393,6 +1397,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         let mut probes_in_flight = std::collections::BTreeMap::<u64, Instant>::new();
         // --smoke-flash: click→changed frame against a --flash-on-input host.
         let mut flash = options.smoke_flash.then(FlashTimer::default);
+        // Session warnings, logged once a second like the window shows them.
+        let mut warnings = crate::overlay::Warnings::new(false);
+        let mut health = HealthSampler::default();
+        let mut last_health = Instant::now();
+        let mut warning_count = 0_usize;
+        let (mut host_encode_us, mut host_encoder) = (0_u64, String::new());
         let mut probe_rtts = Vec::<Duration>::new();
         let mut next_probe = Instant::now();
         let mut probe_id = 0_u64;
@@ -1441,6 +1451,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         }
                     }
                     Update::Clipboard { text } => clipboard_ok = text == CLIPBOARD_SMOKE,
+                    Update::Telemetry {
+                        encode_us, encoder, ..
+                    } => (host_encode_us, host_encoder) = (encode_us, encoder),
                     Update::Pong { id, host_us } => {
                         let arrived = pong_arrivals.take(id);
                         if let Some(sent) = probes_in_flight.remove(&id) {
@@ -1501,6 +1514,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     // Headless: "presented" is when this loop takes the frame.
                     e2e_latency.presented(frame_latency, now, &clock);
                 }
+                health.frame(now, frame.latency.as_ref());
                 if let Some(flash) = flash.as_mut() {
                     flash.frame(&frame, now);
                 }
@@ -1668,6 +1682,14 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             {
                 send(&events, event)?;
             }
+            if count > 0 && last_health.elapsed() >= Duration::from_secs(1) {
+                last_health = Instant::now();
+                let sample = health.sample(&stream_stats, &desktop, host_encode_us, &host_encoder);
+                for text in warnings.observe(&sample, last_health) {
+                    warning_count += 1;
+                    tracing::warn!(%text, "session warning");
+                }
+            }
             std::thread::sleep(Duration::from_millis(2));
         }
         ensure!(
@@ -1746,6 +1768,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             flash_presses,
             flash_p50_us,
             flash_p95_us,
+            warnings = warning_count,
             probes = probe_rtts.len(),
             probe_p50_us,
             probe_p95_us,
@@ -1880,6 +1903,14 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut frame_decoded_at: Option<Instant> = None;
     // Its host stamps, for the end-to-end breakdown.
     let mut frame_latency: Option<crate::stats::FrameLatency> = None;
+    // G22: on-screen warnings and the F8 graph.
+    let mut warnings = crate::overlay::Warnings::new(!options.no_warnings);
+    let mut health = HealthSampler::default();
+    let mut graph = crate::overlay::Graph::default();
+    let mut last_video_present: Option<Instant> = None;
+    let mut bitrate_sample = (Instant::now(), 0_u64);
+    // Refreshed with the stats lines, once a second.
+    let mut graph_labels: [String; 3] = Default::default();
     'running: loop {
         present_timer.iterations += 1;
         WAKE_QUEUED.store(false, Ordering::Release);
@@ -2826,6 +2857,24 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             if let Some(headroom) = hdr_headroom {
                 stats_lines.push(format!("HDR display headroom  {headroom:.2} × SDR white"));
             }
+            let mean = |series: &std::collections::VecDeque<f32>| {
+                series.iter().sum::<f32>() / series.len().max(1) as f32
+            };
+            graph_labels = [
+                format!("Frame time {:.1} ms", mean(&graph.frame_ms)),
+                if graph.latency_ms.is_empty() {
+                    "Latency unavailable".into()
+                } else {
+                    format!("Latency {:.1} ms", mean(&graph.latency_ms))
+                },
+                format!("Video {:.1} Mbps", mean(&graph.mbps)),
+            ];
+            if total_frames > 0 {
+                let sample = health.sample(&stream_stats, &desktop, host_encode_us, &host_encoder);
+                for text in warnings.observe(&sample, Instant::now()) {
+                    tracing::warn!(%text, "session warning");
+                }
+            }
             stats = Instant::now();
             frames = 0;
         }
@@ -3005,14 +3054,48 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     12
                 },
                 panel_width,
-                stats_lines.len() as u32 * 24 + 28,
+                stats_lines.len() as u32 * 24 + 28 + GRAPH_HEIGHT,
             );
             stats_panel = Some(panel);
             canvas.set_draw_color(Color::RGB(16, 23, 33));
             canvas.fill_rect(panel).map_err(anyhow::Error::msg)?;
             canvas.set_draw_color(Color::RGB(67, 103, 114));
             canvas.draw_rect(panel).map_err(anyhow::Error::msg)?;
+            // Rolling graph under the title: frame time, latency, bitrate.
+            let series = [
+                (&graph.frame_ms, 20.0, Color::RGB(99, 218, 193)),
+                (&graph.latency_ms, 20.0, Color::RGB(240, 190, 90)),
+                (&graph.mbps, 5.0, Color::RGB(130, 170, 250)),
+            ];
+            for (row, ((values, floor, color), label)) in
+                series.into_iter().zip(&graph_labels).enumerate()
+            {
+                let top = panel.y() + 40 + row as i32 * GRAPH_ROW;
+                session_text(
+                    &mut canvas,
+                    &creator,
+                    &mut session_fonts,
+                    &mut text_cache,
+                    label,
+                    Rect::new(panel.x() + 14, top + 8, 200, 20),
+                    color,
+                )?;
+                let area = Rect::new(
+                    panel.x() + 220,
+                    top,
+                    panel_width.saturating_sub(234).max(1),
+                    GRAPH_ROW as u32 - 6,
+                );
+                canvas.set_draw_color(Color::RGB(28, 38, 52));
+                canvas.fill_rect(area).map_err(anyhow::Error::msg)?;
+                let (points, _) = crate::overlay::Graph::points(values, area, floor);
+                if points.len() > 1 {
+                    canvas.set_draw_color(color);
+                    canvas.draw_lines(&points[..]).map_err(anyhow::Error::msg)?;
+                }
+            }
             for (index, line) in stats_lines.iter().enumerate() {
+                let graph_offset = if index == 0 { 0 } else { GRAPH_HEIGHT as i32 };
                 session_text(
                     &mut canvas,
                     &creator,
@@ -3021,7 +3104,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     line,
                     Rect::new(
                         panel.x() + 14,
-                        panel.y() + 14 + index as i32 * 24,
+                        panel.y() + 14 + index as i32 * 24 + graph_offset,
                         panel_width - 28,
                         20,
                     ),
@@ -3030,6 +3113,44 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     } else {
                         Color::RGB(207, 220, 234)
                     },
+                )?;
+            }
+        }
+        // G22: concise warnings over the top-left of the video.
+        let mut warning_panel = None;
+        let shown = warnings.visible(Instant::now());
+        if !shown.is_empty() {
+            let video = chrome.rect(window_size, size);
+            let top = video.y().max(if chrome.visible() {
+                TOOLBAR_HEIGHT as i32
+            } else {
+                0
+            });
+            let panel = Rect::new(
+                video.x() + 12,
+                top + 12,
+                460.min(window_size.0.saturating_sub(24)).max(1),
+                shown.len() as u32 * 26 + 8,
+            );
+            warning_panel = Some(panel);
+            canvas.set_draw_color(Color::RGB(48, 26, 18));
+            canvas.fill_rect(panel).map_err(anyhow::Error::msg)?;
+            canvas.set_draw_color(Color::RGB(214, 128, 60));
+            canvas.draw_rect(panel).map_err(anyhow::Error::msg)?;
+            for (index, text) in shown.iter().enumerate() {
+                session_text(
+                    &mut canvas,
+                    &creator,
+                    &mut session_fonts,
+                    &mut text_cache,
+                    text,
+                    Rect::new(
+                        panel.x() + 10,
+                        panel.y() + 6 + index as i32 * 26,
+                        panel.width().saturating_sub(20),
+                        20,
+                    ),
+                    Color::RGB(255, 196, 120),
                 )?;
             }
         }
@@ -3043,7 +3164,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 },
                 window_size,
             )?];
-            if let Some(panel) = stats_panel {
+            for panel in [stats_panel, warning_panel].into_iter().flatten() {
                 ui.push(read_hdr_overlay(&mut canvas, panel, window_size)?);
             }
             let overlays: Vec<_> = ui
@@ -3110,8 +3231,27 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         if let Some(decoded_at) = frame_decoded_at.take() {
             present_timer.presented(decoded_at);
         }
-        if let Some(frame_latency) = frame_latency.take() {
-            e2e_latency.presented(&frame_latency, Instant::now(), &clock);
+        if new_frame {
+            let now = Instant::now();
+            let stages = frame_latency.and_then(|frame| e2e_latency.presented(&frame, now, &clock));
+            health.frame(now, frame_latency.as_ref());
+            if let Some(last) = last_video_present {
+                graph.frame(
+                    now.saturating_duration_since(last).as_secs_f32() * 1000.0,
+                    stages.map(|stages| stages.total as f32 / 1000.0),
+                );
+            }
+            last_video_present = Some(now);
+            frame_latency = None;
+        }
+        if bitrate_sample.0.elapsed() >= Duration::from_millis(250) {
+            let bytes = stream_stats.received_bytes.load(Ordering::Relaxed);
+            graph.bitrate(
+                bytes.saturating_sub(bitrate_sample.1) as f32 * 8.0
+                    / bitrate_sample.0.elapsed().as_secs_f32()
+                    / 1_000_000.0,
+            );
+            bitrate_sample = (Instant::now(), bytes);
         }
         if options
             .exit_after_frames
@@ -3129,6 +3269,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
 }
 
 const TOOLBAR_HEIGHT: u32 = crate::fullscreen::HEIGHT;
+/// The F8 graph: three rows under the title line.
+const GRAPH_ROW: i32 = 40;
+const GRAPH_HEIGHT: u32 = 3 * GRAPH_ROW as u32 + 8;
 
 /// Longest render-loop sleep when nothing wakes it: bounds how late polled
 /// state (pipeline errors, toolbar hiding, probes) is noticed.
@@ -3237,6 +3380,72 @@ impl PresentTimer {
             loop_cpu_percent = format!("{:.1}", cpu * 100.0 / wall),
             "video presentation summary (mean/p50/p95/max)"
         );
+    }
+}
+
+/// Builds the once-a-second session health sample for the warnings
+/// (`overlay::Warnings`) from the stream counters and host telemetry.
+#[derive(Default)]
+struct HealthSampler {
+    skipped_groups: u64,
+    recoveries: u64,
+    /// Arrival of the previous frame (client `clock_us`).
+    last_arrival_us: Option<u64>,
+    /// Lowest arrival − host capture this session (offset included).
+    fastest_transit_us: Option<i64>,
+    /// This second's longest arrival gap, and how late (µs) the frame
+    /// ending it was against the fastest transit.
+    stall: (u64, Option<u64>),
+}
+
+impl HealthSampler {
+    /// A frame was taken for display at `now`; tracks arrival gaps and
+    /// whether the frame ending one was held up on the way.
+    fn frame(&mut self, now: Instant, latency: Option<&crate::stats::FrameLatency>) {
+        let arrival = latency.map_or_else(|| protocol::clock_us(now), |frame| frame.received_us);
+        let late = latency.map(|frame| {
+            let transit = frame.received_us as i64 - frame.host.capture_us as i64;
+            let fastest = self.fastest_transit_us.get_or_insert(transit);
+            *fastest = (*fastest).min(transit);
+            (transit - *fastest) as u64
+        });
+        if let Some(last) = self.last_arrival_us {
+            let gap = arrival.saturating_sub(last);
+            if gap > self.stall.0 {
+                self.stall = (gap, late);
+            }
+        }
+        self.last_arrival_us = Some(arrival);
+    }
+
+    fn sample(
+        &mut self,
+        stats: &crate::stats::StreamStats,
+        desktop: &Desktop,
+        host_encode_us: u64,
+        host_encoder: &str,
+    ) -> crate::overlay::Sample {
+        let snapshot = stats.snapshot();
+        let delta = |now: u64, previous: &mut u64| {
+            let delta = now.saturating_sub(*previous);
+            *previous = now;
+            delta
+        };
+        let queue_delay_ms = stats.queue_delay_ms.load(Ordering::Relaxed);
+        let (stall_us, late_us) = std::mem::take(&mut self.stall);
+        crate::overlay::Sample {
+            stream_fps: desktop.fps,
+            skipped_groups: delta(snapshot.skipped_groups, &mut self.skipped_groups),
+            decoder_recoveries: delta(snapshot.decoder_recoveries, &mut self.recoveries),
+            queue_delay_ms: u32::try_from(queue_delay_ms).ok(),
+            stepped_down: desktop.stepped_down,
+            decode_us: snapshot.decode_us,
+            software_decoder_fallback: stats.software_fallback.load(Ordering::Relaxed),
+            host_encode_us,
+            host_software_encoder: crate::overlay::software_encoder(host_encoder),
+            stall_ms: stall_us / 1000,
+            stall_late_ms: late_us.map(|late| late / 1000),
+        }
     }
 }
 

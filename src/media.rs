@@ -1235,6 +1235,9 @@ pub async fn receive_video_with_stats(
         loop {
             interval.tick().await;
             let (delay_ms, received_kbps) = meter.lock().unwrap().report(Instant::now());
+            stats
+                .queue_delay_ms
+                .store(delay_ms.map_or(u64::MAX, u64::from), Ordering::Relaxed);
             let _ = events.try_send(crate::protocol::Event::NetworkFeedback {
                 delay_ms,
                 received_kbps,
@@ -1620,6 +1623,7 @@ async fn receive_video_inner(
                         record_drop(1);
                         request_keyframe();
                         if let Some(replacement) = replacement {
+                            stats.software_fallback.store(true, Ordering::Relaxed);
                             tracing::warn!(
                                 replacement,
                                 "Linux hardware decode repeatedly stalled; switching this session to software at the next keyframe"

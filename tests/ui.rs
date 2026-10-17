@@ -1708,3 +1708,113 @@ fn hidden_host_pointer_locks_the_client_mouse() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// Whether `rgb` appears anywhere in the window's current contents.
+fn window_shows(connection: &RustConnection, window: u32, rgb: u32) -> bool {
+    let geometry = connection.get_geometry(window).unwrap().reply().unwrap();
+    let Ok(image) = connection
+        .get_image(
+            xproto::ImageFormat::Z_PIXMAP,
+            window,
+            0,
+            0,
+            geometry.width,
+            geometry.height,
+            u32::MAX,
+        )
+        .unwrap()
+        .reply()
+    else {
+        return false;
+    };
+    let little = connection.setup().image_byte_order == xproto::ImageOrder::LSB_FIRST;
+    image.data.chunks_exact(4).any(|bytes| {
+        let bytes = <[u8; 4]>::try_from(bytes).unwrap();
+        let pixel = if little {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        };
+        pixel & 0xffffff == rgb
+    })
+}
+
+/// G22: with F8 open the graph is drawn, and the software-encoding test
+/// host raises an on-screen warning, unless `--no-warnings`.
+#[test]
+#[ignore = "requires Xvfb, UDP and GStreamer runtime plugins"]
+fn stats_graph_and_warnings_are_drawn() {
+    // Graph background and warning box fill (src/client.rs).
+    const GRAPH: u32 = 0x1c2634;
+    const WARNING: u32 = 0x301a12;
+    let temp = tempfile::tempdir().unwrap();
+    let (_display, display_name) = xvfb("1600x1000x24");
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    drop(socket);
+    let pairing = temp.path().join("pairing.json");
+    let _host = Process(
+        teleport(&display_name)
+            .args([
+                "host",
+                "--source",
+                "test",
+                "--encoder",
+                "software",
+                "--width",
+                "640",
+                "--fps",
+                "30",
+                "--listen",
+                &address,
+                "--pairing-file",
+            ])
+            .arg(&pairing)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while std::fs::read(&pairing)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .is_none()
+    {
+        assert!(Instant::now() < deadline, "host never published pairing");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let (connection, screen) = x11rb::connect(Some(&display_name)).unwrap();
+    let root = connection.setup().roots[screen].root;
+    for warnings in [true, false] {
+        let mut client = Process(
+            teleport(&display_name)
+                .args(["client", &address, "--software-decoder", "--stats"])
+                .args((!warnings).then_some("--no-warnings"))
+                .arg("--pairing-file")
+                .arg(&pairing)
+                .spawn()
+                .unwrap(),
+        );
+        let window = desktop_window(
+            &connection,
+            root,
+            &mut client,
+            "Teleport - Remote Desktop",
+            None,
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !window_shows(&connection, window, GRAPH) {
+            assert!(Instant::now() < deadline, "F8 graph never drawn");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // The warning comes with the host's first telemetry (about a second).
+        let mut seen = false;
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until && !seen {
+            seen = window_shows(&connection, window, WARNING);
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert_eq!(seen, warnings, "warning shown: {seen}, enabled: {warnings}");
+        drop(client);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}

@@ -219,7 +219,10 @@ p50/p95, split into capture→encode, encode→send, network, receive→decode
 and decode→present: hosts stamp each frame and the client maps their clock
 onto its own from the control round trips (NTP-style). Display scanout is
 not in it; `teleport host --source test --flash-on-input` and a photodiode
-or high-speed camera time input to photon. See
+or high-speed camera time input to photon. F8 opens with a rolling graph of
+frame time, latency and bitrate, and short warnings appear over the video
+when the network, decoder or host degrades (`--no-warnings` or the
+launcher's **Warnings off** hides them). See
 [performance diagnostics](docs/performance.md).
 
 Clipboard transfers are explicit text-only actions, limited to 64 KiB. Enable

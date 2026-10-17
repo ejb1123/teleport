@@ -589,8 +589,8 @@ What is on `main`/this branch, from README, docs and code:
   (includes scheduling). Encoded payload. Received, decoded and displayed FPS.
   Skipped groups. Decoder queue. Receive→decoded, decode stages, host encode
   time, decoder name, renderer and pixel path. (Since 2026-10-17, G3:
-  capture→present p50/p95 per stage.) No glass-to-glass number, no
-  warnings.
+  capture→present p50/p95 per stage; G22: a graph and on-screen warnings.)
+  No glass-to-glass number.
 - **Distribution:** Nix (flake, NixOS module, systemd user unit). A native
   `.app` that depends on the Nix store; no signed installer and no Windows
   build.
@@ -658,7 +658,7 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Host approval prompt / share link | Yes | Pairing codes and links; no live approve | Partial | |
 | Guest permission levels | Pad, keyboard, mouse per guest | All or nothing | Missing | |
 | Chat | Yes | No | Do not copy | |
-| Stats overlay | Rich, plus graph and warnings | Rich F8, no warnings or graph | Partial | |
+| Stats overlay | Rich, plus graph and warnings | Rich F8 with end-to-end stages, graph and warnings (2026-10-17) | Parity | G22 |
 | Published latency numbers | "7 ms LAN", "4–8 ms at 240 FPS" | Measured capture→present per stage in F8 (2026-10-17); no glass-to-glass number yet | Partial | G3 |
 | Teams / SSO / audit / API | Yes | No | Not a gamer gap | |
 | Installers | Signed Windows/macOS/deb/APK | Nix only | **Missing** | |
@@ -1133,6 +1133,13 @@ each.**
 
 **G22. Overlay warnings and a metrics graph. Effort S.**
 
+- **Status (2026-10-17): implemented** (review tracker R14). Rate-limited
+  on-screen warnings for network loss, stalls, queueing delay and
+  step-down; decoder backlog, slowness and software fallback; host encoder
+  overload, software encoding and capture stalls (docs/performance.md has
+  every threshold). `--no-warnings` and a launcher toggle hide them. F8
+  starts with a rolling graph of frame time, capture→present latency (G3)
+  and bitrate. Host capture time is in F8 since G3 (step 3).
 - **Why:** Parsec's actionable warnings ("host is using software encoding",
   "decode too slow for this resolution/FPS", "network loss/congestion") cut
   support load (STATS, LAG).

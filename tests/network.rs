@@ -100,6 +100,8 @@ struct Outcome {
     flash_presses: u64,
     flash_p50_us: u64,
     flash_p95_us: u64,
+    /// Session warnings the client raised (G22), as logged.
+    warnings: Vec<String>,
 }
 
 const E2E_STAGES: [&str; 6] = [
@@ -292,6 +294,14 @@ sleep 1.5
         flash_presses: field("flash_presses"),
         flash_p50_us: field("flash_p50_us"),
         flash_p95_us: field("flash_p95_us"),
+        warnings: stdout
+            .lines()
+            .filter(|line| line.contains("session warning"))
+            .filter_map(|line| {
+                line.split_once("text=")
+                    .map(|(_, text)| text.trim_matches('"').to_owned())
+            })
+            .collect(),
     };
     let utilisation = profile
         .capacity
@@ -356,6 +366,15 @@ sleep 1.5
         outcome.clock_checked,
         ms(outcome.clock_error_p50_us),
         ms(outcome.clock_error_max_us),
+    );
+    println!(
+        "WARN    {:<10} {}",
+        profile.name,
+        if outcome.warnings.is_empty() {
+            "none".to_owned()
+        } else {
+            outcome.warnings.join(" | ")
+        }
     );
     if profile.flash {
         println!(
@@ -445,6 +464,16 @@ fn clean_link_streams_at_full_rate() {
     });
     assert!(outcome.fps() >= 25.0, "{outcome:?}");
     assert!(outcome.max_frame_gap_ms < 250, "{outcome:?}");
+    // G22: a clean link raises no network or decoder warnings (the test
+    // host does encode in software, which is reported).
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .all(|text| text.starts_with("Host is encoding in software")),
+        "{:?}",
+        outcome.warnings
+    );
 }
 
 #[test]
@@ -522,6 +551,15 @@ fn two_second_blackout_recovers_without_reconnect() {
     // The stall must cover the outage, and video must resume promptly after.
     assert!(outcome.max_frame_gap_ms >= 1500, "{outcome:?}");
     assert!(outcome.max_frame_gap_ms < 4000, "{outcome:?}");
+    // G22: blamed on the network, not the host's capture.
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|text| text.starts_with("Network: video stalled")),
+        "{:?}",
+        outcome.warnings
+    );
 }
 
 /// G6/G7 profiles: 20 s of `snow` (always fills its target) so the rate
@@ -576,6 +614,15 @@ fn narrow_link_steps_resolution_down() {
         ..LONG
     });
     assert!(outcome.fps() >= 15.0, "{outcome:?}");
+    // G22: the user is told the link is the problem.
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|text| text.starts_with("Network:")),
+        "{:?}",
+        outcome.warnings
+    );
 }
 
 /// Random loss on a 10 Mbps bottleneck: loss alone must not starve the rate.
