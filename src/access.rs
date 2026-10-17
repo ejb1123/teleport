@@ -687,12 +687,13 @@ mod server {
     }
     impl SessionLease {
         /// Whether the credential is the desktop owner's, for owner-only
-        /// requests (`crate::host_command`). Every credential this host
-        /// admits is the owner's today: paired devices, the host pairing
-        /// token, and system-login tickets (the account password). Guest
-        /// roles would narrow this.
+        /// requests (`crate::host_command`: wake relay, suspend), read now
+        /// from the access record: devices paired with a code, password or
+        /// Linux login, the host pairing token and system-login tickets are
+        /// owners; invited guest devices are not, whatever they were
+        /// granted (docs/guests.md). A revoked credential is no owner.
         pub fn owner(&self) -> bool {
-            true
+            self.access().is_some_and(|role| role.is_owner())
         }
 
         /// The session came from a system login (PAM just verified the
@@ -1978,6 +1979,8 @@ mod server {
             assert_eq!(role.role, Role::Guest);
             assert_eq!(role.permissions, Permissions::GUEST_DEFAULT);
             assert!(!role.trusted && !role.is_owner());
+            // Owner-only requests (wake relay, suspend) refuse it.
+            assert!(!lease.owner());
             let keys = Permissions {
                 keyboard_mouse: true,
                 ..Permissions::default()
@@ -1985,6 +1988,10 @@ mod server {
             state.set_guest(&first.id, Some(keys), Some(true))?;
             let role = lease.access().unwrap();
             assert_eq!((role.permissions, role.trusted), (keys, true));
+            // Whatever a guest is granted, it is never the owner.
+            state.set_guest(&first.id, Some(Permissions::ALL), Some(true))?;
+            assert!(!lease.owner());
+            state.set_guest(&first.id, Some(keys), Some(true))?;
             // Owners' devices are not guests and cannot be made guests here.
             let owner = state.enroll_device("Laptop", None)?;
             assert!(state.set_guest(&owner.id, Some(keys), None).is_err());
@@ -1993,9 +2000,11 @@ mod server {
             assert_eq!(owner_lease.access().unwrap().permissions, Permissions::ALL);
             let legacy = state.begin_session(&state.legacy.token)?;
             assert!(legacy.access().unwrap().is_owner());
+            assert!(owner_lease.owner() && legacy.owner());
             // Revocation ends the role at once.
             state.revoke_device(&first.id)?;
             assert!(lease.access().is_none());
+            assert!(!lease.owner());
             assert!(
                 state
                     .begin_session(&second.pairing.token)?

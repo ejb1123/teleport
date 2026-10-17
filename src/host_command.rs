@@ -462,7 +462,12 @@ pub mod host {
         let incoming = moq_net::Origin::random().produce();
         let session = request.ok(&outgoing, incoming);
         let (reply, after) = policy.execute(&command, owner).await;
-        tracing::info!(command = command.name(), ok = reply.ok, "host command");
+        tracing::info!(
+            command = command.name(),
+            ok = reply.ok,
+            owner,
+            "host command"
+        );
         let published = publish(&outgoing, &reply);
         let linger = async {
             // The client closes once it has read the reply.
@@ -489,6 +494,7 @@ pub mod host {
         tracing::info!(
             command = command.name(),
             ok = reply.ok,
+            owner,
             "relayed host command"
         );
         let published = publish(&bridged.outgoing, &reply);
