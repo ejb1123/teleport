@@ -268,11 +268,26 @@ fn test_host_advertises_and_accepts_gamepad_events() {
         stdout.contains("host rumble pad=0"),
         "no rumble update: {stdout}"
     );
+    // The DualSense pad: the test host answers its connect with the
+    // kernel's player-1 lights and its press with a trigger effect, sent
+    // because the client declared `gamepad_lights` (real pads:
+    // gamepad::tests::uhid_*).
+    assert!(
+        stdout.contains("host gamepad lights pad=1"),
+        "no lights update: {stdout}"
+    );
+    assert!(
+        stdout.contains("host gamepad triggers pad=1"),
+        "no trigger update: {stdout}"
+    );
     assert!(host.0.try_wait().unwrap().is_none(), "host exited");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let text = std::fs::read_to_string(&log).unwrap();
-        if text.contains("gamepad connected") && text.contains("gamepad disconnected") {
+        if text.contains("gamepad connected")
+            && text.contains("gamepad disconnected")
+            && text.contains("kind=DualSense")
+        {
             assert!(
                 text.contains("virtual_device=false"),
                 "test host must not create a uinput device: {text}"

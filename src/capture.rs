@@ -982,7 +982,9 @@ impl Capture {
             Event::GamepadConnected { .. }
             | Event::GamepadDisconnected { .. }
             | Event::GamepadButton { .. }
-            | Event::GamepadAxis { .. } => self.gamepads.input(&event)?,
+            | Event::GamepadAxis { .. }
+            | Event::GamepadTouch { .. }
+            | Event::GamepadMotion { .. } => self.gamepads.input(&event)?,
             Event::Ping => (),
             // Host-level controls are handled before injection.
             Event::SelectMonitor { .. }
@@ -1201,15 +1203,25 @@ impl Capture {
         }
     }
 
-    /// The client plays rumble: pads created from now on in this session
-    /// offer force feedback, reported to `sender`.
-    pub fn enable_rumble(&mut self, sender: crate::gamepad::RumbleSender) {
-        self.gamepads.enable_rumble(sender);
+    /// The client plays pad feedback (rumble and/or PlayStation lights and
+    /// trigger effects), reported to `sender`.
+    pub fn enable_pad_feedback(
+        &mut self,
+        sender: crate::gamepad::FeedbackSender,
+        rumble: bool,
+        lights: bool,
+    ) {
+        self.gamepads.enable_feedback(sender, rumble, lights);
     }
 
     /// Whether `Gamepad*` events can be backed by virtual pads.
     pub fn gamepads_available(&self) -> bool {
         self.gamepads.available()
+    }
+
+    /// Pad types the client may ask for (`Desktop::gamepad_types`).
+    pub fn gamepad_types(&self) -> Vec<crate::protocol::GamepadType> {
+        self.gamepads.types()
     }
 
     /// A previous recreation failed: the capture must be reopened before use.

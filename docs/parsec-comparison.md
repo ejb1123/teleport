@@ -491,7 +491,8 @@ The installer holds the `parsecd.exe` launcher, the engine
   - Guests' gamepads go through VUSB, falling back to ViGEmBus 1.17
     automatically. DualShock 4 (with touchpad) and DualSense are supported.
   - YubiKey passthrough (1.19) uses the same bus.
-  This is the Windows form of gap G13.
+  This is the Windows form of gap G13 (closed on Linux hosts through uhid,
+  2026-10-17).
 - **Unattended access through `pservice.exe`.** A service running as
   SYSTEM:
   - enumerates sessions (WTSAPI), duplicates the token of `winlogon.exe`,
@@ -642,7 +643,7 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Cmd/Ctrl swap | Yes | Fixed Cmd→Super | Missing | S |
 | Gamepad (Xbox 360) | Yes (Windows host) | Yes (Linux host, 4 pads) | Parity | |
 | Rumble | Yes | Yes (2026-10-16) | Parity | G12 |
-| DS4 / DualSense emulation, touchpad, motion, haptics | Yes (Windows host) | No | Missing | |
+| DS4 / DualSense emulation, touchpad, motion, haptics | Yes (Windows host) | DS4 and DualSense through uhid: touchpad, motion, LEDs, adaptive triggers (Linux host, 2026-10-17) | Mostly closed | G13; no DualSense haptics or audio |
 | Pad remapping UI | Yes | SDL database only | Missing | Low |
 | Pen / tablet | Warp | No | Missing | Low for gamers |
 | Mic passthrough | Windows host | No | Missing | Voice chat in games |
@@ -1016,6 +1017,22 @@ refresh. Effort M.**
 
 **G13. DualShock 4 / DualSense emulation, with touchpad, gyro and LEDs.
 Effort M–L.**
+
+- **Status (2026-10-17): implemented on Linux hosts** (docs/gamepad.md,
+  review tracker R17). `/dev/uhid` pads with the genuine USB descriptors
+  and IDs (`054c:05c4`, `054c:0ce6`), bound by the kernel's
+  `hid-playstation`: buttons, sticks, triggers, touchpad (two contacts and
+  click), gyro and accelerometer host-ward; rumble, lightbar, DualSense
+  player LEDs and adaptive-trigger effects client-ward (triggers through
+  `SDL_GameControllerSendEffect`, DualSense clients only). The type follows
+  the client's controller (`--gamepad-type auto|xbox|ds4|dualsense`), gated
+  on `Desktop.gamepad_types` and `ClientFeatures.gamepad_lights`; hosts
+  without uhid access and older peers keep the Xbox pad. Verified in a KVM
+  guest on the host's kernel: the driver binds, evdev reads back every
+  input, SDL sees PS4/PS5 controllers with sensors and touchpad, and
+  driver, game and SDL output reports reach the client side. Not verified:
+  a physical PlayStation controller on the client, a real game or Steam
+  Input. No DualSense haptics or audio.
 
 - **Why:** Parsec emulates DS4/DualSense on Windows hosts (GP). Sunshine
   emulates DualSense on Linux (https://docs.lizardbyte.dev/projects/sunshine).

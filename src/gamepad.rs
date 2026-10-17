@@ -10,14 +10,27 @@
 //! `FF_RUMBLE` like `xpad`. A thread per pad answers the kernel's effect
 //! uploads and erases on the uinput fd (a game blocks in `EVIOCSFF` until
 //! then) and turns played effects into [`Rumble`] updates for the client.
+//!
+//! Pads the client connects as a DualShock 4 or DualSense are `/dev/uhid`
+//! HID devices instead (`uhid`, reports in `ps`), so the kernel's
+//! `hid-playstation` driver gives games real PlayStation pads with
+//! touchpad, motion sensors and LEDs. Without uhid access the host offers
+//! only the Xbox pad.
 
-use crate::protocol::{Event, GAMEPAD_AXES, MAX_GAMEPADS, MAX_RUMBLE_MS};
+#[path = "gamepad_ps.rs"]
+mod ps;
+#[path = "gamepad_uhid.rs"]
+mod uhid;
+
+use crate::protocol::{
+    Event, GAMEPAD_AXES, GamepadType, MAX_GAMEPADS, MAX_RUMBLE_MS, TRIGGER_EFFECT_LEN,
+};
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
     os::fd::AsRawFd,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -210,7 +223,37 @@ pub struct Rumble {
     pub motors: Motors,
 }
 
-pub type RumbleSender = tokio::sync::mpsc::UnboundedSender<Rumble>;
+/// What a game asked of a virtual pad, for the client's controller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PadFeedback {
+    Rumble(Rumble),
+    /// PlayStation lightbar and DualSense player LEDs (`Update::GamepadLights`).
+    Lights {
+        pad: u8,
+        red: u8,
+        green: u8,
+        blue: u8,
+        player: u8,
+    },
+    /// DualSense adaptive-trigger effects (`Update::GamepadTriggers`).
+    Triggers {
+        pad: u8,
+        right: [u8; TRIGGER_EFFECT_LEN],
+        left: [u8; TRIGGER_EFFECT_LEN],
+    },
+}
+
+pub type FeedbackSender = tokio::sync::mpsc::UnboundedSender<PadFeedback>;
+
+/// Where pad feedback goes and which kinds the client plays
+/// (`ClientFeatures::rumble`, `ClientFeatures::gamepad_lights`). Shared
+/// with the uhid pads' threads, which exist before the client declares.
+#[derive(Clone, Default)]
+pub struct FeedbackTarget {
+    pub sender: Option<FeedbackSender>,
+    pub rumble: bool,
+    pub lights: bool,
+}
 
 /// How often an effect without an end is re-sent: one update lasts at most
 /// [`MAX_RUMBLE_MS`].
@@ -501,7 +544,12 @@ fn answer_erase(fd: libc::c_int, request_id: u32, effects: &mut Effects) -> Resu
 /// the device goes away or the session's receiver is gone. Reports the
 /// motors whenever a game uploads, erases or plays an effect, when effects
 /// end, and every [`RUMBLE_REFRESH`] for effects without an end.
-fn serve_force_feedback(file: std::fs::File, pad: u8, sender: RumbleSender, stop: Arc<AtomicBool>) {
+fn serve_force_feedback(
+    file: std::fs::File,
+    pad: u8,
+    sender: FeedbackSender,
+    stop: Arc<AtomicBool>,
+) {
     let fd = file.as_raw_fd();
     let mut effects = Effects::default();
     let mut sent = Motors::default();
@@ -566,24 +614,48 @@ fn serve_force_feedback(file: std::fs::File, pad: u8, sender: RumbleSender, stop
         let changed = (motors.low, motors.high) != (sent.low, sent.high);
         let refresh = motors.duration_ms == MAX_RUMBLE_MS && now - sent_at >= RUMBLE_REFRESH;
         if changed || refresh || (requested && motors.duration_ms > 0) {
-            if sender.send(Rumble { pad, motors }).is_err() {
+            if sender
+                .send(PadFeedback::Rumble(Rumble { pad, motors }))
+                .is_err()
+            {
                 return;
             }
             (sent, sent_at) = (motors, now);
         }
     }
     if sent.duration_ms > 0 {
-        let _ = sender.send(Rumble {
+        let _ = sender.send(PadFeedback::Rumble(Rumble {
             pad,
             motors: Motors::default(),
-        });
+        }));
+    }
+}
+
+enum Device {
+    Uinput(UinputPad),
+    Uhid(uhid::UhidPad),
+}
+
+#[cfg(test)]
+impl Device {
+    /// Kernel name of a uinput pad (see [`UinputPad::sysname`]).
+    fn sysname(&self) -> Result<String> {
+        match self {
+            Self::Uinput(device) => device.sysname(),
+            Self::Uhid(_) => anyhow::bail!("not a uinput pad"),
+        }
     }
 }
 
 struct Pad {
+    kind: GamepadType,
+    /// Xbox pads.
     state: PadState,
+    /// PlayStation pads.
+    ps: ps::PsState,
+    created: Instant,
     /// `None` for the `--source test` backend: events are accepted and dropped.
-    device: Option<UinputPad>,
+    device: Option<Device>,
     /// Stops the pad's force-feedback thread, if it has one.
     force_feedback: Option<Arc<AtomicBool>>,
 }
@@ -600,8 +672,56 @@ impl Drop for Pad {
 impl Pad {
     fn emit(&mut self, events: &[RawEvent]) -> Result<()> {
         match &mut self.device {
-            Some(device) => device.write(events),
-            None => Ok(()),
+            Some(Device::Uinput(device)) => device.write(events),
+            _ => Ok(()),
+        }
+    }
+
+    /// Send the PlayStation state as a new input report.
+    fn report(&mut self) -> Result<()> {
+        let elapsed = self.created.elapsed().as_micros() as u64;
+        let report = self.ps.report(elapsed);
+        match &mut self.device {
+            Some(Device::Uhid(device)) => device.write(&report),
+            _ => Ok(()),
+        }
+    }
+
+    fn playstation(&self) -> bool {
+        !self.kind.is_xbox()
+    }
+
+    fn button(&mut self, button: u8, down: bool) -> Result<()> {
+        if self.playstation() {
+            if self.ps.button(button, down) {
+                self.report()?;
+            }
+            Ok(())
+        } else {
+            let events = self.state.button(button, down);
+            self.emit(&events)
+        }
+    }
+
+    fn axis(&mut self, axis: u8, value: i16) -> Result<()> {
+        if self.playstation() {
+            if self.ps.axis(axis, value) {
+                self.report()?;
+            }
+            Ok(())
+        } else {
+            let events = self.state.axis(axis, value);
+            self.emit(&events)
+        }
+    }
+
+    fn neutral(&mut self) -> Result<()> {
+        if self.playstation() {
+            self.ps.neutral();
+            self.report()
+        } else {
+            let events = self.state.neutral();
+            self.emit(&events)
         }
     }
 }
@@ -609,10 +729,11 @@ impl Pad {
 /// The session's pads, indexed by the client's slot number.
 pub struct Gamepads {
     pads: [Option<Pad>; MAX_GAMEPADS as usize],
-    /// Create real uinput devices (false for `--source test`).
+    /// Create real uinput/uhid devices (false for `--source test`).
     virtual_devices: bool,
-    /// Set for a client that plays rumble: new pads offer force feedback.
-    rumble: Option<RumbleSender>,
+    /// Where feedback goes once the client plays it: new uinput pads offer
+    /// force feedback when `rumble` is set.
+    target: Arc<Mutex<FeedbackTarget>>,
 }
 
 impl Gamepads {
@@ -620,14 +741,23 @@ impl Gamepads {
         Self {
             pads: Default::default(),
             virtual_devices,
-            rumble: None,
+            target: Arc::default(),
         }
     }
 
-    /// The client plays rumble (`ClientFeatures::rumble`); pads created
-    /// from now on in this session offer `FF_RUMBLE` and report to `sender`.
-    pub fn enable_rumble(&mut self, sender: RumbleSender) {
-        self.rumble = Some(sender);
+    /// The client plays rumble (`ClientFeatures::rumble`) and/or lights and
+    /// trigger effects (`ClientFeatures::gamepad_lights`). Xbox pads created
+    /// from now on in this session offer `FF_RUMBLE`; PlayStation pads report
+    /// their output reports to `sender`.
+    pub fn enable_feedback(&mut self, sender: FeedbackSender, rumble: bool, lights: bool) {
+        let mut target = self.target.lock().expect("feedback lock");
+        target.sender = Some(sender);
+        target.rumble |= rumble;
+        target.lights |= lights;
+    }
+
+    fn feedback(&self) -> FeedbackTarget {
+        self.target.lock().expect("feedback lock").clone()
     }
 
     /// Advertise `Desktop::gamepads` only if pads can actually be created.
@@ -635,8 +765,114 @@ impl Gamepads {
         !self.virtual_devices || uinput_writable()
     }
 
+    /// `Desktop::gamepad_types`: the PlayStation pads need `/dev/uhid`.
+    pub fn types(&self) -> Vec<GamepadType> {
+        if !self.available() {
+            return Vec::new();
+        }
+        let mut types = vec![GamepadType::Xbox];
+        if !self.virtual_devices || uhid::uhid_writable() {
+            types.extend([GamepadType::Ds4, GamepadType::DualSense]);
+        }
+        types
+    }
+
     pub fn connected(&self) -> usize {
         self.pads.iter().flatten().count()
+    }
+
+    /// A new pad of type `kind` (an Xbox pad when a PlayStation one cannot
+    /// be created).
+    fn create(&self, pad: u8, kind: GamepadType) -> Result<Pad> {
+        let feedback = self.feedback();
+        let rumble = feedback.rumble && feedback.sender.is_some();
+        let mut created = Pad {
+            kind,
+            state: PadState::default(),
+            ps: ps::PsState::new(kind),
+            created: Instant::now(),
+            device: None,
+            force_feedback: None,
+        };
+        if !self.virtual_devices {
+            return Ok(created);
+        }
+        if created.playstation() {
+            let report = created.ps.report(0);
+            match uhid::UhidPad::create(pad, kind, &report, self.target.clone()) {
+                Ok(device) => {
+                    tracing::debug!(pad, phys = %device.phys, "uhid pad created");
+                    created.device = Some(Device::Uhid(device));
+                    return Ok(created);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        pad,
+                        kind = kind.label(),
+                        error = format!("{error:#}"),
+                        "PlayStation pad unavailable; creating an Xbox pad"
+                    );
+                    created.kind = GamepadType::Xbox;
+                }
+            }
+        }
+        let device = UinputPad::create(pad, rumble)?;
+        if rumble && let Some(sender) = feedback.sender {
+            let stop = Arc::new(AtomicBool::new(false));
+            let (file, flag) = (device.file.try_clone()?, stop.clone());
+            std::thread::Builder::new()
+                .name(format!("pad{pad}-rumble"))
+                .spawn(move || serve_force_feedback(file, pad, sender, flag))?;
+            created.force_feedback = Some(stop);
+        }
+        created.device = Some(Device::Uinput(device));
+        Ok(created)
+    }
+
+    /// The test backend has no games: it answers like one so the update
+    /// path can be tested (a short rumble per press; PlayStation pads also
+    /// get the kernel's player-1 lights on connect and a trigger effect per
+    /// press).
+    fn test_feedback(&self, pad: u8, kind: GamepadType, connected: bool) {
+        let feedback = self.feedback();
+        let Some(sender) = feedback.sender else {
+            return;
+        };
+        if connected {
+            if feedback.lights && !kind.is_xbox() {
+                let _ = sender.send(PadFeedback::Lights {
+                    pad,
+                    red: 0,
+                    green: 0,
+                    blue: 64,
+                    player: if kind == GamepadType::DualSense {
+                        0b00100
+                    } else {
+                        0
+                    },
+                });
+            }
+            return;
+        }
+        if feedback.rumble {
+            let _ = sender.send(PadFeedback::Rumble(Rumble {
+                pad,
+                motors: Motors {
+                    low: 0x4000,
+                    high: 0x8000,
+                    duration_ms: 100,
+                },
+            }));
+        }
+        if feedback.lights && kind == GamepadType::DualSense {
+            let mut right = [0u8; TRIGGER_EFFECT_LEN];
+            right[..2].copy_from_slice(&[0x21, 0x7f]);
+            let _ = sender.send(PadFeedback::Triggers {
+                pad,
+                right,
+                left: [0; TRIGGER_EFFECT_LEN],
+            });
+        }
     }
 
     /// Apply one validated `Gamepad*` event. Events for a slot that was never
@@ -645,40 +881,27 @@ impl Gamepads {
     pub fn input(&mut self, event: &Event) -> Result<()> {
         event.validate()?;
         match *event {
-            Event::GamepadConnected { pad, ref name } => {
+            Event::GamepadConnected {
+                pad,
+                ref name,
+                kind,
+            } => {
                 if let Some(existing) = &mut self.pads[usize::from(pad)] {
-                    let events = existing.state.neutral();
-                    return existing.emit(&events);
+                    return existing.neutral();
                 }
-                let device = if self.virtual_devices {
-                    Some(UinputPad::create(pad, self.rumble.is_some())?)
-                } else {
-                    None
-                };
-                let force_feedback = match (&device, &self.rumble) {
-                    (Some(device), Some(sender)) => {
-                        let stop = Arc::new(AtomicBool::new(false));
-                        let (file, sender, flag) =
-                            (device.file.try_clone()?, sender.clone(), stop.clone());
-                        std::thread::Builder::new()
-                            .name(format!("pad{pad}-rumble"))
-                            .spawn(move || serve_force_feedback(file, pad, sender, flag))?;
-                        Some(stop)
-                    }
-                    _ => None,
-                };
+                let created = self.create(pad, kind)?;
                 tracing::info!(
                     pad,
                     controller = %name,
-                    virtual_device = device.is_some(),
-                    rumble = self.rumble.is_some(),
+                    kind = %created.kind.label(),
+                    virtual_device = created.device.is_some(),
+                    rumble = created.force_feedback.is_some() || created.playstation(),
                     "gamepad connected"
                 );
-                self.pads[usize::from(pad)] = Some(Pad {
-                    state: PadState::default(),
-                    device,
-                    force_feedback,
-                });
+                if created.device.is_none() {
+                    self.test_feedback(pad, created.kind, true);
+                }
+                self.pads[usize::from(pad)] = Some(created);
             }
             Event::GamepadDisconnected { pad } => {
                 let removed = self.pads[usize::from(pad)].take();
@@ -686,30 +909,39 @@ impl Gamepads {
             }
             Event::GamepadButton { pad, button, down } => {
                 if let Some(state) = &mut self.pads[usize::from(pad)] {
-                    let events = state.state.button(button, down);
-                    state.emit(&events)?;
-                    // The test backend has no games: it answers each press
-                    // with a short rumble so the update path can be tested.
-                    if down
-                        && state.device.is_none()
-                        && let Some(sender) = &self.rumble
-                    {
-                        let _ = sender.send(Rumble {
-                            pad,
-                            motors: Motors {
-                                low: 0x4000,
-                                high: 0x8000,
-                                duration_ms: 100,
-                            },
-                        });
+                    state.button(button, down)?;
+                    if down && state.device.is_none() {
+                        let kind = state.kind;
+                        self.test_feedback(pad, kind, false);
                     }
                 }
             }
             Event::GamepadAxis { pad, axis, value } => {
                 debug_assert!(axis < GAMEPAD_AXES);
                 if let Some(pad) = &mut self.pads[usize::from(pad)] {
-                    let events = pad.state.axis(axis, value);
-                    pad.emit(&events)?;
+                    pad.axis(axis, value)?;
+                }
+            }
+            Event::GamepadTouch {
+                pad,
+                finger,
+                down,
+                x,
+                y,
+            } => {
+                if let Some(pad) = &mut self.pads[usize::from(pad)]
+                    && pad.playstation()
+                    && pad.ps.touch(finger, down, x, y)
+                {
+                    pad.report()?;
+                }
+            }
+            Event::GamepadMotion { pad, gyro, accel } => {
+                if let Some(pad) = &mut self.pads[usize::from(pad)]
+                    && pad.playstation()
+                    && pad.ps.motion(gyro, accel)
+                {
+                    pad.report()?;
                 }
             }
             _ => (),
@@ -721,8 +953,7 @@ impl Gamepads {
     /// devices so a game does not see its controller unplugged on focus loss.
     pub fn neutralise(&mut self) {
         for pad in self.pads.iter_mut().flatten() {
-            let events = pad.state.neutral();
-            if let Err(error) = pad.emit(&events) {
+            if let Err(error) = pad.neutral() {
                 tracing::warn!(%error, "gamepad release failed");
             }
         }
@@ -733,7 +964,7 @@ impl Gamepads {
         self.neutralise();
         let count = self.connected();
         self.pads = Default::default();
-        self.rumble = None;
+        self.target = Arc::default();
         if count > 0 {
             tracing::info!(count, "virtual gamepads removed");
         }
@@ -806,6 +1037,7 @@ mod tests {
         pads.input(&Event::GamepadConnected {
             pad: 3,
             name: "Pad".into(),
+            kind: crate::protocol::GamepadType::Xbox,
         })
         .unwrap();
         pads.input(&Event::GamepadButton {
@@ -838,6 +1070,7 @@ mod tests {
         pads.input(&Event::GamepadConnected {
             pad: 0,
             name: String::new(),
+            kind: crate::protocol::GamepadType::Xbox,
         })
         .unwrap();
         pads.destroy_all();
@@ -908,6 +1141,7 @@ mod tests {
         pads.input(&Event::GamepadConnected {
             pad: 2,
             name: "Pad".into(),
+            kind: crate::protocol::GamepadType::Xbox,
         })
         .unwrap();
         pads.input(&press).unwrap();
@@ -915,15 +1149,18 @@ mod tests {
             receiver.try_recv().is_err(),
             "no rumble before the client asks"
         );
-        pads.enable_rumble(sender);
+        pads.enable_feedback(sender, true, false);
         pads.input(&press).unwrap();
-        let rumble = receiver.try_recv().unwrap();
+        let Ok(PadFeedback::Rumble(rumble)) = receiver.try_recv() else {
+            panic!("no rumble")
+        };
         assert_eq!(rumble.pad, 2);
         assert!(rumble.motors.duration_ms > 0);
         pads.destroy_all();
         pads.input(&Event::GamepadConnected {
             pad: 2,
             name: "Pad".into(),
+            kind: crate::protocol::GamepadType::Xbox,
         })
         .unwrap();
         pads.input(&press).unwrap();
@@ -944,6 +1181,7 @@ mod tests {
         pads.input(&Event::GamepadConnected {
             pad: 1,
             name: "test".into(),
+            kind: crate::protocol::GamepadType::Xbox,
         })
         .unwrap();
         let sysname = pads.pads[1]
@@ -1065,6 +1303,7 @@ mod tests {
         pads.input(&Event::GamepadConnected {
             pad: 0,
             name: "test".into(),
+            kind: crate::protocol::GamepadType::Xbox,
         })
         .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1184,10 +1423,10 @@ mod tests {
         panic!("cannot open {} for reading and writing", path.display());
     }
 
-    fn next_rumble(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<Rumble>) -> Rumble {
+    fn next_rumble(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<PadFeedback>) -> Rumble {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            if let Ok(rumble) = receiver.try_recv() {
+            if let Ok(PadFeedback::Rumble(rumble)) = receiver.try_recv() {
                 return rumble;
             }
             assert!(Instant::now() < deadline, "no rumble reported");
@@ -1209,10 +1448,11 @@ mod tests {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut pads = Gamepads::new(true);
         assert!(pads.available(), "/dev/uinput is not writable");
-        pads.enable_rumble(sender);
+        pads.enable_feedback(sender, true, false);
         pads.input(&Event::GamepadConnected {
             pad: 3,
             name: "test".into(),
+            kind: crate::protocol::GamepadType::Xbox,
         })
         .unwrap();
         let (sys, mut device) = open_evdev(&pads, 3);
@@ -1282,6 +1522,7 @@ mod tests {
         pads.input(&Event::GamepadConnected {
             pad: 0,
             name: "test".into(),
+            kind: crate::protocol::GamepadType::Xbox,
         })
         .unwrap();
         let (sys, _) = open_evdev(&pads, 0);
@@ -1302,10 +1543,11 @@ mod tests {
         for _ in pump.poll_iter() {}
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut pads = Gamepads::new(true);
-        pads.enable_rumble(sender);
+        pads.enable_feedback(sender, true, false);
         pads.input(&Event::GamepadConnected {
             pad: 0,
             name: "test".into(),
+            kind: crate::protocol::GamepadType::Xbox,
         })
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1339,6 +1581,580 @@ mod tests {
             assert!(Instant::now() < deadline, "rumble never stopped");
         }
         drop(controller);
+        pads.destroy_all();
+    }
+
+    #[test]
+    fn test_backend_takes_playstation_pads_and_answers_with_lights() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut pads = Gamepads::new(false);
+        assert_eq!(
+            pads.types(),
+            [GamepadType::Xbox, GamepadType::Ds4, GamepadType::DualSense]
+        );
+        pads.enable_feedback(sender, true, true);
+        pads.input(&Event::GamepadConnected {
+            pad: 1,
+            name: "Pad".into(),
+            kind: GamepadType::DualSense,
+        })
+        .unwrap();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(PadFeedback::Lights {
+                pad: 1,
+                player: 0b00100,
+                ..
+            })
+        ));
+        for event in [
+            Event::GamepadTouch {
+                pad: 1,
+                finger: 1,
+                down: true,
+                x: 0.5,
+                y: 0.5,
+            },
+            Event::GamepadMotion {
+                pad: 1,
+                gyro: [1.0; 3],
+                accel: [0.0; 3],
+            },
+            Event::GamepadAxis {
+                pad: 1,
+                axis: 2,
+                value: 500,
+            },
+        ] {
+            pads.input(&event).unwrap();
+        }
+        let report = pads.pads[1].as_ref().unwrap().ps.clone().report(0);
+        assert_eq!(report[37] & 0x80, 0, "second finger down");
+        pads.input(&Event::GamepadButton {
+            pad: 1,
+            button: 0,
+            down: true,
+        })
+        .unwrap();
+        assert!(matches!(receiver.try_recv(), Ok(PadFeedback::Rumble(_))));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(PadFeedback::Triggers { pad: 1, .. })
+        ));
+        pads.neutralise();
+        let report = pads.pads[1].as_mut().unwrap().ps.report(0);
+        assert_eq!((report[8], report[3], report[37] & 0x80), (8, 0x80, 0x80));
+        // Touch and motion for an Xbox pad are ignored.
+        pads.input(&Event::GamepadConnected {
+            pad: 0,
+            name: "Pad".into(),
+            kind: GamepadType::Xbox,
+        })
+        .unwrap();
+        pads.input(&Event::GamepadTouch {
+            pad: 0,
+            finger: 0,
+            down: true,
+            x: 0.0,
+            y: 0.0,
+        })
+        .unwrap();
+        pads.destroy_all();
+    }
+
+    /// Raw events from an evdev node until `done` holds or 3 s pass.
+    fn read_evdev(
+        device: &mut std::fs::File,
+        mut done: impl FnMut(&[RawEvent]) -> bool,
+    ) -> Vec<RawEvent> {
+        use std::io::Read;
+        let size = size_of::<libc::input_event>();
+        let mut seen = Vec::new();
+        let mut buffer = vec![0u8; size * 64];
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !done(&seen) {
+            assert!(Instant::now() < deadline, "evdev events missing: {seen:?}");
+            let mut poll = libc::pollfd {
+                fd: device.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut poll, 1, 50) } <= 0 {
+                continue;
+            }
+            let read = device.read(&mut buffer).unwrap();
+            for chunk in buffer[..read].chunks_exact(size) {
+                let event: libc::input_event =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast()) };
+                if event.type_ != EV_SYN {
+                    seen.push(raw(event.type_, event.code, event.value));
+                }
+            }
+        }
+        seen
+    }
+
+    /// The input devices `hid-playstation` made for the HID device at `hid`:
+    /// (name, /dev/input/eventN) once all three appeared.
+    fn playstation_nodes(hid: &std::path::Path) -> Vec<(String, std::path::PathBuf)> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut nodes = Vec::new();
+            for input in std::fs::read_dir(hid.join("input"))
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let name = std::fs::read_to_string(input.path().join("name")).unwrap_or_default();
+                let event = std::fs::read_dir(input.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .find(|name| name.starts_with("event"));
+                if let Some(event) = event {
+                    nodes.push((
+                        name.trim().to_owned(),
+                        std::path::Path::new("/dev/input").join(event),
+                    ));
+                }
+            }
+            // Newer drivers add a DualSense "Headset Jack" device too.
+            let has = |suffix: &str| nodes.iter().any(|(name, _)| name.ends_with(suffix));
+            if nodes.len() >= 3 && has("Touchpad") && has("Motion Sensors") {
+                return nodes;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "hid-playstation did not create gamepad, touchpad and motion devices: {nodes:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn open_node(path: &std::path::Path) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt;
+        for _ in 0..100 {
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+            {
+                return file;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("cannot open {} for reading and writing", path.display());
+    }
+
+    fn next_feedback(
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<PadFeedback>,
+        mut wanted: impl FnMut(&PadFeedback) -> bool,
+    ) -> PadFeedback {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(feedback) = receiver.try_recv()
+                && wanted(&feedback)
+            {
+                return feedback;
+            }
+            assert!(Instant::now() < deadline, "feedback missing");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A DualSense and a DualShock 4 through `/dev/uhid`: the kernel binds
+    /// `hid-playstation` and creates gamepad, touchpad and motion devices;
+    /// buttons, sticks, triggers, touch and motion come out of evdev in the
+    /// driver's units; the driver's own LED setup, a game's rumble
+    /// (`EVIOCSFF`) and a game's hidraw output report (lightbar, player
+    /// LEDs, adaptive triggers) reach the client side.
+    #[test]
+    #[ignore = "needs read/write access to /dev/uhid, the hid-playstation module and access to the created evdev and hidraw nodes (root in a VM)"]
+    fn uhid_playstation_pads_bind_hid_playstation() {
+        use std::io::Write;
+        if !uhid::uhid_writable() {
+            eprintln!(
+                "SKIPPED uhid_playstation_pads_bind_hid_playstation: {} is not readable and writable by this user (see docs/gamepad.md)",
+                uhid::UHID_PATH
+            );
+            return;
+        }
+        const BTN_LEFT: u16 = 0x110;
+        const ABS_MT_POSITION_X: u16 = 0x35;
+        const EVIOCSFF: u64 =
+            (1 << 30) | ((size_of::<libc::ff_effect>() as u64) << 16) | ((b'E' as u64) << 8) | 0x80;
+        for (pad, kind) in [(0u8, GamepadType::DualSense), (1, GamepadType::Ds4)] {
+            let model = ps::model(kind).unwrap();
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let mut pads = Gamepads::new(true);
+            pads.enable_feedback(sender, true, true);
+            pads.input(&Event::GamepadConnected {
+                pad,
+                name: "test".into(),
+                kind,
+            })
+            .unwrap();
+            let phys = match &pads.pads[usize::from(pad)].as_ref().unwrap().device {
+                Some(Device::Uhid(device)) => device.phys.clone(),
+                _ => panic!("{kind:?} fell back to an Xbox pad"),
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let hid = loop {
+                if let Some(hid) = uhid::hid_device(&phys)
+                    && hid.join("driver").exists()
+                {
+                    break hid;
+                }
+                assert!(Instant::now() < deadline, "{kind:?}: no bound HID device");
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let driver = std::fs::read_link(hid.join("driver")).unwrap();
+            assert_eq!(
+                driver.file_name().unwrap(),
+                "playstation",
+                "{kind:?} bound by {driver:?}"
+            );
+            eprintln!("{kind:?}: {} bound by hid-playstation", hid.display());
+            let nodes = playstation_nodes(&hid);
+            let node = |suffix: &str| {
+                nodes
+                    .iter()
+                    .find(|(name, _)| {
+                        name.strip_prefix(model.name)
+                            .is_some_and(|rest| rest.trim() == suffix)
+                    })
+                    .unwrap_or_else(|| panic!("{kind:?}: no {suffix:?} device in {nodes:?}"))
+                    .1
+                    .clone()
+            };
+            let mut gamepad = open_node(&node(""));
+            let mut touchpad = open_node(&node("Touchpad"));
+            let mut motion = open_node(&node("Motion Sensors"));
+            // The driver's probe sets the lightbar (and the DualSense's
+            // player LEDs) through output reports.
+            let lights = next_feedback(&mut receiver, |f| matches!(f, PadFeedback::Lights { .. }));
+            eprintln!("{kind:?}: lights set by the driver: {lights:?}");
+            for event in [
+                Event::GamepadButton {
+                    pad,
+                    button: 0,
+                    down: true,
+                },
+                Event::GamepadAxis {
+                    pad,
+                    axis: 0,
+                    value: i16::MIN,
+                },
+                Event::GamepadAxis {
+                    pad,
+                    axis: 5,
+                    value: i16::MAX,
+                },
+                Event::GamepadTouch {
+                    pad,
+                    finger: 0,
+                    down: true,
+                    x: 0.5,
+                    y: 0.25,
+                },
+                Event::GamepadButton {
+                    pad,
+                    button: 20,
+                    down: true,
+                },
+                Event::GamepadMotion {
+                    pad,
+                    gyro: [90f32.to_radians(), 0.0, -45f32.to_radians()],
+                    accel: [0.0, 2.0 * 9.80665, 0.0],
+                },
+            ] {
+                pads.input(&event).unwrap();
+            }
+            let seen = read_evdev(&mut gamepad, |seen| {
+                seen.contains(&raw(EV_ABS, ABS_RZ, 255))
+            });
+            assert!(
+                seen.contains(&raw(EV_KEY, BTN_A, 1)),
+                "{kind:?} cross: {seen:?}"
+            );
+            assert!(
+                seen.contains(&raw(EV_ABS, ABS_X, 0)),
+                "{kind:?} stick: {seen:?}"
+            );
+            let seen = read_evdev(&mut touchpad, |seen| {
+                seen.iter().any(|e| e.kind == EV_KEY && e.code == BTN_LEFT)
+            });
+            assert!(
+                seen.contains(&raw(EV_ABS, ABS_MT_POSITION_X, 960)),
+                "{kind:?} touch: {seen:?}"
+            );
+            assert!(
+                seen.contains(&raw(EV_KEY, BTN_LEFT, 1)),
+                "{kind:?} click: {seen:?}"
+            );
+            // hid-playstation reports 1/1024 °/s and 1/8192 g.
+            let seen = read_evdev(&mut motion, |seen| {
+                seen.contains(&raw(EV_ABS, ABS_RX, 90 * 1024))
+            });
+            assert!(
+                seen.contains(&raw(EV_ABS, ABS_RZ, -45 * 1024)),
+                "{kind:?} gyro: {seen:?}"
+            );
+            assert!(
+                seen.contains(&raw(EV_ABS, ABS_Y, 2 * 8192)),
+                "{kind:?} accel: {seen:?}"
+            );
+            eprintln!("{kind:?}: button, stick, trigger, touch, click and motion read back");
+            // A game's rumble through the driver's force feedback.
+            let mut effect: libc::ff_effect = unsafe { std::mem::zeroed() };
+            effect.type_ = FF_RUMBLE;
+            effect.id = -1;
+            unsafe {
+                std::ptr::write_unaligned(
+                    effect.u.as_mut_ptr().cast(),
+                    libc::ff_rumble_effect {
+                        strong_magnitude: 0x8000,
+                        weak_magnitude: 0x4000,
+                    },
+                )
+            };
+            let fd = gamepad.as_raw_fd();
+            let result = unsafe { libc::ioctl(fd, EVIOCSFF as _, &mut effect) };
+            assert!(result >= 0, "EVIOCSFF: {}", std::io::Error::last_os_error());
+            let mut record: libc::input_event = unsafe { std::mem::zeroed() };
+            record.type_ = EV_FF;
+            record.code = effect.id as u16;
+            record.value = 1;
+            gamepad
+                .write_all(unsafe {
+                    std::slice::from_raw_parts(
+                        (&record as *const libc::input_event).cast::<u8>(),
+                        size_of::<libc::input_event>(),
+                    )
+                })
+                .unwrap();
+            let rumble = next_feedback(
+                &mut receiver,
+                |f| matches!(f, PadFeedback::Rumble(r) if r.motors.low > 0),
+            );
+            assert_eq!(
+                rumble,
+                PadFeedback::Rumble(Rumble {
+                    pad,
+                    motors: Motors {
+                        low: 0x80 * 257,
+                        high: 0x40 * 257,
+                        duration_ms: MAX_RUMBLE_MS,
+                    },
+                }),
+                "{kind:?}"
+            );
+            // A game writing the hidraw node (Steam Input, SDL's HIDAPI).
+            let hidraw = std::fs::read_dir(hid.join("hidraw"))
+                .unwrap()
+                .flatten()
+                .next()
+                .unwrap()
+                .file_name();
+            let mut hidraw = open_node(&std::path::Path::new("/dev").join(hidraw));
+            let report = match kind {
+                GamepadType::DualSense => {
+                    let mut report = vec![0u8; 63];
+                    report[0] = 0x02;
+                    report[1] = 0x04 | 0x08;
+                    report[2] = 0x04 | 0x10;
+                    report[11] = 0x21;
+                    report[12] = 0x55;
+                    report[22] = 0x26;
+                    report[44] = 0b11011;
+                    report[45..48].copy_from_slice(&[0x12, 0x34, 0x56]);
+                    report
+                }
+                _ => {
+                    let mut report = vec![0u8; 32];
+                    report[0] = 0x05;
+                    report[1] = 0x02;
+                    report[6..9].copy_from_slice(&[0x12, 0x34, 0x56]);
+                    report
+                }
+            };
+            hidraw.write_all(&report).unwrap();
+            let lights = next_feedback(&mut receiver, |f| {
+                matches!(f, PadFeedback::Lights { red: 0x12, .. })
+            });
+            let player = if kind == GamepadType::DualSense {
+                0b11011
+            } else {
+                0
+            };
+            assert_eq!(
+                lights,
+                PadFeedback::Lights {
+                    pad,
+                    red: 0x12,
+                    green: 0x34,
+                    blue: 0x56,
+                    player,
+                }
+            );
+            if kind == GamepadType::DualSense {
+                let triggers =
+                    next_feedback(&mut receiver, |f| matches!(f, PadFeedback::Triggers { .. }));
+                let PadFeedback::Triggers { right, left, .. } = triggers else {
+                    unreachable!()
+                };
+                assert_eq!((right[0], right[1], left[0]), (0x21, 0x55, 0x26));
+            }
+            eprintln!(
+                "{kind:?}: rumble, lightbar, player LEDs and triggers reached the client side"
+            );
+            drop((gamepad, touchpad, motion, hidraw));
+            pads.destroy_all();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while hid.exists() {
+                assert!(Instant::now() < deadline, "{kind:?} device not destroyed");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
+    /// What a game using SDL sees on the host: each uhid pad is a PS5 or
+    /// PS4 controller with the touchpad and motion sensors, reporting the
+    /// forwarded button, touch and gyro, and SDL's own LED and rumble
+    /// requests come back to the client side.
+    #[test]
+    #[ignore = "needs read/write access to /dev/uhid, hid-playstation, and access to the created evdev and hidraw nodes (root in a VM)"]
+    fn sdl_reads_uhid_pads_as_playstation_controllers() {
+        use sdl2::{controller::Button, sensor::SensorType};
+        if !uhid::uhid_writable() {
+            eprintln!(
+                "SKIPPED sdl_reads_uhid_pads_as_playstation_controllers: {} is not readable and writable by this user",
+                uhid::UHID_PATH
+            );
+            return;
+        }
+        let sdl = sdl2::init().unwrap();
+        let subsystem = sdl.game_controller().unwrap();
+        let mut pump = sdl.event_pump().unwrap();
+        for _ in pump.poll_iter() {}
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut pads = Gamepads::new(true);
+        pads.enable_feedback(sender, true, true);
+        for (pad, kind) in [(0u8, GamepadType::DualSense), (1, GamepadType::Ds4)] {
+            let model = ps::model(kind).unwrap();
+            pads.input(&Event::GamepadConnected {
+                pad,
+                name: "test".into(),
+                kind,
+            })
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut controller = None;
+            while controller.is_none() {
+                assert!(Instant::now() < deadline, "SDL did not report the {kind:?}");
+                for event in pump.poll_iter() {
+                    if let sdl2::event::Event::ControllerDeviceAdded { which, .. } = event {
+                        let candidate = subsystem.open(which).unwrap();
+                        if candidate.product_id() == Some(model.product) {
+                            controller = Some(candidate);
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let mut controller = controller.unwrap();
+            eprintln!(
+                "{kind:?}: SDL controller {:?}, mapping {}",
+                controller.name(),
+                controller.mapping()
+            );
+            for sensor in [SensorType::Gyroscope, SensorType::Accelerometer] {
+                assert!(controller.has_sensor(sensor), "{kind:?}: no {sensor:?}");
+                controller.sensor_set_enabled(sensor, true).unwrap();
+            }
+            let settle = |pump: &mut sdl2::EventPump| -> Vec<sdl2::event::Event> {
+                std::thread::sleep(Duration::from_millis(60));
+                pump.poll_iter().collect()
+            };
+            settle(&mut pump);
+            pads.input(&Event::GamepadButton {
+                pad,
+                button: 0,
+                down: true,
+            })
+            .unwrap();
+            pads.input(&Event::GamepadTouch {
+                pad,
+                finger: 0,
+                down: true,
+                x: 0.5,
+                y: 0.25,
+            })
+            .unwrap();
+            pads.input(&Event::GamepadMotion {
+                pad,
+                gyro: [1.0, -0.5, 0.25],
+                accel: [0.0, 9.80665, 0.0],
+            })
+            .unwrap();
+            let events = settle(&mut pump);
+            assert!(controller.button(Button::A), "{kind:?}: cross");
+            let touch = events.iter().find_map(|event| match event {
+                sdl2::event::Event::ControllerTouchpadDown { x, y, .. }
+                | sdl2::event::Event::ControllerTouchpadMotion { x, y, .. } => Some((*x, *y)),
+                _ => None,
+            });
+            let (x, y) = touch.unwrap_or_else(|| panic!("{kind:?}: no touch in {events:?}"));
+            assert!(
+                (x - 0.5).abs() < 0.01 && (y - 0.25).abs() < 0.01,
+                "{kind:?}: touch at {x},{y}"
+            );
+            let mut gyro = [0f32; 3];
+            controller
+                .sensor_get_data(SensorType::Gyroscope, &mut gyro)
+                .unwrap();
+            let mut accel = [0f32; 3];
+            controller
+                .sensor_get_data(SensorType::Accelerometer, &mut accel)
+                .unwrap();
+            eprintln!("{kind:?}: SDL gyro {gyro:?} accel {accel:?}");
+            for (seen, sent) in gyro.iter().zip([1.0, -0.5, 0.25]) {
+                assert!((seen - sent).abs() < 0.01, "{kind:?}: gyro {gyro:?}");
+            }
+            assert!(
+                (accel[1] - 9.80665).abs() < 0.05,
+                "{kind:?}: accel {accel:?}"
+            );
+            // SDL's own output reports, as a game would send them.
+            controller.set_led(0x11, 0x22, 0x33).unwrap();
+            let lights = next_feedback(
+                &mut receiver,
+                |f| matches!(f, PadFeedback::Lights { pad: p, red: 0x11, .. } if *p == pad),
+            );
+            eprintln!("{kind:?}: SDL lightbar {lights:?}");
+            controller.set_rumble(0x8000, 0x4000, 1000).unwrap();
+            let rumble = next_feedback(
+                &mut receiver,
+                |f| matches!(f, PadFeedback::Rumble(r) if r.pad == pad && r.motors.low > 0),
+            );
+            eprintln!("{kind:?}: SDL rumble {rumble:?}");
+            if kind == GamepadType::DualSense {
+                // An adaptive-trigger effect as the client replays it.
+                let mut right = [0u8; TRIGGER_EFFECT_LEN];
+                right[..3].copy_from_slice(&[0x01, 0x40, 0xff]);
+                let effect = crate::protocol::dualsense_trigger_effect(&right, &[0; 11]);
+                controller.send_effect(&effect).unwrap();
+                let triggers = next_feedback(
+                    &mut receiver,
+                    |f| matches!(f, PadFeedback::Triggers { right: r, .. } if r[0] == 0x01),
+                );
+                eprintln!("{kind:?}: SDL trigger effect {triggers:?}");
+            }
+            drop(controller);
+            pads.input(&Event::GamepadDisconnected { pad }).unwrap();
+        }
         pads.destroy_all();
     }
 }

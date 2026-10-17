@@ -397,8 +397,11 @@ to separate networking/decoding problems from portal/capture problems.
 - Games: the client locks the mouse (relative mode) while the host hides
   its pointer; `--relative-mouse always|never` (launcher **Mouse** button)
   changes that, Ctrl+Alt+M toggles the lock by hand.
-- Gamepads (with rumble) need a Linux host with `/dev/uinput` access;
-  see [gamepads](docs/gamepad.md).
+- Gamepads (with rumble) need a Linux host with `/dev/uinput` access.
+  PlayStation controllers become a DualShock 4 or DualSense (touchpad,
+  gyro, lightbar, adaptive triggers) when the host can also use
+  `/dev/uhid`; `--gamepad-type` (launcher **Gamepad:**) overrides the
+  choice. See [gamepads](docs/gamepad.md).
 - Virtual displays and privacy mode need KDE Plasma 6 (GNOME untested);
   see [virtual displays](docs/virtual-display.md).
 - No file transfer, IME, monitor hotplug or
