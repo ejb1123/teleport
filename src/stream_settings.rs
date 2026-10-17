@@ -106,6 +106,10 @@ pub fn choose_codec(
     if choice != CodecChoice::Auto {
         return decision(requested, "chosen with --codec");
     }
+    if desktop.shared_stream {
+        // Another session already chose it; the host encodes once.
+        return decision(desktop.codec, "auto: shared with another session");
+    }
     if range == protocol::DynamicRange::Hdr10 {
         return decision(H265, "auto: HDR10 needs H.265");
     }

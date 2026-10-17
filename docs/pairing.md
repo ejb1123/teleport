@@ -99,6 +99,18 @@ once (others ignored), each at most 100 s and 64 KiB per direction.
 Password enrollment (OPAQUE) and Linux system login also work through the
 relay; see [relay enrollment](relay.md#enrollment-through-the-relay).
 
+## Guest invites
+
+Invites (`teleport host-admin create-invite`) enroll **guest** devices with
+the same SPAKE2 exchange and device-key binding, magic `TPINVT01`: the
+password is the invite's 128-bit secret instead of six digits, the invite id
+travels first in the clear and is bound into the transcript, and the device
+key is mandatory. An invite may allow several uses and lasts up to a week;
+uses are counted in `access.json` before the credential is sent. The guest
+enters the link where `teleport pair` asks for a code. Through a relay the
+exchange runs on the host's own relay namespace (named in the link), not a
+rendezvous. See [guests](guests.md).
+
 ## Limits and recovery
 
 The listener exists only with explicit `--pair`, for five minutes and five total

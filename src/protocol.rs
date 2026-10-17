@@ -391,6 +391,21 @@ pub struct Desktop {
     /// session streams a virtual output.
     #[serde(default)]
     pub privacy_active: bool,
+    /// Host shares the desktop between several sessions (docs/guests.md):
+    /// it sends `Update::Access` (and, to owners, `Update::GuestRequest`)
+    /// once the client declares `ClientFeatures::guests`, and accepts
+    /// `Event::TakeControl` and `Event::ApproveGuest`. Older hosts reject
+    /// those events.
+    #[serde(default)]
+    pub guests: bool,
+    /// This session's role and permissions, from hosts with `guests`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<SessionAccess>,
+    /// Another session already chose the stream: the client takes `codec`
+    /// as it is (one encoder is shared), even when choosing automatically,
+    /// and does not send `SelectCodec`.
+    #[serde(default)]
+    pub shared_stream: bool,
     /// Host plays the client's microphone into a virtual source ("Teleport
     /// Microphone") once the client declares `ClientFeatures::microphone`
     /// and publishes [`MICROPHONE_TRACK`] (host `--microphone`).
@@ -436,6 +451,166 @@ pub struct WakeInfo {
     #[serde(default)]
     pub suspend: bool,
 }
+
+/// What a guest may do besides watching (docs/guests.md). Owners may do
+/// everything; a guest starts with [`Permissions::GUEST_DEFAULT`].
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Permissions {
+    /// Its own virtual pads (a block of [`MAX_GAMEPADS`] host slots).
+    #[serde(default)]
+    pub gamepad: bool,
+    /// Keyboard and mouse, while it holds control (one session at a time).
+    #[serde(default)]
+    pub keyboard_mouse: bool,
+    /// Explicit clipboard transfer (only on hosts started with `--clipboard`).
+    #[serde(default)]
+    pub clipboard: bool,
+    /// Its microphone into the host's virtual microphone (host `--microphone`;
+    /// one session at a time). Off by default: host applications hear it as
+    /// the host user.
+    #[serde(default)]
+    pub microphone: bool,
+}
+
+impl Permissions {
+    /// Least privilege for a new guest: view plus its own gamepads.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub const GUEST_DEFAULT: Self = Self {
+        gamepad: true,
+        keyboard_mouse: false,
+        clipboard: false,
+        microphone: false,
+    };
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub const ALL: Self = Self {
+        gamepad: true,
+        keyboard_mouse: true,
+        clipboard: true,
+        microphone: true,
+    };
+
+    /// `view`, `gamepad`, `keyboard-mouse`, `clipboard`, `microphone`, comma
+    /// separated (`view` alone grants nothing beyond watching).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let mut permissions = Self::default();
+        for item in text
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+        {
+            match item {
+                "view" => (),
+                "gamepad" => permissions.gamepad = true,
+                "keyboard-mouse" => permissions.keyboard_mouse = true,
+                "clipboard" => permissions.clipboard = true,
+                "microphone" => permissions.microphone = true,
+                _ => {
+                    return Err(format!(
+                        "unknown permission {item:?}; use view, gamepad, keyboard-mouse, clipboard, microphone"
+                    ));
+                }
+            }
+        }
+        Ok(permissions)
+    }
+
+    /// `view, gamepad, keyboard and mouse, clipboard, microphone`: what is
+    /// granted.
+    pub fn label(&self) -> String {
+        let mut parts = vec!["view"];
+        if self.gamepad {
+            parts.push("gamepad");
+        }
+        if self.keyboard_mouse {
+            parts.push("keyboard and mouse");
+        }
+        if self.clipboard {
+            parts.push("clipboard");
+        }
+        if self.microphone {
+            parts.push("microphone");
+        }
+        parts.join(", ")
+    }
+}
+
+/// Who a session is to the host (docs/guests.md).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Role {
+    /// The host's own devices (pairing code, password, Linux login, the
+    /// host pairing file): full control, no approval.
+    Owner,
+    /// A device enrolled through an invite: what it was granted.
+    Guest,
+}
+
+impl Role {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Guest => "guest",
+        }
+    }
+}
+
+/// Who drives the host's keyboard and mouse.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlHolder {
+    /// Nobody: the next permitted session to type or move takes it.
+    #[default]
+    Nobody,
+    /// This session.
+    You,
+    /// An owner's session.
+    Owner,
+    /// Another guest.
+    Guest,
+    /// Someone at the host took it back (host settings or `host-admin`).
+    Host,
+}
+
+impl ControlHolder {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Nobody => "nobody",
+            Self::You => "you",
+            Self::Owner => "the owner",
+            Self::Guest => "another guest",
+            Self::Host => "the host",
+        }
+    }
+}
+
+/// A session's role, effective permissions and the keyboard/mouse holder.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionAccess {
+    pub role: Role,
+    pub permissions: Permissions,
+    #[serde(default)]
+    pub control: ControlHolder,
+    /// Other sessions watching the same desktop.
+    #[serde(default)]
+    pub others: u32,
+}
+
+impl SessionAccess {
+    /// One line for F8.
+    pub fn label(&self) -> String {
+        format!(
+            "{}: {}   |   keys/mouse: {}   |   {} other session(s)",
+            self.role.label(),
+            self.permissions.label(),
+            self.control.label(),
+            self.others
+        )
+    }
+}
+
+/// Longest device name shown in an approval prompt or session list.
+pub const MAX_DEVICE_NAME: usize = 128;
 
 /// A network step-down: the negotiated stream, and the bitrate that made the
 /// host leave it.
@@ -640,6 +815,24 @@ pub enum Update {
         right: [u8; TRIGGER_EFFECT_LEN],
         left: [u8; TRIGGER_EFFECT_LEN],
     },
+    /// This session's role, permissions or the keyboard/mouse holder
+    /// changed. Only sent after the client declared `ClientFeatures::guests`
+    /// (a `Notice` explains the change to every client).
+    Access {
+        access: SessionAccess,
+    },
+    /// A guest device asks to join; an owner's client may answer with
+    /// `Event::ApproveGuest` within `timeout_s` (the host denies after it).
+    /// Only to owners that declared `ClientFeatures::guests`.
+    GuestRequest {
+        id: u64,
+        name: String,
+        timeout_s: u32,
+    },
+    /// Request `id` was answered (here or elsewhere) or timed out.
+    GuestRequestClosed {
+        id: u64,
+    },
 }
 
 /// Bytes of one DualSense adaptive-trigger effect.
@@ -688,6 +881,15 @@ impl Update {
             Self::GamepadTriggers { pad, .. } => {
                 ensure!(*pad < MAX_GAMEPADS, "invalid gamepad triggers")
             }
+            Self::GuestRequest {
+                name, timeout_s, ..
+            } => ensure!(
+                name.len() <= MAX_DEVICE_NAME
+                    && !name.chars().any(char::is_control)
+                    && *timeout_s <= 3600,
+                "invalid guest request"
+            ),
+            Self::Access { access } => ensure!(access.others < 1024, "invalid access update"),
             _ => (),
         }
         Ok(())
@@ -718,6 +920,10 @@ pub const MAX_RELATIVE_MOTION: u32 = 4096;
 /// Side mouse buttons in X11 numbering (SDL X1/X2, evdev BTN_SIDE/BTN_EXTRA).
 pub const BUTTON_BACK: u8 = 8;
 pub const BUTTON_FORWARD: u8 = 9;
+
+/// Lowest video bitrate (kbit/s) the host accepts or targets.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub const MIN_BITRATE: u32 = 500;
 
 /// Most gamepads one session may attach (Xbox-style player slots).
 pub const MAX_GAMEPADS: u8 = 4;
@@ -907,6 +1113,11 @@ pub enum Event {
         /// sent when `Desktop::microphone`; older hosts ignore the field.
         #[serde(default)]
         microphone: bool,
+        /// The client reads `Update::Access`, `Update::GuestRequest` and
+        /// `Update::GuestRequestClosed` (docs/guests.md). Only sent to hosts
+        /// advertising `Desktop::guests`; older hosts ignore the field.
+        #[serde(default)]
+        guests: bool,
     },
     /// "Secure attention" (the client's Ctrl+Alt+End, Teleport's
     /// Ctrl+Alt+Del): lock the host session, or show the lock screen's
@@ -942,6 +1153,18 @@ pub enum Event {
     NetworkFeedback {
         delay_ms: Option<u32>,
         received_kbps: u32,
+    },
+    /// An owner takes keyboard and mouse control and keeps it from guests
+    /// (`take: true`), or lets guests take it again (`take: false`). Only
+    /// to hosts advertising `Desktop::guests`; refused from guests.
+    TakeControl {
+        take: bool,
+    },
+    /// An owner answers `Update::GuestRequest` `id`. Only to hosts
+    /// advertising `Desktop::guests`; refused from guests.
+    ApproveGuest {
+        id: u64,
+        allow: bool,
     },
 }
 
@@ -1623,6 +1846,7 @@ mod tests {
                 virtual_monitor: true,
                 gamepad_lights: true,
                 microphone: true,
+                guests: true,
             },
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
@@ -1785,6 +2009,7 @@ mod tests {
                 virtual_monitor: false,
                 gamepad_lights: false,
                 microphone: false,
+                guests: false,
             }
         ));
         let primary: Event = serde_json::from_str(r#"{"type":"request_keyframe"}"#).unwrap();
@@ -2386,5 +2611,77 @@ mod tests {
         })
         .unwrap();
         assert!(!plain.contains("host_us"));
+    }
+
+    #[test]
+    fn guest_access_is_negotiated_and_bounded() {
+        assert_eq!(Permissions::parse("view"), Ok(Permissions::default()));
+        assert_eq!(
+            Permissions::parse("view,gamepad"),
+            Ok(Permissions::GUEST_DEFAULT)
+        );
+        assert_eq!(
+            Permissions::parse("gamepad, keyboard-mouse,clipboard,microphone"),
+            Ok(Permissions::ALL)
+        );
+        assert!(Permissions::parse("admin").is_err());
+        assert_eq!(
+            Permissions::ALL.label(),
+            "view, gamepad, keyboard and mouse, clipboard, microphone"
+        );
+        // Older hosts' metadata has no access; an older client ignores it.
+        let old: Desktop = serde_json::from_value(serde_json::json!({ "version": 2,
+            "width": 1, "height": 1, "fps": 1, "source": "test", "monitors": [],
+            "active_monitor": 0, "audio": false, "clipboard": false }))
+        .unwrap();
+        assert!(!old.guests && old.access.is_none() && !old.shared_stream);
+        // Grants stored before the microphone permission: no microphone.
+        let stored: Permissions =
+            serde_json::from_str(r#"{"gamepad":true,"keyboard_mouse":true,"clipboard":true}"#)
+                .unwrap();
+        assert!(!stored.microphone);
+        let access = SessionAccess {
+            role: Role::Guest,
+            permissions: Permissions::GUEST_DEFAULT,
+            control: ControlHolder::Owner,
+            others: 1,
+        };
+        let wire = serde_json::to_string(&Update::Access { access }).unwrap();
+        assert!(wire.contains(r#""role":"guest""#) && wire.contains(r#""control":"owner""#));
+        let back: Update = serde_json::from_str(&wire).unwrap();
+        back.validate().unwrap();
+        // Prompts carry a bounded, printable name.
+        let request = |name: &str| Update::GuestRequest {
+            id: 1,
+            name: name.into(),
+            timeout_s: 30,
+        };
+        assert!(request("Alice").validate().is_ok());
+        assert!(request("Ali\nce").validate().is_err());
+        assert!(
+            request(&"x".repeat(MAX_DEVICE_NAME + 1))
+                .validate()
+                .is_err()
+        );
+        // New events round-trip; older hosts fail closed on them, which is
+        // why clients send them only to hosts advertising `guests`.
+        for event in [
+            Event::TakeControl { take: true },
+            Event::ApproveGuest {
+                id: 7,
+                allow: false,
+            },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            let back: Event = serde_json::from_str(&json).unwrap();
+            back.validate().unwrap();
+            assert!(!back.is_lossy());
+        }
+        let features: Event =
+            serde_json::from_str(r#"{"type":"client_features","guests":true}"#).unwrap();
+        assert!(matches!(
+            features,
+            Event::ClientFeatures { guests: true, .. }
+        ));
     }
 }

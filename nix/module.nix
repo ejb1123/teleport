@@ -179,6 +179,60 @@ in
         '';
       };
     };
+    sessions = {
+      max = lib.mkOption {
+        type = lib.types.ints.between 1 8;
+        default = 8;
+        description = ''
+          Most sessions at once, owners and guests together
+          (`--max-sessions`). They share one encoder and the host's input;
+          see docs/guests.md.
+        '';
+      };
+      kickGuestsWithOwner = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = ''
+          Disconnect guests when the last owner session leaves, and ask for
+          approval even for trusted guests while no owner is connected.
+          `false` passes `--keep-guests-without-owner`.
+        '';
+      };
+      lockOnLastDisconnect = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Lock the desktop (`loginctl lock-session`) when the last session
+          disconnects (`--lock-on-last-disconnect`).
+        '';
+      };
+      guestIdleMinutes = lib.mkOption {
+        type = lib.types.ints.between 0 1440;
+        default = 0;
+        description = ''
+          Disconnect a guest that sent no keyboard, mouse or gamepad input
+          for this many minutes; 0 never does (`--guest-idle-minutes`).
+        '';
+      };
+      bandwidthCapKbps = lib.mkOption {
+        type = lib.types.ints.between 0 100000;
+        default = 0;
+        description = ''
+          Total video bitrate for all sessions in kbit/s (500 or more), 0 for no cap
+          (`--bandwidth-cap`). The shared encoder runs at most at this
+          divided by the number of sessions.
+        '';
+      };
+      guestApprovalTimeout = lib.mkOption {
+        type = lib.types.ints.between 5 600;
+        default = 30;
+        description = ''
+          Seconds a guest waits for approval before it is denied
+          (`--guest-approval-timeout`). Guests always need approval unless
+          the owner marked them trusted; there is no setting to skip it.
+        '';
+      };
+    };
     preauthorizeRemoteDesktop = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -312,7 +366,9 @@ in
       ]
       ++ lib.optional plasma pkgs.kdePackages.libkscreen;
       serviceConfig = {
-        ExecStart = "${cfg.package}/bin/teleport host --listen ${lib.escapeShellArg cfg.listen} --identity-dir %h/.local/state/teleport/host --restore-token %h/.local/state/teleport/host/portal-restore.json --virtual-display ${cfg.virtualDisplay} --privacy-mode ${cfg.privacyMode} ${lib.optionalString cfg.microphone "--microphone"} ${lib.optionalString cfg.systemLogin "--system-auth-helper ${pamHelper}/libexec/teleport-pam"} ${lib.optionalString cfg.unattended.unlockOnSystemLogin "--unlock-on-system-login"} ${lib.optionalString cfg.wakeRelay "--wake-relay"} ${lib.optionalString cfg.allowSuspend "--allow-suspend"} ${lib.escapeShellArgs cfg.extraArgs}";
+        ExecStart = "${cfg.package}/bin/teleport host --listen ${lib.escapeShellArg cfg.listen} --identity-dir %h/.local/state/teleport/host --restore-token %h/.local/state/teleport/host/portal-restore.json --virtual-display ${cfg.virtualDisplay} --privacy-mode ${cfg.privacyMode} --max-sessions ${toString cfg.sessions.max} --guest-idle-minutes ${toString cfg.sessions.guestIdleMinutes} --bandwidth-cap ${toString cfg.sessions.bandwidthCapKbps} --guest-approval-timeout ${toString cfg.sessions.guestApprovalTimeout} ${
+          lib.optionalString (!cfg.sessions.kickGuestsWithOwner) "--keep-guests-without-owner"
+        } ${lib.optionalString cfg.sessions.lockOnLastDisconnect "--lock-on-last-disconnect"} ${lib.optionalString cfg.microphone "--microphone"} ${lib.optionalString cfg.systemLogin "--system-auth-helper ${pamHelper}/libexec/teleport-pam"} ${lib.optionalString cfg.unattended.unlockOnSystemLogin "--unlock-on-system-login"} ${lib.optionalString cfg.wakeRelay "--wake-relay"} ${lib.optionalString cfg.allowSuspend "--allow-suspend"} ${lib.escapeShellArgs cfg.extraArgs}";
         # However the host stopped (crash, kill, logout), turn monitors left
         # off by privacy mode back on. "-": nothing to do is not a failure.
         ExecStopPost =

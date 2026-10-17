@@ -13,6 +13,8 @@ mod ffmpeg;
 mod fullscreen;
 #[cfg(target_os = "linux")]
 mod gamepad;
+#[cfg(target_os = "linux")]
+mod guests;
 mod hdr;
 mod hdr_present;
 #[cfg(target_os = "linux")]
@@ -84,6 +86,7 @@ enum Command {
     Launcher,
     /// Pair once using the short-lived code shown by a host started with --pair.
     /// With --relay, enter the host's relay pairing link instead of the code.
+    /// A guest enters the invite link the host's owner shared (docs/guests.md).
     Pair {
         address: String,
         #[command(flatten)]
@@ -381,20 +384,29 @@ fn run(command: Option<Command>) -> Result<()> {
             print!(
                 "{}",
                 if endpoint.is_some() {
-                    "Relay pairing link from the host: "
+                    "Relay pairing link or guest invite link from the host: "
                 } else {
-                    "Pairing code from the host: "
+                    "Pairing code or guest invite link from the host: "
                 }
             );
             std::io::stdout().flush()?;
             let mut code = zeroize::Zeroizing::new(String::new());
             std::io::stdin().lock().take(256).read_line(&mut code)?;
-            let pairing = match endpoint {
-                Some(endpoint) => runtime.block_on(relay_enroll::pair(
+            let invite = code
+                .trim()
+                .starts_with(pairing::INVITE_PREFIX)
+                .then(|| pairing::InviteLink::parse(&code))
+                .transpose()?;
+            let pairing = match (endpoint, invite) {
+                (Some(endpoint), Some(invite)) => {
+                    runtime.block_on(relay_enroll::join(&endpoint, &invite))?
+                }
+                (None, Some(invite)) => runtime.block_on(pairing::join(&address, &invite))?,
+                (Some(endpoint), None) => runtime.block_on(relay_enroll::pair(
                     &endpoint,
                     &relay_enroll::Invite::parse(&code)?,
                 ))?,
-                None => runtime.block_on(pairing::pair(&address, &code))?,
+                (None, None) => runtime.block_on(pairing::pair(&address, &code))?,
             };
             let profile = profiles::save_pairing(&address, &pairing, &mut profiles::load()?)?;
             println!(

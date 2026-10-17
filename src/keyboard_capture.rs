@@ -70,6 +70,12 @@ pub enum Action {
     SecureAttention,
     Disconnect,
     Stats,
+    /// Ctrl+Alt+Y / Ctrl+Alt+N: answer the oldest guest request (owners).
+    AllowGuest,
+    DenyGuest,
+    /// Ctrl+Alt+T: take keyboard and mouse control from guests, or give
+    /// them the chance again (owners of shared sessions).
+    TakeControl,
     Swallow,
 }
 
@@ -81,6 +87,8 @@ pub struct Shortcuts {
     microphone_down: bool,
     stats_down: bool,
     attention_down: bool,
+    /// The guest chords (Y, N, T) held since their key-down.
+    guest_down: Option<Keycode>,
 }
 impl Shortcuts {
     pub fn event(&mut self, event: &Event, captured: bool) -> Option<Action> {
@@ -138,6 +146,17 @@ impl Shortcuts {
             } else {
                 Action::Swallow
             });
+        }
+        for (chord_key, action) in [
+            (Keycode::Y, Action::AllowGuest),
+            (Keycode::N, Action::DenyGuest),
+            (Keycode::T, Action::TakeControl),
+        ] {
+            if key == chord_key && (self.guest_down == Some(key) || (down && chord)) {
+                let first = down && !repeat && self.guest_down != Some(key);
+                self.guest_down = down.then_some(key);
+                return Some(if first { action } else { Action::Swallow });
+            }
         }
         if key == Keycode::F8 && (self.stats_down || (!captured && down)) {
             let first = down && !repeat && !self.stats_down;
@@ -243,6 +262,39 @@ mod tests {
             // Ctrl+V (paste) still goes to the remote desktop.
             assert_eq!(
                 shortcuts.event(&key(Keycode::V, true, Mod::LCTRLMOD, false), captured),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn guest_chords_act_once_and_swallow_their_release() {
+        let chord = Mod::LCTRLMOD | Mod::LALTMOD;
+        for (code, action) in [
+            (Keycode::Y, Action::AllowGuest),
+            (Keycode::N, Action::DenyGuest),
+            (Keycode::T, Action::TakeControl),
+        ] {
+            let mut shortcuts = Shortcuts::default();
+            assert_eq!(
+                shortcuts.event(&key(code, true, chord, false), true),
+                Some(action)
+            );
+            assert_eq!(
+                shortcuts.event(&key(code, true, chord, true), true),
+                Some(Action::Swallow)
+            );
+            assert_eq!(
+                shortcuts.event(&key(code, false, Mod::NOMOD, false), true),
+                Some(Action::Swallow)
+            );
+            // Plain letters are typed into the remote desktop.
+            assert_eq!(
+                shortcuts.event(&key(code, true, Mod::NOMOD, false), true),
+                None
+            );
+            assert_eq!(
+                shortcuts.event(&key(code, false, Mod::NOMOD, false), true),
                 None
             );
         }

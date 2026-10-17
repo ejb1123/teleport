@@ -67,6 +67,22 @@ pub struct Options {
     /// between black and white (hosts with `--flash-on-input`).
     #[arg(long, hide = true, requires = "headless_frames")]
     pub smoke_flash: bool,
+    /// From the fifth frame on, every tenth frame: pointer motion, a key and
+    /// a click, and a test gamepad's connect, button and disconnect (shared
+    /// sessions: what the host injects or refuses is in its log).
+    #[arg(long, hide = true, requires = "headless_frames")]
+    pub smoke_guest_input: bool,
+    /// At the fifth frame, take keyboard and mouse control (owners).
+    #[arg(long, hide = true, requires = "headless_frames")]
+    pub smoke_take_control: bool,
+    /// At the fifth frame, send secure attention (Ctrl+Alt+End), whatever
+    /// the host offers (tests: the host decides who may).
+    #[arg(long, hide = true, requires = "headless_frames")]
+    pub smoke_secure_attention: bool,
+    /// Answer every guest request the host shows this owner: `allow` or
+    /// `deny` (the overlay prompt's Ctrl+Alt+Y / Ctrl+Alt+N).
+    #[arg(long, hide = true, requires = "headless_frames")]
+    pub smoke_answer_guests: Option<SmokeAnswer>,
     /// Send pointer motion on the ordered input track even when the host
     /// accepts datagrams (comparison and troubleshooting).
     #[arg(long, hide = true)]
@@ -324,6 +340,9 @@ struct Link {
     audio: Option<moq_net::track::Subscriber>,
     /// The session's desktop audio (Opus 128 with older hosts).
     audio_settings: protocol::AudioSettings,
+    /// Shown once the session runs: the shared stream's audio is not what
+    /// this client asked for.
+    audio_notice: Option<String>,
     /// `--mic`: the microphone track, sent only to hosts that take it.
     microphone: Option<moq_net::track::Producer>,
 }
@@ -547,9 +566,20 @@ async fn connect_via(
         }
     };
     let incoming_broadcasts = incoming.consume();
-    let remote = tokio::select! {
-        result = incoming_broadcasts.announced_broadcast("desktop") => result.context("host did not announce desktop")?,
-        error = session.closed() => anyhow::bail!("host rejected or closed this session: {error}; check saved credentials and requested features{}", if options.forward_ssh_agent { "; SSH forwarding requires a current host with --allow-ssh-agent" } else { "" }),
+    let announced = incoming_broadcasts.announced_broadcast("desktop");
+    tokio::pin!(announced);
+    let mut waiting = Box::pin(tokio::time::sleep(Duration::from_secs(3)));
+    let remote = loop {
+        break tokio::select! {
+            result = &mut announced => result.context("host did not announce desktop")?,
+            error = session.closed() => anyhow::bail!("host rejected or closed this session: {error}; check saved credentials and requested features (a guest may have been denied or not approved in time){}", if options.forward_ssh_agent { "; SSH forwarding requires a current host with --allow-ssh-agent" } else { "" }),
+            // Guests wait for the host to approve them (docs/guests.md).
+            _ = &mut waiting => {
+                tracing::info!("waiting for the host; a guest's connection waits until the host approves it");
+                waiting = Box::pin(tokio::time::sleep(Duration::from_secs(3600)));
+                continue;
+            }
+        };
     };
     let desktop: Desktop = tokio::select! {
         result = async {
@@ -602,8 +632,28 @@ async fn connect_via(
     );
     // Desktop audio: this client's choice over the host's defaults, with
     // hosts that negotiate it; Opus 128 otherwise.
+    // A shared stream's audio is the first session's choice: play it as it
+    // is (docs/guests.md).
     let audio_options = desktop.audio_options && desktop.codec_selection;
-    let audio_settings = if audio_options {
+    let mut audio_notice = None;
+    let audio_settings = if desktop.shared_stream && desktop.audio_options {
+        let shared = desktop.audio_settings;
+        let wanted_format = options.audio_format.unwrap_or(shared.format);
+        let wanted_bitrate = options.audio_bitrate.unwrap_or(shared.bitrate);
+        if desktop.audio
+            && (wanted_format != shared.format
+                || (shared.format == protocol::AudioFormat::Opus
+                    && wanted_bitrate != shared.bitrate))
+        {
+            let text = format!(
+                "Desktop audio is shared with another session: playing {} as it chose",
+                shared.label()
+            );
+            tracing::warn!("{text}");
+            audio_notice = Some(text);
+        }
+        shared
+    } else if audio_options {
         protocol::AudioSettings {
             format: options
                 .audio_format
@@ -618,9 +668,24 @@ async fn connect_via(
         }
         protocol::AudioSettings::default()
     };
+    ensure!(
+        !desktop.shared_stream || decision.codec == desktop.codec,
+        "the host is already streaming {} to another session; reconnect with --codec auto or --codec {}",
+        desktop.codec.label(),
+        desktop.codec.label().to_ascii_lowercase().replace('.', "")
+    );
+    tracing::info!(
+        microphone = desktop.microphone,
+        secure_attention = desktop.secure_attention,
+        wake = desktop.wake.is_some(),
+        "host offers"
+    );
+    if let Some(access) = &desktop.access {
+        tracing::info!(role = access.role.label(), permissions = %access.permissions.label(), others = access.others, "session access");
+    }
     let mut input = input;
     let mut input_sequence = 0;
-    if desktop.codec_selection {
+    if desktop.codec_selection && !desktop.shared_stream {
         // First on the input track: the host waits for it to start video.
         let mut group = input.append_group()?;
         group.write_frame(
@@ -691,6 +756,7 @@ async fn connect_via(
         updates,
         audio,
         audio_settings,
+        audio_notice,
         microphone,
     })
 }
@@ -1425,15 +1491,25 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             }
         }
         Some(_) => {
-            tracing::warn!("this host does not take a microphone (teleport host --microphone)");
-            let _ = updates_sender.try_send(Update::Notice {
-                text: "This host does not take a microphone (teleport host --microphone)".into(),
-            });
+            // A guest's microphone needs the host's permission (docs/guests.md).
+            let text = if desktop
+                .access
+                .is_some_and(|access| access.role == protocol::Role::Guest)
+            {
+                "The host has not allowed you to send your microphone"
+            } else {
+                "This host does not take a microphone (teleport host --microphone)"
+            };
+            tracing::warn!("{text}");
+            let _ = updates_sender.try_send(Update::Notice { text: text.into() });
             None
         }
         None => None,
     };
     let audio_source = audio.as_ref().map(|(_, source)| source.clone());
+    if let Some(text) = link.audio_notice.take() {
+        let _ = updates_sender.try_send(Update::Notice { text });
+    }
     let audio_settings = link.audio_settings;
     let audio_format = audio_settings.format;
     let audio_notices = updates_sender.clone();
@@ -1506,6 +1582,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 privacy: options.privacy && desktop.privacy_mode,
                 virtual_monitor: options.virtual_monitor && desktop.virtual_monitor,
                 microphone: microphone.is_some(),
+                guests: desktop.guests,
             },
         )?;
     }
@@ -1670,6 +1747,24 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     Update::GamepadTriggers { pad, right, left } => {
                         tracing::info!(pad, ?right, ?left, "host gamepad triggers")
                     }
+                    Update::Access { access } => {
+                        tracing::info!(role = access.role.label(), permissions = %access.permissions.label(), control = access.control.label(), others = access.others, "session access changed")
+                    }
+                    Update::GuestRequest { id, name, .. } => {
+                        tracing::info!(request = id, guest = %name, "a guest asks to join");
+                        if let Some(answer) = options.smoke_answer_guests {
+                            send(
+                                &events,
+                                Event::ApproveGuest {
+                                    id,
+                                    allow: answer == SmokeAnswer::Allow,
+                                },
+                            )?;
+                        }
+                    }
+                    Update::GuestRequestClosed { id } => {
+                        tracing::info!(request = id, "guest request closed")
+                    }
                     _ => (),
                 }
             }
@@ -1762,6 +1857,61 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     }
                     if count > 5 && frame.height > frame.width {
                         switched = true;
+                    }
+                }
+                if options.smoke_take_control && count == 5 {
+                    ensure!(desktop.guests, "this host does not share sessions");
+                    send(&events, Event::TakeControl { take: true })?;
+                }
+                if options.smoke_secure_attention && count == 5 {
+                    send(&events, Event::SecureAttention)?;
+                }
+                if options.smoke_guest_input && count >= 5 && count % 10 == 5 {
+                    for event in [
+                        Event::Motion { x: 0.25, y: 0.75 },
+                        Event::Key {
+                            code: 30,
+                            down: true,
+                        },
+                        Event::Key {
+                            code: 30,
+                            down: false,
+                        },
+                        Event::Button {
+                            button: 1,
+                            down: true,
+                        },
+                        Event::Button {
+                            button: 1,
+                            down: false,
+                        },
+                        Event::GamepadConnected {
+                            pad: 0,
+                            name: "Smoke guest pad".into(),
+                            kind: protocol::GamepadType::Xbox,
+                        },
+                        Event::GamepadButton {
+                            pad: 0,
+                            button: 0,
+                            down: true,
+                        },
+                        Event::GamepadButton {
+                            pad: 0,
+                            button: 0,
+                            down: false,
+                        },
+                        Event::GamepadDisconnected { pad: 0 },
+                    ] {
+                        // Real hosts would create a system-wide pad: test hosts only.
+                        let pad = matches!(
+                            event,
+                            Event::GamepadConnected { .. }
+                                | Event::GamepadButton { .. }
+                                | Event::GamepadDisconnected { .. }
+                        );
+                        if !pad || (desktop.gamepads && desktop.source == "test") {
+                            send(&events, event)?;
+                        }
                     }
                 }
                 if options.smoke_input && count == 5 {
@@ -2105,6 +2255,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut muted = options.mute;
     let mut reconnect = false;
     let mut notice = String::new();
+    // Shared sessions: guests asking to join, access changes (docs/guests.md).
+    let mut guest_panel = crate::overlay::GuestPanel::default();
+    let mut access = desktop.access;
+    let mut control_taken = false;
     let mut previous_notice = String::new();
     let mut notice_at = Instant::now();
     let mut clipboard_requested = false;
@@ -2336,6 +2490,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         next.codec == session_codec && next.dynamic_range == options.dynamic_range,
                         "host changed codec during an active session; reconnect to change codec"
                     );
+                    if next.access.is_some() {
+                        access = next.access;
+                    }
                     desktop = next;
                     stream_stats
                         .stream_fps
@@ -2396,6 +2553,20 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 Update::GamepadTriggers { pad, right, left } => {
                     controllers.triggers(pad, &right, &left)
                 }
+                Update::Access { access: next } => {
+                    guest_panel.access_changed(access.as_ref(), &next, Instant::now());
+                    tracing::info!(role = next.role.label(), permissions = %next.permissions.label(), control = next.control.label(), "session access changed");
+                    access = Some(next);
+                }
+                Update::GuestRequest {
+                    id,
+                    name,
+                    timeout_s,
+                } => {
+                    tracing::info!(request = id, guest = %name, "a guest asks to join");
+                    guest_panel.request(id, &name, timeout_s, Instant::now());
+                }
+                Update::GuestRequestClosed { id } => guest_panel.closed(id),
                 _ => (),
             }
         }
@@ -2477,6 +2648,12 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     Action::SecureAttention => {
                         if desktop.secure_attention {
                             send(&events, Event::SecureAttention)?;
+                        } else if desktop
+                            .access
+                            .is_some_and(|access| access.role == protocol::Role::Guest)
+                        {
+                            notice =
+                                "Only the host's owner can lock or unlock it (Ctrl+Alt+End)".into();
                         } else {
                             notice =
                                 "Host cannot lock or unlock its session (Ctrl+Alt+End); update it"
@@ -2485,6 +2662,45 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     }
                     Action::Disconnect => break 'running,
                     Action::Stats => show_stats = !show_stats,
+                    Action::AllowGuest | Action::DenyGuest => {
+                        let allow = action == Action::AllowGuest;
+                        notice = match guest_panel.first(Instant::now()) {
+                            Some(id) if desktop.guests => {
+                                send(&events, Event::ApproveGuest { id, allow })?;
+                                guest_panel.closed(id);
+                                if allow {
+                                    "Guest allowed"
+                                } else {
+                                    "Guest denied"
+                                }
+                                .into()
+                            }
+                            _ => "No guest is waiting for approval".into(),
+                        };
+                        guest_panel.notice(notice.clone(), Instant::now());
+                    }
+                    Action::TakeControl => {
+                        notice = if !desktop.guests
+                            || access.is_none_or(|access| access.role != protocol::Role::Owner)
+                        {
+                            "Only the host's owner can take keyboard and mouse control".into()
+                        } else {
+                            control_taken = !control_taken;
+                            send(
+                                &events,
+                                Event::TakeControl {
+                                    take: control_taken,
+                                },
+                            )?;
+                            if control_taken {
+                                "Keyboard and mouse locked to you; Ctrl+Alt+T lets guests take them again"
+                            } else {
+                                "Guests may take keyboard and mouse control again"
+                            }
+                            .into()
+                        };
+                        guest_panel.notice(notice.clone(), Instant::now());
+                    }
                     Action::Swallow => (),
                 }
                 continue;
@@ -3185,6 +3401,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     desktop.bitrate as f64 / 1000.0
                 ),
                 format!("Path                  {}", session_path.description()),
+                format!(
+                    "Access                {}",
+                    access.as_ref().map_or_else(
+                        || "full (single-session host)".into(),
+                        protocol::SessionAccess::label
+                    )
+                ),
                 format!("Control round trip    {latency}"),
                 format!("Host encoder          {host_encoder}"),
                 format!(
@@ -3558,6 +3781,45 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 )?;
             }
         }
+        // Shared sessions: approval prompts and access changes, top right.
+        let mut guest_rect = None;
+        let guest_lines = guest_panel.lines(Instant::now());
+        if !guest_lines.is_empty() {
+            let video = chrome.rect(window_size, size);
+            let top = video.y().max(if chrome.visible() {
+                TOOLBAR_HEIGHT as i32
+            } else {
+                0
+            });
+            let width = 640.min(window_size.0.saturating_sub(24)).max(1);
+            let panel = Rect::new(
+                (video.x() + video.width() as i32 - width as i32 - 12).max(0),
+                top + 12,
+                width,
+                guest_lines.len() as u32 * 26 + 8,
+            );
+            guest_rect = Some(panel);
+            canvas.set_draw_color(Color::RGB(16, 30, 50));
+            canvas.fill_rect(panel).map_err(anyhow::Error::msg)?;
+            canvas.set_draw_color(Color::RGB(88, 160, 232));
+            canvas.draw_rect(panel).map_err(anyhow::Error::msg)?;
+            for (index, text) in guest_lines.iter().enumerate() {
+                session_text(
+                    &mut canvas,
+                    &creator,
+                    &mut session_fonts,
+                    &mut text_cache,
+                    text,
+                    Rect::new(
+                        panel.x() + 10,
+                        panel.y() + 6 + index as i32 * 26,
+                        panel.width().saturating_sub(20),
+                        20,
+                    ),
+                    Color::RGB(196, 224, 255),
+                )?;
+            }
+        }
         if let (Some(presenter), Some(frame)) = (&mut hdr_presenter, &hdr_frame) {
             let mut ui = vec![read_hdr_overlay(
                 &mut canvas,
@@ -3568,7 +3830,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 },
                 window_size,
             )?];
-            for panel in [stats_panel, warning_panel].into_iter().flatten() {
+            for panel in [stats_panel, warning_panel, guest_rect]
+                .into_iter()
+                .flatten()
+            {
                 ui.push(read_hdr_overlay(&mut canvas, panel, window_size)?);
             }
             let overlays: Vec<_> = ui
@@ -4383,6 +4648,13 @@ impl PointerLock {
         self.active = on && applied;
         applied || !on
     }
+}
+
+/// `--smoke-answer-guests`.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmokeAnswer {
+    Allow,
+    Deny,
 }
 
 /// When to lock the pointer without being asked (`--relative-mouse`).
