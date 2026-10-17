@@ -20,6 +20,13 @@
 //! `<attempt>/response` streams, here or on a pairing rendezvous namespace;
 //! see `crate::relay_enroll`.
 //!
+//! On a moq-lite relay (`teleport relay`) the connection URL's path is the
+//! namespace and peers find each other's broadcasts through the relay's
+//! announcements. A moq-transport relay (a provider such as Cloudflare) keeps
+//! the URL path for its own use (an access token), so the namespace is the
+//! first segment of every track namespace instead, and peers announce their
+//! broadcasts to each other themselves (`crate::discovery`).
+//!
 //! `teleport relay` runs a minimal self-hosted relay for testing or for users
 //! who prefer their own server to a third-party relay such as Cloudflare's.
 
@@ -66,6 +73,11 @@ pub struct Options {
     /// 3478.
     #[arg(long, value_name = "ADDRESS|off")]
     pub stun_listen: Option<String>,
+    /// Tests: announce nothing to moq-transport peers (answer
+    /// SUBSCRIBE_NAMESPACE with an empty set) while still routing SUBSCRIBEs
+    /// by name, as Cloudflare's relay does.
+    #[arg(long, hide = true)]
+    pub no_namespace_discovery: bool,
 }
 
 /// Start the relay's STUN responder (see `crate::stun`). A port already in
@@ -157,15 +169,30 @@ pub async fn serve(options: Options) -> Result<()> {
             let _ = request.close(404).await;
             continue;
         };
+        // Without discovery the session's publisher sees an origin that
+        // announces nothing but resolves every exact path from the real one.
+        let (published, resolver) = if options.no_namespace_discovery {
+            let hidden = moq_net::Origin::random().produce();
+            let resolver = resolve_unannounced(hidden.dynamic(), scoped.consume());
+            (hidden, Some(resolver))
+        } else {
+            (scoped.clone(), None)
+        };
         tokio::spawn(async move {
             match request
-                .with_publisher(&scoped)
+                .with_publisher(&published)
                 .with_subscriber(scoped.clone())
                 .ok()
                 .await
             {
                 Ok(session) => {
-                    let error = session.closed().await;
+                    let error = match resolver {
+                        Some(resolver) => tokio::select! {
+                            error = session.closed() => error,
+                            () = resolver => session.closed().await,
+                        },
+                        None => session.closed().await,
+                    };
                     tracing::debug!(%error, "relay session closed");
                 }
                 Err(error) => tracing::debug!(%error, "relay session rejected"),
@@ -173,6 +200,21 @@ pub async fn serve(options: Options) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Serve requests for broadcasts that `requests`' origin never announces from
+/// `source`, by exact path (`--no-namespace-discovery`).
+async fn resolve_unannounced(
+    mut requests: moq_net::origin::Dynamic,
+    source: moq_net::origin::Consumer,
+) {
+    while let Ok(request) = requests.requested_broadcast().await {
+        let path = request.path().to_owned();
+        match source.request_broadcast(&path).await {
+            Ok(broadcast) => request.accept(broadcast),
+            Err(error) => request.reject(error),
+        }
+    }
 }
 
 fn versions(requested: &[String]) -> Result<Vec<moq_net::Version>> {
@@ -287,10 +329,14 @@ impl RelayArgs {
 }
 
 impl Endpoint {
-    /// The URL without its query, which may carry a provider token.
+    /// The URL without its path and query, which may carry a provider token
+    /// (Cloudflare's goes in the path).
     pub fn display_url(&self) -> String {
         let mut url = self.url.clone();
         url.set_query(None);
+        if !url.path().trim_matches('/').is_empty() {
+            url.set_path("/redacted");
+        }
         url.to_string()
     }
 }
@@ -312,12 +358,73 @@ pub struct Link {
     pub session: moq_net::Session,
     /// Broadcasts we publish to the relay.
     pub outgoing: moq_net::origin::Producer,
-    /// Broadcasts the relay announces to us.
+    /// Broadcasts the relay (or, on a provider relay, the peer) announces to us.
     pub incoming: moq_net::origin::Producer,
+    /// Peer announcements on a moq-transport relay (`crate::discovery`).
+    discovery: Option<crate::discovery::Discovery>,
+    /// One handle per relayed host session using this connection.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    sessions: Arc<()>,
 }
 
+/// moq-transport relays need not raise a connection's request limit:
+/// Cloudflare's grants request ids below 100, i.e. 50 client requests, and
+/// never more. Past this many a host connection is replaced once idle.
+const PROVIDER_REQUEST_BUDGET: u64 = 30;
+/// A worn host connection is replaced only after this long without a peer
+/// announcing anything (a handshake or enrollment in progress).
+#[cfg(target_os = "linux")]
+const RENEW_QUIET: Duration = Duration::from_secs(10);
+
+impl Link {
+    /// A moq-transport (provider) relay: no announcements, no datagrams.
+    pub fn provider(&self) -> bool {
+        self.discovery.is_some()
+    }
+
+    /// Whether this connection has used most of what a provider relay grants
+    /// it (see [`PROVIDER_REQUEST_BUDGET`]); a long-lived user reconnects.
+    pub fn worn(&self) -> bool {
+        self.discovery
+            .as_ref()
+            .is_some_and(|discovery| discovery.requests() >= PROVIDER_REQUEST_BUDGET)
+    }
+
+    /// Host side: whether a worn connection can be replaced now, without
+    /// cutting off a session or a handshake (no peer announced anything for a
+    /// while).
+    #[cfg(target_os = "linux")]
+    pub fn renewable(&self) -> bool {
+        self.worn()
+            && Arc::strong_count(&self.sessions) == 1
+            && self
+                .discovery
+                .as_ref()
+                .is_some_and(|discovery| discovery.quiet() >= RENEW_QUIET)
+    }
+}
+
+/// Connect as a client of the host whose namespace this is.
 pub async fn connect(endpoint: &Endpoint, namespace: &str) -> Result<Link> {
-    connect_with_keep_alive(endpoint, namespace, protocol::QUIC_KEEP_ALIVE).await
+    connect_as(
+        endpoint,
+        namespace,
+        crate::discovery::Role::Client,
+        protocol::QUIC_KEEP_ALIVE,
+    )
+    .await
+}
+
+/// Connect as the host that owns this namespace (or pairing rendezvous).
+#[cfg(target_os = "linux")]
+pub async fn connect_host(endpoint: &Endpoint, namespace: &str) -> Result<Link> {
+    connect_as(
+        endpoint,
+        namespace,
+        crate::discovery::Role::Host,
+        protocol::QUIC_KEEP_ALIVE,
+    )
+    .await
 }
 
 /// Keep-alive for idle watchers (presence): below the relay's idle timeout,
@@ -329,11 +436,35 @@ pub async fn connect_with_keep_alive(
     namespace: &str,
     keep_alive: Duration,
 ) -> Result<Link> {
+    connect_as(
+        endpoint,
+        namespace,
+        crate::discovery::Role::Client,
+        keep_alive,
+    )
+    .await
+}
+
+/// The URL to dial: a moq-lite relay takes the namespace as its path, while a
+/// provider URL that has a path of its own (a token) keeps it.
+fn dial_url(endpoint: &Endpoint, namespace: &str) -> url::Url {
     let mut url = endpoint.url.clone();
-    url.set_path(&format!("/{namespace}"));
+    if url.path().trim_matches('/').is_empty() {
+        url.set_path(&format!("/{namespace}"));
+    }
     if let Some(key) = &endpoint.key {
         url.query_pairs_mut().append_pair("key", key);
     }
+    url
+}
+
+async fn connect_as(
+    endpoint: &Endpoint,
+    namespace: &str,
+    role: crate::discovery::Role,
+    keep_alive: Duration,
+) -> Result<Link> {
+    let url = dial_url(endpoint, namespace);
     let mut config = moq_native::ClientConfig::default();
     // `TELEPORT_RELAY_VERSIONS=moq-transport-14,...` pins what is offered, for
     // provider relays whose drafts differ in behaviour.
@@ -362,10 +493,29 @@ pub async fn connect_with_keep_alive(
         .connect(url)
         .await
         .context("relay connection failed")?;
+    if session.version().is_lite() {
+        return Ok(Link {
+            session,
+            outgoing,
+            incoming,
+            discovery: None,
+            sessions: Arc::default(),
+        });
+    }
+    // moq-transport: the namespace travels in band and peers announce
+    // themselves (see the module documentation).
+    let outgoing = outgoing
+        .with_root(namespace)
+        .context("invalid relay namespace")?;
+    let (incoming, discovery) =
+        crate::discovery::start(session.clone(), role, namespace, outgoing.clone(), incoming)?;
+    tracing::debug!(version = ?session.version(), "moq-transport relay: peers announce themselves");
     Ok(Link {
         session,
         outgoing,
         incoming,
+        discovery: Some(discovery),
+        sessions: Arc::default(),
     })
 }
 
@@ -785,6 +935,8 @@ pub struct HostSession {
     /// relay (the client left); the relay connection itself is shared.
     pub gone: tokio::sync::watch::Receiver<bool>,
     _bridges: Vec<AbortOnDrop>,
+    /// Counts this session against the connection (`Link::renewable`).
+    _uses: Arc<()>,
 }
 
 #[cfg(target_os = "linux")]
@@ -852,6 +1004,7 @@ pub fn host(link: &Link, accepted: &Accepted) -> Result<HostSession> {
             AbortOnDrop(import),
             AbortOnDrop(watcher),
         ],
+        _uses: link.sessions.clone(),
     })
 }
 
@@ -867,5 +1020,36 @@ mod tests {
         assert_eq!(namespace, super::namespace(&fingerprint).unwrap());
         assert!(!fingerprint.contains(&namespace));
         assert!(super::namespace("not hex").is_err());
+    }
+
+    #[test]
+    fn provider_tokens_keep_their_path_and_stay_out_of_logs() {
+        let namespace = "0123456789abcdef0123456789abcdef";
+        let endpoint = |url: &str, key: Option<&str>| Endpoint {
+            url: url.parse().unwrap(),
+            fingerprint: None,
+            key: key.map(str::to_owned),
+        };
+        // A self-hosted relay is scoped by the namespace as its path.
+        let own = endpoint("moqt://relay.example:4444", Some("secret"));
+        assert_eq!(
+            dial_url(&own, namespace).as_str(),
+            format!("moqt://relay.example:4444/{namespace}?key=secret")
+        );
+        // A provider token in the path is kept; the namespace goes in band.
+        let cloudflare = endpoint(
+            "https://draft-16.cloudflare.mediaoverquic.com/eyJtoken",
+            None,
+        );
+        assert_eq!(
+            dial_url(&cloudflare, namespace).as_str(),
+            "https://draft-16.cloudflare.mediaoverquic.com/eyJtoken"
+        );
+        let jwt = endpoint("https://relay.example/?jwt=eyJtoken", None);
+        for endpoint in [cloudflare, jwt] {
+            let shown = format!("{} {endpoint:?}", endpoint.display_url());
+            assert!(!shown.contains("eyJtoken"), "{shown}");
+        }
+        assert_eq!(own.display_url(), "moqt://relay.example:4444");
     }
 }

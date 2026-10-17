@@ -183,18 +183,25 @@ fn pipe(
     peer: impl Future<Output = Result<moq_net::broadcast::Consumer>> + Send + 'static,
     session: Option<moq_net::Session>,
 ) -> Result<Stream> {
-    let mut broadcast = outgoing.create_broadcast(
+    let network = outgoing.create_broadcast(
         write_path,
         moq_net::broadcast::Route::new().with_announce(true),
     )?;
+    // Chunks go to a local track; the relay is served from it, from the first
+    // chunk whenever it asks: a moq-transport relay forwards a subscription
+    // from the publisher's live edge, which may be past chunks already written.
+    let mut chunks = moq_net::broadcast::Info::new().produce();
     let mut track =
-        broadcast.create_track(TRACK, moq_net::track::Info::default().with_ordered(true))?;
+        chunks.create_track(TRACK, moq_net::track::Info::default().with_ordered(true))?;
+    let server = serve_from_start(network.dynamic(), chunks.consume());
     let (local, remote) = tokio::io::duplex(2 * MAX_CHUNK);
     let (mut from_local, mut to_local) = tokio::io::split(remote);
     // Writer: not aborted when the stream drops, so the final message is still
     // published; it ends at local EOF plus LINGER.
     tokio::spawn(async move {
-        let _broadcast = broadcast;
+        let _network = network;
+        let _chunks = chunks;
+        let _server = AbortOnDrop(tokio::spawn(server));
         let mut buffer = vec![0; MAX_CHUNK];
         let mut total = 0;
         loop {
@@ -247,6 +254,45 @@ fn pipe(
         _reader: AbortOnDrop(reader),
         _link: None,
     })
+}
+
+/// Answer the relay's requests for our stream track with every chunk from
+/// the first.
+async fn serve_from_start(
+    mut requests: moq_net::broadcast::Dynamic,
+    chunks: moq_net::broadcast::Consumer,
+) -> Result<()> {
+    let mut copies = tokio::task::JoinSet::new();
+    loop {
+        let request = requests.requested_track().await?;
+        while copies.try_join_next().is_some() {}
+        if request.name() != TRACK {
+            request.reject(moq_net::Error::NotFound);
+            continue;
+        }
+        let mut out = request.accept(moq_net::track::Info::default().with_ordered(true));
+        let mut source = chunks
+            .track(TRACK)?
+            .subscribe(
+                moq_net::track::Subscription::default()
+                    .with_ordered(true)
+                    .with_group_start(0),
+            )
+            .await?;
+        copies.spawn(async move {
+            while let Some(mut group) = source.recv_group().await? {
+                let mut copy = out.create_group(moq_net::group::Info {
+                    sequence: group.sequence,
+                })?;
+                while let Some(frame) = crate::protocol::read_frame(&mut group, MAX_CHUNK).await? {
+                    copy.write_frame(moq_net::Timestamp::now(), frame)?;
+                }
+                copy.finish()?;
+            }
+            out.finish()?;
+            Ok::<_, anyhow::Error>(())
+        });
+    }
 }
 
 async fn receive(

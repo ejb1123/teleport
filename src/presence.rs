@@ -148,24 +148,74 @@ pub async fn publish(
     identity: std::sync::Arc<crate::e2e::HostIdentity>,
     namespace: String,
 ) -> Result<()> {
-    let mut broadcast = outgoing.create_broadcast(
+    let broadcast = outgoing.create_broadcast(
         BROADCAST,
         moq_net::broadcast::Route::new().with_announce(true),
     )?;
-    let mut track =
-        broadcast.create_track(TRACK, moq_net::track::Info::default().with_ordered(true))?;
+    // Every track named `presence` or `presence/<suffix>` carries the
+    // statements, starting with the latest. On a provider relay each client
+    // asks for a name of its own: such a relay merges subscribers of one track
+    // and would give a newcomer nothing until the next statement.
+    let mut requests = broadcast.dynamic();
+    let (latest, _) = tokio::sync::watch::channel::<Option<bytes::Bytes>>(None);
+    let mut served = std::collections::VecDeque::new();
     let mut ticker = tokio::time::interval(INTERVAL);
     let mut sequence = 0u64;
     loop {
-        ticker.tick().await;
-        let statement = sign(&identity, &namespace, now_ms(), sequence)?;
-        sequence += 1;
-        let mut group = track.append_group()?;
-        group.write_frame(
-            moq_net::Timestamp::now(),
-            bytes::Bytes::from(serde_json::to_vec(&statement)?),
-        )?;
-        group.finish()?;
+        tokio::select! {
+            _ = ticker.tick() => {
+                let statement = sign(&identity, &namespace, now_ms(), sequence)?;
+                sequence += 1;
+                latest.send_replace(Some(bytes::Bytes::from(serde_json::to_vec(&statement)?)));
+            }
+            request = requests.requested_track() => {
+                let request = request?;
+                if !is_track(request.name()) {
+                    request.reject(moq_net::Error::NotFound);
+                    continue;
+                }
+                let track = request.accept(moq_net::track::Info::default().with_ordered(true));
+                // A provider relay never says a subscriber left: bound what
+                // departed watchers can hold on to.
+                if served.len() >= MAX_SERVED {
+                    served.pop_front();
+                }
+                served.push_back(relay::AbortOnDrop(tokio::spawn(serve(track, latest.subscribe()))));
+            }
+        }
+    }
+}
+
+/// Watchers served at once through a provider relay.
+#[cfg(target_os = "linux")]
+const MAX_SERVED: usize = 64;
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_track(name: &str) -> bool {
+    name == TRACK
+        || name
+            .strip_prefix(TRACK)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.len() <= 64)
+}
+
+/// Write the latest statement and every later one to one presence track.
+#[cfg(target_os = "linux")]
+async fn serve(
+    mut track: moq_net::track::Producer,
+    mut latest: tokio::sync::watch::Receiver<Option<bytes::Bytes>>,
+) -> Result<()> {
+    loop {
+        let statement = latest.borrow_and_update().clone();
+        if let Some(statement) = statement {
+            let mut group = track.append_group()?;
+            group.write_frame(moq_net::Timestamp::now(), statement)?;
+            group.finish()?;
+        }
+        tokio::select! {
+            changed = latest.changed() => changed?,
+            _ = track.unused() => return Ok(()),
+        }
     }
 }
 
@@ -181,11 +231,21 @@ pub async fn observe(
         .scope(&[moq_net::Path::new(BROADCAST)])
         .context("presence path unavailable")?
         .announced();
+    // A provider relay merges subscribers of one track: ask for our own.
+    let track_name = if link.provider() {
+        format!("{TRACK}/{}", relay::hex(&crate::e2e::random::<8>()))
+    } else {
+        TRACK.to_owned()
+    };
     let mut subscriber: Option<moq_net::track::Subscriber> = None;
     let mut last: Option<(u64, u64)> = None;
     let mut online_until: Option<tokio::time::Instant> = None;
     let decide_at = tokio::time::Instant::now() + ANNOUNCE_WAIT;
     loop {
+        if link.worn() {
+            // Reconnect before the provider relay stops taking requests.
+            return Ok(());
+        }
         let now = tokio::time::Instant::now();
         let current = match online_until {
             Some(until) if until > now => State::Online,
@@ -211,7 +271,7 @@ pub async fn observe(
                 }
                 match announce.broadcast {
                     Some(broadcast) => {
-                        let track = broadcast.track(TRACK)?;
+                        let track = broadcast.track(&track_name)?;
                         subscriber = tokio::time::timeout(
                             READ_TIMEOUT,
                             track.subscribe(moq_net::track::Subscription::default()),
@@ -282,11 +342,12 @@ pub async fn watch(
         )
         .await
         {
-            Ok(Ok(link)) => {
-                if let Err(error) = observe(&link, &fingerprint, &state).await {
-                    tracing::debug!(%error, "presence watch ended");
-                }
-            }
+            Ok(Ok(link)) => match observe(&link, &fingerprint, &state).await {
+                // A worn provider connection: renew it at once, keeping the
+                // state.
+                Ok(()) => continue,
+                Err(error) => tracing::debug!(%error, "presence watch ended"),
+            },
             Ok(Err(error)) => tracing::debug!(%error, "relay unavailable for presence"),
             Err(_) => tracing::debug!("relay connection timed out for presence"),
         }
