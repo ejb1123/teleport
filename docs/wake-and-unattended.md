@@ -59,8 +59,13 @@ to it, and it broadcasts the packet on its own networks.
 - **The MoQ relay cannot trigger wakes**: it cannot complete the handshake
   for any credential, cannot alter the options, and a replayed hello is
   answered once and never confirmed.
-- Owner-only: every credential a host admits is its owner's today (there are
-  no guest roles); `access::SessionLease::owner` is the single check point.
+- Owner-only: `access::SessionLease::owner` is the single check point and
+  reads the role from the access record at request time. Devices paired with
+  a code, password or Linux login, the host pairing file and system-login
+  tickets are owners; invited guest devices (docs/guests.md) are refused
+  `wake` and `suspend` whatever they were granted, directly and through the
+  relay (`ping` stays open to them). Guests are also not told the host's
+  hardware address, network or power options (`Desktop.wake`).
 - Opt-in, bounded: hosts refuse `wake` without `--wake-relay`, wake only
   unicast addresses (optionally only `--wake-relay-allow MAC`, repeatable),
   and at most 6 per minute.
@@ -150,6 +155,10 @@ With `unlockOnSystemLogin`, a **Linux account** sign-in (PAM-verified,
 docs/system-login.md) unlocks the session through `loginctl unlock-session`
 before the stream starts. The password is never stored; a saved-device
 connection never unlocks anything by itself.
+Only owners sign in with the Linux account, so only an owner's connection
+unlocks, and only once that session has joined the desktop (not when its
+connection fails or the host is full); guests already watching see the
+desktop from then on, as they would after typing the password.
 
 ### Secure attention: Ctrl+Alt+End
 
@@ -160,6 +169,13 @@ found). Unlocked: the host locks the session (logind `lock-session`; the
 Windows Ctrl+Alt+Del menu's first entry). Locked: it taps Shift, which wakes
 the screen and shows the password field. Either way the client shows a
 notice. End alone, and Ctrl+Alt+Del, are still forwarded unchanged.
+
+Secure attention is the owner's: on a shared desktop (docs/guests.md) a
+guest's request is refused before anything happens, whatever it was
+granted, and guests are not offered it. Locking ends what every session
+sees; typing the password into the lock screen needs keyboard and mouse
+control like any other typing, so a guest with that permission could type
+there too, but only with the password.
 
 ### Surviving lock, unlock and screen-off
 

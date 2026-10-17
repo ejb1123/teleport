@@ -45,6 +45,12 @@ let
     wakeOnLan.interface = "enp5s0";
     wakeRelay = true;
     allowSuspend = true;
+    sessions = {
+      max = 4;
+      kickGuestsWithOwner = false;
+      lockOnLastDisconnect = true;
+      guestApprovalTimeout = 60;
+    };
     unattended = {
       enable = true;
       lockEveryLogin = true;
@@ -76,7 +82,9 @@ let
     failures = {
       unattended = failed unattended;
       plain = failed plain;
-      withoutPreauthorization = failed (evaluate { unattended.enable = true; });
+      withoutPreauthorization = failed (evaluate {
+        unattended.enable = true;
+      });
       unlockWithoutSystemLogin = failed (evaluate {
         preauthorizeRemoteDesktop = true;
         unattended = {
@@ -116,6 +124,12 @@ let
     (expect "the host gets the power and unlock flags" (
       has "--wake-relay" host && has "--allow-suspend" host && has "--unlock-on-system-login" host
     ))
+    (expect "the host gets the session policy flags (guests)" (
+      has "--max-sessions 4" host
+      && has "--keep-guests-without-owner" host
+      && has "--lock-on-last-disconnect" host
+      && has "--guest-approval-timeout 60" host
+    ))
     (expect "the host can run ethtool and loginctl" (
       lib.any (has "ethtool") hostPath && lib.any (has "systemd") hostPath
     ))
@@ -125,6 +139,9 @@ let
       && !(has "--wake-relay" plainHost)
       && !(has "--allow-suspend" plainHost)
       && !(has "--unlock-on-system-login" plainHost)
+      && has "--max-sessions 8" plainHost
+      && !(has "--keep-guests-without-owner" plainHost)
+      && !(has "--lock-on-last-disconnect" plainHost)
     ))
     (expect "valid configurations pass their assertions" (
       failures.unattended == [ ] && failures.plain == [ ]
@@ -142,7 +159,12 @@ let
   passed = lib.all (check: check) checks;
 in
 # Building it runs the checks too.
-pkgs.writeText "teleport-module-eval" (builtins.toJSON (assert passed; settings))
+pkgs.writeText "teleport-module-eval" (
+  builtins.toJSON (
+    assert passed;
+    settings
+  )
+)
 // {
   inherit settings passed;
 }

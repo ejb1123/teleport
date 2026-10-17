@@ -77,6 +77,7 @@ several uses), so prompts never show text a guest chose.
 | gamepad | Its own virtual pads: a block of four host pad slots, separate from everyone else's |
 | keyboard-mouse | Keyboard and mouse, while it holds control (one session at a time) |
 | clipboard | Explicit clipboard transfer, on hosts started with `--clipboard` |
+| microphone | Its microphone into the host's virtual microphone, on hosts started with `--microphone`, one session at a time (off by default: host applications hear it as you) |
 
 The default is least privilege: **view and gamepad**. Change a guest live:
 
@@ -85,8 +86,9 @@ teleport host-admin set-guest DEVICE_ID --permissions view,gamepad,keyboard-mous
 teleport host-admin set-guest DEVICE_ID --trusted true
 ```
 
-or the **Gamepad / Keys+mouse / Clipboard / Trusted** buttons in the host
-settings window. Changes apply to running sessions at once: a lost
+or the **Gamepad / Keys+mouse / Clipboard / Trusted / Microphone** buttons in
+the host settings window (granting keyboard and mouse or the microphone asks
+for confirmation). Changes apply to running sessions at once: a lost
 permission releases what the guest held (keys, buttons, its pads) and its
 client shows the change.
 
@@ -123,6 +125,39 @@ One session drives the keyboard and mouse at a time:
 
 When control changes hands, keys and buttons the previous holder held are
 released first, and its client is told who took control.
+
+## Owner-only
+
+Whatever a guest was granted, these stay with the owner's devices (checked
+on the host; guests' clients are not offered them):
+
+- **Power** (docs/wake-and-unattended.md): `suspend` and wake relaying
+  (`teleport wake --via`), directly or through the relay. The host checks
+  the role of the credential at request time (`SessionLease::owner`).
+  Guests are not told the host's hardware address, network or power options
+  (`Desktop.wake`).
+- **Secure attention** (Ctrl+Alt+End): locking the host session or showing
+  its unlock prompt. A guest who may type can still type into a lock screen
+  an owner opened, but needs the password for it.
+- **Unlocking on Linux account sign-in** (`--unlock-on-system-login`): only
+  owners sign in with the account password.
+- **Stream and display changes** for the stream leader only, and **privacy
+  mode, virtual monitors** for an owner leading it (see below).
+- **Approving guests, taking control** (Ctrl+Alt+Y/N/T), **pairing** (refused
+  while a guest watches) and **SSH agent forwarding** (the first session,
+  stopped while a keyboard guest is connected).
+
+## Microphone
+
+One virtual microphone serves the host ("Teleport Microphone",
+docs/audio.md), so one session sends its microphone at a time: the first to
+ask keeps it until it stops, leaves or loses the permission, and others are
+refused with a notice, owners included. Owners may always ask; a guest only
+with the **microphone** permission. That is off by default because voice
+and call applications on the host hear the virtual microphone as the host
+user: a guest's voice would speak as you. Taking the permission away stops
+the guest's microphone at once; granting it applies when the guest next
+connects (its client decides to send the microphone when it joins).
 
 ## Approval
 
@@ -166,8 +201,14 @@ request. Revoking a device while it waits keeps it out.
 
 - One capture and one encoder serve every session; the first session's
   broadcast holds the stream and later sessions' broadcasts forward it
-  (`forward_track`). Audio is forwarded the same way. A joining session
-  starts at a fresh keyframe.
+  (`forward_track`). A joining session starts at a fresh keyframe.
+- Desktop audio is captured once, in the first session's format and
+  bitrate (Opus at its bitrate, or PCM, docs/audio.md), and forwarded to
+  every session. Joining sessions are told the stream's settings
+  (`Desktop.audio_settings`) and play them; a client that asked for
+  something else says so ("Desktop audio is shared with another session").
+  Clients from before audio options play only Opus, so they hear nothing
+  from a PCM stream.
 - The **stream leader** is the first owner session, or the first session
   when no owner is connected. Only the leader changes the stream (size,
   frame rate, bitrate, monitor, extra monitor streams, local cursor mode);
