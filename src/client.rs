@@ -68,7 +68,8 @@ pub struct Options {
     #[arg(long, hide = true)]
     pub reliable_pointer: bool,
     /// Keep the host pointer drawn into the video instead of drawing it
-    /// locally from cursor shapes (hosts that support it: X11).
+    /// locally from cursor shapes (X11 hosts, and Wayland hosts whose
+    /// portal sends cursor metadata).
     #[arg(long)]
     pub embedded_cursor: bool,
     /// Reach the host through this MoQ relay with end-to-end encryption
@@ -1275,6 +1276,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 local_cursor,
                 // Played on the local controller (headless runs log it).
                 rumble: desktop.gamepads,
+                // Where to put the pointer when relative mode ends.
+                cursor_positions: local_cursor,
             },
         )?;
     }
@@ -1388,6 +1391,9 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         tracing::info!("remote cursor {}x{}", image.width, image.height)
                     }
                     Update::Cursor { cursor: None } => tracing::info!("remote cursor hidden"),
+                    Update::CursorPosition { monitor, x, y } => {
+                        tracing::debug!(monitor, x, y, "remote cursor position")
+                    }
                     Update::Rumble {
                         pad,
                         low,

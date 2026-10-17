@@ -38,6 +38,11 @@ const DEFAULT_BITRATE: u32 = 8000;
 
 /// Minimum spacing of video reconfigurations (each may restart the encoder).
 const CONFIGURE_INTERVAL: Duration = Duration::from_millis(500);
+/// A portal session left in cursor-metadata mode by an earlier client goes
+/// back to an embedded pointer if the new client has not opted in by then.
+const CURSOR_CHOICE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Host pointer positions go to the client at most this often.
+const CURSOR_POSITION_INTERVAL: Duration = Duration::from_millis(33);
 
 /// The stream for the client's display on the active monitor.
 fn negotiate_stream(
@@ -117,6 +122,11 @@ pub struct Options {
     /// Disable receiver-feedback bitrate adjustment.
     #[arg(long)]
     pub fixed_bitrate: bool,
+    /// Always draw the pointer into the video. By default a desktop portal
+    /// session sends it as cursor metadata (when the compositor offers it)
+    /// so clients can draw it locally (docs/cursor.md).
+    #[arg(long)]
+    pub embedded_cursor: bool,
     /// Explicit PulseAudio/PipeWire output .monitor name; never records a microphone.
     #[arg(long)]
     pub audio_source: Option<String>,
@@ -160,6 +170,7 @@ pub async fn run(options: Options) -> Result<()> {
         &options.source,
         options.restore_token.as_deref(),
         options.monitor,
+        !options.embedded_cursor,
     )
     .await?;
     let result = serve(&options, &mut capture).await;
@@ -761,9 +772,22 @@ async fn run_session(
     // vanished while sleeping monitors woke). Recovered in place below.
     let mut portal_lost = false;
     let mut portal_recoveries: Vec<Instant> = Vec::new();
-    // XFixes cursor shapes for a client drawing the pointer locally (X11);
-    // dropping it at session end stops the watcher thread.
-    let mut cursor_watcher: Option<crate::x11_cursor::Watcher> = None;
+    // Cursor shapes for a client drawing the pointer locally: XFixes (X11)
+    // or PipeWire cursor metadata (portal). Dropping an X11 watcher at
+    // session end stops its thread.
+    let mut cursor_watcher: Option<CursorFeed> = None;
+    // The client takes host pointer positions (portal metadata only).
+    let mut cursor_positions = false;
+    // Capture must restart for the client's cursor choice: `Some(true)`
+    // leaves the pointer out of the video, `Some(false)` draws it in again.
+    let mut cursor_restart: Option<bool> = None;
+    // A portal session still in metadata mode from an earlier client: the
+    // pointer goes back into the video unless this client opts in by then.
+    let mut cursor_choice_deadline = capture
+        .cursor_metadata()
+        .then(|| Instant::now() + CURSOR_CHOICE_TIMEOUT);
+    let mut position_tick = tokio::time::interval(CURSOR_POSITION_INTERVAL);
+    position_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The client's latest display (size, refresh, choices). Applied once the
     // video-settings rate limit allows, coalescing bursts into the newest.
     let mut client_display: Option<protocol::ClientDisplay> = None;
@@ -771,6 +795,108 @@ async fn run_session(
     // Force feedback from the virtual pads, once the client plays rumble.
     let mut rumble: Option<tokio::sync::mpsc::UnboundedReceiver<crate::gamepad::Rumble>> = None;
     loop {
+        if let Some(local) = cursor_restart.take() {
+            // Restart capture as for a monitor switch: without the pointer
+            // (X11), or in the other portal cursor mode (a new ScreenCast
+            // session, so every stream stops first).
+            capture.release_all().await;
+            while_starting(retire(pipeline), &mut events, capture, &mut updates).await?;
+            let active: Vec<_> = monitor_streams.keys().copied().collect();
+            while_starting(
+                retire(std::mem::take(&mut monitor_streams)),
+                &mut events,
+                capture,
+                &mut updates,
+            )
+            .await?;
+            if capture.is_portal() {
+                let mut attempt = 0;
+                while let Err(error) = capture.set_cursor_metadata(local).await {
+                    attempt += 1;
+                    ensure!(
+                        attempt < PORTAL_REOPEN_ATTEMPTS,
+                        error.context("changing the portal cursor mode")
+                    );
+                    tracing::warn!(
+                        attempt,
+                        error = format!("{error:#}"),
+                        "desktop portal not ready yet; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            } else {
+                capture.local_cursor = local;
+            }
+            video_start_group = video_barrier(&video)?;
+            let info = desktop(options, capture, video_start_group)?;
+            pipeline = while_starting(
+                start_encoder(
+                    options,
+                    capture.pipeline_source_for_range(options.dynamic_range)?,
+                    (info.width, info.height),
+                    options.fps,
+                    options.bitrate,
+                    &video,
+                ),
+                &mut events,
+                capture,
+                &mut updates,
+            )
+            .await?;
+            if long_gop {
+                pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS));
+            }
+            for index in active {
+                match monitor_encoder(
+                    options,
+                    capture,
+                    index,
+                    &monitor_tracks[index],
+                    &mut events,
+                    &mut updates,
+                )
+                .await
+                {
+                    Ok(stream) => {
+                        publish_update(
+                            &mut updates,
+                            Update::MonitorStream {
+                                index,
+                                desktop: stream.desktop.clone(),
+                            },
+                        )?;
+                        if long_gop {
+                            stream.pipeline.set_key_interval(
+                                options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS),
+                            );
+                        }
+                        monitor_streams.insert(index, stream);
+                    }
+                    Err(error) => publish_update(
+                        &mut updates,
+                        Update::MonitorStreamStopped {
+                            index,
+                            reason: format!("Monitor restart failed: {error}"),
+                            requested: false,
+                        },
+                    )?,
+                }
+            }
+            adaptation = media::BitrateController::new(options.bitrate);
+            network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
+            encoder_metrics = pipeline.encoder_metrics()?;
+            adaptive = !options.fixed_bitrate;
+            last_feedback = Instant::now();
+            publish_update(&mut updates, Update::Desktop { desktop: info })?;
+            // Portal shapes arrive through the feed (`pw_cursor::subscribe`).
+            if local
+                && let Some(CursorFeed::X11(watcher)) = cursor_watcher.as_mut()
+                && let Some(cursor) = watcher.shapes.borrow_and_update().clone()
+            {
+                publish_update(&mut updates, Update::Cursor { cursor })?;
+            }
+            tracing::info!(local, "capture restarted for the client's cursor choice");
+        }
         if portal_lost {
             portal_lost = false;
             let now = Instant::now();
@@ -866,12 +992,12 @@ async fn run_session(
             error = session.closed() => anyhow::bail!("{error}"),
             shape = async {
                 match cursor_watcher.as_mut() {
-                    Some(watcher) => watcher.shapes.changed().await,
+                    Some(feed) => feed.shapes().changed().await,
                     None => std::future::pending().await,
                 }
             } => {
                 let shape = match (shape, cursor_watcher.as_mut()) {
-                    (Ok(()), Some(watcher)) => watcher.shapes.borrow_and_update().clone(),
+                    (Ok(()), Some(feed)) => feed.shapes().borrow_and_update().clone(),
                     _ => {
                         // The pointer stays out of the video; the client keeps its last shape.
                         cursor_watcher = None;
@@ -881,6 +1007,22 @@ async fn run_session(
                 };
                 if let Some(cursor) = shape {
                     publish_update(&mut updates, Update::Cursor { cursor })?;
+                }
+            },
+            // Latest host pointer position, rate limited (portal metadata).
+            _ = position_tick.tick(), if cursor_positions => {
+                if let Some(CursorFeed::Portal(feed)) = cursor_watcher.as_mut()
+                    && feed.positions.has_changed().unwrap_or(false)
+                    && let Some(position) = *feed.positions.borrow_and_update() {
+                    publish_update(&mut updates, Update::CursorPosition { monitor: position.monitor, x: position.x, y: position.y })?;
+                }
+            },
+            // The client never opted in: draw the pointer into the video again.
+            _ = tokio::time::sleep_until(cursor_choice_deadline.unwrap_or_else(Instant::now).into()), if cursor_choice_deadline.is_some() => {
+                cursor_choice_deadline = None;
+                if capture.cursor_metadata() && cursor_watcher.is_none() {
+                    tracing::info!("client did not choose a local cursor; embedding the pointer in the video");
+                    cursor_restart = Some(false);
                 }
             },
             _ = tokio::time::sleep_until((last_configure + CONFIGURE_INTERVAL).into()), if display_pending => {
@@ -978,7 +1120,7 @@ async fn run_session(
                     // Auxiliary streams currently use fixed bitrate. Their
                     // congestion must never adapt the independent primary.
                     Event::MonitorFeedback { .. } => {}
-                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble } => {
+                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble, cursor_positions: wants_positions } => {
                         if plays_rumble && rumble.is_none() {
                             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
                             capture.enable_rumble(sender);
@@ -993,46 +1135,29 @@ async fn run_session(
                             pipeline.set_key_interval(frames);
                             for stream in monitor_streams.values() { stream.pipeline.set_key_interval(frames); }
                         }
-                        if local_cursor && capture.supports_local_cursor() && cursor_watcher.is_none() {
+                        cursor_choice_deadline = None;
+                        let local = local_cursor && capture.supports_local_cursor();
+                        if capture.is_portal() {
+                            // Shapes come from the capture pipelines' cursor
+                            // metadata; a session in the other mode restarts.
+                            if local && cursor_watcher.is_none() {
+                                cursor_watcher = Some(CursorFeed::Portal(crate::pw_cursor::subscribe()));
+                                cursor_positions = wants_positions;
+                                tracing::info!("client draws the cursor locally (portal cursor metadata)");
+                            }
+                            if local != capture.cursor_metadata() {
+                                cursor_restart = Some(local);
+                            }
+                        } else if local && cursor_watcher.is_none() {
                             // Watch first: without shapes the client would have no pointer at all.
-                            let mut watcher = match crate::x11_cursor::watch() {
-                                Ok(watcher) => watcher,
-                                Err(error) => {
-                                    tracing::warn!(error = format!("{error:#}"), "local cursor unavailable; keeping the pointer in the video");
-                                    continue;
+                            match crate::x11_cursor::watch() {
+                                Ok(watcher) => {
+                                    cursor_watcher = Some(CursorFeed::X11(watcher));
+                                    cursor_restart = Some(true);
+                                    tracing::info!("client draws the cursor locally");
                                 }
-                            };
-                            // Restart capture without the pointer, as for a monitor switch.
-                            capture.release_all().await;
-                            while_starting(retire(pipeline), &mut events, capture, &mut updates).await?;
-                            capture.local_cursor = true;
-                            video_start_group = video_barrier(&video)?;
-                            let info = desktop(options, capture, video_start_group)?;
-                            pipeline = while_starting(start_encoder(options, capture.pipeline_source_for_range(options.dynamic_range)?, (info.width, info.height), options.fps, options.bitrate, &video), &mut events, capture, &mut updates).await?;
-                            if long_gop { pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
-                            let active: Vec<_> = monitor_streams.keys().copied().collect();
-                            while_starting(retire(std::mem::take(&mut monitor_streams)), &mut events, capture, &mut updates).await?;
-                            for index in active {
-                                match monitor_encoder(options, capture, index, &monitor_tracks[index], &mut events, &mut updates).await {
-                                    Ok(stream) => {
-                                        publish_update(&mut updates, Update::MonitorStream { index, desktop: stream.desktop.clone() })?;
-                                        if long_gop { stream.pipeline.set_key_interval(options.fps.saturating_mul(LONG_KEY_INTERVAL_SECONDS)); }
-                                        monitor_streams.insert(index, stream);
-                                    }
-                                    Err(error) => publish_update(&mut updates, Update::MonitorStreamStopped { index, reason: format!("Monitor restart failed: {error}"), requested: false })?,
-                                }
+                                Err(error) => tracing::warn!(error = format!("{error:#}"), "local cursor unavailable; keeping the pointer in the video"),
                             }
-                            adaptation = media::BitrateController::new(options.bitrate);
-                            network_rate = media::NetworkRateController::new(options.bitrate, Instant::now());
-                            encoder_metrics = pipeline.encoder_metrics()?;
-                            adaptive = !options.fixed_bitrate;
-                            last_feedback = Instant::now();
-                            publish_update(&mut updates, Update::Desktop { desktop: info })?;
-                            if let Some(cursor) = watcher.shapes.borrow_and_update().clone() {
-                                publish_update(&mut updates, Update::Cursor { cursor })?;
-                            }
-                            cursor_watcher = Some(watcher);
-                            tracing::info!("client draws the cursor locally");
                         }
                     }
                     Event::ClientDisplay(display) => {
@@ -1252,6 +1377,21 @@ fn desktop_for_monitor(
         hardware_codecs: options.hardware_codecs.clone(),
         extra_mouse_buttons: true,
     })
+}
+
+/// Where a locally drawn cursor's shapes come from.
+enum CursorFeed {
+    X11(crate::x11_cursor::Watcher),
+    Portal(crate::pw_cursor::Feed),
+}
+
+impl CursorFeed {
+    fn shapes(&mut self) -> &mut tokio::sync::watch::Receiver<crate::x11_cursor::Shape> {
+        match self {
+            Self::X11(watcher) => &mut watcher.shapes,
+            Self::Portal(feed) => &mut feed.shapes,
+        }
+    }
 }
 
 struct MonitorEncoder {

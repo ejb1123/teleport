@@ -763,6 +763,15 @@ refresh. Effort M.**
 
 **G11. Wayland local cursor and automatic pointer lock. Effort M.**
 
+- **Status (2026-10-16): step 1–2 implemented** (docs/cursor.md, tracker
+  R5). Not with a separate PipeWire consumer: `pipewiresrc` already
+  negotiates `SPA_META_Cursor`, and a pad probe (`src/pw_cursor.rs`) reads it
+  from the PipeWire buffer behind each GStreamer buffer, so it rides on the
+  zero-copy DMA-BUFs. The portal session is opened in metadata mode and
+  switched back to an embedded pointer for clients that do not opt in.
+  Verified on KDE Plasma 6.7.5. Gap: with DMA-BUF capture KWin's first
+  bitmap is lost, so the shape arrives with its first change.
+
 - **Why:** local cursor only works on X11 hosts (docs/cursor.md), and KDE
   Wayland is the primary host. On Wayland the pointer has a full
   encode→network→decode round trip, which is the most visible latency in

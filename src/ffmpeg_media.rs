@@ -725,7 +725,8 @@ mod tests {
             .ok()
             .and_then(|fps| fps.parse().ok())
             .unwrap_or(60);
-        let mut capture = crate::capture::Capture::open_with_options("portal", None, 0).await?;
+        let mut capture =
+            crate::capture::Capture::open_with_options("portal", None, 0, false).await?;
         let size = (capture.width & !1, capture.height & !1);
         // Count what PipeWire delivers before the rate limit, and keep the
         // source to report the format the compositor negotiated.
@@ -801,6 +802,69 @@ mod tests {
             per_frame(after.1 - before.1),
         );
         drop(encode);
+        capture.close().await;
+        Ok(())
+    }
+
+    /// The portal's cursor metadata mode (G11): negotiates on this
+    /// compositor, rides on the captured (DMA-BUF unless
+    /// `TELEPORT_CAPTURE_ZERO_COPY=0`) buffers and reaches the cursor hub.
+    /// Opens its own portal session (no restore token, no input); a shape
+    /// arrives only while the pointer is on the captured monitor.
+    #[tokio::test]
+    #[ignore = "opens a desktop portal session; set TELEPORT_TEST_PORTAL=1"]
+    async fn portal_cursor_metadata() -> Result<()> {
+        if std::env::var("TELEPORT_TEST_PORTAL").as_deref() != Ok("1") {
+            eprintln!("SKIP: set TELEPORT_TEST_PORTAL=1 inside a graphical session");
+            return Ok(());
+        }
+        test_tracing();
+        gst::init()?;
+        let mut capture =
+            crate::capture::Capture::open_with_options("portal", None, 0, true).await?;
+        ensure!(
+            capture.cursor_metadata(),
+            "the compositor did not offer cursor metadata"
+        );
+        let mut feed = crate::pw_cursor::subscribe();
+        let mut seen = false;
+        // The pointer is on one monitor; only that stream carries its shape.
+        for monitor in 0..capture.monitors.len() {
+            capture.select_monitor(monitor).await?;
+            let size = (capture.width & !1, capture.height & !1);
+            let (metas, stale) = (
+                crate::pw_cursor::METAS.load(Ordering::Relaxed),
+                crate::pw_cursor::STALE.load(Ordering::Relaxed),
+            );
+            let encode = encoder(
+                &capture.pipeline_source(),
+                size,
+                60,
+                crate::protocol::auto_bitrate(size.0, size.1, 60),
+                moq_net::broadcast::Info::new()
+                    .produce()
+                    .create_track(VideoCodec::H264.track(), None)?,
+                EncoderKind::Nvidia,
+                VideoCodec::H264.into(),
+            )?;
+            let metrics = encode.encoder_metrics()?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            encode.error()?;
+            let metas = crate::pw_cursor::METAS.load(Ordering::Relaxed) - metas;
+            seen |= metas > 0;
+            eprintln!(
+                "CURSOR monitor {monitor} {}x{} {}: {metas} buffers with cursor meta, {} stale (cursor-only) dropped, {} frames encoded, shape {:?}, position {:?}",
+                size.0,
+                size.1,
+                metrics.encoder,
+                crate::pw_cursor::STALE.load(Ordering::Relaxed) - stale,
+                metrics.totals.lock().unwrap().2,
+                feed.shapes.borrow_and_update().clone(),
+                *feed.positions.borrow_and_update(),
+            );
+            drop(encode);
+        }
+        ensure!(seen, "no cursor meta on the captured buffers");
         capture.close().await;
         Ok(())
     }
@@ -1565,6 +1629,7 @@ fn start(
             .map_err(|_| anyhow::anyhow!("not a capture pipeline"))?,
     );
     attach(&pipeline.0, state.clone());
+    crate::pw_cursor::attach(&pipeline.0);
     #[cfg(test)]
     if let Some(hook) = tests::PIPELINE_HOOK.lock().unwrap().as_ref() {
         hook(&pipeline.0);

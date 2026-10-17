@@ -319,6 +319,14 @@ pub enum Update {
     Cursor {
         cursor: Option<CursorImage>,
     },
+    /// Where the host pointer is on monitor `monitor`, normalised like
+    /// `Event::Motion` (0..=1). Latest wins, at most ~30 per second; only
+    /// sent after the client declared `ClientFeatures::cursor_positions`.
+    CursorPosition {
+        monitor: usize,
+        x: f64,
+        y: f64,
+    },
     /// Force feedback a game started on virtual pad `pad`: play `low`
     /// (strong, low-frequency motor) and `high` (weak, high-frequency) for
     /// `duration_ms` unless a newer update replaces it; zeros stop it. Only
@@ -343,6 +351,10 @@ impl Update {
             Self::Cursor {
                 cursor: Some(image),
             } => image.validate()?,
+            Self::CursorPosition { monitor, x, y } => ensure!(
+                *monitor < 64 && (0.0..=1.0).contains(x) && (0.0..=1.0).contains(y),
+                "invalid cursor position"
+            ),
             Self::Rumble {
                 pad, duration_ms, ..
             } => ensure!(
@@ -508,6 +520,10 @@ pub enum Event {
         /// ignore the field.
         #[serde(default)]
         rumble: bool,
+        /// The client takes `Update::CursorPosition` (it places its pointer
+        /// there when it leaves relative mode). Older hosts ignore the field.
+        #[serde(default)]
+        cursor_positions: bool,
     },
     /// The session's video codec. Sent as the very first input event to hosts
     /// advertising `Desktop::codec_selection`, which wait for it before
@@ -1034,6 +1050,7 @@ mod tests {
                 pointer_datagrams: true,
                 local_cursor: true,
                 rumble: true,
+                cursor_positions: true,
             },
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
@@ -1185,6 +1202,7 @@ mod tests {
                 pointer_datagrams: false,
                 local_cursor: false,
                 rumble: false,
+                cursor_positions: false,
             }
         ));
         let primary: Event = serde_json::from_str(r#"{"type":"request_keyframe"}"#).unwrap();
@@ -1358,6 +1376,33 @@ mod tests {
             "active_monitor": 0, "audio": false, "clipboard": false, "local_cursor": true }))
         .unwrap();
         assert!(desktop.local_cursor);
+        // Positions only go to clients that ask for them, and are bounded.
+        let features: Event = serde_json::from_str(
+            r#"{"type":"client_features","local_cursor":true,"cursor_positions":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            features,
+            Event::ClientFeatures {
+                cursor_positions: true,
+                ..
+            }
+        ));
+        let position = Update::CursorPosition {
+            monitor: 1,
+            x: 0.25,
+            y: 1.0,
+        };
+        let wire = serde_json::to_vec(&position).unwrap();
+        assert!(
+            serde_json::from_slice::<Update>(&wire)
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+        for (monitor, x, y) in [(64, 0.5, 0.5), (0, -0.1, 0.5), (0, 0.5, f64::NAN)] {
+            assert!(Update::CursorPosition { monitor, x, y }.validate().is_err());
+        }
     }
 
     #[test]

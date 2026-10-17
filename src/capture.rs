@@ -57,6 +57,13 @@ pub struct Capture {
     lost: bool,
     /// The client draws the pointer itself; leave it out of X11 video.
     pub local_cursor: bool,
+    /// Portal: the host allows sending the pointer as metadata (the default).
+    allow_cursor_metadata: bool,
+    /// Portal: the compositor offers `CursorMode::Metadata`.
+    cursor_metadata_available: bool,
+    /// Portal: the open session sends the pointer as PipeWire cursor metadata
+    /// (read by `crate::pw_cursor`) instead of drawing it into the video.
+    cursor_metadata: bool,
 }
 
 enum Backend {
@@ -100,7 +107,8 @@ impl Capture {
                     .open_pipe_wire_remote(session)
                     .await?;
                 let source = format!(
-                    "pipewiresrc fd={} path={} do-timestamp=true keepalive-time={KEEPALIVE_MS} ! {PIPEWIRE_SYSTEM_MEMORY}",
+                    "pipewiresrc name={} fd={} path={} do-timestamp=true keepalive-time={KEEPALIVE_MS} ! {PIPEWIRE_SYSTEM_MEMORY}",
+                    crate::pw_cursor::source_name(index),
                     remote.as_raw_fd(),
                     nodes[index]
                 );
@@ -170,13 +178,17 @@ impl Capture {
     }
     #[cfg(test)]
     pub async fn open(source: &str) -> Result<Self> {
-        Self::open_with_options(source, None, 0).await
+        Self::open_with_options(source, None, 0, false).await
     }
 
+    /// `cursor_metadata`: open a portal session with the pointer sent as
+    /// PipeWire metadata when the compositor offers it (the client draws it,
+    /// docs/cursor.md); otherwise the pointer is drawn into the video.
     pub async fn open_with_options(
         source: &str,
         restore_token_path: Option<&Path>,
         monitor: usize,
+        cursor_metadata: bool,
     ) -> Result<Self> {
         let mut result = Self {
             width: 1280,
@@ -204,6 +216,9 @@ impl Capture {
             restore_token_path: restore_token_path.map(Path::to_path_buf),
             lost: false,
             local_cursor: false,
+            allow_cursor_metadata: cursor_metadata,
+            cursor_metadata_available: false,
+            cursor_metadata: false,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
             gamepads: crate::gamepad::Gamepads::new(false),
@@ -244,9 +259,20 @@ impl Capture {
                     )
                     .await?
                     .response()?;
+                // Portals before version 2 have no AvailableCursorModes and
+                // keep the pointer embedded.
+                let available = cast
+                    .available_cursor_modes()
+                    .await
+                    .is_ok_and(|modes| modes.contains(CursorMode::Metadata));
+                let metadata = cursor_metadata && available;
                 cast.select_sources(
                     &session,
-                    CursorMode::Embedded,
+                    if metadata {
+                        CursorMode::Metadata
+                    } else {
+                        CursorMode::Embedded
+                    },
                     SourceType::Monitor.into(),
                     true,
                     None,
@@ -300,6 +326,13 @@ impl Capture {
                     }
                 }
                 let fd = cast.open_pipe_wire_remote(&session).await?;
+                result.cursor_metadata_available = available;
+                result.cursor_metadata = metadata;
+                tracing::info!(
+                    cursor = if metadata { "metadata" } else { "embedded" },
+                    metadata_available = available,
+                    "desktop portal session started"
+                );
                 result.name = "Wayland portal";
                 result.backend = Backend::Portal {
                     proxy,
@@ -367,7 +400,8 @@ impl Capture {
                 test_pattern(self.active_monitor)
             ),
             Backend::Portal { fd, nodes, .. } => format!(
-                "pipewiresrc fd={} path={} do-timestamp=true keepalive-time={KEEPALIVE_MS} ! {PIPEWIRE_SYSTEM_MEMORY}",
+                "pipewiresrc name={} fd={} path={} do-timestamp=true keepalive-time={KEEPALIVE_MS} ! {PIPEWIRE_SYSTEM_MEMORY}",
+                crate::pw_cursor::source_name(self.active_monitor),
                 fd.as_raw_fd(),
                 nodes[self.active_monitor]
             ),
@@ -668,16 +702,48 @@ impl Capture {
     }
 
     /// Whether the pointer can be left out of the video and sent as shapes
-    /// instead. Only X11 so far: GStreamer's `pipewiresrc` does not expose
-    /// the portal's cursor metadata.
+    /// instead: X11 (XFixes), or the desktop portal when the compositor
+    /// offers cursor metadata and the host allows it.
     pub fn supports_local_cursor(&self) -> bool {
-        matches!(self.backend, Backend::X11 { .. })
+        match self.backend {
+            Backend::X11 { .. } => true,
+            Backend::Portal { .. } => self.allow_cursor_metadata && self.cursor_metadata_available,
+            Backend::Test => false,
+        }
+    }
+
+    /// Portal: the pointer is left out of the video and sent as PipeWire
+    /// cursor metadata (`crate::pw_cursor`).
+    pub fn cursor_metadata(&self) -> bool {
+        self.cursor_metadata
+    }
+
+    /// Portal: switch between cursor metadata (the client draws the pointer)
+    /// and a pointer drawn into the video. The cursor mode belongs to the
+    /// ScreenCast session, so this recreates the session as for a lost one
+    /// (the saved token or the compositor's pre-authorization avoids a
+    /// dialog). Returns whether the session changed; callers then rebuild
+    /// every capture pipeline.
+    pub async fn set_cursor_metadata(&mut self, metadata: bool) -> Result<bool> {
+        if metadata == self.cursor_metadata || (metadata && !self.supports_local_cursor()) {
+            return Ok(false);
+        }
+        tracing::info!(
+            metadata,
+            "recreating the desktop portal session for the client's cursor"
+        );
+        self.reopen_with(metadata).await?;
+        Ok(true)
     }
 
     /// Replace a lost portal session with a new one, restored from the saved
     /// token (no local dialog when the compositor honours it). Keeps the
-    /// active monitor when it still exists.
+    /// active monitor when it still exists, and the cursor mode.
     pub async fn reopen(&mut self) -> Result<()> {
+        self.reopen_with(self.cursor_metadata).await
+    }
+
+    async fn reopen_with(&mut self, metadata: bool) -> Result<()> {
         let monitor = self.active_monitor;
         // A portal recreation mid-session keeps the session's (neutralised)
         // pads: uinput does not depend on the portal.
@@ -689,6 +755,7 @@ impl Capture {
             &self.source,
             self.restore_token_path.as_deref(),
             monitor,
+            metadata,
         )
         .await
         {
@@ -696,11 +763,18 @@ impl Capture {
             // The monitor may be gone after an output change; start on the first.
             Err(error) if monitor != 0 => {
                 tracing::warn!(%error, monitor, "previous monitor unavailable; reopening on the first");
-                Self::open_with_options(&self.source, self.restore_token_path.as_deref(), 0).await?
+                Self::open_with_options(
+                    &self.source,
+                    self.restore_token_path.as_deref(),
+                    0,
+                    metadata,
+                )
+                .await?
             }
             Err(error) => return Err(error),
         };
         fresh.local_cursor = self.local_cursor;
+        fresh.allow_cursor_metadata = self.allow_cursor_metadata;
         std::mem::swap(self, &mut fresh);
         std::mem::swap(&mut self.gamepads, &mut fresh.gamepads);
         Ok(())

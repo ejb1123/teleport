@@ -361,6 +361,10 @@ to separate networking/decoding problems from portal/capture problems.
 - Initial local approval is required for Wayland. Saved permission is opt-in
   and compositor-dependent. No login-screen access or unattended-access guarantee.
 - HDR requires the experimental patched-KWin/Mac path; see [its limitations](docs/hdr.md).
+- The client draws the remote pointer locally (no round trip) with X11 hosts
+  and Wayland hosts whose portal sends cursor metadata (KDE Plasma 6);
+  `--embedded-cursor` on either end keeps it in the video. See
+  [local cursor](docs/cursor.md).
 - Gamepads (with rumble) need a Linux host with `/dev/uinput` access;
   see [gamepads](docs/gamepad.md).
 - No file transfer, virtual display, IME, monitor hotplug or
