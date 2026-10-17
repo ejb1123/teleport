@@ -24,7 +24,15 @@ NVENC/VA-API encode test cover H.265 as well as H.264. 10-bit output stays
 HDR10-only, which is always H.265.
 
 Encoders use closed, short GOPs without B-frames. NVENC also explicitly disables
-its output delay. Bitrate changes transactionally reopen the encoder and start
+its output delay. libx264 and h264_nvenc use periodic intra refresh (a one
+second sweep) instead of periodic IDRs once the client requests keyframes
+itself; IDRs then come only at the start and on request (`forced-idr`), and
+only IDRs start a MoQ group (`protocol::annexb_keyframe`: these encoders
+also flag refresh starts as key frames). `TELEPORT_INTRA_REFRESH=0` on the
+host turns it off. H.265, VA-API and QSV keep periodic IDRs: FFmpeg's H.265
+decoder cannot decode past a missing reference, and FFmpeg exposes no VA-API
+or QSV intra refresh. Test: `intra_refresh_heals_a_lost_frame_without_an_idr`
+(add `TELEPORT_TEST_HARDWARE=1` for NVENC). Bitrate changes transactionally reopen the encoder and start
 a new keyframe group; accepted bitrate is the configured target, not measured
 wire throughput. Decoder recovery flushes references and resumes at a new GOP.
 Ten-bit HDR requires HEVC and verified BT.2020/PQ decoded output; SDR cannot be

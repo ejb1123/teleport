@@ -837,6 +837,35 @@ pub async fn read_frame(
         .map(|(_, _, bytes)| bytes))
 }
 
+/// Whether an Annex B access unit is an IDR (H.264) or IRAP (H.265) picture,
+/// where a decoder can start. Decided by its first slice NAL unit, so only
+/// the parameter sets in front of it are scanned. Encoders with intra
+/// refresh also flag refresh starts as key frames; those are not.
+pub fn annexb_keyframe(codec: VideoCodec, data: &[u8]) -> bool {
+    let mut index = 0;
+    while index + 3 < data.len() {
+        if data[index] != 0 || data[index + 1] != 0 || data[index + 2] != 1 {
+            index += 1;
+            continue;
+        }
+        let header = data[index + 3];
+        match codec {
+            VideoCodec::H264 => match header & 0x1f {
+                5 => return true,
+                1..=4 => return false,
+                _ => (),
+            },
+            VideoCodec::H265 => match (header >> 1) & 0x3f {
+                16..=21 => return true,
+                0..=31 => return false,
+                _ => (),
+            },
+        }
+        index += 3;
+    }
+    false
+}
+
 /// [`read_frame`] with the frame's MoQ timestamp and when its first byte
 /// arrived.
 pub async fn read_timed_frame(

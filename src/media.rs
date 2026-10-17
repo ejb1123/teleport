@@ -127,6 +127,7 @@ impl Pipeline {
 
     /// Space periodic IDRs `frames` apart once the client requests keyframes
     /// itself. Direct FFmpeg only; the legacy encoder keeps its fixed GOP.
+    /// Encoders with intra refresh send none (only requested IDRs).
     #[cfg(target_os = "linux")]
     pub fn set_key_interval(&self, frames: u32) {
         if let Some(state) = ffmpeg_media::state(&self.0) {

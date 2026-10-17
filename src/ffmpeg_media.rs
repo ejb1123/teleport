@@ -71,7 +71,19 @@ impl State {
     }
     #[cfg(target_os = "linux")]
     pub fn set_key_interval(&self, frames: u32) {
+        // The client asks for an IDR when it needs one; an encoder refreshing
+        // intra blocks heals losses by itself, so it needs no periodic IDRs.
+        let frames = if self.intra_refresh() {
+            u32::MAX
+        } else {
+            frames
+        };
         self.key_interval.store(frames.max(1), Ordering::Relaxed);
+    }
+    /// The encoder heals losses by periodic intra refresh.
+    #[cfg(target_os = "linux")]
+    pub fn intra_refresh(&self) -> bool {
+        self.codec.lock().unwrap().config.intra_refresh > 0
     }
     #[cfg(target_os = "linux")]
     pub fn bitrate(&self) -> u32 {
@@ -181,6 +193,7 @@ fn config(name: &str, format: VideoFormat, output: i32) -> Config {
         output,
         gop: 0,
         gpu_input: false,
+        intra_refresh: 0,
     }
 }
 
@@ -1294,6 +1307,23 @@ fn dmabuf_frame(sample: &gst::Sample) -> Result<crate::ffmpeg::Dmabuf> {
     Ok(frame)
 }
 
+/// Intra-refresh period (frames) for encoders that refresh instead of
+/// sending periodic IDRs (parsec-comparison G7): one second, so a lost or
+/// skipped frame heals within a second without an IDR burst. H.264 only:
+/// FFmpeg's H.265 decoder (also under NVDEC and VA-API) drops every picture
+/// after a missing reference, so H.265 needs an IDR anyway. VA-API and QSV
+/// keep IDRs (FFmpeg exposes no intra refresh for them).
+/// `TELEPORT_INTRA_REFRESH=0` turns it off.
+#[cfg(target_os = "linux")]
+fn intra_refresh_frames(name: &str, fps: u32) -> u32 {
+    let enabled = std::env::var_os("TELEPORT_INTRA_REFRESH").is_none_or(|value| value != "0");
+    if enabled && (name == "libx264" || name == "h264_nvenc") {
+        fps.max(1)
+    } else {
+        0
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn encoder_name(kind: EncoderKind, codec: VideoCodec) -> String {
     let prefix = if codec == VideoCodec::H265 {
@@ -1420,6 +1450,7 @@ pub(super) fn encoder(
     let mut last = None;
     for choice in choices {
         let name = encoder_name(choice, format.codec);
+        let intra_refresh = intra_refresh_frames(&name, fps);
         let config = Config {
             encoder: true,
             gpu_input: zero_copy.is_some()
@@ -1432,6 +1463,7 @@ pub(super) fn encoder(
             // The callback forces IDRs at the session interval (see State::
             // key_interval); this is only a ceiling the encoder never reaches.
             gop: fps.saturating_mul(10).max(1),
+            intra_refresh,
             ..config("", format, 1)
         };
         if let Some(cached) = &cached {
@@ -1726,8 +1758,13 @@ fn start(
                         return Ok(());
                     }
                     encode_failures = 0;
+                    let refresh = codec.config.intra_refresh > 0;
                     for packet in packets {
-                        if packet.key {
+                        // With intra refresh, encoders flag refresh starts as key
+                        // frames too; only IDRs start a group a decoder can join.
+                        let key = packet.key
+                            && (!refresh || crate::protocol::annexb_keyframe(format.codec, &packet.bytes));
+                        if key {
                             since_key = 1;
                         }
                         let elapsed = packet
@@ -1736,7 +1773,7 @@ fn start(
                             .map(|at| at.elapsed());
                         let captured_at = packet.pts.and_then(|pts| captured.remove(&pts));
                         let capture = captured_at.map(|at| at.elapsed());
-                        metrics.record_packet(packet.bytes.len(), packet.key);
+                        metrics.record_packet(packet.bytes.len(), key);
                         metrics.encode_us.store(
                             elapsed.map_or(0, |elapsed| elapsed.as_micros().max(1) as u64),
                             Ordering::Relaxed,
@@ -1748,7 +1785,7 @@ fn start(
                             totals.2 += 1;
                             totals.3 += capture.unwrap_or(elapsed).as_micros() as u64;
                         }
-                        if packet.key {
+                        if key {
                             if let Some(mut old) = group.take() {
                                 let _ = old.finish();
                             }
