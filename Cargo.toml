@@ -29,6 +29,8 @@ rpassword = "7"
 zeroize = "1"
 libloading = "0.8"
 libc = "0.2"
+# Self-signed identities for hosts and `teleport relay` (all platforms).
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 moq-net = "=0.2.20"
 moq-native = { version = "=0.19.17", default-features = false, features = ["quinn", "ring"] }
 bytes = "1"
@@ -46,7 +48,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 ashpd = { version = "0.11", default-features = false, features = ["tokio"] }
 x11rb = { version = "0.13", features = ["xtest", "randr", "xfixes"] }
-rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.3"

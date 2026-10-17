@@ -34,6 +34,7 @@ pub fn read_pem(path: &Path, label: &str) -> Result<Vec<u8>> {
     Ok(base64::engine::general_purpose::STANDARD.decode(encoded)?)
 }
 
+#[cfg(target_os = "linux")]
 impl Identity {
     /// The host identity used to authenticate relayed sessions end to end.
     pub fn e2e(&self) -> Result<crate::e2e::HostIdentity> {
