@@ -574,7 +574,9 @@ fn auto_route_falls_back_to_the_relay_and_presence_follows_the_host() {
     assert!(stdout.contains("end-to-end encrypted relay session established"));
     assert!(started.elapsed() < Duration::from_secs(40));
 
-    // A reachable direct address wins.
+    // A reachable host is never reached through the relay. The direct
+    // address and peer-to-peer are tried at once, and on loopback either may
+    // connect first; both are direct UDP paths.
     let output = auto_client(&setup, &setup.host_address);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -583,7 +585,8 @@ fn auto_route_falls_back_to_the_relay_and_presence_follows_the_host() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        stdout.contains("connection path chosen: direct"),
+        stdout.contains("connection path chosen: direct")
+            || stdout.contains("connection path chosen: p2p"),
         "{stdout}"
     );
     assert!(!stdout.contains("relay session established"), "{stdout}");
