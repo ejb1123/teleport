@@ -9,6 +9,9 @@ Capture is off by default and is not persisted across reconnects.
   **Ctrl+Alt+End** is secure attention (Teleport's Ctrl+Alt+Del): it locks
   the host session, or shows its unlock prompt when locked
   ([wake and unattended start](wake-and-unattended.md)).
+  **Ctrl+Alt+S** saves snapshots (BMP, in Downloads): the window as drawn
+  and the next decoded video frame unscaled, for reporting rendering
+  artefacts ([UX audit](ux-audit.md)).
 - While bound, ordinary keys including Alt+Tab, Super and F8 are forwarded
   when the local OS delivers them. Use the **Stats** button for local statistics.
 - Keyboard capture follows focus between the session's monitor windows; it

@@ -2310,6 +2310,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut switch_ack = false;
     let mut first_draw = true;
     let mut show_stats = options.stats;
+    // Ctrl+Alt+S: images of the window and of the next decoded frame.
+    let mut snapshot_request = Snapshot::default();
+    // Test hook: open F8 and take the Ctrl+Alt+S snapshots once this many
+    // frames are shown (rendering checks without key injection).
+    let mut snapshot_after: Option<u64> = std::env::var("TELEPORT_SNAPSHOT_AFTER_FRAMES")
+        .ok()
+        .and_then(|frames| frames.parse().ok());
+    // Overlay layers drawn in the last presented frame (F8 diagnostics).
+    let mut last_layers = String::new();
     let mut fps = 0.0;
     let mut mbps = 0.0;
     let mut previous_bytes = 0;
@@ -2372,6 +2381,11 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     // How long the frame drawn next waited in the pacer.
     let mut frame_held = Duration::ZERO;
     'running: loop {
+        if snapshot_after.is_some_and(|after| total_frames as u64 >= after) {
+            snapshot_after = None;
+            snapshot_request = Snapshot::requested();
+            show_stats = true;
+        }
         present_timer.iterations += 1;
         WAKE_QUEUED.store(false, Ordering::Release);
         let mut redraw = first_draw || deferred_redraw;
@@ -2748,6 +2762,10 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         };
                         guest_panel.notice(notice.clone(), Instant::now());
                     }
+                    Action::Snapshot => {
+                        snapshot_request = Snapshot::requested();
+                        notice = "Saving snapshots (window now, video at the next frame)…".into();
+                    }
                     Action::Swallow => (),
                 }
                 continue;
@@ -3111,6 +3129,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             frame_latency = frame.latency;
             present_timer.picked_up(frame.decoded_at);
             protocol::validate_video_size(frame.width, frame.height)?;
+            if snapshot_request.video {
+                snapshot_request.video = false;
+                notice = match save_video_snapshot(&frame) {
+                    Ok(Some(path)) => format!("Video frame saved: {}", path.display()),
+                    Ok(None) => "Video stays on the GPU here; only the window was saved".into(),
+                    Err(error) => format!("Video snapshot failed: {error:#}"),
+                };
+                tracing::info!(%notice, "snapshot");
+            }
             'frame: {
                 if let Some(gpu) = frame.gpu.take() {
                     // Zero-copy: keep the decoded surface; it is drawn on the GPU below.
@@ -3229,6 +3256,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             continue;
         }
         deferred_redraw = false;
+        let mut layers: Vec<&str> = Vec::new();
         let window_size = canvas.window().size();
         canvas.set_logical_size(window_size.0.max(1), window_size.1.max(TOOLBAR_HEIGHT + 1))?;
         canvas.set_draw_color(sdl2::pixels::Color::RGB(12, 15, 20));
@@ -3237,6 +3265,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             canvas
                 .copy(texture, None, chrome.rect(window_size, size))
                 .map_err(anyhow::Error::msg)?;
+            layers.push("video (SDL texture)");
         }
         #[cfg(target_os = "linux")]
         if let (Some(presenter), Some(frame)) = (zero_copy.as_mut(), gpu_frame.as_ref())
@@ -3250,6 +3279,13 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             );
             ZERO_COPY_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
             return Ok(true);
+        }
+        #[cfg(target_os = "linux")]
+        if zero_copy.is_some() && gpu_frame.is_some() {
+            layers.push("video (zero-copy GL)");
+        }
+        if hdr_presenter.is_some() && hdr_frame.is_some() {
+            layers.push("video (Metal layer; UI composited on it)");
         }
         if stats.elapsed() >= Duration::from_secs(1) || stats_lines.is_empty() {
             let snapshot = stream_stats.snapshot();
@@ -3467,6 +3503,30 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                     }
                 ),
                 {
+                    // HiDPI diagnostics: points, GL drawable, renderer output.
+                    let window = canvas.window().size();
+                    let drawable = canvas.window().drawable_size();
+                    let output = canvas.output_size().unwrap_or((0, 0));
+                    format!(
+                        "Window                {}x{} pt | drawable {}x{} | output {}x{} ({:.2}x)",
+                        window.0,
+                        window.1,
+                        drawable.0,
+                        drawable.1,
+                        output.0,
+                        output.1,
+                        f64::from(output.0) / f64::from(window.0.max(1))
+                    )
+                },
+                format!(
+                    "Layers (last frame)   {}",
+                    if last_layers.is_empty() {
+                        "none"
+                    } else {
+                        &last_layers
+                    }
+                ),
+                {
                     let (_, deviation, _) = pace.frame_time_us();
                     let detail = if pacer.mode() != options.pacing {
                         " (smooth needs an updated host)".to_owned()
@@ -3602,6 +3662,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         }
         use sdl2::pixels::Color;
         if chrome.visible() {
+            layers.push("toolbar");
             canvas.set_draw_color(Color::RGB(21, 27, 38));
             canvas
                 .fill_rect(Rect::new(0, 0, window_size.0, TOOLBAR_HEIGHT))
@@ -3761,6 +3822,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             )?;
         } else {
             canvas.set_draw_color(Color::RGB(99, 218, 193));
+            layers.push("reveal strip");
             canvas
                 .fill_rect(reveal_rect(window_size.0))
                 .map_err(anyhow::Error::msg)?;
@@ -3779,6 +3841,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 stats_lines.len() as u32 * 24 + 28 + GRAPH_HEIGHT,
             );
             stats_panel = Some(panel);
+            layers.push("F8 stats");
             canvas.set_draw_color(Color::RGB(16, 23, 33));
             canvas.fill_rect(panel).map_err(anyhow::Error::msg)?;
             canvas.set_draw_color(Color::RGB(67, 103, 114));
@@ -3855,6 +3918,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 shown.len() as u32 * 26 + 8,
             );
             warning_panel = Some(panel);
+            layers.push("warnings");
             canvas.set_draw_color(Color::RGB(48, 26, 18));
             canvas.fill_rect(panel).map_err(anyhow::Error::msg)?;
             canvas.set_draw_color(Color::RGB(214, 128, 60));
@@ -3894,6 +3958,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 guest_lines.len() as u32 * 26 + 8,
             );
             guest_rect = Some(panel);
+            layers.push("guest/notice panel");
             canvas.set_draw_color(Color::RGB(16, 30, 50));
             canvas.fill_rect(panel).map_err(anyhow::Error::msg)?;
             canvas.set_draw_color(Color::RGB(88, 160, 232));
@@ -3915,6 +3980,22 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                 )?;
             }
         }
+        if snapshot_request.window {
+            snapshot_request.window = false;
+            notice = match save_window_snapshot(&mut canvas) {
+                Ok(path) => format!(
+                    "Window saved ({}x{} pt, {}x{} px): {}",
+                    window_size.0,
+                    window_size.1,
+                    canvas.output_size().unwrap_or_default().0,
+                    canvas.output_size().unwrap_or_default().1,
+                    path.display()
+                ),
+                Err(error) => format!("Window snapshot failed: {error:#}"),
+            };
+            tracing::info!(%notice, "snapshot");
+        }
+        last_layers = layers.join(", ");
         if let (Some(presenter), Some(frame)) = (&mut hdr_presenter, &hdr_frame) {
             let mut ui = vec![read_hdr_overlay(
                 &mut canvas,
@@ -4362,6 +4443,89 @@ fn reveal_rect(width: u32) -> Rect {
         width.clamp(1, 120),
         crate::fullscreen::REVEAL_HEIGHT,
     )
+}
+
+/// Ctrl+Alt+S: what to save next (docs/ux-audit.md, "Double overlapping
+/// text"). Comparing the window with the unscaled decoded frame tells a
+/// host/encoder artefact from a client presentation one.
+#[derive(Default)]
+struct Snapshot {
+    window: bool,
+    video: bool,
+}
+
+impl Snapshot {
+    fn requested() -> Self {
+        Self {
+            window: true,
+            video: true,
+        }
+    }
+}
+
+/// `~/Downloads/teleport-<time>-<kind>.bmp`, else the temporary directory.
+fn snapshot_path(kind: &str) -> PathBuf {
+    let directory = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Downloads"))
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(std::env::temp_dir);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |time| time.as_millis());
+    directory.join(format!("teleport-{stamp}-{kind}.bmp"))
+}
+
+fn save_bmp(path: &std::path::Path, width: u32, height: u32, rgb: &mut [u8]) -> Result<()> {
+    let surface =
+        sdl2::surface::Surface::from_data(rgb, width, height, width * 3, PixelFormatEnum::RGB24)
+            .map_err(anyhow::Error::msg)?;
+    surface.save_bmp(path).map_err(anyhow::Error::msg)
+}
+
+/// The decoded frame before any scaling; `None` when it never reaches the
+/// CPU (zero-copy, native Mac surfaces, HDR planes).
+fn save_video_snapshot(frame: &media::Image) -> Result<Option<PathBuf>> {
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    let mut rgb = vec![0_u8; width * height * 3];
+    if let Some(nv12) = &frame.nv12 {
+        // Luma only: enough to see doubled edges.
+        for row in 0..height {
+            let line = &nv12.y[row * nv12.y_stride..][..width];
+            for (pixel, &luma) in rgb[row * width * 3..][..width * 3]
+                .chunks_exact_mut(3)
+                .zip(line)
+            {
+                pixel.fill(luma);
+            }
+        }
+    } else if frame.gpu.is_none()
+        && frame.hdr.is_none()
+        && frame.surface.is_none()
+        && frame.data.len() >= frame.stride * height.saturating_sub(1) + width * 3
+    {
+        for row in 0..height {
+            rgb[row * width * 3..][..width * 3]
+                .copy_from_slice(&frame.data[row * frame.stride..][..width * 3]);
+        }
+    } else {
+        return Ok(None);
+    }
+    let path = snapshot_path("video");
+    save_bmp(&path, frame.width, frame.height, &mut rgb)?;
+    Ok(Some(path))
+}
+
+/// Everything the SDL renderer drew this frame, at drawable resolution.
+fn save_window_snapshot(canvas: &mut sdl2::render::Canvas<sdl2::video::Window>) -> Result<PathBuf> {
+    let logical = canvas.logical_size();
+    canvas.set_logical_size(0, 0)?;
+    let (width, height) = canvas.output_size().map_err(anyhow::Error::msg)?;
+    let pixels = canvas.read_pixels(None, PixelFormatEnum::RGB24);
+    canvas.set_logical_size(logical.0, logical.1)?;
+    let mut pixels = pixels.map_err(anyhow::Error::msg)?;
+    let path = snapshot_path("window");
+    save_bmp(&path, width, height, &mut pixels)?;
+    Ok(path)
 }
 
 struct HdrOverlayPixels {

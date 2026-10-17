@@ -76,6 +76,9 @@ pub enum Action {
     /// Ctrl+Alt+T: take keyboard and mouse control from guests, or give
     /// them the chance again (owners of shared sessions).
     TakeControl,
+    /// Ctrl+Alt+S: save what the window drew and the next decoded video
+    /// frame as images (diagnosing rendering artefacts).
+    Snapshot,
     Swallow,
 }
 
@@ -151,6 +154,7 @@ impl Shortcuts {
             (Keycode::Y, Action::AllowGuest),
             (Keycode::N, Action::DenyGuest),
             (Keycode::T, Action::TakeControl),
+            (Keycode::S, Action::Snapshot),
         ] {
             if key == chord_key && (self.guest_down == Some(key) || (down && chord)) {
                 let first = down && !repeat && self.guest_down != Some(key);
@@ -274,6 +278,7 @@ mod tests {
             (Keycode::Y, Action::AllowGuest),
             (Keycode::N, Action::DenyGuest),
             (Keycode::T, Action::TakeControl),
+            (Keycode::S, Action::Snapshot),
         ] {
             let mut shortcuts = Shortcuts::default();
             assert_eq!(
