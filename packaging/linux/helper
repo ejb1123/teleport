@@ -1,0 +1,6 @@
+#!/bin/sh
+# Runs a bundled helper program (clipboard tools, GStreamer's plugin scanner)
+# through the bundle's loader and the library path AppRun chose.
+here=$(dirname -- "$(readlink -f -- "$0")")
+root=${here%/usr/libexec/teleport*}
+exec "$root/usr/lib/@loader@" --library-path "${TELEPORT_LIBRARY_PATH:-$root/usr/lib:$root/usr/lib/libva:$root/usr/lib/fallback}" --argv0 "$0" "$root/usr/libexec/teleport/elf/@name@" "$@"

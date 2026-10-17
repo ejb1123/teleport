@@ -1,0 +1,115 @@
+#!/bin/sh
+# Launcher of the relocatable Linux bundle (AppImage, .deb, .rpm).
+#
+# Everything Teleport needs except the GPU driver userspace is in this
+# directory: glibc and its loader, GStreamer and its plugins, FFmpeg, SDL,
+# PipeWire's client library. The binaries are Nix builds, so they are started
+# through the bundled loader with an explicit library path rather than the
+# system's: the bundle comes first, then the system's driver directories
+# (NVIDIA, Mesa, VA-API, CUDA, oneVPL), which the bundle deliberately leaves
+# out. See docs/distribution.md, "GPU drivers in the relocatable bundle".
+set -eu
+
+here=$(dirname -- "$(readlink -f -- "$0")")
+lib="$here/usr/lib"
+
+# Driver directories, searched after the bundle. Explicit additions first,
+# then NixOS's driver link, the distribution's multiarch/lib64/lib
+# directories and whatever /etc/ld.so.conf.d adds (NVIDIA, CUDA, ...).
+path="$lib"
+add() {
+    case ":$path:" in
+    *":$1:"*) ;;
+    *) if [ -d "$1" ]; then path="$path:$1"; fi ;;
+    esac
+}
+old_ifs=$IFS
+IFS=:
+for directory in ${TELEPORT_DRIVER_PATH-}; do
+    IFS=$old_ifs
+    add "$directory"
+done
+IFS=$old_ifs
+add /run/opengl-driver/lib
+for directory in /usr/lib/@triple@ /lib/@triple@ /usr/lib64 /lib64 /usr/lib /lib; do
+    add "$directory"
+done
+for conf in /etc/ld.so.conf.d/*.conf; do
+    [ -r "$conf" ] || continue
+    while read -r directory _; do
+        case "$directory" in
+        /*) add "$directory" ;;
+        esac
+    done <"$conf"
+done
+for directory in /usr/local/cuda/lib64 /usr/lib/@triple@/nvidia/current; do
+    add "$directory"
+done
+# Last: GL dispatch and libgbm for systems without them (headless servers).
+add "$lib/fallback"
+
+# libva: the newer of the system's and the bundle's. VA drivers built for a
+# newer libva fail to load into an older one; FFmpeg needs the bundled one's
+# symbols. Versions come from the file name (libva.so.2.2300.0 is 2.23).
+va_version() {
+    version=${1##*/libva.so.2.}
+    version=${version%%.*}
+    case "$version" in
+    '' | *[!0-9]*) echo 0 ;;
+    *) echo "$version" ;;
+    esac
+}
+bundled_va=$(va_version "$(readlink -f "$lib/libva/libva.so.2")")
+system_va=0
+IFS=:
+for directory in ${path#"$lib":}; do
+    if [ -e "$directory/libva.so.2" ]; then
+        system_va=$(va_version "$(readlink -f "$directory/libva.so.2")")
+        break
+    fi
+done
+IFS=$old_ifs
+if [ "$system_va" -ge "$bundled_va" ]; then
+    path="$path:$lib/libva"
+else
+    path="$lib:$lib/libva${path#"$lib"}"
+fi
+# For the bundled helpers (packaging/linux/helper): GStreamer's plugin scanner.
+export TELEPORT_LIBRARY_PATH="$path"
+
+# VA-API drivers come from the system as well.
+if [ -z "${LIBVA_DRIVERS_PATH-}" ]; then
+    drivers=
+    for directory in /run/opengl-driver/lib/dri /usr/lib/@triple@/dri /usr/lib64/dri /usr/lib/dri; do
+        if [ -d "$directory" ]; then drivers="${drivers:+$drivers:}$directory"; fi
+    done
+    if [ -n "$drivers" ]; then export LIBVA_DRIVERS_PATH="$drivers"; fi
+fi
+
+# Child processes (the session started by the launcher, privacy guard) start
+# through this script, or through the AppImage itself so that they outlive
+# the launcher's mount.
+if [ -n "${APPIMAGE-}" ] && [ "${APPDIR-}" = "$here" ] && [ -f "$APPIMAGE" ]; then
+    export TELEPORT_SELF_EXE="$APPIMAGE"
+else
+    export TELEPORT_SELF_EXE="$here/AppRun"
+fi
+
+# Only bundled plugins: system plugins are built against other libraries.
+export GST_PLUGIN_SYSTEM_PATH_1_0="$lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER_1_0="$here/usr/libexec/teleport/gst-plugin-scanner"
+export GST_REGISTRY="${GST_REGISTRY:-${XDG_CACHE_HOME:-$HOME/.cache}/teleport/bundle-@id@-registry.bin}"
+export SPA_PLUGIN_DIR="$lib/spa-0.2"
+export PIPEWIRE_MODULE_DIR="$lib/pipewire-0.3"
+export PIPEWIRE_CONFIG_DIR="${PIPEWIRE_CONFIG_DIR:-$here/usr/share/pipewire}"
+export FONTCONFIG_FILE="$here/usr/share/teleport/fonts.conf"
+export TELEPORT_FONT="$here/usr/share/fonts/truetype/DejaVuSans.ttf"
+export TELEPORT_LIBFIDO2="$lib/libfido2.so.1"
+export TELEPORT_PACKAGED=1
+export PATH="$here/usr/libexec/teleport/bin:$PATH"
+# A system SDL or preloaded library would mix with the bundled glibc.
+unset SDL_DYNAMIC_API SDL3_DYNAMIC_API LD_PRELOAD
+
+# --library-path applies to this process only: LD_LIBRARY_PATH would leak the
+# bundled glibc into system programs Teleport starts (kscreen-doctor).
+exec "$lib/@loader@" --library-path "$path" --argv0 teleport "$here/usr/bin/teleport" "$@"

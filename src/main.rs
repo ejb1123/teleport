@@ -59,6 +59,17 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::io::IsTerminal;
 
+/// The executable to start Teleport child processes (sessions, guards,
+/// settings) with. Relocatable packages such as the AppImage run the binary
+/// through a bundled dynamic loader, so `current_exe` is that loader; their
+/// launcher names itself in `TELEPORT_SELF_EXE` instead.
+pub(crate) fn self_exe() -> std::io::Result<std::path::PathBuf> {
+    match std::env::var_os("TELEPORT_SELF_EXE") {
+        Some(path) if !path.is_empty() => Ok(path.into()),
+        _ => std::env::current_exe(),
+    }
+}
+
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -232,7 +243,7 @@ fn main() -> Result<()> {
             let data = zeroize::Zeroizing::new(serde_json::to_vec(&pairing)?);
             credential.write_all(&data)?;
             credential.flush()?;
-            let mut child = std::process::Command::new(std::env::current_exe()?);
+            let mut child = std::process::Command::new(crate::self_exe()?);
             child
                 .arg("client")
                 .arg(address)

@@ -197,7 +197,7 @@ impl Privacy {
             heartbeat: None,
             restored: false,
         };
-        let mut guard = tokio::process::Command::new(std::env::current_exe()?)
+        let mut guard = tokio::process::Command::new(crate::self_exe()?)
             .arg("privacy-guard")
             .arg("--state")
             .arg(&privacy.path)
