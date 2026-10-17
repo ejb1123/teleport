@@ -2483,9 +2483,10 @@ mod tests {
     #[test]
     fn every_setting_is_on_one_tab_above_the_status_panel() {
         use super::{SETTINGS_TABS, setting_rect, settings_tab_rect};
-        let mut seen = vec![0; 22];
+        let mut seen = vec![0; super::PREF_BUTTONS];
         for (tab, (_, settings)) in SETTINGS_TABS.iter().enumerate() {
-            assert!(settings.len() <= 6, "tab {tab} is crowded");
+            // Three rows of three at most: the third ends at y 624.
+            assert!(settings.len() <= 9, "tab {tab} is crowded");
             let tab_rect = settings_tab_rect(tab);
             assert!(tab_rect.right() <= 1016);
             for &index in *settings {
