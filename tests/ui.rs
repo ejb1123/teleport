@@ -1440,6 +1440,9 @@ fn windowed_presentation_latency() {
             "--software-decoder",
             "--exit-after-frames",
             &frames,
+            // G4: `smooth` to time the jitter buffer windowed.
+            "--pacing",
+            &std::env::var("TELEPORT_TEST_PACING").unwrap_or_else(|_| "latency".into()),
             "--pairing-file",
         ])
         .arg(&pairing)
@@ -1461,6 +1464,12 @@ fn windowed_presentation_latency() {
         .find(|line| line.contains("end-to-end latency summary"))
         .unwrap_or_else(|| panic!("no end-to-end summary:\n{log}"));
     println!("{end_to_end}");
+    if let Some(pacing) = log
+        .lines()
+        .find(|line| line.contains("frame pacing summary"))
+    {
+        println!("{pacing}");
+    }
     drop(host);
 }
 

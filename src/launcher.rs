@@ -460,6 +460,8 @@ pub fn run() -> Result<()> {
     let mut mute = false;
     // On-screen network, decoder and host warnings (`--no-warnings` when off).
     let mut overlay_warnings = true;
+    // Frame pacing: lowest latency (default) or smooth (`--pacing smooth`).
+    let mut smooth_pacing = false;
     let mut agent_consent = AgentConsent::default();
     let mut relay_url = String::new();
     let mut relay_pin = String::new();
@@ -1005,6 +1007,9 @@ pub fn run() -> Result<()> {
                                 if hit(pref_rect(12), x, y) {
                                     overlay_warnings = !overlay_warnings;
                                 }
+                                if hit(pref_rect(13), x, y) {
+                                    smooth_pacing = !smooth_pacing;
+                                }
                                 if hit(pref_rect(3), x, y) {
                                     codec = (codec + 1) % CODECS.len();
                                     if CODECS[codec].1 != "h265" {
@@ -1175,6 +1180,9 @@ pub fn run() -> Result<()> {
                         }
                         if !overlay_warnings {
                             command.arg("--no-warnings");
+                        }
+                        if smooth_pacing {
+                            command.args(["--pacing", "smooth"]);
                         }
                         // A Linux-password sign-in yields a single-use ticket
                         // (kept in the ephemeral directory): retrying it after a
@@ -1642,6 +1650,11 @@ pub fn run() -> Result<()> {
                                 "Warnings on"
                             } else {
                                 "Warnings off"
+                            },
+                            if smooth_pacing {
+                                "Pacing: smooth"
+                            } else {
+                                "Pacing: lowest latency"
                             },
                         ];
                         for (index, label) in labels.into_iter().enumerate() {

@@ -29,6 +29,7 @@ mod media;
 mod natpmp;
 mod overlay;
 mod p2p;
+mod pacing;
 mod pairing;
 mod presence;
 mod profiles;

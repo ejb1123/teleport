@@ -102,6 +102,11 @@ struct Outcome {
     flash_p95_us: u64,
     /// Session warnings the client raised (G22), as logged.
     warnings: Vec<String>,
+    /// G4: present-to-present mean, standard deviation and p95, and the
+    /// time frames waited in the pacer (p50, p95), µs.
+    frame_time: (u64, u64, u64),
+    paced_held: (u64, u64),
+    paced_late: u64,
 }
 
 const E2E_STAGES: [&str; 6] = [
@@ -294,6 +299,13 @@ sleep 1.5
         flash_presses: field("flash_presses"),
         flash_p50_us: field("flash_p50_us"),
         flash_p95_us: field("flash_p95_us"),
+        frame_time: (
+            field("frame_time_mean_us"),
+            field("frame_time_sd_us"),
+            field("frame_time_p95_us"),
+        ),
+        paced_held: (field("paced_held_p50_us"), field("paced_held_p95_us")),
+        paced_late: field("paced_late"),
         warnings: stdout
             .lines()
             .filter(|line| line.contains("session warning"))
@@ -375,6 +387,23 @@ sleep 1.5
         } else {
             outcome.warnings.join(" | ")
         }
+    );
+    println!(
+        "PACE    {:<10} {} frame_time_ms={:.2} sd_ms={:.2} p95_ms={:.2} held_ms={:.1}/{:.1} late={} total_ms={:.1}/{:.1}",
+        profile.name,
+        if profile.client_args.contains("smooth") {
+            "smooth"
+        } else {
+            "latency"
+        },
+        outcome.frame_time.0 as f64 / 1000.0,
+        outcome.frame_time.1 as f64 / 1000.0,
+        outcome.frame_time.2 as f64 / 1000.0,
+        outcome.paced_held.0 as f64 / 1000.0,
+        outcome.paced_held.1 as f64 / 1000.0,
+        outcome.paced_late,
+        ms(outcome.e2e[5].0),
+        ms(outcome.e2e[5].1),
     );
     if profile.flash {
         println!(
@@ -645,15 +674,35 @@ fn capped_link_with_random_loss() {
 #[test]
 #[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
 fn wifi_like_link() {
+    let outcome = run(&WIFI);
+    assert!(outcome.fps() >= 20.0, "{outcome:?}");
+}
+
+const WIFI: Profile = Profile {
+    name: "wifi",
+    netem: "delay 5ms 5ms distribution paretonormal rate 25mbit limit 300 slot 2ms 12ms loss 0.5%",
+    capacity: Some(25_000),
+    bitrate: 8_000,
+    width: 1280,
+    ..LONG
+};
+
+/// G4: smooth pacing on the Wi-Fi-like link. Frames wait in a bounded
+/// buffer (at most 3 frames, 50 ms) and come out at a steadier cadence than
+/// `wifi_like_link`'s present-on-arrival (compare their PACE lines).
+#[test]
+#[ignore = "requires unprivileged user/network namespaces, iproute2 and GStreamer plugins"]
+fn wifi_like_link_with_smooth_pacing() {
     let outcome = run(&Profile {
-        name: "wifi",
-        netem: "delay 5ms 5ms distribution paretonormal rate 25mbit limit 300 slot 2ms 12ms loss 0.5%",
-        capacity: Some(25_000),
-        bitrate: 8_000,
-        width: 1280,
-        ..LONG
+        name: "wifi_smooth",
+        client_args: "--pacing smooth",
+        ..WIFI
     });
     assert!(outcome.fps() >= 20.0, "{outcome:?}");
+    assert!(outcome.paced_held.1 <= 51_000, "{outcome:?}");
+    // At 30 fps frames are 33 ms apart; smoothed, 95% come within a few ms
+    // of that (present-on-arrival: ~54 ms). Late frames still jump.
+    assert!(outcome.frame_time.2 < 40_000, "{outcome:?}");
 }
 
 /// A 400 ms loss burst (a Wi-Fi roam or a microwave) on an otherwise clean
