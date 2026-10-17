@@ -143,14 +143,14 @@ requirement. Both endpoints must run application protocol version 2.
 | Video codecs / GPU | H.264/H.265 selection; actual NVIDIA and software encode/decode; live bitrate changes; verified frame generations | VA hardware validation; physical Mac VideoToolbox acceptance; zero-copy capture/rendering |
 | Adaptive quality | Bounded bitrate decrease/recovery based on receive backlog/skipped groups; fixed-bitrate override | Controlled WAN/congestion measurement, resolution/FPS adaptation, full bandwidth estimation |
 | Audio and clipboard | Opt-in monitor-source Opus, mute, headless network PCM proof; explicit Unicode text roundtrip using isolated X11 clipboard | Real Mac output/device-change and Wayland clipboard acceptance; precise A/V synchronization; file transfer |
-| Distribution | Reproducible Nix package, Linux desktop entry, Nix-dependent Mac `.app`, CI and manual closure artifacts | Portable Mac dependency bundle, Developer-ID signing/notarization, clean-machine installer tests |
+| Distribution | Reproducible Nix package, Linux desktop entry; AppImage, .deb/.rpm (systemd user unit, udev rules) and client Flatpak tested in stock distribution containers; Mac `.app` bundling/signing/notarisation script and release workflow (docs/distribution.md) | A run of the Mac script on a Mac with a Developer ID; real desktops of other distributions; NVIDIA/AMD outside NixOS; package signing and hosting |
 | Multi-monitor | Authorized portal streams, X11 RandR regions, switching/correct coordinate origins; synthetic landscape/portrait and toolbar tests | Physical mixed-scale monitors; hotplug (currently restart host) |
 | Unattended sessions | Stable private host identity, portal restore tokens, activated NixOS graphical-session user service; KDE Wayland restoration across service restart; user-confirmed remote unlock and reconnect while locked | Other compositors and logout/reboot acceptance; login-screen/pre-login access is not implemented |
 
-The signed standalone Mac distribution needs Apple Developer signing/notarization
-setup, but credentials alone are not the whole task: the portable dependency
-bundle and clean-machine testing still need implementation. Never commit signing
-keys, pairing credentials or portal tokens.
+The signed standalone Mac app (`tools/macos-app.sh`) needs a Mac, an Apple
+Developer ID and notary credentials to run, then clean-machine testing. Signing
+secrets belong in the CI secret store (docs/distribution.md, "Release
+artifacts"). Never commit signing keys, pairing credentials or portal tokens.
 
 Wayland permission persistence is a request to the compositor, not a guarantee.
 The combined capture/control session uses RemoteDesktop's restoration mechanism,

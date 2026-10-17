@@ -664,7 +664,7 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Stats overlay | Rich, plus graph and warnings | Rich F8 with end-to-end stages, graph and warnings (2026-10-17) | Parity | G22 |
 | Published latency numbers | "7 ms LAN", "4–8 ms at 240 FPS" | Measured capture→present per stage in F8 (2026-10-17); no glass-to-glass number yet | Partial | G3 |
 | Teams / SSO / audit / API | Yes | No | Not a gamer gap | |
-| Installers | Signed Windows/macOS/deb/APK | Nix only | **Missing** | |
+| Installers | Signed Windows/macOS/deb/APK | AppImage, .deb/.rpm, client Flatpak built and tested in distribution containers; signed, notarised Mac `.app` script untested on a Mac; no Windows, nothing published (2026-10-17) | Partial | G25 |
 
 ---
 
@@ -1227,6 +1227,27 @@ each.**
 - **Why:** Parsec is a one-click install. Teleport requires Nix
   (docs/distribution.md). This is the biggest adoption barrier after
   platform reach, and it is not a feature.
+- **Status (2026-10-17): Linux done, Mac written but not run** (review
+  tracker R21, docs/distribution.md). One relocatable bundle from the flake
+  (`nix/bundle.nix`: the Nix binary started through its bundled glibc
+  loader, GStreamer, FFmpeg, SDL, PipeWire client; GPU drivers from the
+  system, libglvnd/libgbm as fallbacks after the system's, libva whichever is
+  newer) is packaged as an AppImage (`nix build .#appimage`, 129 MB) and as a
+  .deb and .rpm (nfpm, 158 MB each) that add the systemd user unit, the
+  uinput/uhid udev rules, module loading, the UDP sysctl and the portal's
+  `dev.teleport.Host` entry. Doctor and a loopback session pass in stock
+  Ubuntu 22.04/24.04, Debian 13 and Fedora 43 containers; VA-API decoding
+  through Ubuntu's Intel driver and a windowed client on Ubuntu's Mesa work.
+  The client Flatpak (`packaging/flatpak/`, Freedesktop 26.08) builds from
+  source with flatpak-builder; doctor and a loopback session pass in the
+  sandbox (NVIDIA decoding through Flatpak's GL extension). The host stays
+  native or Nix (portals, uinput/uhid). Mac:
+  `tools/macos-app.sh` bundles the dylib closure into `Teleport.app`, signs
+  with the hardened runtime, notarises and staples, and
+  `.github/workflows/release.yml` runs it on a macOS runner with signing
+  secrets; neither has run (no Mac). Open: a run on a real Mac with a
+  Developer ID, real desktops of other distributions, NVIDIA/AMD outside
+  NixOS, Linux package signing and a place to publish, Windows.
 
 **G26. Android, iOS/tvOS and browser clients. Effort L each.**
 
