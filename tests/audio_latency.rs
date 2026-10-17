@@ -473,6 +473,21 @@ fn logs(directory: &std::path::Path) -> String {
 #[test]
 #[ignore = "requires a PipeWire session (pw-cli), Xvfb, UDP and GStreamer plugins; prints timings"]
 fn audio_end_to_end_latency() {
+    desktop_audio("AUDIO", "");
+}
+
+/// G21: uncompressed PCM against Opus over the same link, interleaved.
+#[test]
+#[ignore = "requires a PipeWire session (pw-cli), Xvfb, UDP and GStreamer plugins; prints timings"]
+fn pcm_and_opus_end_to_end_latency() {
+    for _ in 0..2 {
+        desktop_audio("OPUS", "--audio-format opus");
+        desktop_audio("PCM", "--audio-format pcm");
+    }
+}
+
+/// Desktop audio from a host null sink to a windowed client's null sink.
+fn desktop_audio(label: &str, client_args: &str) {
     gst::init().unwrap();
     let tag = std::process::id();
     let source = NullSink::new(format!("teleport_latency_source_{tag}"));
@@ -487,7 +502,7 @@ fn audio_end_to_end_latency() {
             &display,
             &netem,
             &format!("--audio-source {}.monitor", source.name),
-            "",
+            client_args,
             &output.name,
         )
     });
@@ -525,7 +540,7 @@ fn audio_end_to_end_latency() {
         .unwrap_or(u64::MAX)
         .saturating_add(1_000_000_000);
     println!("(source dropouts {})", dropouts(&recorded[0], from));
-    report("AUDIO", &netem, &delays, ticks, gaps);
+    report(label, &netem, &delays, ticks, gaps);
 }
 
 /// The host's virtual microphone nodes (`src/virtual_mic.rs`).

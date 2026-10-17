@@ -247,7 +247,10 @@ then add `--audio-source YOUR_OUTPUT.monitor` to the host command. Never choose
 a microphone: only explicit `.monitor` names are accepted. Audio uses low-delay
 Opus and the client's audio output; use **Audio** or `--mute` to mute playback.
 There is no tight A/V sync guarantee. `--audio-source test` generates a
-diagnostic tone.
+diagnostic tone. `--audio-bitrate` (64–510 kbit/s Opus, default 128) and
+`--audio-format pcm` (uncompressed, ~1.5 Mbit/s, for fast clean links) set
+the quality, on the host as a default and on the client (or the launcher's
+**Audio:** button) per session.
 
 Microphone passthrough is opt-in on both ends: start the host with
 `--microphone` (PipeWire) and the client with `--mic` (or the launcher's

@@ -58,6 +58,82 @@ impl EncoderPreset {
     }
 }
 
+/// Desktop audio encoding (parsec-comparison G21).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioFormat {
+    /// 10 ms Opus packets at the chosen bitrate.
+    #[default]
+    Opus,
+    /// Uncompressed 48 kHz stereo S16LE, ~1.5 Mbit/s, for unconstrained links
+    /// (Parsec's `network_raw_audio`): [`PCM_FRAME_BYTES`] per group.
+    Pcm,
+}
+
+impl AudioFormat {
+    /// The host track carrying this format.
+    pub fn track(self) -> &'static str {
+        match self {
+            Self::Opus => "opus",
+            Self::Pcm => "pcm",
+        }
+    }
+}
+
+/// Opus bitrates offered, in kbit/s (510 is Opus's maximum).
+pub const AUDIO_BITRATES: [u32; 6] = [64, 96, 128, 192, 256, 510];
+pub const DEFAULT_AUDIO_BITRATE: u32 = 128;
+/// One 10 ms PCM frame: 480 samples × 2 channels × 2 bytes.
+pub const PCM_FRAME_BYTES: usize = 480 * 2 * 2;
+/// The PCM payload rate, kbit/s.
+pub const PCM_KBPS: u32 = 48_000 * 2 * 16 / 1000;
+
+/// `--audio-bitrate`: one of [`AUDIO_BITRATES`].
+pub fn parse_audio_bitrate(value: &str) -> Result<u32, String> {
+    value
+        .parse()
+        .ok()
+        .filter(|kbps| AUDIO_BITRATES.contains(kbps))
+        .ok_or_else(|| format!("expected one of {AUDIO_BITRATES:?} (kbit/s)"))
+}
+
+/// A session's desktop audio: Opus at `bitrate` kbit/s, or PCM.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioSettings {
+    pub format: AudioFormat,
+    /// Opus bitrate in kbit/s, one of [`AUDIO_BITRATES`]; unused for PCM.
+    pub bitrate: u32,
+}
+
+impl Default for AudioSettings {
+    fn default() -> Self {
+        Self {
+            format: AudioFormat::Opus,
+            bitrate: DEFAULT_AUDIO_BITRATE,
+        }
+    }
+}
+
+impl AudioSettings {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            AUDIO_BITRATES.contains(&self.bitrate),
+            "unsupported audio bitrate"
+        );
+        Ok(())
+    }
+
+    pub fn label(&self) -> String {
+        match self.format {
+            AudioFormat::Opus => format!("Opus {} kbps", self.bitrate),
+            AudioFormat::Pcm => format!(
+                "PCM 48 kHz stereo ({:.1} Mbps)",
+                f64::from(PCM_KBPS) / 1000.0
+            ),
+        }
+    }
+}
+
 /// HDR10 here specifies PQ/BT.2020 limited-range 10-bit video, not mastering metadata.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
@@ -251,6 +327,13 @@ pub struct Desktop {
     /// and publishes [`MICROPHONE_TRACK`] (host `--microphone`).
     #[serde(default)]
     pub microphone: bool,
+    /// Host applies `SelectCodec::audio` (bitrate, PCM) and publishes both
+    /// audio tracks; older hosts send Opus at 128 kbit/s on `opus` only.
+    #[serde(default)]
+    pub audio_options: bool,
+    /// The host's desktop audio settings for clients that do not choose.
+    #[serde(default)]
+    pub audio_settings: AudioSettings,
 }
 
 /// A network step-down: the negotiated stream, and the bitrate that made the
@@ -642,6 +725,11 @@ pub enum Event {
         /// keeps the host's `--encoder-preset`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         encoder_preset: Option<EncoderPreset>,
+        /// Desktop audio for this session, only to hosts advertising
+        /// `Desktop::audio_options`; `None` (older clients) is Opus at the
+        /// host's bitrate.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audio: Option<AudioSettings>,
     },
     /// The client's display and stream choices; the host picks the stream
     /// size, rate and bitrate from them ([`negotiate`]) and answers with
@@ -805,6 +893,9 @@ impl Event {
                 "invalid gamepad slot or name"
             ),
             Self::ClientDisplay(display) => display.validate()?,
+            Self::SelectCodec {
+                audio: Some(audio), ..
+            } => audio.validate()?,
             Self::GamepadDisconnected { pad } => {
                 ensure!(*pad < MAX_GAMEPADS, "invalid gamepad slot")
             }
@@ -1504,6 +1595,7 @@ mod tests {
             Event::SelectCodec {
                 codec: VideoCodec::H265,
                 encoder_preset: None,
+                audio: None,
             }
         ));
         assert!(event.validate().is_ok() && !event.is_lossy());
@@ -1524,6 +1616,7 @@ mod tests {
         let chosen = Event::SelectCodec {
             codec: VideoCodec::H264,
             encoder_preset: Some(EncoderPreset::Quality),
+            audio: None,
         };
         let wire = serde_json::to_string(&chosen).unwrap();
         assert!(wire.contains(r#""encoder_preset":"quality""#), "{wire}");
@@ -1537,9 +1630,63 @@ mod tests {
         let plain = serde_json::to_string(&Event::SelectCodec {
             codec: VideoCodec::H264,
             encoder_preset: None,
+            audio: None,
         })
         .unwrap();
         assert!(!plain.contains("encoder_preset"), "{plain}");
+        assert!(!plain.contains("audio"), "{plain}");
+    }
+
+    #[test]
+    fn audio_settings_are_chosen_in_codec_selection_and_bounded() {
+        // Older hosts: Opus 128 on the "opus" track, no options.
+        let old: Desktop = serde_json::from_value(serde_json::json!({ "version": 2,
+            "width": 1, "height": 1, "fps": 1, "source": "test", "monitors": [],
+            "active_monitor": 0, "audio": true, "clipboard": false }))
+        .unwrap();
+        assert!(!old.audio_options);
+        assert_eq!(old.audio_settings, AudioSettings::default());
+        assert_eq!(old.audio_settings.format.track(), "opus");
+        let pcm = AudioSettings {
+            format: AudioFormat::Pcm,
+            bitrate: DEFAULT_AUDIO_BITRATE,
+        };
+        let chosen = Event::SelectCodec {
+            codec: VideoCodec::H264,
+            encoder_preset: None,
+            audio: Some(pcm),
+        };
+        let wire = serde_json::to_string(&chosen).unwrap();
+        assert!(
+            wire.contains(r#""audio":{"format":"pcm","bitrate":128}"#),
+            "{wire}"
+        );
+        let parsed: Event = serde_json::from_str(&wire).unwrap();
+        assert!(matches!(parsed, Event::SelectCodec { audio: Some(audio), .. } if audio == pcm));
+        assert!(parsed.validate().is_ok());
+        assert_eq!(pcm.format.track(), "pcm");
+        for bitrate in AUDIO_BITRATES {
+            assert_eq!(parse_audio_bitrate(&bitrate.to_string()), Ok(bitrate));
+        }
+        for bad in ["0", "100", "511", "x"] {
+            assert!(parse_audio_bitrate(bad).is_err());
+        }
+        let odd = Event::SelectCodec {
+            codec: VideoCodec::H264,
+            encoder_preset: None,
+            audio: Some(AudioSettings {
+                format: AudioFormat::Opus,
+                bitrate: 1000,
+            }),
+        };
+        assert!(odd.validate().is_err());
+        assert!(
+            serde_json::from_str::<AudioSettings>(r#"{"format":"flac","bitrate":128}"#).is_err()
+        );
+        // 10 ms of 48 kHz stereo S16, ~1.5 Mbit/s.
+        assert_eq!(PCM_FRAME_BYTES * 100 * 8 / 1000, PCM_KBPS as usize);
+        assert_eq!(pcm.label(), "PCM 48 kHz stereo (1.5 Mbps)");
+        assert_eq!(AudioSettings::default().label(), "Opus 128 kbps");
     }
     #[test]
     fn rumble_updates_are_bounded_and_declared_by_the_client() {

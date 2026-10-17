@@ -5,7 +5,7 @@
 //! way the same way: 10 ms voice-tuned Opus packets, one per MoQ group, played
 //! on the host with the same sequence-timed playout into a virtual source
 //! (`crate::virtual_mic`).
-use crate::media::Pipeline;
+use crate::{media::Pipeline, protocol::AudioFormat};
 use anyhow::{Context, Result, ensure};
 use gst::prelude::*;
 use gstreamer as gst;
@@ -18,11 +18,15 @@ use std::{
     time::Duration,
 };
 
-/// Desktop audio: 48 kHz stereo Opus (CELT, restricted low delay).
-const DESKTOP_CAPS: &str = "audio/x-opus,rate=48000,channels=2,channel-mapping-family=0";
+/// Desktop audio players: 48 kHz stereo Opus (CELT, restricted low delay)
+/// with PLC, or uncompressed PCM (G21); 10 ms per packet either way.
+const OPUS_INPUT: &str =
+    "audio/x-opus,rate=48000,channels=2,channel-mapping-family=0 ! opusdec name=opus plc=true";
+const PCM_INPUT: &str = "audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved";
 /// Microphone audio: 48 kHz mono Opus (voice mode, in-band FEC).
 #[cfg(target_os = "linux")]
-const MICROPHONE_CAPS: &str = "audio/x-opus,rate=48000,channels=1,channel-mapping-family=0";
+const MICROPHONE_INPUT: &str =
+    "audio/x-opus,rate=48000,channels=1,channel-mapping-family=0 ! opusdec name=opus plc=true";
 /// The echo probe in the desktop audio player that the microphone's echo
 /// canceller reads (`webrtcechoprobe`/`webrtcdsp` find each other by name
 /// within one process).
@@ -95,12 +99,26 @@ fn launch(description: &str) -> Result<Pipeline> {
     ))
 }
 
+/// Desktop audio capture: Opus at the session's bitrate, or PCM cut into
+/// 10 ms frames.
 #[cfg(target_os = "linux")]
-pub fn capture(source: &str, track: moq_net::track::Producer) -> Result<Pipeline> {
+pub fn capture(
+    source: &str,
+    settings: crate::protocol::AudioSettings,
+    track: moq_net::track::Producer,
+) -> Result<Pipeline> {
+    settings.validate()?;
     let source = capture_description(source)?;
+    let encode = match settings.format {
+        AudioFormat::Opus => format!(
+            "audio/x-raw,rate=48000,channels=2 ! opusenc bitrate={} frame-size=10 \
+             audio-type=restricted-lowdelay",
+            settings.bitrate * 1000
+        ),
+        AudioFormat::Pcm => PCM_INPUT.to_owned(),
+    };
     let pipeline = launch(&format!(
-        "{source} ! audioconvert ! audioresample ! audio/x-raw,rate=48000,channels=2 \
-        ! opusenc bitrate=128000 frame-size=10 audio-type=restricted-lowdelay \
+        "{source} ! audioconvert ! audioresample ! {encode} \
         ! appsink name=encoded_audio sync=false max-buffers=4 drop=false"
     ))?;
     let sink = pipeline
@@ -109,9 +127,65 @@ pub fn capture(source: &str, track: moq_net::track::Producer) -> Result<Pipeline
         .unwrap()
         .downcast::<AppSink>()
         .unwrap();
-    publish_packets(&sink, track, None);
+    match settings.format {
+        AudioFormat::Opus => publish_packets(&sink, track, None),
+        AudioFormat::Pcm => publish_pcm(&sink, track),
+    }
     pipeline.0.set_state(gst::State::Playing)?;
     Ok(pipeline)
+}
+
+/// Cuts captured PCM, whatever its buffer sizes, into 10 ms frames
+/// ([`crate::protocol::PCM_FRAME_BYTES`]), one per MoQ group as for Opus.
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct PcmFramer {
+    pending: Vec<u8>,
+}
+
+#[cfg(target_os = "linux")]
+impl PcmFramer {
+    fn push(&mut self, bytes: &[u8]) -> Vec<bytes::Bytes> {
+        const FRAME: usize = crate::protocol::PCM_FRAME_BYTES;
+        self.pending.extend_from_slice(bytes);
+        let whole = self.pending.len() / FRAME * FRAME;
+        let frames = self.pending[..whole]
+            .chunks_exact(FRAME)
+            .map(bytes::Bytes::copy_from_slice)
+            .collect();
+        self.pending.drain(..whole);
+        frames
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn publish_pcm(sink: &AppSink, mut track: moq_net::track::Producer) {
+    let mut framer = PcmFramer::default();
+    sink.set_callbacks(
+        gstreamer_app::AppSinkCallbacks::builder()
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                let bytes = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                for frame in framer.push(bytes.as_slice()) {
+                    let mut group = track.append_group().map_err(|_| gst::FlowError::Error)?;
+                    group
+                        .write_frame(moq_net::Timestamp::now(), frame)
+                        .map_err(|_| gst::FlowError::Error)?;
+                    group.finish().map_err(|_| gst::FlowError::Error)?;
+                }
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
+}
+
+/// The desktop audio player's input caps and decoder for `format`.
+fn player_input(format: AudioFormat) -> &'static str {
+    match format {
+        AudioFormat::Opus => OPUS_INPUT,
+        AudioFormat::Pcm => PCM_INPUT,
+    }
 }
 
 /// `--mic-device`: a PulseAudio/PipeWire source name, or `test` (a tone).
@@ -222,7 +296,7 @@ impl Microphone {
 
 /// The desktop audio player. `echo_probe` lets a microphone cancel what it
 /// plays (`Microphone::start` with echo cancellation).
-pub fn decoder(echo_probe: bool) -> Result<(Pipeline, AppSrc)> {
+pub fn decoder(echo_probe: bool, format: AudioFormat) -> Result<(Pipeline, AppSrc)> {
     // pulsesink defaults to a 200 ms buffer; 40 ms keeps 4 packets queued
     // and cut measured playout latency by ~40 ms (docs/review-2026-10.md, M8).
     let sink = if cfg!(target_os = "linux") && gst::ElementFactory::find("pulsesink").is_some() {
@@ -238,7 +312,7 @@ pub fn decoder(echo_probe: bool) -> Result<(Pipeline, AppSrc)> {
     } else {
         sink.to_owned()
     };
-    decoder_with_sink(DESKTOP_CAPS, &sink)
+    decoder_with_sink(player_input(format), &sink)
 }
 
 /// Play the client's microphone into the host's virtual microphone sink
@@ -248,7 +322,7 @@ pub fn decoder(echo_probe: bool) -> Result<(Pipeline, AppSrc)> {
 pub fn microphone_player(sink: &str) -> Result<(Pipeline, AppSrc)> {
     ensure!(valid_device_name(sink), "invalid virtual microphone sink");
     let (pipeline, source) = build_decoder(
-        MICROPHONE_CAPS,
+        MICROPHONE_INPUT,
         &format!(
             "audioconvert ! audio/x-raw,channels=2 ! pulsesink name=microphone_out device={sink} \
              buffer-time=40000 latency-time=10000"
@@ -266,14 +340,16 @@ pub fn microphone_player(sink: &str) -> Result<(Pipeline, AppSrc)> {
 }
 
 /// Decode without opening the client's audio device, while proving PCM delivery.
-pub fn decoder_for_headless() -> Result<(
+pub fn decoder_for_headless(
+    format: AudioFormat,
+) -> Result<(
     Pipeline,
     AppSrc,
     std::sync::Arc<std::sync::atomic::AtomicU64>,
 )> {
     use std::sync::atomic::AtomicU64;
     let (pipeline, source) = decoder_with_sink(
-        DESKTOP_CAPS,
+        player_input(format),
         "appsink name=audio_pcm sync=false max-buffers=4 drop=true",
     )?;
     let sink = pipeline
@@ -298,17 +374,18 @@ pub fn decoder_for_headless() -> Result<(
     Ok((pipeline, source, counter))
 }
 
-fn decoder_with_sink(caps: &str, sink: &str) -> Result<(Pipeline, AppSrc)> {
-    let (pipeline, source) = build_decoder(caps, sink)?;
+fn decoder_with_sink(input: &str, sink: &str) -> Result<(Pipeline, AppSrc)> {
+    let (pipeline, source) = build_decoder(input, sink)?;
     pipeline.0.set_state(gst::State::Playing)?;
     Ok((pipeline, source))
 }
 
-/// A stopped player for 10 ms Opus packets pushed by `receive`.
-fn build_decoder(caps: &str, sink: &str) -> Result<(Pipeline, AppSrc)> {
+/// A stopped player for the 10 ms packets `receive` pushes; `input` is
+/// their caps and decoder.
+fn build_decoder(input: &str, sink: &str) -> Result<(Pipeline, AppSrc)> {
     let pipeline = launch(&format!(
-        "appsrc name=audio_in is-live=true format=time max-bytes=65536 block=false caps={caps} \
-        ! opusdec name=opus plc=true ! audioconvert ! audioresample ! volume name=audio_volume \
+        "appsrc name=audio_in is-live=true format=time max-bytes=65536 block=false caps={input} \
+        ! audioconvert ! audioresample ! volume name=audio_volume \
         ! queue max-size-time=100000000 max-size-buffers=0 max-size-bytes=0 leaky=downstream ! {sink}"
     ))?;
     let source = pipeline
@@ -424,7 +501,11 @@ impl Timeline {
     }
 }
 
-pub async fn receive(mut track: moq_net::track::Subscriber, source: AppSrc) -> Result<()> {
+pub async fn receive(
+    mut track: moq_net::track::Subscriber,
+    source: AppSrc,
+    format: AudioFormat,
+) -> Result<()> {
     let mut sequence = None;
     let mut current: Option<moq_net::group::Consumer> = None;
     let mut timeline = Timeline::default();
@@ -439,6 +520,10 @@ pub async fn receive(mut track: moq_net::track::Subscriber, source: AppSrc) -> R
                 let Ok(Some((_, _, bytes))) = packet else {
                     continue;
                 };
+                // A malformed PCM frame is dropped and concealed like a lost one.
+                if format == AudioFormat::Pcm && bytes.len() != crate::protocol::PCM_FRAME_BYTES {
+                    continue;
+                }
                 ensure!(
                     source.current_level_bytes() < 65536,
                     "audio decoder is not keeping up"
@@ -456,7 +541,8 @@ pub async fn receive(mut track: moq_net::track::Subscriber, source: AppSrc) -> R
                             conceal,
                         } => {
                             if let Some((at, duration)) = conceal {
-                                // A GAP event (not a timestamp hole) makes opusdec run PLC.
+                                // A GAP event (not a timestamp hole) makes opusdec run PLC;
+                                // with PCM the sink plays silence.
                                 source.send_event(
                                     gst::event::Gap::builder(clock_time(at))
                                         .duration(clock_time(duration))
@@ -592,7 +678,7 @@ mod tests {
             .unwrap()
             .downcast::<AppSink>()
             .unwrap();
-        let (decoder, source) = decoder_with_sink(DESKTOP_CAPS, "appsink name=pcm sync=false")?;
+        let (decoder, source) = decoder_with_sink(OPUS_INPUT, "appsink name=pcm sync=false")?;
         encoder.0.set_state(gst::State::Playing)?;
         let mut index = 0;
         while let Some(sample) = packets.try_pull_sample(gst::ClockTime::from_seconds(2)) {
@@ -639,6 +725,60 @@ mod tests {
     }
 
     #[test]
+    fn pcm_is_cut_into_whole_10_ms_frames() {
+        const FRAME: usize = crate::protocol::PCM_FRAME_BYTES;
+        let mut framer = PcmFramer::default();
+        let audio: Vec<u8> = (0..FRAME * 3 + 100).map(|i| i as u8).collect();
+        // Capture buffers of any size: 1000 bytes, then the rest.
+        let mut frames = framer.push(&audio[..1000]);
+        assert!(frames.is_empty());
+        frames.extend(framer.push(&audio[1000..]));
+        assert_eq!(frames.len(), 3);
+        assert!(frames.iter().all(|frame| frame.len() == FRAME));
+        assert_eq!(frames.concat(), audio[..FRAME * 3]);
+        // The 100-byte remainder starts the next frame.
+        let next = framer.push(&audio[..FRAME - 100]);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0][..100], audio[FRAME * 3..]);
+    }
+
+    #[test]
+    #[ignore = "requires GStreamer plugins; run inside nix develop"]
+    fn pcm_frames_pass_the_player_around_a_gap() -> Result<()> {
+        gst::init()?;
+        let (decoder, source) = decoder_with_sink(PCM_INPUT, "appsink name=pcm sync=false")?;
+        let pcm = decoder
+            .0
+            .by_name("pcm")
+            .unwrap()
+            .downcast::<AppSink>()
+            .unwrap();
+        for index in 0..5_u32 {
+            let at = clock_time(PACKET * index);
+            if index == 2 {
+                source.send_event(
+                    gst::event::Gap::builder(at)
+                        .duration(clock_time(PACKET))
+                        .build(),
+                );
+                continue;
+            }
+            let mut frame = gst::Buffer::from_slice(vec![1_u8; crate::protocol::PCM_FRAME_BYTES]);
+            let frame_mut = frame.get_mut().unwrap();
+            frame_mut.set_pts(at);
+            frame_mut.set_duration(clock_time(PACKET));
+            source.push_buffer(frame)?;
+        }
+        source.end_of_stream()?;
+        let mut bytes = 0;
+        while let Some(sample) = pcm.try_pull_sample(gst::ClockTime::from_seconds(2)) {
+            bytes += sample.buffer().unwrap().size();
+        }
+        assert_eq!(bytes, crate::protocol::PCM_FRAME_BYTES * 4);
+        Ok(())
+    }
+
+    #[test]
     fn refuses_microphones_and_pipeline_injection() {
         assert!(capture_description("alsa_output.pci-0000_00_1f.3.analog-stereo.monitor").is_ok());
         for source in [
@@ -665,7 +805,7 @@ mod tests {
             .unwrap()
             .downcast::<AppSink>()
             .unwrap();
-        let (decoder, source) = decoder_with_sink(DESKTOP_CAPS, "appsink name=pcm sync=false")?;
+        let (decoder, source) = decoder_with_sink(OPUS_INPUT, "appsink name=pcm sync=false")?;
         let pcm = decoder
             .0
             .by_name("pcm")

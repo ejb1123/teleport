@@ -188,6 +188,35 @@ const MICROPHONE: [(&str, &[&str]); 3] = [
     ("Microphone on", &["--mic"]),
     ("Mic on, no echo cancel", &["--mic", "--no-echo-cancel"]),
 ];
+/// Desktop audio (G21): the host's choice, an Opus bitrate, or PCM.
+const AUDIO_QUALITY: [(&str, &[&str]); 8] = [
+    ("Audio: host default", &[]),
+    (
+        "Audio: Opus 64 kbps",
+        &["--audio-format", "opus", "--audio-bitrate", "64"],
+    ),
+    (
+        "Audio: Opus 96 kbps",
+        &["--audio-format", "opus", "--audio-bitrate", "96"],
+    ),
+    (
+        "Audio: Opus 128 kbps",
+        &["--audio-format", "opus", "--audio-bitrate", "128"],
+    ),
+    (
+        "Audio: Opus 192 kbps",
+        &["--audio-format", "opus", "--audio-bitrate", "192"],
+    ),
+    (
+        "Audio: Opus 256 kbps",
+        &["--audio-format", "opus", "--audio-bitrate", "256"],
+    ),
+    (
+        "Audio: Opus 510 kbps",
+        &["--audio-format", "opus", "--audio-bitrate", "510"],
+    ),
+    ("Audio: PCM 1.5 Mbps", &["--audio-format", "pcm"]),
+];
 
 #[derive(Default)]
 struct StreamPreferences {
@@ -471,6 +500,7 @@ pub fn run() -> Result<()> {
     let mut encoder_preset = 0usize;
     let mut host_display = 0usize;
     let mut microphone = 0usize;
+    let mut audio_quality = 0usize;
     let mut hdr = false;
     let mut decoder = DecoderPreference::default();
     let mut clipboard = false;
@@ -1028,6 +1058,9 @@ pub fn run() -> Result<()> {
                                 if hit(pref_rect(14), x, y) {
                                     microphone = (microphone + 1) % MICROPHONE.len();
                                 }
+                                if hit(pref_rect(15), x, y) {
+                                    audio_quality = (audio_quality + 1) % AUDIO_QUALITY.len();
+                                }
                                 if hit(pref_rect(3), x, y) {
                                     codec = (codec + 1) % CODECS.len();
                                     if CODECS[codec].1 != "h265" {
@@ -1192,6 +1225,7 @@ pub fn run() -> Result<()> {
                             command.arg(HOST_DISPLAY[host_display].1);
                         }
                         command.args(MICROPHONE[microphone].1);
+                        command.args(AUDIO_QUALITY[audio_quality].1);
                         decoder.apply(&mut command);
                         apply_relay(profile, &mut command)?;
                         if clipboard {
@@ -1672,6 +1706,7 @@ pub fn run() -> Result<()> {
                             },
                             HOST_DISPLAY[host_display].0,
                             MICROPHONE[microphone].0,
+                            AUDIO_QUALITY[audio_quality].0,
                         ];
                         for (index, label) in labels.into_iter().enumerate() {
                             ui.button(

@@ -644,8 +644,8 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Pad remapping UI | Yes | SDL database only | Missing | Low |
 | Pen / tablet | Warp | No | Missing | Low for gamers |
 | Mic passthrough | Windows host, echo cancellation | Linux (PipeWire) host "Teleport Microphone", any client, WebRTC echo cancellation (2026-10-17) | **Parity** | G20; owner = every paired client (no guest roles) |
-| Multi-channel audio | 5.1/7.1 | Stereo | Missing | |
-| Audio bitrate / raw PCM | 128–512, raw option | Fixed 128k Opus | Partial | |
+| Multi-channel audio | 5.1/7.1 | Stereo | Missing | G21: not built, see there |
+| Audio bitrate / raw PCM | 128–512, raw option | Opus 64–510 kbps or raw 48 kHz stereo PCM, host default + client choice (2026-10-17) | Parity | G21 |
 | Audio FEC / buffer tuning | 50–100 ms buffer | ≤100 ms leaky; tuning WIP | WIP | |
 | Multi-monitor | 3→5 screens (paid) | Up to 5 windows (1+4), free | **Parity / ahead (free)** | Per-screen settings partly |
 | Virtual displays / headless | VDD (paid), fallback (free) | Portal virtual outputs (KDE): headless fallback, `always`, extra monitor sized to the client (2026-10-17) | **Parity (free)** | G17; GNOME and a connector-less machine untested |
@@ -1161,6 +1161,21 @@ L.**
 **G21. Audio quality options: in-band FEC (M8), surround, bitrate. Effort S
 each.**
 
+- **Status (2026-10-17): bitrate and PCM implemented, surround not**
+  (review tracker R18, docs/audio.md). Host `--audio-bitrate
+  64|96|128|192|256|510` (default 128) and `--audio-format opus|pcm`
+  (default Opus) set what clients get by default (`Desktop.audio_options`,
+  `Desktop.audio_settings`); clients choose with `--audio-format` and
+  `--audio-bitrate`, the launcher's **Audio:** button, sent in
+  `SelectCodec.audio`; F8 shows the session's audio. PCM is 48 kHz stereo
+  S16LE, one 10 ms frame (1920 bytes) per group on a `pcm` track, through
+  the same sequence-timed playout (a lost frame becomes silence; there is no
+  PLC for PCM). Older clients get Opus at the host's bitrate. Measured: PCM
+  2–7 ms below Opus on a clean link, but 11–22 dropouts in 12 s at 2% loss
+  where Opus had none. Surround: not built; the capture follows the
+  monitored sink's channels, raw Opus packets would need multistream caps
+  (stream and coupled counts, mapping) on both ends, and the client output
+  must be 5.1 too, all of it untestable here without such hardware.
 - **FEC:** `inband-fec=true` plus a `packet-loss-percentage` hint from QUIC
   stats.
 - **Surround:** 5.1/7.1 via Opus multistream (channel-mapping family 1), when
@@ -1235,8 +1250,8 @@ mute on connect, camera passthrough (v4l2loopback), USB/YubiKey passthrough
 YubiKeys over libusb, 1.19), and display rotation.
 
 Found in Parsec's client (1.19), not in its manual:
-- **Uncompressed PCM audio option** for unconstrained links (S): an
-  alternative to Opus in `src/audio.rs`, capability-gated.
+- **Uncompressed PCM audio option** for unconstrained links (S): done
+  2026-10-17 (G21, `--audio-format pcm`).
 - **Per-hotkey exclusions** (S): keep chosen hotkeys (push-to-talk) on the
   client while keyboard capture is on (`docs/keyboard-capture.md`).
 - **Ctrl/Command swap** between macOS and other systems (S).

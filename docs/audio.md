@@ -9,6 +9,30 @@ the client times them by sequence number with an adaptive playout delay and
 conceals missing ones (docs/review-2026-10.md, M8). **Audio** in the session
 toolbar or `--mute` mutes playback.
 
+### Quality (G21)
+
+| Option | Host (default for clients) | Client (this session) |
+| --- | --- | --- |
+| Opus bitrate | `--audio-bitrate 64\|96\|128\|192\|256\|510` (128) | `--audio-bitrate`, launcher **Audio:** |
+| Uncompressed | `--audio-format pcm` (opus) | `--audio-format pcm`, launcher **Audio: PCM** |
+
+PCM is 48 kHz stereo S16LE, about 1.5 Mbit/s: one 10 ms frame of 1920 bytes
+per MoQ group on the host's `pcm` track. It uses the same sequence-timed
+playout as Opus, but a lost or late frame becomes silence (Opus conceals
+it), so use it only on fast, clean links. F8 shows the session's audio.
+Clients from before these options, and these clients with older hosts, get
+Opus at 128 kbit/s (older clients: at the host's bitrate).
+
+Measured (`pcm_and_opus_end_to_end_latency`, tests/audio_latency.rs, two
+interleaved runs): clean link Opus 66.6–74.6 ms, PCM 64.5–71.1 ms, no
+dropouts; 10 ms delay and 2% loss Opus 78.1–85.8 ms with no dropouts, PCM
+79.1–81.4 ms with 11–22 dropouts in 12 s.
+
+Stereo only. Surround (5.1) is not built: the host would capture a 5.1
+sink, raw Opus packets need multistream caps (stream and coupled counts,
+channel mapping) on both ends, and the client's output must be 5.1 as well.
+PCM 5.1 would be 4.6 Mbit/s.
+
 ## Microphone (G20)
 
 The client can send its microphone to the host, where applications such as

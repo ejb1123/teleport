@@ -127,6 +127,15 @@ pub struct Options {
     /// Start with remote audio muted.
     #[arg(long)]
     pub mute: bool,
+    /// Desktop audio encoding: `opus`, or `pcm` (uncompressed 48 kHz
+    /// stereo, ~1.5 Mbit/s, for fast, unconstrained links). Default: the
+    /// host's `--audio-format`.
+    #[arg(long, value_enum)]
+    pub audio_format: Option<protocol::AudioFormat>,
+    /// Opus bitrate in kbit/s: 64, 96, 128, 192, 256 or 510. Default: the
+    /// host's `--audio-bitrate` (128).
+    #[arg(long, value_parser = protocol::parse_audio_bitrate)]
+    pub audio_bitrate: Option<u32>,
     /// Send this computer's microphone to the host, where applications can
     /// record it as "Teleport Microphone" (hosts started with --microphone).
     /// Ctrl+Alt+V mutes and unmutes it.
@@ -290,6 +299,8 @@ struct Link {
     input_sequence: u64,
     updates: moq_net::track::Subscriber,
     audio: Option<moq_net::track::Subscriber>,
+    /// The session's desktop audio (Opus 128 with older hosts).
+    audio_settings: protocol::AudioSettings,
     /// `--mic`: the microphone track, sent only to hosts that take it.
     microphone: Option<moq_net::track::Producer>,
 }
@@ -566,6 +577,24 @@ async fn connect_via(
         &desktop,
         client_hevc_decoder(options).as_deref(),
     );
+    // Desktop audio: this client's choice over the host's defaults, with
+    // hosts that negotiate it; Opus 128 otherwise.
+    let audio_options = desktop.audio_options && desktop.codec_selection;
+    let audio_settings = if audio_options {
+        protocol::AudioSettings {
+            format: options
+                .audio_format
+                .unwrap_or(desktop.audio_settings.format),
+            bitrate: options
+                .audio_bitrate
+                .unwrap_or(desktop.audio_settings.bitrate),
+        }
+    } else {
+        if desktop.audio && (options.audio_format.is_some() || options.audio_bitrate.is_some()) {
+            tracing::warn!("this host does not offer audio options; playing Opus at 128 kbit/s");
+        }
+        protocol::AudioSettings::default()
+    };
     let mut input = input;
     let mut input_sequence = 0;
     if desktop.codec_selection {
@@ -578,6 +607,7 @@ async fn connect_via(
                 event: Event::SelectCodec {
                     codec: decision.codec,
                     encoder_preset: options.encoder_preset.filter(|_| desktop.encoder_presets),
+                    audio: audio_options.then_some(audio_settings),
                 },
                 motion: None,
             })?,
@@ -613,7 +643,7 @@ async fn connect_via(
     let audio = if desktop.audio {
         Some(
             remote
-                .track("opus")?
+                .track(audio_settings.format.track())?
                 .subscribe(media::audio_subscription())
                 .await?,
         )
@@ -637,6 +667,7 @@ async fn connect_via(
         input_sequence,
         updates,
         audio,
+        audio_settings,
         microphone,
     })
 }
@@ -1307,11 +1338,15 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let echo_cancel = options.mic && !options.no_echo_cancel && desktop.microphone;
     let mut audio = if link.audio.is_some() {
         if options.headless_frames.is_some() {
-            let (pipeline, source, counter) = crate::audio::decoder_for_headless()?;
+            let (pipeline, source, counter) =
+                crate::audio::decoder_for_headless(link.audio_settings.format)?;
             decoded_audio = Some(counter);
             Some((pipeline, source))
         } else {
-            Some(crate::audio::decoder(echo_cancel)?)
+            Some(crate::audio::decoder(
+                echo_cancel,
+                link.audio_settings.format,
+            )?)
         }
     } else {
         None
@@ -1355,6 +1390,8 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         None => None,
     };
     let audio_source = audio.as_ref().map(|(_, source)| source.clone());
+    let audio_settings = link.audio_settings;
+    let audio_format = audio_settings.format;
     let audio_notices = updates_sender.clone();
     let local_notices = updates_sender.clone();
     let network_stats = stream_stats.clone();
@@ -1381,7 +1418,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             result = receive_updates(link.updates, updates_sender, update_pongs) => result,
             result = async {
                 if let (Some(track), Some(source)) = (link.audio, audio_source)
-                    && let Err(error) = crate::audio::receive(track, source).await {
+                    && let Err(error) = crate::audio::receive(track, source, audio_format).await {
                         tracing::warn!(%error, "remote audio stopped; desktop remains connected");
                         let _ = audio_notices.send(Update::Notice { text: "Audio stopped; reconnect to retry audio".into() }).await;
                         media::wake_presenter();
@@ -2842,6 +2879,22 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
                         auto_lock.state(pointer_lock.active())
                     } else {
                         "host cannot lock"
+                    }
+                ),
+                format!(
+                    "Audio                 {}",
+                    if !desktop.audio {
+                        "host sends none".to_owned()
+                    } else {
+                        format!(
+                            "{}{}",
+                            audio_settings.label(),
+                            match (options.audio_format, options.audio_bitrate) {
+                                (None, None) if desktop.audio_options => "   |   host default",
+                                _ if !desktop.audio_options => "   |   older host: fixed",
+                                _ => "",
+                            }
+                        )
                     }
                 ),
                 format!(

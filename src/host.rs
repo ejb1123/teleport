@@ -167,6 +167,15 @@ pub struct Options {
     /// Explicit PulseAudio/PipeWire output .monitor name; never records a microphone.
     #[arg(long)]
     pub audio_source: Option<String>,
+    /// Desktop audio encoding for clients that do not choose: `opus`, or
+    /// `pcm` (uncompressed 48 kHz stereo, ~1.5 Mbit/s, for unconstrained
+    /// links). Clients from before audio options always get Opus.
+    #[arg(long, value_enum, default_value_t = protocol::AudioFormat::Opus)]
+    pub audio_format: protocol::AudioFormat,
+    /// Opus bitrate in kbit/s for clients that do not choose: 64, 96, 128,
+    /// 192, 256 or 510.
+    #[arg(long, default_value_t = protocol::DEFAULT_AUDIO_BITRATE, value_parser = protocol::parse_audio_bitrate)]
+    pub audio_bitrate: u32,
     /// Offer clients a virtual microphone: while a client sends its
     /// microphone (`teleport client --mic`), applications here can record it
     /// from the "Teleport Microphone" input (PipeWire; docs/audio.md).
@@ -797,11 +806,13 @@ async fn run_session(
     } else {
         None
     };
-    let audio_track = if options.audio_source.is_some() {
-        Some(broadcast.create_track("opus", None)?)
-    } else {
-        None
-    };
+    // Both formats' tracks exist until the client has chosen (SelectCodec).
+    let mut audio_tracks = Vec::new();
+    if options.audio_source.is_some() {
+        for format in [protocol::AudioFormat::Opus, protocol::AudioFormat::Pcm] {
+            audio_tracks.push((format, broadcast.create_track(format.track(), None)?));
+        }
+    }
     let session = session.await?;
     let input = tokio::time::timeout(Duration::from_secs(10), async {
         let remote = incoming
@@ -887,13 +898,22 @@ async fn run_session(
     // something else (at least a heartbeat within INPUT_TIMEOUT) and get the
     // codec from their connection request, as before.
     let first = tokio::time::timeout(protocol::INPUT_TIMEOUT, events.receiver.recv()).await;
+    // Older clients play Opus from the "opus" track only.
+    let mut audio_settings = protocol::AudioSettings {
+        format: protocol::AudioFormat::Opus,
+        bitrate: options.audio_bitrate,
+    };
     let chosen_by_client = match first {
         Ok(Some(Event::SelectCodec {
             codec,
             encoder_preset,
+            audio,
         })) => {
             if let Some(preset) = encoder_preset {
                 options.encoder_preset = preset;
+            }
+            if let Some(audio) = audio {
+                audio_settings = audio;
             }
             ensure!(
                 options.dynamic_range != protocol::DynamicRange::Hdr10
@@ -935,9 +955,16 @@ async fn run_session(
     )
     .await
     .context("encoder start failed")??;
-    let audio = match (options.audio_source.as_deref(), audio_track) {
-        (Some(source), Some(track)) => Some(crate::audio::capture(source, track)?),
-        _ => None,
+    let audio = match options.audio_source.as_deref() {
+        Some(source) => {
+            let track = audio_tracks
+                .into_iter()
+                .find_map(|(format, track)| (format == audio_settings.format).then_some(track))
+                .context("no track for the session audio format")?;
+            tracing::info!(audio = audio_settings.label(), "session desktop audio");
+            Some(crate::audio::capture(source, audio_settings, track)?)
+        }
+        None => None,
     };
     tracing::info!(
         width = info.width,
@@ -1948,6 +1975,11 @@ fn desktop_for_monitor(
         privacy_mode: options.privacy_available,
         privacy_active: capture.privacy(),
         microphone: options.microphone_available,
+        audio_options: true,
+        audio_settings: protocol::AudioSettings {
+            format: options.audio_format,
+            bitrate: options.audio_bitrate,
+        },
     })
 }
 
@@ -2239,7 +2271,11 @@ impl SessionMicrophone {
             "playing the client's microphone into the virtual microphone"
         );
         Ok(Self {
-            receive: AbortOnDrop(tokio::spawn(crate::audio::receive(track, source))),
+            receive: AbortOnDrop(tokio::spawn(crate::audio::receive(
+                track,
+                source,
+                protocol::AudioFormat::Opus,
+            ))),
             player,
             virtual_mic,
         })
