@@ -845,6 +845,7 @@ pub fn hardware_decoder(format: impl Into<VideoFormat>) -> Result<Option<String>
 
 /// Codecs this host encodes in hardware with `kind` (8-bit; probed once per
 /// process). Blocks for up to a few seconds on the first call.
+#[cfg(target_os = "linux")]
 pub fn hardware_codecs(kind: EncoderKind) -> Vec<VideoCodec> {
     [VideoCodec::H264, VideoCodec::H265]
         .into_iter()
@@ -862,11 +863,6 @@ fn hardware_encoder(kind: EncoderKind, codec: VideoCodec) -> bool {
         ),
         Err(_) => false,
     }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn hardware_encoder(_: EncoderKind, _: VideoCodec) -> bool {
-    false
 }
 
 pub fn decoder_with_stats(

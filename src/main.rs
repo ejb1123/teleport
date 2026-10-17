@@ -21,7 +21,9 @@ mod host;
 mod host_admin;
 #[cfg(target_os = "linux")]
 mod host_ui;
-#[cfg(target_os = "linux")]
+// Unix-wide: `teleport relay` uses it too, and runs on macOS.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod identity;
 mod keyboard_capture;
 mod launcher;
