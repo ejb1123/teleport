@@ -15,7 +15,9 @@ changelog up to 150-105c (2026-10-08).
   from. Anything taken from memory or a third party is marked **(unverified)**.
 - **Parsec's client.** The shipped Linux client (`parsec-bin` 150_97c from
   nixpkgs) was inspected statically: libraries, embedded strings, its
-  configuration keys and settings help text. See section 1.19.
+  configuration keys and settings help text. See section 1.19. The Windows
+  installer, Virtual Display Driver and Virtual USB Driver were downloaded
+  from `builds.parsec.app` and inspected the same way. See section 1.20.
 - **Teleport.** README.md, docs/*.md (especially `docs/review-2026-10.md`),
   the clap structs in `src/host.rs`, `src/client.rs` and `src/main.rs`,
   `src/launcher.rs`, plus spot checks in `src/audio.rs`, `src/ffmpeg_codec.c`
@@ -444,6 +446,83 @@ not run or connected.
     Discord push-to-talk hotkey").
   - **Ctrl/Command swap** between macOS and other systems.
   - Extra client windows for multiple monitors.
+
+### 1.20 The Windows build, inspected (2026-10-17)
+
+Downloaded from `builds.parsec.app` and unpacked with 7-Zip; static inspection
+only, nothing was run. Packages (SHA-256 prefix):
+- `package/parsec-windows.exe` (4.4 MB, b8a9cd51…), the installer;
+- `vdd/parsec-vdd-0.45.0.0.exe` (e2333244…), the Virtual Display Driver;
+- `vud/parsec-vud-0.3.0.0.exe` (fb73da59…), the Virtual USB Driver.
+
+The installer holds the `parsecd.exe` launcher, the engine
+`parsecd-150-104a.dll` (6.2 MB, three releases newer than Linux 150-97c),
+`pservice.exe`, `teams.exe`, and nested VDD and VUD installers.
+`setup.json` selects a shared ProgramData install.
+
+- **Codecs and GPUs without FFmpeg.** The engine loads vendor SDKs directly:
+  - encoding: NVENC (`nvEncodeAPI64`), AMD AMF (`amfrt64`, with
+    `AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY`), and Intel oneVPL/Media SDK
+    (`libvpl`, `libmfxhw64`);
+  - decoding: NVDEC (`nvcuvid`) and D3D11/D3D12, with an option to keep
+    decoder output in video memory (D3D11 only), i.e. zero-copy
+    presentation like Teleport's;
+  - 4:4:4 on Windows asks the user to download FFmpeg separately.
+  AV1 parameter structures (`AV1BitstreamParam`, `AV1TileParam`,
+  `AV1FilmGrainParam`) are present, so AV1 code paths exist on Windows even
+  though no Parsec documentation mentions AV1 (open question 6). Encoder
+  internals match the hidden keys in 1.19 (`encoder_slices`,
+  `encoder_vbv_*`, long-term reference strings).
+- **Virtual Display Driver.** `mm.dll` is a UMDF Indirect Display driver
+  (IddCx 1.2, `UmdfLibraryVersion 2.25.0`): "Parsec Virtual Display
+  Adapter", a root device `Root\Parsec\VDA`, installed with Nefarius's
+  `nefconw`. The engine uses it to:
+  - add extra virtual displays during owner connections;
+  - add one when no monitor is present ("Fallback To Virtual Display",
+    headless hosting);
+  - run privacy mode, which extends to a virtual display and blanks the
+    real ones.
+  This is the Windows form of gap G17.
+- **Virtual USB Driver.**
+  - `parsecvusba.sys` is a virtual USB host controller (`Root\Parsec\VUSBA`)
+    with 15 persisted device slots.
+  - `parsecvirtualds.sys` is a demand-start kernel service, "Parsec Virtual
+    DS".
+  - Guests' gamepads go through VUSB, falling back to ViGEmBus 1.17
+    automatically. DualShock 4 (with touchpad) and DualSense are supported.
+  - YubiKey passthrough (1.19) uses the same bus.
+  This is the Windows form of gap G13.
+- **Unattended access through `pservice.exe`.** A service running as
+  SYSTEM:
+  - enumerates sessions (WTSAPI), duplicates the token of `winlogon.exe`,
+    and launches `parsecd.exe` into the active console session with
+    `CreateProcessAsUserW`, so Parsec can see and drive the login screen,
+    lock screen and UAC prompts;
+  - sends Ctrl+Alt+Del through `SAS.dll`;
+  - talks to the app over `\\.\pipe\PARSEC-NP`;
+  - checks signatures with WinVerifyTrust and carries an embedded RSA public
+    key.
+  This is how gap G24 is solved on Windows. On Linux the equivalent is a
+  system service with greeter/logind integration; Teleport's `systemLogin`
+  mode covers part of it.
+- **Host features only in the Windows help text:**
+  - virtual microphone for mic passthrough, plus echo cancellation for
+    Discord and "certain apps" (G20);
+  - virtual camera passthrough of a client webcam (Windows 11);
+  - a virtual Wacom Intuos Pro (M) for tablets, and enhanced pen (tilt,
+    rotation, pressure via Windows Ink);
+  - a dummy virtual mouse so a headless host still shows a cursor;
+  - "Allow guests to only see and interact with certain applications";
+  - automatic host resolution change for owner connections;
+  - lock the desktop when the last guest leaves, and kick non-owner guests
+    when the owner disconnects;
+  - one guest controls the mouse at a time, and the host can always take
+    control back;
+  - excluding an app from the streamed audio;
+  - a bandwidth cap split between all guests;
+  - an idle kick after a set number of minutes;
+  - "Prevents this machine from simultaneously acting as a host and a
+    client" (daisy-chaining guard).
 
 ---
 
@@ -1166,8 +1245,10 @@ ships its own FFmpeg with CUDA and VA-API, and presents zero-copy.
    the HPR docs do not say. It does see BUD packets on UDP 5000.
 5. **Parsec's macOS host encoder (VideoToolbox?) and its latency.** Not
    documented.
-6. **Parsec AV1.** Absent from the support corpus and changelog; no other
-   source checked.
+6. **Parsec AV1.** Absent from the support corpus and changelog, but the
+   Windows engine (1.20) contains AV1 encoder parameter structures, so AV1
+   code paths exist there. Whether they are enabled, and on which GPUs, is
+   unknown.
 7. **Parsec extra mouse buttons (X1/X2).** Not documented; assumed supported.
 8. **Parsec "Always Relative" mouse mode (150-105a)**: only the changelog line
    exists; whether it auto-engages when a game hides the cursor is unknown.
