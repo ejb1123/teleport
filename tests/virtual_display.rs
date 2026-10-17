@@ -266,6 +266,7 @@ impl Client {
             gamepad_lights: false,
             microphone: false,
             guests: false,
+            video_formats: false,
         })
     }
 

@@ -25,6 +25,9 @@ pub enum VideoCodec {
     #[default]
     H264,
     H265,
+    /// Only to hosts advertising `Desktop::av1`: older peers reject the
+    /// name, so it never appears in `Desktop::codecs` or `hardware_codecs`.
+    Av1,
 }
 
 /// Encoder speed/quality trade-off (parsec-comparison G10). None adds frame
@@ -217,17 +220,37 @@ impl DynamicRange {
 }
 
 impl VideoCodec {
+    pub const ALL: [Self; 3] = [Self::H264, Self::H265, Self::Av1];
     pub fn track(self) -> &'static str {
         match self {
             Self::H264 => "h264",
             Self::H265 => "h265",
+            Self::Av1 => "av1",
         }
     }
     pub fn label(self) -> &'static str {
         match self {
             Self::H264 => "H.264",
             Self::H265 => "H.265",
+            Self::Av1 => "AV1",
         }
+    }
+    /// `tp_codec_open`'s codec number.
+    pub fn ffmpeg_id(self) -> i32 {
+        match self {
+            Self::H264 => 0,
+            Self::H265 => 1,
+            Self::Av1 => 2,
+        }
+    }
+    /// Codecs that can carry 4:4:4 here (`SelectCodec::chroma_444`).
+    pub fn supports_444(self) -> bool {
+        self != Self::Av1
+    }
+    /// Codecs that can carry 10-bit SDR here (`SelectCodec::ten_bit`): no
+    /// hardware encodes or decodes H.264 High 10.
+    pub fn supports_ten_bit(self) -> bool {
+        self != Self::H264
     }
 }
 pub const MAX_FRAME: usize = 8 * 1024 * 1024;
@@ -353,9 +376,35 @@ pub struct Desktop {
     pub codec_selection: bool,
     /// Codecs the host encodes in hardware (its encoder probe), so a client
     /// choosing automatically prefers H.265 only when it is cheap to encode.
-    /// Empty for older and software-only hosts.
+    /// Empty for older and software-only hosts. H.264 and H.265 only: older
+    /// clients reject other names (see `hardware_av1`).
     #[serde(default)]
     pub hardware_codecs: Vec<VideoCodec>,
+    /// Host encodes `VideoCodec::Av1` when `SelectCodec` asks (in hardware,
+    /// or with SVT-AV1); older hosts reject the name.
+    #[serde(default)]
+    pub av1: bool,
+    /// Host encodes AV1 in hardware.
+    #[serde(default)]
+    pub hardware_av1: bool,
+    /// Host applies `SelectCodec::chroma_444` (H.264/H.265 4:4:4).
+    #[serde(default)]
+    pub chroma_444_selection: bool,
+    /// Codecs the host encodes 4:4:4 in hardware.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hardware_444: Vec<VideoCodec>,
+    /// The session's video is 4:4:4 (full-resolution chroma).
+    #[serde(default)]
+    pub chroma_444: bool,
+    /// Host applies `SelectCodec::ten_bit` (H.265/AV1 Main 10 SDR).
+    #[serde(default)]
+    pub ten_bit_selection: bool,
+    /// Codecs the host encodes as Main 10 in hardware.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hardware_ten_bit: Vec<VideoCodec>,
+    /// The session's video is 10-bit SDR (Main 10, BT.709).
+    #[serde(default)]
+    pub ten_bit: bool,
     /// Host injects the back and forward mouse buttons
     /// ([`BUTTON_BACK`], [`BUTTON_FORWARD`]); older hosts reject them.
     #[serde(default)]
@@ -1118,6 +1167,12 @@ pub enum Event {
         /// advertising `Desktop::guests`; older hosts ignore the field.
         #[serde(default)]
         guests: bool,
+        /// The client reads `Desktop::chroma_444` and `Desktop::ten_bit` and
+        /// decodes AV1, 4:4:4 and 10-bit SDR (or leaves when it cannot), so
+        /// it may join a shared stream in those formats; hosts remove older
+        /// clients from one (docs/guests.md). Older hosts ignore the field.
+        #[serde(default)]
+        video_formats: bool,
     },
     /// "Secure attention" (the client's Ctrl+Alt+End, Teleport's
     /// Ctrl+Alt+Del): lock the host session, or show the lock screen's
@@ -1139,6 +1194,14 @@ pub enum Event {
         /// host's bitrate.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         audio: Option<AudioSettings>,
+        /// Full-resolution chroma (4:4:4, H.264/H.265 SDR), only to hosts
+        /// advertising `Desktop::chroma_444_selection`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        chroma_444: bool,
+        /// Main 10 from 8-bit capture (H.265/AV1 SDR, not with 4:4:4), only
+        /// to hosts advertising `Desktop::ten_bit_selection`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        ten_bit: bool,
     },
     /// The client's display and stream choices; the host picks the stream
     /// size, rate and bitrate from them ([`negotiate`]) and answers with
@@ -1334,8 +1397,24 @@ impl Event {
             ),
             Self::ClientDisplay(display) => display.validate()?,
             Self::SelectCodec {
-                audio: Some(audio), ..
-            } => audio.validate()?,
+                codec,
+                audio,
+                chroma_444,
+                ten_bit,
+                ..
+            } => {
+                ensure!(
+                    !chroma_444 || codec.supports_444(),
+                    "4:4:4 needs H.264 or H.265"
+                );
+                ensure!(
+                    !ten_bit || (codec.supports_ten_bit() && !chroma_444),
+                    "10-bit SDR needs H.265 or AV1 without 4:4:4"
+                );
+                if let Some(audio) = audio {
+                    audio.validate()?;
+                }
+            }
             Self::GamepadDisconnected { pad } => {
                 ensure!(*pad < MAX_GAMEPADS, "invalid gamepad slot")
             }
@@ -1479,11 +1558,16 @@ pub async fn read_frame(
         .map(|(_, _, bytes)| bytes))
 }
 
-/// Whether an Annex B access unit is an IDR (H.264) or IRAP (H.265) picture,
-/// where a decoder can start. Decided by its first slice NAL unit, so only
-/// the parameter sets in front of it are scanned. Encoders with intra
-/// refresh also flag refresh starts as key frames; those are not.
-pub fn annexb_keyframe(codec: VideoCodec, data: &[u8]) -> bool {
+/// Whether an encoded frame is one where a decoder can start: an IDR (H.264)
+/// or IRAP (H.265) picture in an Annex B access unit, decided by its first
+/// slice NAL unit (only the parameter sets in front of it are scanned), or
+/// an AV1 temporal unit with a sequence header and a shown key frame.
+/// Encoders with intra refresh also flag refresh starts as key frames; those
+/// are not.
+pub fn keyframe(codec: VideoCodec, data: &[u8]) -> bool {
+    if codec == VideoCodec::Av1 {
+        return av1_keyframe(data);
+    }
     let mut index = 0;
     while index + 3 < data.len() {
         if data[index] != 0 || data[index + 1] != 0 || data[index + 2] != 1 {
@@ -1502,8 +1586,69 @@ pub fn annexb_keyframe(codec: VideoCodec, data: &[u8]) -> bool {
                 0..=31 => return false,
                 _ => (),
             },
+            VideoCodec::Av1 => unreachable!(),
         }
         index += 3;
+    }
+    false
+}
+
+/// An AV1 temporal unit in the low-overhead OBU format FFmpeg's encoders
+/// emit (AV1 spec 5.3): a sequence header, then a frame (header) OBU with
+/// `show_existing_frame` 0, `frame_type` KEY_FRAME and `show_frame` 1. Every
+/// encoder here repeats the sequence header in front of key frames; a unit
+/// without one cannot start a decoder. Frame headers are read without
+/// `reduced_still_picture_header`, which video streams never set.
+fn av1_keyframe(data: &[u8]) -> bool {
+    let mut index = 0;
+    let mut sequence_header = false;
+    while index < data.len() {
+        let header = data[index];
+        if header & 0x80 != 0 {
+            return false;
+        }
+        let kind = (header >> 3) & 0x0f;
+        index += 1 + usize::from(header & 0x04 != 0);
+        let size = if header & 0x02 != 0 {
+            // leb128 size field
+            let mut size = 0_usize;
+            let mut shift = 0;
+            loop {
+                let Some(&byte) = data.get(index) else {
+                    return false;
+                };
+                index += 1;
+                size |= usize::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+                if shift > 28 {
+                    return false;
+                }
+            }
+            size
+        } else {
+            data.len().saturating_sub(index)
+        };
+        let Some(payload) = index.checked_add(size).and_then(|end| data.get(index..end)) else {
+            return false;
+        };
+        match kind {
+            1 => sequence_header = true,
+            // OBU_FRAME_HEADER, OBU_FRAME
+            3 | 6 => {
+                let Some(&first) = payload.first() else {
+                    return false;
+                };
+                return sequence_header
+                    && first & 0x80 == 0
+                    && (first >> 5) & 0x03 == 0
+                    && first & 0x10 != 0;
+            }
+            _ => (),
+        }
+        index += size;
     }
     false
 }
@@ -1847,6 +1992,7 @@ mod tests {
                 gamepad_lights: true,
                 microphone: true,
                 guests: true,
+                video_formats: true,
             },
         ] {
             assert!(!strict.is_lossy(), "{strict:?} must never be dropped");
@@ -2010,6 +2156,7 @@ mod tests {
                 gamepad_lights: false,
                 microphone: false,
                 guests: false,
+                video_formats: false,
             }
         ));
         let primary: Event = serde_json::from_str(r#"{"type":"request_keyframe"}"#).unwrap();
@@ -2045,10 +2192,23 @@ mod tests {
                 codec: VideoCodec::H265,
                 encoder_preset: None,
                 audio: None,
+                chroma_444: false,
+                ten_bit: false,
             }
         ));
         assert!(event.validate().is_ok() && !event.is_lossy());
-        assert!(serde_json::from_str::<Event>(r#"{"type":"select_codec","codec":"av1"}"#).is_err());
+        assert!(serde_json::from_str::<Event>(r#"{"type":"select_codec","codec":"vp9"}"#).is_err());
+        assert!(matches!(
+            serde_json::from_str::<Event>(
+                r#"{"type":"select_codec","codec":"av1","chroma_444":true}"#
+            )
+            .unwrap(),
+            Event::SelectCodec {
+                codec: VideoCodec::Av1,
+                chroma_444: true,
+                ..
+            }
+        ));
         let desktop: Desktop = serde_json::from_value(serde_json::json!({ "version": 2,
             "width": 1, "height": 1, "fps": 1, "source": "test", "monitors": [],
             "active_monitor": 0, "audio": false, "clipboard": false,
@@ -2061,14 +2221,23 @@ mod tests {
         );
         // Encoder presets: optional on the wire, old hosts default to none.
         assert!(!desktop.encoder_presets);
+        // Neither AV1 nor 4:4:4 from hosts that predate them.
+        assert!(!desktop.av1 && !desktop.hardware_av1);
+        assert!(!desktop.chroma_444_selection && !desktop.chroma_444);
+        assert!(desktop.hardware_444.is_empty());
+        assert!(!desktop.ten_bit_selection && !desktop.ten_bit);
+        assert!(desktop.hardware_ten_bit.is_empty());
         assert_eq!(desktop.encoder_preset, EncoderPreset::Latency);
         let chosen = Event::SelectCodec {
-            codec: VideoCodec::H264,
+            codec: VideoCodec::H265,
             encoder_preset: Some(EncoderPreset::Quality),
             audio: None,
+            chroma_444: false,
+            ten_bit: true,
         };
         let wire = serde_json::to_string(&chosen).unwrap();
         assert!(wire.contains(r#""encoder_preset":"quality""#), "{wire}");
+        assert!(wire.contains(r#""ten_bit":true"#), "{wire}");
         assert!(matches!(
             serde_json::from_str::<Event>(&wire).unwrap(),
             Event::SelectCodec {
@@ -2080,10 +2249,16 @@ mod tests {
             codec: VideoCodec::H264,
             encoder_preset: None,
             audio: None,
+            chroma_444: false,
+            ten_bit: false,
         })
         .unwrap();
         assert!(!plain.contains("encoder_preset"), "{plain}");
         assert!(!plain.contains("audio"), "{plain}");
+        assert!(
+            !plain.contains("chroma_444") && !plain.contains("ten_bit"),
+            "{plain}"
+        );
     }
 
     #[test]
@@ -2104,6 +2279,8 @@ mod tests {
             codec: VideoCodec::H264,
             encoder_preset: None,
             audio: Some(pcm),
+            chroma_444: false,
+            ten_bit: false,
         };
         let wire = serde_json::to_string(&chosen).unwrap();
         assert!(
@@ -2127,6 +2304,8 @@ mod tests {
                 format: AudioFormat::Opus,
                 bitrate: 1000,
             }),
+            chroma_444: false,
+            ten_bit: false,
         };
         assert!(odd.validate().is_err());
         assert!(
@@ -2136,6 +2315,64 @@ mod tests {
         assert_eq!(PCM_FRAME_BYTES * 100 * 8 / 1000, PCM_KBPS as usize);
         assert_eq!(pcm.label(), "PCM 48 kHz stereo (1.5 Mbps)");
         assert_eq!(AudioSettings::default().label(), "Opus 128 kbps");
+    }
+
+    /// Every codec, preset, audio, 4:4:4 and 10-bit combination: absent
+    /// fields stay off the wire (older hosts read the rest), everything
+    /// round-trips, and only formats the codec can carry validate.
+    #[test]
+    fn codec_selection_combinations_have_minimal_wire_forms_and_validate() {
+        let audio = AudioSettings {
+            format: AudioFormat::Pcm,
+            bitrate: DEFAULT_AUDIO_BITRATE,
+        };
+        for codec in VideoCodec::ALL {
+            for encoder_preset in [None, Some(EncoderPreset::Balanced)] {
+                for audio in [None, Some(audio)] {
+                    for chroma_444 in [false, true] {
+                        for ten_bit in [false, true] {
+                            let event = Event::SelectCodec {
+                                codec,
+                                encoder_preset,
+                                audio,
+                                chroma_444,
+                                ten_bit,
+                            };
+                            let wire = serde_json::to_string(&event).unwrap();
+                            assert!(wire.contains(&format!(r#""codec":"{}""#, codec.track())));
+                            assert_eq!(wire.contains("encoder_preset"), encoder_preset.is_some());
+                            assert_eq!(wire.contains(r#""audio""#), audio.is_some());
+                            assert_eq!(wire.contains(r#""chroma_444":true"#), chroma_444);
+                            assert_eq!(wire.contains(r#""ten_bit":true"#), ten_bit);
+                            assert!(!wire.contains("false"), "{wire}");
+                            let parsed: Event = serde_json::from_str(&wire).unwrap();
+                            assert!(matches!(
+                                parsed,
+                                Event::SelectCodec { codec: c, encoder_preset: p, audio: a, chroma_444: x, ten_bit: t }
+                                    if c == codec && p == encoder_preset && a == audio && x == chroma_444 && t == ten_bit
+                            ));
+                            let valid = (!chroma_444 || codec.supports_444())
+                                && (!ten_bit || (codec.supports_ten_bit() && !chroma_444));
+                            assert_eq!(parsed.validate().is_ok(), valid, "{wire}");
+                            assert!(!parsed.is_lossy());
+                        }
+                    }
+                }
+            }
+        }
+        // AV1 4:4:4, H.264 10-bit and 4:4:4 10-bit are refused.
+        for wire in [
+            r#"{"type":"select_codec","codec":"av1","chroma_444":true}"#,
+            r#"{"type":"select_codec","codec":"h264","ten_bit":true}"#,
+            r#"{"type":"select_codec","codec":"h265","chroma_444":true,"ten_bit":true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Event>(wire)
+                    .unwrap()
+                    .validate()
+                    .is_err()
+            );
+        }
     }
     #[test]
     fn rumble_updates_are_bounded_and_declared_by_the_client() {

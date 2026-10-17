@@ -198,9 +198,19 @@ pub struct Options {
     pub smoke_hardware_codecs: Option<Vec<protocol::VideoCodec>>,
     #[arg(skip)]
     pub dynamic_range: protocol::DynamicRange,
-    /// Codecs `encoder` encodes in hardware here (`Desktop::hardware_codecs`).
+    /// Codecs `encoder` encodes in hardware here (`Desktop::hardware_codecs`
+    /// and `hardware_av1`).
     #[arg(skip)]
     pub hardware_codecs: Vec<protocol::VideoCodec>,
+    /// Codecs `encoder` encodes 4:4:4 and Main 10 in hardware.
+    #[arg(skip)]
+    pub hardware_formats: Box<HardwareFormats>,
+    /// The session streams 4:4:4 (the client asked in `SelectCodec`).
+    #[arg(skip)]
+    pub chroma_444: bool,
+    /// The session streams 10-bit SDR (the client asked in `SelectCodec`).
+    #[arg(skip)]
+    pub ten_bit: bool,
     /// Set while a network step-down streams below `width`/`fps`
     /// (`Desktop::stepped_down`); `width` and `fps` then hold the step.
     #[arg(skip)]
@@ -286,6 +296,35 @@ fn parse_sessions(value: &str) -> std::result::Result<usize, String> {
             crate::guests::MAX_SESSIONS
         )),
     }
+}
+
+/// The host can serve AV1: in hardware, or with SVT-AV1 when `--encoder`
+/// allows software (explicit hardware encoders never fall back).
+fn offers_av1(options: &Options) -> bool {
+    options.hardware_codecs.contains(&protocol::VideoCodec::Av1)
+        || (matches!(
+            options.encoder,
+            media::EncoderKind::Auto | media::EncoderKind::Software
+        ) && media::av1_available())
+}
+
+/// The host can serve a format (4:4:4 or 10-bit SDR) its `hardware` probe
+/// found, or any of them when `--encoder` allows software.
+fn offers_format(options: &Options, hardware: &[protocol::VideoCodec]) -> bool {
+    crate::ffmpeg::enabled().unwrap_or(false)
+        && (!hardware.is_empty()
+            || matches!(
+                options.encoder,
+                media::EncoderKind::Auto | media::EncoderKind::Software
+            ))
+}
+
+/// Codecs the host encodes in hardware as 4:4:4 (`Desktop::hardware_444`)
+/// and as Main 10 SDR (`Desktop::hardware_ten_bit`).
+#[derive(Clone, Debug, Default)]
+pub struct HardwareFormats {
+    pub chroma_444: Vec<protocol::VideoCodec>,
+    pub ten_bit: Vec<protocol::VideoCodec>,
 }
 
 pub async fn run(mut options: Options) -> Result<()> {
@@ -451,7 +490,11 @@ async fn serve(options: &Options, idle: &mut Option<Capture>) -> Result<()> {
     // Warm the hardware encoder probe so the first client does not wait for it.
     let kind = options.encoder;
     if options.smoke_hardware_codecs.is_none() {
-        std::thread::spawn(move || media::hardware_codecs(kind));
+        std::thread::spawn(move || {
+            media::hardware_codecs(kind);
+            media::hardware_444_codecs(kind);
+            media::hardware_ten_bit_codecs(kind);
+        });
     }
     let mut config = moq_native::ServerConfig::default();
     config.bind = Some(options.listen.clone());
@@ -2032,7 +2075,7 @@ impl Members {
             )?;
             let mut idle = Vec::new();
             let mut tasks = Vec::new();
-            for codec in [protocol::VideoCodec::H264, protocol::VideoCodec::H265] {
+            for codec in protocol::VideoCodec::ALL {
                 let track = broadcast.create_track(
                     codec.track(),
                     moq_net::track::Info::default().with_latency_max(Duration::from_millis(500)),
@@ -2208,10 +2251,10 @@ async fn run_session(
         "desktop",
         moq_net::broadcast::Route::new().with_announce(true),
     )?;
-    // Both codecs' tracks exist until the client has chosen (SelectCodec):
+    // Every codec's track exists until the client has chosen (SelectCodec):
     // it subscribes to its choice right after sending it.
     let mut video_tracks = Vec::new();
-    for codec in [protocol::VideoCodec::H264, protocol::VideoCodec::H265] {
+    for codec in protocol::VideoCodec::ALL {
         video_tracks.push((
             codec,
             broadcast.create_track(
@@ -2226,7 +2269,7 @@ async fn run_session(
     let monitor_slots =
         (capture.monitors.len() + usize::from(capture.virtual_monitors_available())).min(64);
     let mut monitor_codec_tracks = Vec::new();
-    for codec in [protocol::VideoCodec::H264, protocol::VideoCodec::H265] {
+    for codec in protocol::VideoCodec::ALL {
         let mut tracks = Vec::new();
         for index in 0..monitor_slots {
             tracks.push(broadcast.create_track(
@@ -2290,12 +2333,24 @@ async fn run_session(
     }
     // Probed once per process (src/ffmpeg_media.rs), off the async loop.
     let kind = options.encoder;
-    options.hardware_codecs = match &options.smoke_hardware_codecs {
-        Some(codecs) => codecs.clone(),
-        None => tokio::task::spawn_blocking(move || media::hardware_codecs(kind))
-            .await
-            .context("hardware encoder probe failed")?,
+    let (codecs, formats) = match &options.smoke_hardware_codecs {
+        Some(codecs) => (codecs.clone(), HardwareFormats::default()),
+        None => tokio::task::spawn_blocking(move || {
+            (
+                media::hardware_codecs(kind),
+                HardwareFormats {
+                    chroma_444: media::hardware_444_codecs(kind),
+                    ten_bit: media::hardware_ten_bit_codecs(kind),
+                },
+            )
+        })
+        .await
+        .context("hardware encoder probe failed")?,
     };
+    options.hardware_codecs = codecs;
+    *options.hardware_formats = formats;
+    options.chroma_444 = false;
+    options.ten_bit = false;
     let (sender, receiver) = tokio::sync::mpsc::channel(256);
     let mut events = SessionEvents {
         receiver,
@@ -2377,6 +2432,8 @@ async fn run_session(
                 codec,
                 encoder_preset,
                 audio,
+                chroma_444,
+                ten_bit,
             },
         ))) => {
             if let Some(preset) = encoder_preset {
@@ -2390,7 +2447,28 @@ async fn run_session(
                     || codec == protocol::VideoCodec::H265,
                 "HDR10 requires H.265"
             );
+            ensure!(
+                codec != protocol::VideoCodec::Av1 || offers_av1(options),
+                "this host has no AV1 encoder"
+            );
+            ensure!(
+                !chroma_444
+                    || (codec.supports_444()
+                        && options.dynamic_range == protocol::DynamicRange::Sdr
+                        && crate::ffmpeg::enabled()?),
+                "4:4:4 needs H.264 or H.265 SDR with the FFmpeg backend"
+            );
+            ensure!(
+                !ten_bit
+                    || (codec.supports_ten_bit()
+                        && !chroma_444
+                        && options.dynamic_range == protocol::DynamicRange::Sdr
+                        && crate::ffmpeg::enabled()?),
+                "10-bit SDR needs H.265 or AV1 without 4:4:4 and the FFmpeg backend"
+            );
             options.codec = codec;
+            options.chroma_444 = chroma_444;
+            options.ten_bit = ten_bit;
             true
         }
         Ok(Some(tagged)) => {
@@ -2402,6 +2480,8 @@ async fn run_session(
     };
     tracing::info!(
         codec = options.codec.label(),
+        chroma_444 = options.chroma_444,
+        ten_bit = options.ten_bit,
         chosen_by_client,
         encoder_preset = options.encoder_preset.label(),
         hardware = ?options.hardware_codecs,
@@ -3198,7 +3278,7 @@ async fn run_session(
                     // Auxiliary streams currently use fixed bitrate. Their
                     // congestion must never adapt the independent primary.
                     Event::MonitorFeedback { .. } => {}
-                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble, cursor_positions: wants_positions, frame_timing, privacy: wants_privacy, virtual_monitor: wants_virtual, gamepad_lights, guests, microphone: wants_microphone } => {
+                    Event::ClientFeatures { keyframe_requests , pointer_datagrams, local_cursor, rumble: plays_rumble, cursor_positions: wants_positions, frame_timing, privacy: wants_privacy, virtual_monitor: wants_virtual, gamepad_lights, guests, microphone: wants_microphone, video_formats } => {
                         let is_leader = members.is_leader(from);
                         let first_declaration = members.sessions.get(&from).is_some_and(|s| !s.features.declared);
                         if let Some(session) = members.sessions.get_mut(&from) {
@@ -3242,6 +3322,17 @@ async fn run_session(
                         // be read by a client that cannot strip the stamps.
                         if !is_leader && options.frame_timing && !frame_timing {
                             members.remove(from, "client cannot read the shared stream", Some("Update Teleport to join this shared desktop".into()), capture).await;
+                            continue;
+                        }
+                        // Nor one in AV1, 4:4:4 or 10-bit by a client that
+                        // does not know those formats (newer clients check
+                        // they can decode it, and leave when not).
+                        if !is_leader
+                            && !video_formats
+                            && (options.chroma_444 || options.ten_bit || options.codec == protocol::VideoCodec::Av1)
+                        {
+                            let shared = crate::client::stream_settings::format_label(options.codec, options.chroma_444, options.ten_bit);
+                            members.remove(from, "client cannot decode the shared stream", Some(format!("This desktop is shared as {shared}; update Teleport to join it")), capture).await;
                             continue;
                         }
                         // One virtual microphone: owners' clients, or a guest
@@ -3667,7 +3758,8 @@ impl Rates {
                 info.width,
                 info.height,
                 options.fps,
-                options.codec == protocol::VideoCodec::H265,
+                // H.265 and AV1 need about two thirds of H.264's bits.
+                options.codec != protocol::VideoCodec::H264,
             ),
             negotiated: (options.width, options.fps),
             ceiling: options.bitrate,
@@ -3812,7 +3904,21 @@ fn desktop_for_monitor(
         max_fps: protocol::MAX_FPS,
         display_negotiation: true,
         codec_selection: true,
-        hardware_codecs: options.hardware_codecs.clone(),
+        // Older clients reject names they do not know.
+        hardware_codecs: options
+            .hardware_codecs
+            .iter()
+            .copied()
+            .filter(|&codec| codec != protocol::VideoCodec::Av1)
+            .collect(),
+        av1: offers_av1(options),
+        hardware_av1: options.hardware_codecs.contains(&protocol::VideoCodec::Av1),
+        chroma_444_selection: offers_format(options, &options.hardware_formats.chroma_444),
+        hardware_444: options.hardware_formats.chroma_444.clone(),
+        chroma_444: options.chroma_444,
+        ten_bit_selection: offers_format(options, &options.hardware_formats.ten_bit),
+        hardware_ten_bit: options.hardware_formats.ten_bit.clone(),
+        ten_bit: options.ten_bit,
         extra_mouse_buttons: true,
         encoder_presets: true,
         encoder_preset: options.encoder_preset,
@@ -3933,6 +4039,8 @@ fn start_encoder(
     let format = media::VideoFormat {
         codec: options.codec,
         dynamic_range: options.dynamic_range,
+        chroma444: options.chroma_444,
+        ten_bit: options.ten_bit,
     };
     tokio::task::spawn_blocking(move || {
         media::encoder(&source, size, fps, bitrate, track, kind, format)
@@ -4080,6 +4188,8 @@ fn requested_format(
     let format = media::VideoFormat {
         codec: codec.unwrap_or(default),
         dynamic_range: range.unwrap_or_default(),
+        chroma444: false,
+        ten_bit: false,
     };
     ensure!(
         format.dynamic_range != protocol::DynamicRange::Hdr10

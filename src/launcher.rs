@@ -158,9 +158,26 @@ const QUALITIES: [(&str, &str); 5] = [
     ("40 Mbps cap", "40000"),
     ("80 Mbps cap", "80000"),
 ];
-/// Auto is H.265 when the host encodes and this client decodes it in
-/// hardware, otherwise H.264 (and always H.264 with older hosts).
-const CODECS: [(&str, &str); 3] = [("Auto codec", "auto"), ("H.264", "h264"), ("H.265", "h265")];
+/// Auto is AV1, else H.265, when the host encodes and this client decodes it
+/// in hardware, otherwise H.264 (and always H.264 with older hosts).
+const CODECS: [(&str, &str); 4] = [
+    ("Auto codec", "auto"),
+    ("H.264", "h264"),
+    ("H.265", "h265"),
+    ("AV1", "av1"),
+];
+/// `--chroma-444`: full-resolution chroma for sharp coloured text.
+const CHROMA_444: [(&str, &str); 3] = [
+    ("4:4:4 colour: off", "off"),
+    ("4:4:4 colour: auto", "auto"),
+    ("4:4:4 colour: on", "on"),
+];
+/// `--ten-bit`: Main 10 from 8-bit capture, against banding.
+const TEN_BIT: [(&str, &str); 3] = [
+    ("10-bit: off", "off"),
+    ("10-bit: auto", "auto"),
+    ("10-bit: on", "on"),
+];
 /// `--relative-mouse`: lock the pointer for games while the host hides it,
 /// always, or only by Ctrl+Alt+M.
 const RELATIVE_MOUSE: [(&str, &str); 3] = [
@@ -355,6 +372,25 @@ fn approval_confirm_rect() -> Rect {
     Rect::new(304, 560, 448, 44)
 }
 
+/// Connection settings buttons shown (the rest of the grid stays empty).
+const PREF_BUTTONS: usize = 22;
+/// The settings caption's top; the grid starts below it.
+const PREF_CAPTION_Y: i32 = 390;
+/// Top of the status panel, which the grid must stay above.
+const STATUS_Y: i32 = 716;
+
+/// Connection settings button `index`: eight rows of three between the
+/// caption (below the session buttons; the power row is hidden with
+/// settings shown) and the status panel.
+fn pref_rect(index: usize) -> Rect {
+    Rect::new(
+        304 + (index % 3) as i32 * 232,
+        414 + (index / 3) as i32 * 38,
+        220,
+        32,
+    )
+}
+
 #[derive(Default)]
 struct AgentConsent {
     address: String,
@@ -469,15 +505,6 @@ pub fn run() -> Result<()> {
     let REJECT = Rect::new(764, 560, 228, 44);
     debug_assert!(!APPROVE.has_intersection(AUTH));
     let mode_rect = |index: usize| Rect::new(304 + index as i32 * 174, 220, 166, 38);
-    // Six rows of three fit above the status panel (y 716).
-    let pref_rect = |index: usize| {
-        Rect::new(
-            304 + (index % 3) as i32 * 232,
-            452 + (index / 3) as i32 * 44,
-            220,
-            36,
-        )
-    };
     let (sdl, video) = crate::windowing::init()?;
     let ttf = sdl2::ttf::init().map_err(anyhow::Error::msg)?;
     let font = ttf
@@ -523,6 +550,8 @@ pub fn run() -> Result<()> {
     let mut settings = false;
     let mut stream = StreamPreferences::default();
     let mut codec = 0usize;
+    let mut chroma_444 = 0usize;
+    let mut ten_bit = 0usize;
     let mut relative_mouse = 0usize;
     let mut encoder_preset = 0usize;
     let mut host_display = 0usize;
@@ -1219,6 +1248,12 @@ pub fn run() -> Result<()> {
                                 if hit(pref_rect(19), x, y) {
                                     keep_local = (keep_local + 1) % KEEP_LOCAL.len();
                                 }
+                                if hit(pref_rect(20), x, y) {
+                                    chroma_444 = (chroma_444 + 1) % CHROMA_444.len();
+                                }
+                                if hit(pref_rect(21), x, y) {
+                                    ten_bit = (ten_bit + 1) % TEN_BIT.len();
+                                }
                                 if hit(pref_rect(3), x, y) {
                                     codec = (codec + 1) % CODECS.len();
                                     if CODECS[codec].1 != "h265" {
@@ -1366,6 +1401,10 @@ pub fn run() -> Result<()> {
                             .arg(credential)
                             .arg("--codec")
                             .arg(CODECS[codec].1)
+                            .arg("--chroma-444")
+                            .arg(CHROMA_444[chroma_444].1)
+                            .arg("--ten-bit")
+                            .arg(TEN_BIT[ten_bit].1)
                             .arg("--relative-mouse")
                             .arg(RELATIVE_MOUSE[relative_mouse].1)
                             .arg("--dynamic-range")
@@ -1843,12 +1882,12 @@ pub fn run() -> Result<()> {
                             &small_font,
                             "STREAM SETTINGS · Match follows this window and display. VSync on stops tearing on fixed-refresh screens.",
                             304,
-                            420,
+                            PREF_CAPTION_Y,
                             688,
                             MUTED,
                         )?;
                         let [resolution_label, frame_rate_label, quality_label] = stream.labels();
-                        let labels = [
+                        let labels: [&str; PREF_BUTTONS] = [
                             resolution_label,
                             frame_rate_label,
                             quality_label,
@@ -1904,6 +1943,8 @@ pub fn run() -> Result<()> {
                                 "Ctrl/Cmd as is"
                             },
                             KEEP_LOCAL[keep_local].0,
+                            CHROMA_444[chroma_444].0,
+                            TEN_BIT[ten_bit].0,
                         ];
                         for (index, label) in labels.into_iter().enumerate() {
                             ui.button(
@@ -1927,7 +1968,7 @@ pub fn run() -> Result<()> {
                 }
             }
         }
-        ui.panel(Rect::new(280, 716, 736, 70), Color::RGB(17, 37, 44))?;
+        ui.panel(Rect::new(280, STATUS_Y, 736, 70), Color::RGB(17, 37, 44))?;
         let surface = small_font.render(&status).blended_wrapped(INK, 688)?;
         let texture = textures.create_texture_from_surface(&surface)?;
         let height = surface.height().min(54);
@@ -2139,6 +2180,29 @@ fn append_code(code: &mut String, text: &str) {
 
 #[cfg(test)]
 mod tests {
+    /// Every connection setting has its own button inside the settings area:
+    /// below the session buttons and caption, above the status panel, inside
+    /// the window, overlapping nothing.
+    #[test]
+    fn settings_buttons_fit_between_the_caption_and_the_status_panel() {
+        use super::{PREF_BUTTONS, PREF_CAPTION_Y, STATUS_Y, pref_rect};
+        let session_buttons = sdl2::rect::Rect::new(304, 342, 688, 36);
+        assert!(session_buttons.bottom() < PREF_CAPTION_Y);
+        for index in 0..PREF_BUTTONS {
+            let rect = pref_rect(index);
+            assert!(rect.top() >= PREF_CAPTION_Y + 20, "{index}: {rect:?}");
+            assert!(rect.bottom() <= STATUS_Y, "{index}: {rect:?}");
+            assert!(
+                rect.left() >= 280 && rect.right() <= 1016,
+                "{index}: {rect:?}"
+            );
+            assert!(rect.height() >= 28, "{index}: {rect:?}");
+            for other in index + 1..PREF_BUTTONS {
+                assert!(!rect.has_intersection(pref_rect(other)), "{index} {other}");
+            }
+        }
+    }
+
     #[test]
     fn stream_settings_default_to_matching_and_reach_the_client() {
         use crate::client::stream_settings::{Setting, parse_bitrate, parse_fps, parse_width};

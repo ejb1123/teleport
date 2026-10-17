@@ -252,6 +252,12 @@ fn app_bundle_environment() {
 fn main() -> Result<()> {
     #[cfg(target_os = "macos")]
     app_bundle_environment();
+    // SVT-AV1 prints its whole configuration to stderr on every encoder open;
+    // keep only its errors unless asked.
+    if std::env::var_os("SVT_LOG").is_none() {
+        // Safety: no other thread exists yet to read the environment.
+        unsafe { std::env::set_var("SVT_LOG", "1") };
+    }
     // Start the frame-timing clock before any instant it may be asked about.
     protocol::clock_us(std::time::Instant::now());
     tracing_subscriber::fmt()

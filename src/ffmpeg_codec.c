@@ -19,9 +19,11 @@
 typedef struct {
     AVCodecContext *ctx;
     AVPacket *packet;
-    AVFrame *frame, *download, *converted;
-    struct SwsContext *sws;
-    enum AVPixelFormat hw_format, input_format;
+    AVFrame *frame, *download, *converted, *dithered;
+    struct SwsContext *sws, *sws_dithered;
+    /* input_format: what tp_send_frame takes; upload_format: the encoder's
+     * hardware frames' software format (VA-API and QSV take 4:4:4 packed). */
+    enum AVPixelFormat hw_format, input_format, upload_format;
     int encoder, hdr, output_format, width, height, fps, kbps;
     int live_bitrate; /* encoder applies bitrate changes in place */
     /* Encoders opened for GPU input (NVENC on CUDA frames, VA-API on an
@@ -46,12 +48,19 @@ void tp_codec_free(TpCodec *codec) {
 #ifdef __linux__
     tp_import_free(codec->import); /* before the frames context it converts into */
 #endif
+    /* SVT-AV1 wants an end of stream before it is closed. Low delay: there is
+     * nothing left to drain. */
+    if (codec->encoder && codec->ctx && codec->ctx->codec && !strcmp(codec->ctx->codec->name, "libsvtav1")
+        && avcodec_is_open(codec->ctx) && avcodec_send_frame(codec->ctx, NULL) >= 0)
+        while (avcodec_receive_packet(codec->ctx, codec->packet) >= 0) av_packet_unref(codec->packet);
     avcodec_free_context(&codec->ctx);
     av_packet_free(&codec->packet);
     av_frame_free(&codec->frame);
     av_frame_free(&codec->download);
     av_frame_free(&codec->converted);
+    av_frame_free(&codec->dithered);
     sws_freeContext(codec->sws);
+    sws_freeContext(codec->sws_dithered);
     free(codec);
 }
 
@@ -117,8 +126,37 @@ static void apply_preset(AVDictionary **opts, AVCodecContext *ctx, const char *n
     }
 }
 
+/* SVT-AV1 presets run 0 (slowest) to 13 (fastest), but its low-delay mode
+ * maps everything above 10 to 10 (SVT-AV1 3.1); see docs/ffmpeg.md for the
+ * measured encode times. */
+static void svtav1_preset(AVDictionary **opts, int preset) {
+    av_dict_set(opts, "preset", preset >= 2 ? "8" : preset == 1 ? "9" : "10", 0);
+}
+
+/* The decoder for `codec` (0 H.264, 1 H.265, 2 AV1) and device type `name`.
+ * AV1: dav1d in software; FFmpeg's own AV1 decoder only decodes through a
+ * hardware device (NVDEC, VA-API, VideoToolbox). */
+static const AVCodec *find_decoder(int codec, const char *name) {
+    if (!strcmp(name, "qsv"))
+        return avcodec_find_decoder_by_name(codec == 2 ? "av1_qsv" : codec ? "hevc_qsv" : "h264_qsv");
+    if (codec == 2)
+        return avcodec_find_decoder_by_name(strcmp(name, "software") ? "av1" : "libdav1d");
+    return avcodec_find_decoder(codec ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
+}
+
+/* 1 when an encoder (or a decoder, for `encoder` 0) called `name` is built
+ * into this FFmpeg. */
+int tp_codec_available(int encoder, const char *name) {
+    return (encoder ? avcodec_find_encoder_by_name(name) : avcodec_find_decoder_by_name(name)) != NULL;
+}
+
 /* name: an encoder name, or decoder device type ("software", "cuda",
- * "vaapi", "qsv", "videotoolbox", optionally "type@device"). output: 0 RGB24,
+ * "vaapi", "qsv", "videotoolbox", optionally "type@device").
+ * codec: 0 H.264, 1 H.265, 2 AV1. chroma444 (encoders, H.264/H.265 SDR): take
+ * and encode full-resolution chroma (YUV444P input); decoders need no flag.
+ * ten_bit (encoders, H.265/AV1 SDR): take P010 and encode Main 10 with
+ * BT.709 tags, as HDR does with BT.2020/PQ.
+ * output: 0 RGB24,
  * 1 NV12, 2 P010, 3 GPU frame reference (CUDA or VA-API, no download).
  * gpu_input (NVENC, VA-API encoders): also accept DMA-BUF frames
  * (tp_send_dmabuf); NVENC then takes CUDA frames and VA-API opens the first
@@ -126,19 +164,20 @@ static void apply_preset(AVDictionary **opts, AVCodecContext *ctx, const char *n
  * preset (encoders): 0 lowest latency (the historical settings), 1 balanced,
  * 2 quality; see apply_preset.
  * refresh: intra-refresh period in frames (0: off; see intra_refresh_options). */
-TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
+TpCodec *tp_codec_open(int encoder, const char *name, int codec_id, int hdr, int chroma444, int ten_bit,
                        int width, int height, int fps, int kbps, int output, int gop,
                        int gpu_input, int preset, int refresh, int *error) {
     int result = AVERROR(ENOMEM);
     AVDictionary *opts = NULL;
-    const AVCodec *implementation = encoder ? avcodec_find_encoder_by_name(name)
-        : avcodec_find_decoder(hevc ? AV_CODEC_ID_HEVC : AV_CODEC_ID_H264);
-    if (!encoder && !strcmp(name, "qsv"))
-        implementation = avcodec_find_decoder_by_name(hevc ? "hevc_qsv" : "h264_qsv");
+    int hevc = codec_id == 1, av1 = codec_id == 2;
+    int depth10 = hdr || ten_bit;
+    const AVCodec *implementation = encoder ? avcodec_find_encoder_by_name(name) : find_decoder(codec_id, name);
     TpCodec *codec = calloc(1, sizeof(*codec));
     if (!codec) { *error = result; return NULL; }
+    if (codec_id < 0 || codec_id > 2) { result = AVERROR(EINVAL); goto fail; }
     if (!implementation) { result = encoder ? AVERROR_ENCODER_NOT_FOUND : AVERROR_DECODER_NOT_FOUND; goto fail; }
-    if ((hdr && !hevc) || (encoder && (!dimensions(width, height) || fps < 1 || fps > 240 || kbps < 1 || kbps > 100000))) {
+    if ((hdr && !hevc) || (chroma444 && (hdr || av1)) || (ten_bit && (hdr || chroma444 || codec_id == 0))
+        || (encoder && (!dimensions(width, height) || fps < 1 || fps > 240 || kbps < 1 || kbps > 100000))) {
         result = AVERROR(EINVAL); goto fail;
     }
     codec->ctx = avcodec_alloc_context3(implementation);
@@ -146,7 +185,9 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
     codec->frame = av_frame_alloc();
     codec->download = av_frame_alloc();
     codec->converted = av_frame_alloc();
-    if (!codec->ctx || !codec->packet || !codec->frame || !codec->download || !codec->converted) goto fail;
+    codec->dithered = av_frame_alloc();
+    if (!codec->ctx || !codec->packet || !codec->frame || !codec->download || !codec->converted
+        || !codec->dithered) goto fail;
     codec->encoder = encoder; codec->hdr = hdr; codec->output_format = output;
     codec->width = width; codec->height = height; codec->fps = fps; codec->kbps = kbps;
     codec->live_bitrate = encoder && (strstr(name, "nvenc") || !strcmp(name, "libx264"));
@@ -178,10 +219,20 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
         ctx->color_primaries = hdr ? AVCOL_PRI_BT2020 : AVCOL_PRI_BT709;
         ctx->color_trc = hdr ? AVCOL_TRC_SMPTE2084 : AVCOL_TRC_BT709;
         ctx->colorspace = hdr ? AVCOL_SPC_BT2020_NCL : AVCOL_SPC_BT709;
-        codec->input_format = hdr ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+        codec->input_format = depth10 ? AV_PIX_FMT_P010LE : chroma444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_NV12;
+        codec->upload_format = codec->input_format;
         ctx->pix_fmt = codec->input_format;
-        if (strstr(name, "libx")) {
-            ctx->pix_fmt = hdr ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
+        if (!strcmp(name, "libsvtav1")) {
+            /* SVT-AV1 in its low-delay prediction structure (no B-frames or
+             * look-ahead), CBR, scene-change detection off; the preset is
+             * set in apply_preset. FFmpeg maps gop_size and closed GOPs to
+             * its key-frame interval and refresh type. */
+            ctx->pix_fmt = depth10 ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
+            ctx->thread_count = 0; /* every core: 1080p took 25% less time than with 4 */
+            av_dict_set(&opts, "svtav1-params",
+                "pred-struct=1:rc=2:lookahead=0:scd=0:enable-overlays=0:tile-columns=1:fast-decode=1", 0);
+        } else if (strstr(name, "libx")) {
+            ctx->pix_fmt = depth10 ? AV_PIX_FMT_YUV420P10LE : chroma444 ? AV_PIX_FMT_YUV444P : AV_PIX_FMT_YUV420P;
             av_dict_set(&opts, "preset", "ultrafast", 0);
             av_dict_set(&opts, "tune", "zerolatency", 0);
             av_dict_set(&opts, hevc ? "x265-params" : "x264-params",
@@ -197,6 +248,8 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
             av_dict_set(&opts, "rc-lookahead", "0", 0);
             av_dict_set(&opts, "forced-idr", "1", 0);
             if (gpu_input && !hdr) {
+                /* 4:4:4 and 10-bit SDR too: the DMA-BUF shader then writes
+                 * three planes, or 16-bit ones. */
                 /* CUDA frames: imported DMA-BUFs are converted straight into
                  * them; CPU frames are uploaded by tp_send_frame. */
                 result = av_hwdevice_ctx_create(&ctx->hw_device_ctx, AV_HWDEVICE_TYPE_CUDA, NULL, NULL, 0);
@@ -207,7 +260,7 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
                 if (!ctx->hw_frames_ctx) { result = AVERROR(ENOMEM); goto fail; }
                 AVHWFramesContext *frames = (void *)ctx->hw_frames_ctx->data;
                 frames->format = AV_PIX_FMT_CUDA;
-                frames->sw_format = AV_PIX_FMT_NV12;
+                frames->sw_format = codec->input_format;
                 frames->width = width; frames->height = height;
                 result = av_hwframe_ctx_init(ctx->hw_frames_ctx);
                 if (result < 0) goto fail;
@@ -232,7 +285,9 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
             if (!ctx->hw_frames_ctx) { result = AVERROR(ENOMEM); goto fail; }
             AVHWFramesContext *frames = (void *)ctx->hw_frames_ctx->data;
             frames->format = codec->hw_format;
-            frames->sw_format = codec->input_format;
+            /* 4:4:4 surfaces are packed (Intel Ice Lake and later). */
+            if (chroma444) codec->upload_format = AV_PIX_FMT_VUYX;
+            frames->sw_format = codec->upload_format;
             frames->width = width; frames->height = height; frames->initial_pool_size = 12;
             result = av_hwframe_ctx_init(ctx->hw_frames_ctx);
             if (result < 0) goto fail;
@@ -270,7 +325,8 @@ TpCodec *tp_codec_open(int encoder, const char *name, int hevc, int hdr,
         /* GPU presentation holds the newest frame until it is drawn. */
         if (output == 3) codec->ctx->extra_hw_frames = 3;
     }
-    if (encoder) apply_preset(&opts, codec->ctx, name, preset);
+    if (encoder && !strcmp(name, "libsvtav1")) svtav1_preset(&opts, preset);
+    else if (encoder) apply_preset(&opts, codec->ctx, name, preset);
     if (encoder) intra_refresh_options(codec->ctx, name, refresh, &opts);
     result = avcodec_open2(codec->ctx, implementation, &opts);
     av_dict_free(&opts);
@@ -301,7 +357,7 @@ int tp_send_frame(TpCodec *codec, const uint8_t *data, int size, int64_t pts, in
     if (required < 0 || required != size) return AVERROR(EINVAL);
     av_frame_unref(codec->frame);
     AVFrame *frame = codec->frame;
-    frame->format = codec->hw_format != AV_PIX_FMT_NONE ? codec->input_format : codec->ctx->pix_fmt;
+    frame->format = codec->hw_format != AV_PIX_FMT_NONE ? codec->upload_format : codec->ctx->pix_fmt;
     frame->width = codec->width; frame->height = codec->height;
     int result = av_frame_get_buffer(frame, 32);
     if (result < 0) return result;
@@ -371,6 +427,24 @@ int tp_receive_packet(TpCodec *codec, TpOutput *output) {
     return 1;
 }
 
+/* P010 to NV12 with a 2x2 ordered dither: the two bits an 8-bit output
+ * drops become a fine pattern instead of contours (swscale truncates). */
+static void dither_p010(const AVFrame *p010, AVFrame *nv12) {
+    static const uint16_t bayer[2][2] = {{0, 2}, {3, 1}};
+    for (int plane = 0; plane < 2; plane++) {
+        int rows = plane ? p010->height / 2 : p010->height;
+        for (int y = 0; y < rows; y++) {
+            const uint16_t *in = (const uint16_t *)(p010->data[plane] + (ptrdiff_t)y * p010->linesize[plane]);
+            uint8_t *out = nv12->data[plane] + (ptrdiff_t)y * nv12->linesize[plane];
+            for (int x = 0; x < p010->width; x++) {
+                /* Chroma pairs share their pixel column's threshold. */
+                unsigned value = ((unsigned)(in[x] >> 6) + bayer[y & 1][(plane ? x >> 1 : x) & 1]) >> 2;
+                out[x] = value > 255 ? 255 : (uint8_t)value;
+            }
+        }
+    }
+}
+
 int tp_receive_frame(TpCodec *codec, TpOutput *output) {
     av_frame_unref(codec->frame);
     int result = avcodec_receive_frame(codec->ctx, codec->frame);
@@ -401,6 +475,10 @@ int tp_receive_frame(TpCodec *codec, TpOutput *output) {
         || frame->color_trc != AVCOL_TRC_SMPTE2084 || frame->colorspace != AVCOL_SPC_BT2020_NCL)) return AVERROR(EINVAL);
     enum AVPixelFormat target = codec->output_format == 2 ? AV_PIX_FMT_P010LE
         : codec->output_format == 1 ? AV_PIX_FMT_NV12 : AV_PIX_FMT_RGB24;
+    /* 10-bit SDR shown at 8 bits: through P010 and an ordered dither. */
+    int dither = !codec->hdr && description->comp[0].depth > 8 && target != AV_PIX_FMT_P010LE;
+    enum AVPixelFormat final_target = target;
+    if (dither) target = AV_PIX_FMT_P010LE;
     av_frame_unref(codec->converted);
     codec->converted->format = target;
     codec->converted->width = frame->width; codec->converted->height = frame->height;
@@ -416,12 +494,40 @@ int tp_receive_frame(TpCodec *codec, TpOutput *output) {
     result = sws_scale(codec->sws, (const uint8_t *const *)frame->data, frame->linesize,
         0, frame->height, codec->converted->data, codec->converted->linesize);
     if (result != frame->height) return AVERROR(EINVAL);
+    AVFrame *done = codec->converted;
+    if (dither) {
+        av_frame_unref(codec->dithered);
+        codec->dithered->format = AV_PIX_FMT_NV12;
+        codec->dithered->width = frame->width; codec->dithered->height = frame->height;
+        result = av_frame_get_buffer(codec->dithered, 1);
+        if (result < 0) return result;
+        dither_p010(codec->converted, codec->dithered);
+        done = codec->dithered;
+        target = AV_PIX_FMT_NV12;
+        if (final_target == AV_PIX_FMT_RGB24) {
+            av_frame_unref(codec->converted);
+            codec->converted->format = AV_PIX_FMT_RGB24;
+            codec->converted->width = frame->width; codec->converted->height = frame->height;
+            result = av_frame_get_buffer(codec->converted, 1);
+            if (result < 0) return result;
+            codec->sws_dithered = sws_getCachedContext(codec->sws_dithered, frame->width, frame->height,
+                AV_PIX_FMT_NV12, frame->width, frame->height, AV_PIX_FMT_RGB24, SWS_POINT, NULL, NULL, NULL);
+            if (!codec->sws_dithered) return AVERROR(ENOMEM);
+            sws_setColorspaceDetails(codec->sws_dithered, sws_getCoefficients(SWS_CS_ITU709), 0,
+                sws_getCoefficients(SWS_CS_ITU709), 1, 0, 1 << 16, 1 << 16);
+            result = sws_scale(codec->sws_dithered, (const uint8_t *const *)done->data, done->linesize,
+                0, frame->height, codec->converted->data, codec->converted->linesize);
+            if (result != frame->height) return AVERROR(EINVAL);
+            done = codec->converted;
+            target = AV_PIX_FMT_RGB24;
+        }
+    }
     int size = av_image_get_buffer_size(target, frame->width, frame->height, 1);
     av_packet_unref(codec->packet);
     result = av_new_packet(codec->packet, size);
     if (result < 0) return result;
     result = av_image_copy_to_buffer(codec->packet->data, size,
-        (const uint8_t *const *)codec->converted->data, codec->converted->linesize, target, frame->width, frame->height, 1);
+        (const uint8_t *const *)done->data, done->linesize, target, frame->width, frame->height, 1);
     if (result < 0) return result;
     *output = (TpOutput){.data = codec->packet->data, .size = size,
         .width = frame->width, .height = frame->height, .pts = pts};

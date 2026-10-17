@@ -218,6 +218,21 @@ request. Revoking a device while it waits keeps it out.
 - The codec is chosen once: later clients get `Desktop::shared_stream` and
   take it (`--codec auto`); an explicit different `--codec` is refused with
   a message. HDR and SDR sessions cannot share a stream.
+- So are its format options (docs/ffmpeg.md): the first session's
+  `SelectCodec` decides AV1, 4:4:4 and 10-bit SDR for everyone, and joining
+  sessions are told the stream's format (`Desktop.codec`, `chroma_444`,
+  `ten_bit`). A client that asked for 4:4:4 or 10-bit (`on`) and joins a
+  stream without it shows the shared one and says so ("Video is shared with
+  another session: showing H.265 as it chose"); one left at the default
+  (`off`) shows a shared 4:4:4 or 10-bit stream without a notice. Before
+  subscribing it runs its decoder probe on the shared format; when it cannot
+  decode it (no AV1 decoder, the legacy GStreamer backend for AV1, 4:4:4 or
+  10-bit) it leaves with "the host is already streaming H.265 4:4:4 to
+  another session, which this client cannot decode" rather than showing a
+  broken picture. Clients from before these formats do not declare
+  `ClientFeatures.video_formats`; the host removes them from an AV1, 4:4:4
+  or 10-bit stream with the notice "This desktop is shared as …; update
+  Teleport to join it" (an AV1 `Desktop` already fails to parse there).
 - Rate control is per session: the leader's feedback drives the encoder,
   every other session's own controller can pull the shared bitrate down to
   a quarter of the leader's (a worse link skips frames instead), and the

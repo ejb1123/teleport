@@ -247,6 +247,16 @@ impl Host {
     }
 
     fn client(&self, credential: &Path, frames: &str, args: &[&str]) -> Client {
+        self.client_env(credential, frames, args, &[])
+    }
+
+    fn client_env(
+        &self,
+        credential: &Path,
+        frames: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Client {
         let log = self.temp.path().join(format!(
             "client-{}.log",
             std::time::SystemTime::now()
@@ -268,6 +278,7 @@ impl Host {
                 .env("XDG_CONFIG_HOME", config)
                 .args(["--headless-frames", frames, "--software-decoder"])
                 .args(args)
+                .envs(env.iter().copied())
                 .env("RUST_LOG", "teleport=info")
                 .stdout(file.try_clone().unwrap())
                 .stderr(file)
@@ -702,6 +713,67 @@ fn shared_audio_reaches_every_session_in_the_first_sessions_format() {
     );
     // One audio capture for both.
     assert_eq!(host.count(&["session desktop audio"]), 1);
+    passed(&mut owner_client);
+}
+
+/// The owner's `SelectCodec` decides 4:4:4 for everyone: a joiner that can
+/// decode it shows it (and says it did not get the 10-bit it asked for), a
+/// joiner that cannot (the legacy GStreamer backend) leaves with a clear
+/// error before showing anything, and a client from before these formats
+/// is removed by the host with a notice. The owner's session goes on.
+#[test]
+#[ignore = "requires local TCP/UDP sockets and GStreamer runtime plugins"]
+fn joiners_take_the_owners_4_4_4_stream_or_are_refused() {
+    let host = Host::start(&[]);
+    let owner = host.owner("owner");
+    let trusted = |config: &str, name: &str| {
+        let guest = host.guest(config, name, json!({}));
+        let id = host.device(name);
+        host.admin(json!({ "SetGuest": { "id": id, "permissions": null, "trusted": true } }));
+        guest
+    };
+    let viewer = trusted("viewer", "Viewer");
+    let legacy_backend = trusted("legacy-backend", "Backend");
+    let old_client = trusted("old-client", "Old");
+    let mut owner_client = host.client(&owner, "1500", &["--codec", "h265", "--chroma-444", "on"]);
+    host.wait_log(&["session video codec", "H.265", "chroma_444=true"]);
+    // Cannot decode H.265 4:4:4: refused by itself, before subscribing.
+    let mut backend_client = host.client_env(
+        &legacy_backend,
+        "60",
+        &[],
+        &[("TELEPORT_VIDEO_BACKEND", "gstreamer")],
+    );
+    let (status, log) = backend_client.wait(Duration::from_secs(60));
+    assert!(!status.success(), "{log}");
+    assert!(
+        log.contains(
+            "the host is already streaming H.265 4:4:4 to another session, which this client cannot decode"
+        ),
+        "{log}"
+    );
+    // A client from before 4:4:4 never says it knows the formats: removed.
+    let mut old = host.client(&old_client, "600", &["--smoke-legacy-formats"]);
+    host.wait_log(&[
+        "session left",
+        "Old",
+        "client cannot decode the shared stream",
+    ]);
+    let (status, log) = old.wait(Duration::from_secs(60));
+    assert!(!status.success(), "{log}");
+    // A capable joiner shows the shared 4:4:4 stream, and says it did not
+    // get the 10-bit it asked for.
+    let mut viewer_client = host.client(&viewer, "90", &["--ten-bit", "on"]);
+    host.wait_log(&["session joined the shared desktop", "Viewer"]);
+    let log = passed(&mut viewer_client);
+    assert!(
+        log.contains("Video is shared with another session: showing H.265 4:4:4 as it chose"),
+        "{log}"
+    );
+    assert!(log.contains("chroma_444=true"), "{log}");
+    // One encoder throughout, and the owner's session went on.
+    assert_eq!(host.count(&["session video codec"]), 1);
+    assert!(owner_client.running(), "{}", owner_client.log());
     passed(&mut owner_client);
 }
 

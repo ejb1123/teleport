@@ -187,14 +187,28 @@ impl State {
     }
 }
 
+/// Probe frame size: NVDEC decodes no H.265 smaller than 144x144 (and no
+/// AV1 smaller than 128x128); at 64x48 its probe failed and H.265 sessions
+/// on NVIDIA fell back to VA-API or software.
+fn probe_size(format: VideoFormat) -> (u32, u32) {
+    if format.codec == VideoCodec::H264 {
+        (64, 48)
+    } else {
+        (160, 160)
+    }
+}
+
 fn config(name: &str, format: VideoFormat, output: i32) -> Config {
+    let (width, height) = probe_size(format);
     Config {
         encoder: false,
         name: name.into(),
-        hevc: format.codec == VideoCodec::H265,
+        codec: format.codec,
         hdr: format.hdr(),
-        width: 64,
-        height: 48,
+        chroma444: format.chroma444,
+        ten_bit: format.ten_bit,
+        width,
+        height,
         fps: 30,
         kbps: 1000,
         output,
@@ -205,19 +219,25 @@ fn config(name: &str, format: VideoFormat, output: i32) -> Config {
     }
 }
 
+/// The software encoder for `codec`.
+fn software_encoder(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => "libx264",
+        VideoCodec::H265 => "libx265",
+        VideoCodec::Av1 => "libsvtav1",
+    }
+}
+
 fn synthetic(format: VideoFormat) -> Result<Vec<Vec<u8>>> {
-    let mut config = config(
-        if format.codec == VideoCodec::H265 {
-            "libx265"
-        } else {
-            "libx264"
-        },
-        format,
-        1,
-    );
+    let mut config = config(software_encoder(format.codec), format, 1);
     config.encoder = true;
-    let mut encoder = Codec::new(config)?;
-    let raw = neutral_frame(64, 48, format.hdr());
+    let mut encoder = Codec::new(config.clone())?;
+    let raw = neutral_frame(
+        config.width,
+        config.height,
+        format.depth10(),
+        format.chroma444,
+    );
     let mut packets = Vec::new();
     for pts in 0..3 {
         encoder.submit(&raw, pts)?;
@@ -585,8 +605,19 @@ mod tests {
         *PIPELINE_HOOK.lock().unwrap() = Some(Box::new(move |pipeline: &gst::Pipeline| {
             feeder.feed(pipeline, fps)
         }));
+        // `TELEPORT_BENCH_CODEC=h265` / `TELEPORT_BENCH_CHROMA444=1`: other
+        // formats than 4:2:0 H.264.
+        let format = VideoFormat {
+            codec: match std::env::var("TELEPORT_BENCH_CODEC").as_deref() {
+                Ok("h265") => VideoCodec::H265,
+                Ok("av1") => VideoCodec::Av1,
+                _ => VideoCodec::H264,
+            },
+            chroma444: std::env::var("TELEPORT_BENCH_CHROMA444").as_deref() == Ok("1"),
+            ..Default::default()
+        };
         let mut broadcast = moq_net::broadcast::Info::new().produce();
-        let track = broadcast.create_track(VideoCodec::H264.track(), None)?;
+        let track = broadcast.create_track(format.codec.track(), None)?;
         let mut subscriber = track.subscribe(None);
         let encode = encoder(
             &description,
@@ -595,7 +626,7 @@ mod tests {
             crate::protocol::auto_bitrate(size.0, size.1, fps),
             track,
             kind,
-            VideoCodec::H264.into(),
+            format,
         );
         *PIPELINE_HOOK.lock().unwrap() = None;
         let encode = encode?;
@@ -645,7 +676,7 @@ mod tests {
         let mut decoder = Codec::new(Config {
             width: size.0,
             height: size.1,
-            ..config("software", VideoCodec::H264.into(), 0)
+            ..config("software", format, 0)
         })?;
         let mut last = None;
         for (index, packet) in packets.iter().enumerate() {
@@ -1060,9 +1091,14 @@ mod tests {
         Ok(())
     }
 }
-fn neutral_frame(width: u32, height: u32, hdr: bool) -> Vec<u8> {
+fn neutral_frame(width: u32, height: u32, depth10: bool, chroma444: bool) -> Vec<u8> {
     let pixels = width as usize * height as usize;
-    if hdr {
+    if chroma444 {
+        let mut raw = vec![90; pixels];
+        raw.extend(vec![128; pixels * 2]);
+        return raw;
+    }
+    if depth10 {
         (0..pixels * 3 / 2)
             .flat_map(|index| {
                 (if index < pixels {
@@ -1083,13 +1119,14 @@ fn neutral_frame(width: u32, height: u32, hdr: bool) -> Vec<u8> {
 /// Decode the synthetic stream with `name` and require timestamped frames of
 /// the probe size (and, for output 3, GPU-resident frames).
 fn probe_decoder(name: &str, format: VideoFormat, packets: &[Vec<u8>], output: i32) -> Result<()> {
-    let mut decoder = Codec::new(config(name, format, output))?;
+    let config = config(name, format, output);
+    let mut decoder = Codec::new(config.clone())?;
     let mut frames = 0;
     for (index, packet) in packets.iter().enumerate() {
         decoder.submit(packet, index as u64 + 1)?;
         while let Some(frame) = decoder.receive()? {
             ensure!(
-                (frame.width, frame.height) == (64, 48),
+                (frame.width, frame.height) == (config.width, config.height),
                 "invalid probe size"
             );
             ensure!(frame.pts.is_some(), "decoder lost frame timestamps");
@@ -1108,10 +1145,15 @@ fn probe_decoder(name: &str, format: VideoFormat, packets: &[Vec<u8>], output: i
 /// decodes GPU-resident frames of `format`. Cached per process.
 #[cfg(target_os = "linux")]
 fn gpu_decoder_verified(name: &str, format: VideoFormat) -> bool {
-    type Cache = BTreeMap<(String, bool), bool>;
+    type Cache = BTreeMap<(String, &'static str, bool, bool), bool>;
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     let mut cache = CACHE.get_or_init(Mutex::default).lock().unwrap();
-    let key = (name.to_owned(), format.codec == VideoCodec::H265);
+    let key = (
+        name.to_owned(),
+        format.codec.track(),
+        format.chroma444,
+        format.ten_bit,
+    );
     if let Some(&verified) = cache.get(&key) {
         return verified;
     }
@@ -1132,11 +1174,17 @@ fn gpu_decoder_verified(name: &str, format: VideoFormat) -> bool {
 }
 
 pub(super) fn select_decoder(software: bool, format: VideoFormat) -> Result<String> {
-    type Cache = BTreeMap<(bool, bool, bool), String>;
+    type Cache = BTreeMap<(bool, &'static str, bool, bool, bool), String>;
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     format.validate()?;
     let mut cache = CACHE.get_or_init(Mutex::default).lock().unwrap();
-    let key = (software, format.codec == VideoCodec::H265, format.hdr());
+    let key = (
+        software,
+        format.codec.track(),
+        format.hdr(),
+        format.chroma444,
+        format.ten_bit,
+    );
     if let Some(name) = cache.get(&key) {
         return Ok(name.clone());
     }
@@ -1150,9 +1198,9 @@ pub(super) fn select_decoder(software: bool, format: VideoFormat) -> Result<Stri
     };
     let mut last = None;
     for &name in candidates {
-        match probe_decoder(name, format, &packets, if format.hdr() { 2 } else { 1 }) {
+        match probe_decoder(name, format, &packets, output_format(format, false)) {
             Ok(()) => {
-                tracing::info!(backend="ffmpeg", decoder=name, codec=?format.codec, "direct decoder produced verified output");
+                tracing::info!(backend="ffmpeg", decoder=name, codec=?format.codec, chroma444=format.chroma444, ten_bit=format.ten_bit, "direct decoder produced verified output");
                 cache.insert(key, name.into());
                 return Ok(name.into());
             }
@@ -1163,6 +1211,21 @@ pub(super) fn select_decoder(software: bool, format: VideoFormat) -> Result<Stri
         }
     }
     Err(last.context("no FFmpeg decoder candidates")?)
+}
+
+/// Decoder output for `format` without GPU frames: P010 for HDR, RGB24 for
+/// 4:4:4 (NV12 would halve its chroma again), else NV12 or RGB24 (10-bit SDR
+/// too: swscale dithers it to 8 bits).
+fn output_format(format: VideoFormat, nv12: bool) -> i32 {
+    if format.hdr() {
+        2
+    } else if nv12 && !format.chroma444 {
+        1
+    } else if format.chroma444 {
+        0
+    } else {
+        1
+    }
 }
 
 pub(super) fn decoder(
@@ -1182,21 +1245,25 @@ pub(super) fn decoder(
     // GPU-resident frames only for an 8-bit decode on the presenter's own GPU
     // ("cuda", or "vaapi@<render node>" of its EGL display).
     #[cfg(target_os = "linux")]
+    // 4:4:4 and 10-bit SDR stay on the GPU only through CUDA (three planes,
+    // or 16-bit ones, into GL); the VA-API presenter imports 8-bit NV12
+    // layers, so those are converted on the CPU.
     let gpu = gpu.filter(|preferred| {
         !software
             && !format.hdr()
+            && (!(format.chroma444 || format.ten_bit) || *preferred == "cuda")
             && (*preferred == selected || gpu_decoder_verified(preferred, format))
     });
     #[cfg(not(target_os = "linux"))]
-    let gpu = gpu.filter(|preferred| !format.hdr() && *preferred == selected);
-    let (name, output) = if format.hdr() {
-        (selected, 2)
-    } else if let Some(preferred) = gpu {
+    let gpu = gpu.filter(|preferred| {
+        !format.hdr() && !format.chroma444 && !format.ten_bit && *preferred == selected
+    });
+    let (name, output) = if let Some(preferred) = gpu {
         (preferred.to_owned(), 3)
-    } else if nv12 {
-        (selected, 1)
-    } else {
+    } else if !nv12 && !format.hdr() {
         (selected, 0)
+    } else {
+        (selected, output_format(format, nv12))
     };
     let state = Arc::new(State {
         codec: Mutex::new(Codec::new(config(&name, format, output))?),
@@ -1208,7 +1275,12 @@ pub(super) fn decoder(
         #[cfg(target_os = "linux")]
         reopen: Default::default(),
     });
-    *stats.decoder.lock().unwrap() = format!("ffmpeg:{}:{name}", format.codec.track());
+    *stats.decoder.lock().unwrap() = format!(
+        "ffmpeg:{}{}{}:{name}",
+        format.codec.track(),
+        if format.chroma444 { " 4:4:4" } else { "" },
+        if format.ten_bit { " 10-bit" } else { "" }
+    );
     let pipeline = Pipeline(gst::parse::launch(&format!(
         "appsrc name=in is-live=true format=time max-bytes=8388608 block=false caps={},stream-format=byte-stream,alignment=au ! appsink name=compressed sync=false max-buffers=1 drop=false",
         compressed_caps(format.codec)
@@ -1568,17 +1640,16 @@ fn intra_refresh_frames(name: &str, fps: u32) -> u32 {
 
 #[cfg(target_os = "linux")]
 fn encoder_name(kind: EncoderKind, codec: VideoCodec) -> String {
-    let prefix = if codec == VideoCodec::H265 {
-        "hevc"
-    } else {
-        "h264"
+    let prefix = match codec {
+        VideoCodec::H264 => "h264",
+        VideoCodec::H265 => "hevc",
+        VideoCodec::Av1 => "av1",
     };
     match kind {
         EncoderKind::Nvidia => format!("{prefix}_nvenc"),
         EncoderKind::Qsv => format!("{prefix}_qsv"),
         EncoderKind::Vaapi => format!("{prefix}_vaapi"),
-        _ if codec == VideoCodec::H265 => "libx265".into(),
-        _ => "libx264".into(),
+        _ => software_encoder(codec).into(),
     }
 }
 
@@ -1586,7 +1657,12 @@ fn encoder_name(kind: EncoderKind, codec: VideoCodec) -> String {
 #[cfg(target_os = "linux")]
 fn probe_encoder(config: &Config) -> Result<()> {
     let mut codec = Codec::new(config.clone())?;
-    let raw = neutral_frame(config.width, config.height, config.hdr);
+    let raw = neutral_frame(
+        config.width,
+        config.height,
+        config.hdr || config.ten_bit,
+        config.chroma444,
+    );
     let mut emitted = false;
     for n in 0..3 {
         codec.submit(&raw, n)?;
@@ -1598,16 +1674,22 @@ fn probe_encoder(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// The first hardware encoder for an 8-bit `codec` stream, in the order
-/// `encoder` tries them for `kind`, probed at a small size (720p). `None`
-/// when only software would encode it. Cached per process: hosts advertise
-/// this to clients choosing a codec automatically.
+/// The first hardware encoder for an 8-bit SDR `format` (codec and chroma),
+/// in the order `encoder` tries them for `kind`, probed at a small size
+/// (720p). `None` when only software would encode it. Cached per process:
+/// hosts advertise this to clients choosing a codec automatically.
 #[cfg(target_os = "linux")]
-pub(super) fn hardware_encoder(kind: EncoderKind, codec: VideoCodec) -> Option<String> {
-    type Cache = BTreeMap<(String, bool), Option<String>>;
+pub(super) fn hardware_encoder(kind: EncoderKind, format: VideoFormat) -> Option<String> {
+    type Cache = BTreeMap<(String, &'static str, bool, bool), Option<String>>;
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     let mut cache = CACHE.get_or_init(Mutex::default).lock().unwrap();
-    let key = (format!("{kind:?}"), codec == VideoCodec::H265);
+    let codec = format.codec;
+    let key = (
+        format!("{kind:?}"),
+        codec.track(),
+        format.chroma444,
+        format.ten_bit,
+    );
     if let Some(found) = cache.get(&key) {
         return found.clone();
     }
@@ -1617,8 +1699,8 @@ pub(super) fn hardware_encoder(kind: EncoderKind, codec: VideoCodec) -> Option<S
         _ => std::slice::from_ref(&kind),
     };
     let format = VideoFormat {
-        codec,
         dynamic_range: crate::protocol::DynamicRange::Sdr,
+        ..format
     };
     let found = kinds.iter().find_map(|&choice| {
         let config = Config {
@@ -1639,7 +1721,7 @@ pub(super) fn hardware_encoder(kind: EncoderKind, codec: VideoCodec) -> Option<S
             }
         }
     });
-    tracing::info!(?codec, encoder = ?found, "hardware encoder probe");
+    tracing::info!(?codec, chroma444 = format.chroma444, ten_bit = format.ten_bit, encoder = ?found, "hardware encoder probe");
     cache.insert(key, found.clone());
     found
 }
@@ -1662,18 +1744,21 @@ pub(super) fn encoder(
     format.validate()?;
     crate::protocol::validate_video_size(size.0, size.1)?;
     // Zero-copy capture needs a DMA-BUF source, an 8-bit stream and an
-    // encoder whose GPU can import (NVENC through CUDA, or VA-API).
+    // encoder whose GPU can import (NVENC through CUDA, or VA-API; 4:4:4
+    // through CUDA only).
     let zero_copy = dmabuf_source(source)
         .filter(|_| !format.hdr() && !ZERO_COPY_FAILED.load(Ordering::Relaxed));
     // Probing opens and exercises up to four encoders. Quality and monitor
     // changes re-create the encoder inside the session loop, so remember which
     // one worked for this request and only probe again if it later fails.
-    type Cache = BTreeMap<(String, bool, bool, u32, u32), String>;
+    type Cache = BTreeMap<(String, &'static str, bool, bool, bool, u32, u32), String>;
     static ENCODERS: OnceLock<Mutex<Cache>> = OnceLock::new();
     let cache_key = (
         format!("{kind:?}"),
-        format.codec == VideoCodec::H265,
+        format.codec.track(),
         format.hdr(),
+        format.chroma444,
+        format.ten_bit,
         size.0,
         size.1,
     );
@@ -1701,7 +1786,7 @@ pub(super) fn encoder(
         let config = Config {
             encoder: true,
             gpu_input: zero_copy.is_some()
-                && (name.ends_with("_nvenc") || name.ends_with("_vaapi")),
+                && (name.ends_with("_nvenc") || (name.ends_with("_vaapi") && !format.chroma444)),
             name,
             width: size.0,
             height: size.1,
@@ -1809,12 +1894,16 @@ fn start(
         ?format.codec,
         bitrate,
         capture = if zero_copy { "DMA-BUF zero-copy" } else { "CPU" },
+        chroma444 = format.chroma444,
+        ten_bit = format.ten_bit,
         "direct video encoder"
     );
     let metrics = Arc::new(EncoderMetrics {
         encoder: format!(
-            "ffmpeg:{}{}{}",
+            "ffmpeg:{}{}{}{}{}",
             codec.config.name,
+            if format.chroma444 { " 4:4:4" } else { "" },
+            if format.ten_bit { " 10-bit" } else { "" },
             if zero_copy { " DMA-BUF zero-copy" } else { "" },
             match codec.config.preset {
                 crate::protocol::EncoderPreset::Latency => String::new(),
@@ -1836,8 +1925,19 @@ fn start(
     });
     let pixel = if format.hdr() {
         "P010_10LE,colorimetry=bt2100-pq"
+    } else if format.ten_bit {
+        "P010_10LE,colorimetry=bt709"
+    } else if format.chroma444 {
+        "Y444,colorimetry=bt709"
     } else {
         "NV12,colorimetry=bt709"
+    };
+    // Planes and their rows: NV12/P010 luma + half-height interleaved
+    // chroma, or Y444's three full planes.
+    let planes: &[(usize, usize)] = if format.chroma444 {
+        &[(0, 1), (1, 1), (2, 1)]
+    } else {
+        &[(0, 1), (1, 2)]
     };
     // One-frame leaky queue: a slow encoder always picks up the newest
     // capture. Rate-limit before converting so dropped frames cost nothing.
@@ -1945,9 +2045,10 @@ fn start(
                             &info,
                         )?;
                         use gstreamer_video::prelude::*;
-                        let stride = size.0 as usize * if format.hdr() { 2 } else { 1 };
-                        raw.reserve(stride * size.1 as usize * 3 / 2);
-                        for (plane, rows) in [(0, size.1 as usize), (1, size.1 as usize / 2)] {
+                        let stride = size.0 as usize * if format.depth10() { 2 } else { 1 };
+                        raw.reserve(stride * size.1 as usize * 3);
+                        for &(plane, divisor) in planes {
+                            let rows = size.1 as usize / divisor;
                             let pitch = usize::try_from(frame.plane_stride()[plane])?;
                             ensure!(pitch >= stride, "invalid capture stride");
                             let bytes = frame.plane_data(plane as u32)?;
@@ -1961,7 +2062,7 @@ fn start(
                         }
                     }
                     if let Some(white) = crate::media::test_flash::white()
-                        && !format.hdr()
+                        && !format.depth10()
                         && !raw.is_empty()
                     {
                         // `--flash-on-input`: the whole frame black or white.
@@ -2043,7 +2144,7 @@ fn start(
                         // With intra refresh, encoders flag refresh starts as key
                         // frames too; only IDRs start a group a decoder can join.
                         let key = packet.key
-                            && (!refresh || crate::protocol::annexb_keyframe(format.codec, &packet.bytes));
+                            && (!refresh || crate::protocol::keyframe(format.codec, &packet.bytes));
                         if key {
                             since_key = 1;
                         }

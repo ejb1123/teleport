@@ -551,7 +551,8 @@ What is on `main`/this branch, from README, docs and code:
     2026-10-17, G4: `--pacing latency|smooth`.)
 - **Codecs:** H.264 or H.265. (Since 2026-10-16, G5: `--codec auto`, the
   default, picks H.265 when both ends have it in hardware.) HDR10: HEVC Main10 on the experimental patched-KWin
-  path to a Mac Metal/EDR client (docs/hdr.md). No AV1, no 4:4:4.
+  path to a Mac Metal/EDR client (docs/hdr.md). No AV1, no 4:4:4. (Since
+  2026-10-17, G8: AV1, 4:4:4 and 10-bit SDR.)
 - **Rates:** host `--fps` 1..=120 (`src/host.rs:74`). The launcher offers
   30/60/120 FPS, 8/20/40 Mbps (CLI 0.5–100 Mbps), and native or scaled widths
   (720p, 1080p, 1440p, 4K). The stream is **scaled** to the requested width;
@@ -618,9 +619,9 @@ Legend: **Has** = shipped on main; **Partial** = exists with material limits;
 | Linux client | Ubuntu 22.04, X11 | Any Nix Linux, X11 or Wayland | **Teleport ahead** | |
 | Android / iOS / web | Android experimental; no iOS; Chrome web | None | Missing | No iOS from Parsec is an opening |
 | H.264 / H.265 | Yes, HEVC tried by default with fallback | Yes, auto: H.265 when both ends have hardware (2026-10-16) | Parity | G5 |
-| AV1 | No | No | Parity | Moonlight/Sunshine have it; an opening |
-| 4:4:4 | Warp, Windows host, NVIDIA/Intel | No | Missing | |
-| 10-bit SDR | Experimental | Main10 only for HDR | Partial | |
+| AV1 | No | Yes: NVENC/VA-API/QSV/SVT-AV1 encode, NVDEC/VA-API/dav1d/VideoToolbox decode; auto with hardware on both ends (2026-10-17) | **Teleport ahead** | Hardware AV1 encode unverified here (no RTX 40/Arc); G8 |
+| 4:4:4 | Warp, Windows host, NVIDIA/Intel | Yes, H.264/H.265, free, Linux host; `--chroma-444 off\|auto\|on` (2026-10-17) | **Teleport ahead** | NVENC zero-copy capture and NVDEC zero-copy presentation; G8 |
+| 10-bit SDR | Experimental | Main 10 from 8-bit capture, opt-in `--ten-bit` (2026-10-17) | Parity | Helps dithered gradients only; G8 |
 | HDR | **Not supported** | Experimental (patched KWin → Mac EDR) | **Teleport ahead** (experimental) | |
 | Encoders | NVENC, QSV, AMF/VCE, software fallback | NVENC, QSV, VA-API (AMD/Intel), x264/x265 | Parity | AMD zero-copy unverified |
 | Zero-copy capture→encode | Claimed (OVR) | NVENC + VA-API (DMA-BUF) | Parity (partial coverage) | QSV and HEVC zero-copy unmeasured |
@@ -840,7 +841,8 @@ VRR itself is WIP.**
   video, so there is no restart. Older hosts and clients keep H.264 unless
   asked; HDR10 stays H.265; an explicit `--codec` wins. F8 and both logs
   show the codec and why. Not done: a fallback when a probed hardware path
-  later fails mid-session (the existing decoder recovery applies), and AV1.
+  later fails mid-session (the existing decoder recovery applies). AV1:
+  G8.
 
 - **Why:** Parsec tries H.265 by default and silently falls back (ADV, HW).
   Teleport defaults to H.264 and makes the user choose. HEVC is roughly half
@@ -911,6 +913,37 @@ refresh. Effort M.**
   for R1.
 
 **G8. AV1 (and 4:4:4 / 10-bit SDR as quality options). Effort M each.**
+
+- **Status (2026-10-17): implemented as far as this hardware allows**
+  (docs/ffmpeg.md "AV1", "4:4:4 chroma", "10-bit SDR"; review tracker R24).
+  - AV1: `av1_nvenc`, `av1_vaapi`, `av1_qsv` and SVT-AV1 (low-delay CBR)
+    encoders; NVDEC, VA-API, QSV and VideoToolbox through FFmpeg's AV1
+    decoder, dav1d in software. MoQ groups start at a sequence header plus
+    a shown key frame. `--codec auto` takes AV1 only when the host encodes
+    it in hardware (`Desktop.hardware_av1`) and the client decodes it in
+    hardware, then H.265, then H.264. NVDEC AV1 surfaces use the CUDA/GL
+    zero-copy presenter. Measured: SVT-AV1 gives far better quality per bit
+    on desktop text (52-59 dB vs 41-47 dB for NVENC at 1080p 10 Mbps) but
+    takes 15-47 ms per 1080p frame on 8 cores under load, so software AV1
+    is opt-in only; NVDEC decodes AV1 1080p in 1.0-1.6 ms to a GPU frame.
+    Not verified: hardware AV1 encode (RTX 40, Arc/Meteor Lake), VA-API AV1
+    decode, VideoToolbox AV1 on M3+; intra refresh for `av1_nvenc` is left
+    off (both AV1 decoders here do decode past a lost frame).
+  - 4:4:4: `--chroma-444 off|auto|on`, H.264/H.265 SDR, NVENC (zero-copy:
+    the DMA-BUF shader writes three planes), x264/x265, VA-API/QSV packed
+    4:4:4 on Ice Lake and later (untested here). NVDEC decodes H.265 4:4:4
+    (not H.264) and the CUDA/GL presenter draws it from three planes.
+    `auto` needs H.265 4:4:4 hardware on both ends. On coloured text at
+    1080p60 hevc_nvenc 4:4:4 reaches 45-50 dB RGB PSNR on a still screen
+    where 4:2:0 stops at 28.5 dB, at the same bitrate.
+  - 10-bit SDR: measured first; Main 10 from 8-bit capture keeps a
+    dithered gradient's dither (NVENC Main flattens it into 29 px bands at
+    2 Mbps), clean 8-bit gradients gain nothing. Opt-in `--ten-bit`,
+    H.265/AV1, shown through a 2x2 ordered dither.
+  - Old peers: everything is gated (`Desktop.av1`, `chroma_444_selection`,
+    `ten_bit_selection`; AV1 is never put in fields older clients parse,
+    and auto/explicit AV1 still connects asking for H.264). Explicit
+    `--codec` wins.
 
 - **AV1:** Parsec has none. Sunshine/Moonlight do
   (https://docs.lizardbyte.dev/projects/sunshine). Use FFmpeg `av1_nvenc`
@@ -1452,6 +1485,8 @@ ships its own FFmpeg with CUDA and VA-API, and presents zero-copy.
     Parsec supports IPv6 (STUN6, error codes 800097/6112).
 11. **Inputtino's use of uhid for DualSense (G13), Moonlight WoL, and
     VideoToolbox AV1 on M3+.** Stated from memory or third-party sources.
+    (Teleport probes VideoToolbox AV1 like any decoder since G8; not run on
+    a Mac.)
 12. **Teleport on SteamOS game mode / Steam Deck as a client.** Untested.
 13. **Strategy: is a Windows host (G19) in scope?** This decides whether
     Teleport competes with Parsec head-on or wins the Linux-host niche plus
