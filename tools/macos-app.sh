@@ -140,6 +140,22 @@ bundle_deps() {
 
 copy "$binary" "$contents/MacOS/teleport"
 bundle_deps "$binary"
+# sdl2-compat dlopens SDL3 from a constructor (@loader_path/libSDL3.dylib,
+# then its rpath), which otool -L cannot see. Without it, it shows a modal
+# alert and aborts, and a headless run waits on the alert for ever.
+sdl2=$(otool -L "$binary" | awk '/libSDL2/ { print $1; exit }')
+if [ -n "$sdl2" ]; then
+    sdl3=
+    while IFS= read -r dir; do
+        if [ -e "$dir/libSDL3.dylib" ]; then
+            sdl3=$dir/libSDL3.dylib
+            break
+        fi
+    done < <(otool -l "$sdl2" | awk '/cmd LC_RPATH/ { getline; getline; print $2 }')
+    [ -n "$sdl3" ] || die "no libSDL3.dylib on the rpath of $sdl2"
+    copy "$sdl3" "$contents/Frameworks/libSDL3.dylib"
+    bundle_deps "$sdl3"
+fi
 copy "$scanner" "$contents/MacOS/gst-plugin-scanner"
 bundle_deps "$scanner"
 for dir in $plugin_dirs; do
@@ -238,7 +254,10 @@ done
 "${sign[@]}" --entitlements "$entitlements" "$contents/MacOS/teleport"
 "${sign[@]}" --entitlements "$entitlements" "$app"
 codesign --verify --strict --deep --verbose=2 "$app"
-"$contents/MacOS/teleport" --version
+# A library that cannot load can block on a modal alert, so bound the run
+# (macOS has no timeout(1)).
+perl -e 'alarm 120; exec @ARGV or die "exec: $!"' "$contents/MacOS/teleport" --version ||
+    die "the bundled teleport --version failed or hung"
 
 zip=$out/Teleport-$version-$arch.zip
 notarize() {
