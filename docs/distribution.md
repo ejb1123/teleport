@@ -104,6 +104,24 @@ on Fedora 43 (containers); the files above are in place with mode 0644,
 the rules, and `/usr/bin/teleport doctor` and the loopback session pass. The
 unit has not run under a real graphical session on these distributions.
 
+## openSUSE
+
+The .rpm installs unchanged on Tumbleweed and Leap: the bundle carries its
+own libraries, so its only requirements are `/bin/sh` and the coreutils
+AppRun uses, and its recommendations (`libglvnd-glx`, `libglvnd-egl`, Fedora
+names) are weak dependencies zypper skips when a name does not exist
+(openSUSE has `libglvnd`). zypper refuses unsigned packages unless told:
+
+```sh
+sudo zypper install --allow-unsigned-rpm ./teleport-0.5.4-1.x86_64.rpm
+```
+
+The post-install script creates the `uinput` group with `groupadd` (in
+`shadow`, present on every openSUSE installation; minimal containers too).
+On Leap 15.6 (glibc 2.38) and 16.0 (2.40) the bundle's glibc 2.42 is newer; that
+does not matter, because the bundle uses its own glibc and loader for
+everything it starts (see "GPU drivers in the relocatable bundle").
+
 ## Flatpak (client)
 
 `packaging/flatpak/dev.teleport.Teleport.yml` builds the client from source on
