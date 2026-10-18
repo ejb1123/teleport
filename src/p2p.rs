@@ -70,6 +70,7 @@ pub const ATTEMPT_TIMEOUT: Duration = Duration::from_millis(
         + SETUP_TIMEOUT.as_millis() as u64,
 );
 /// Host: how long an admission ticket (and so the armed socket) lasts.
+#[cfg(target_os = "linux")]
 const ARM_WINDOW: Duration = Duration::from_secs(30);
 /// Host: outstanding admission tickets kept (oldest dropped first).
 #[cfg(target_os = "linux")]
@@ -314,6 +315,7 @@ fn seal_message(
     )
 }
 
+#[cfg(target_os = "linux")]
 fn open_candidates(
     keys: &SessionKeys,
     direction: Direction,

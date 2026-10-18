@@ -66,6 +66,7 @@ const DEVICE_SIGNATURE_LABEL: &[u8] = b"teleport-e2e-v1 device transcript";
 const CONFIRM_TRACK: &str = "confirm";
 /// Length of an Ed25519 public key as stored by hosts.
 pub const DEVICE_PUBLIC_KEY_LEN: usize = 32;
+#[cfg(target_os = "linux")]
 const DEVICE_SIGNATURE_LEN: usize = 64;
 /// Unordered tracks accept objects up to this many counters behind the newest.
 const REPLAY_WINDOW: u64 = 1024;

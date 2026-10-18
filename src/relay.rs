@@ -31,7 +31,7 @@
 //! who prefer their own server to a third-party relay such as Cloudflare's.
 
 use crate::{
-    e2e::{self, ClientHandshake, Direction, SessionKeys},
+    e2e::{self, ClientHandshake, Direction},
     protocol,
 };
 use anyhow::{Context, Result};
@@ -721,7 +721,7 @@ pub struct Accepted {
     /// The device public key whose transcript signature the client proved,
     /// if the host stored one for the credential.
     pub device_key: Option<Vec<u8>>,
-    pub keys: Arc<SessionKeys>,
+    pub keys: Arc<e2e::SessionKeys>,
     _reply: (moq_net::broadcast::Producer, moq_net::track::Producer),
 }
 

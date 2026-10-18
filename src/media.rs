@@ -194,6 +194,7 @@ impl Pipeline {
     /// to the monitor's refresh rate (whole hertz, rounded down: 179.96 Hz
     /// becomes 179) and never exceeds. The portal reports no refresh rate
     /// otherwise.
+    #[cfg(target_os = "linux")]
     pub fn source_refresh_mhz(&self) -> Option<u32> {
         self.0
             .iterate_elements()
@@ -859,6 +860,7 @@ pub fn wake_presenter() {
 /// Host `--flash-on-input` (test source only): every captured frame is
 /// painted black or white, switching on each key or mouse-button press, so a
 /// photodiode or camera can time input→photon (docs/performance.md).
+#[cfg(target_os = "linux")]
 pub mod test_flash {
     use std::sync::atomic::{AtomicU8, Ordering};
 

@@ -270,7 +270,7 @@ impl Capabilities {
         device_key: true,
     };
     /// A client from before U2F and device keys (tests only).
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     const OLD: Self = Self {
         u2f: false,
         device_key: false,
@@ -2498,7 +2498,7 @@ mod tests {
 /// A malicious relay for enrollment tests. It forwards a framed exchange (an
 /// 8-byte magic from the client, then u16-length packets both ways) and lets
 /// the test drop, delay or rewrite any message.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) mod meddler {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};

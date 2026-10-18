@@ -220,6 +220,7 @@ impl DynamicRange {
 }
 
 impl VideoCodec {
+    #[cfg(any(test, target_os = "linux"))]
     pub const ALL: [Self; 3] = [Self::H264, Self::H265, Self::Av1];
     pub fn track(self) -> &'static str {
         match self {
@@ -1591,6 +1592,7 @@ pub async fn read_frame(
 /// an AV1 temporal unit with a sequence header and a shown key frame.
 /// Encoders with intra refresh also flag refresh starts as key frames; those
 /// are not.
+#[cfg(any(test, target_os = "linux"))]
 pub fn keyframe(codec: VideoCodec, data: &[u8]) -> bool {
     if codec == VideoCodec::Av1 {
         return av1_keyframe(data);
@@ -1626,6 +1628,7 @@ pub fn keyframe(codec: VideoCodec, data: &[u8]) -> bool {
 /// encoder here repeats the sequence header in front of key frames; a unit
 /// without one cannot start a decoder. Frame headers are read without
 /// `reduced_still_picture_header`, which video streams never set.
+#[cfg(any(test, target_os = "linux"))]
 fn av1_keyframe(data: &[u8]) -> bool {
     let mut index = 0;
     let mut sequence_header = false;
@@ -1722,6 +1725,7 @@ const FRAME_TIMING_LEN: usize = 4 + 3 * 8;
 
 impl FrameTiming {
     /// `payload` with this header in front (`ClientFeatures::frame_timing`).
+    #[cfg(any(test, target_os = "linux"))]
     pub fn prepend(&self, payload: &[u8]) -> bytes::Bytes {
         let mut out = Vec::with_capacity(FRAME_TIMING_LEN + payload.len());
         out.extend_from_slice(&FRAME_TIMING_MAGIC);
@@ -1763,6 +1767,7 @@ pub fn test_wall_clock() -> bool {
 }
 
 /// The timestamp of a video frame captured at `captured`.
+#[cfg(target_os = "linux")]
 pub fn video_timestamp(captured: std::time::Instant) -> moq_net::Timestamp {
     if test_wall_clock()
         && let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)

@@ -99,6 +99,7 @@ pub fn binding_request(transaction: &TransactionId) -> Vec<u8> {
 
 /// A Binding indication: no response is expected. Used as the hole-punching
 /// datagram, so the peer's QUIC stack never sees it (`looks_like_stun`).
+#[cfg(any(test, target_os = "linux"))]
 pub fn binding_indication(transaction: &TransactionId) -> Vec<u8> {
     header(Class::Indication, transaction, 0)
 }

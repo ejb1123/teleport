@@ -171,7 +171,7 @@ pub async fn pair(address: &str, code: &str) -> Result<Pairing> {
 }
 
 /// A client from before device keys (`TPPAIR01`).
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) async fn pair_without_device_key(address: &str, code: &str) -> Result<Pairing> {
     pair_with(address, code, false).await
 }

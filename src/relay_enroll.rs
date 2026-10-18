@@ -106,6 +106,7 @@ impl Invite {
         })
     }
 
+    #[cfg(any(test, target_os = "linux"))]
     pub fn link(&self) -> String {
         format!(
             "{LINK_PREFIX}{}/{}-{}",
@@ -738,7 +739,9 @@ pub(crate) mod tests {
 
     /// Records what a host reads (everything the client sent through the
     /// relay), e.g. to replay it or check it for secrets.
+    #[cfg(target_os = "linux")]
     pub(crate) struct Recorder<S>(pub S, pub Arc<Mutex<Vec<u8>>>);
+    #[cfg(target_os = "linux")]
     impl<S: AsyncRead + Unpin> AsyncRead for Recorder<S> {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -755,6 +758,7 @@ pub(crate) mod tests {
             result
         }
     }
+    #[cfg(target_os = "linux")]
     impl<S: AsyncWrite + Unpin> AsyncWrite for Recorder<S> {
         fn poll_write(
             self: Pin<&mut Self>,

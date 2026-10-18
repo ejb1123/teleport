@@ -6,6 +6,7 @@ use std::{
 };
 
 #[repr(C)]
+#[derive(Default)]
 struct Output {
     data: *const u8,
     size: c_int,
@@ -14,19 +15,6 @@ struct Output {
     key: c_int,
     pts: i64,
     gpu: *mut c_void,
-}
-impl Default for Output {
-    fn default() -> Self {
-        Self {
-            data: std::ptr::null(),
-            size: 0,
-            width: 0,
-            height: 0,
-            key: 0,
-            pts: 0,
-            gpu: std::ptr::null_mut(),
-        }
-    }
 }
 unsafe extern "C" {
     fn tp_codec_open(
@@ -60,6 +48,7 @@ unsafe extern "C" {
     fn tp_receive_frame(codec: *mut c_void, output: *mut Output) -> c_int;
     fn tp_codec_flush(codec: *mut c_void);
     fn tp_gpu_frame_free(frame: *mut c_void);
+    #[cfg(any(test, target_os = "linux"))]
     fn tp_codec_set_bitrate(codec: *mut c_void, kbps: c_int) -> c_int;
     fn tp_codec_error(error: c_int, buffer: *mut c_char, length: c_int);
     #[cfg(target_os = "linux")]
@@ -310,6 +299,7 @@ impl Codec {
     }
     /// Change an open encoder's bitrate without reopening it. `Ok(false)` means
     /// this encoder cannot, and the caller must reopen to apply the change.
+    #[cfg(any(test, target_os = "linux"))]
     pub fn set_bitrate_in_place(&mut self, kbps: u32) -> Result<bool> {
         let result = unsafe { tp_codec_set_bitrate(self.pointer.as_ptr(), kbps.try_into()?) };
         if result == -libc::ENOSYS {

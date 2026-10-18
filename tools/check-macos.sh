@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Type-check the macOS (aarch64-apple-darwin) build from Linux, without a Mac
-# or the macOS SDK. Catches name-resolution and type errors in Rust code that
-# only compiles on macOS; it does not link, and C code is not compiled (the C
-# compiler and archiver are stand-ins that produce empty outputs).
+# Lint the macOS (aarch64-apple-darwin) build from Linux, without a Mac or the
+# macOS SDK, with the same command CI runs on macos-14:
+# `cargo clippy --locked --all-targets -- -D warnings`. Catches
+# name-resolution and type errors in Rust code that only compiles on macOS,
+# and code that only the Linux host uses (dead on macOS). It does not link,
+# and C code is not compiled (the C compiler and archiver are stand-ins that
+# produce empty outputs).
 #
 #   tools/check-macos.sh            # from the repository root (all targets,
 #                                   # including unit tests, which nix build runs)
+#   tools/check-macos.sh -p NAME    # extra arguments go to cargo, before `--`
 #
 # Builds std for the target from the flake-pinned Rust sources (-Zbuild-std),
 # because prebuilt rust-std does not match Nix's rustc build.
@@ -40,6 +44,7 @@ RUSTC_BOOTSTRAP=1 \
   CC_aarch64_apple_darwin="$work/cc" CXX_aarch64_apple_darwin="$work/cc" \
   AR_aarch64_apple_darwin="$work/ar" AWS_LC_SYS_CMAKE_BUILDER=0 \
   PKG_CONFIG_ALLOW_CROSS=1 CARGO_INCREMENTAL=0 \
-  nix develop --command nice -n 19 ionice -c3 cargo check \
+  nix develop --command nice -n 19 ionice -c3 cargo clippy \
   -Zbuild-std=std,panic_abort --locked -j 2 \
-  --target aarch64-apple-darwin --target-dir "$work/target" --all-targets "$@"
+  --target aarch64-apple-darwin --target-dir "$work/target" --all-targets "$@" \
+  -- -D warnings

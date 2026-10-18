@@ -11,13 +11,16 @@ const MAX_CONSECUTIVE_ENCODE_FAILURES: u32 = 3;
 pub(super) struct State {
     codec: Mutex<Codec>,
     /// Set by a client keyframe request; consumed by the next encoded frame.
+    #[cfg(target_os = "linux")]
     keyframe: std::sync::atomic::AtomicBool,
     /// Encoders: force an IDR after this many frames without one. Starts at the
     /// historical fps/4 so every client recovers by itself; lengthened once
     /// the client declares it requests keyframes on loss.
+    #[cfg(target_os = "linux")]
     key_interval: std::sync::atomic::AtomicU32,
     /// Encoders: put a `protocol::FrameTiming` header in front of every
     /// frame (the client declared `ClientFeatures::frame_timing`).
+    #[cfg(target_os = "linux")]
     frame_timing: std::sync::atomic::AtomicBool,
     #[cfg(target_os = "linux")]
     pub metrics: Option<Arc<EncoderMetrics>>,
@@ -1267,8 +1270,11 @@ pub(super) fn decoder(
     };
     let state = Arc::new(State {
         codec: Mutex::new(Codec::new(config(&name, format, output))?),
+        #[cfg(target_os = "linux")]
         keyframe: Default::default(),
+        #[cfg(target_os = "linux")]
         key_interval: Default::default(),
+        #[cfg(target_os = "linux")]
         frame_timing: Default::default(),
         #[cfg(target_os = "linux")]
         metrics: None,
@@ -1434,7 +1440,7 @@ const REFINE_FRAMES: u32 = 8;
 const REFINE_MAX_BITS_PER_PIXEL: f64 = 0.05;
 
 /// Tests: refinement frames encoded by this process.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 static REFINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Tracks whether captured frames change, to refine a still screen once.
