@@ -5,7 +5,7 @@
   <key>CFBundleDisplayName</key><string>Teleport</string>
   <key>CFBundleIdentifier</key><string>dev.teleport.Teleport</string>
   <key>CFBundleVersion</key><string>12</string>
-  <key>CFBundleShortVersionString</key><string>0.5.4</string>
+  <key>CFBundleShortVersionString</key><string>0.6.0</string>
   <key>CFBundleExecutable</key><string>teleport</string>
   <key>CFBundleIconFile</key><string>Teleport</string>
   <key>CFBundlePackageType</key><string>APPL</string>

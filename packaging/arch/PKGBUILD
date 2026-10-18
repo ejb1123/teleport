@@ -10,8 +10,8 @@
 # generates .SRCINFO; docs/distribution.md ("Arch Linux") has the AUR steps.
 pkgname=teleport-desktop-bin
 # The release version (tag without v); pkgver is it with "-" as "_".
-_version=0.5.4
-pkgver=0.5.4
+_version=0.6.0
+pkgver=0.6.0
 pkgrel=1
 pkgdesc='Native Linux remote desktop over Media over QUIC (host and client)'
 arch=('x86_64')
