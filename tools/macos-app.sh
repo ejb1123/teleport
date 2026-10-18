@@ -162,11 +162,13 @@ for file in "${machos[@]}"; do
         [ -n "$dep" ] || continue
         args+=(-change "$dep" "@rpath/$(basename "$dep")")
     done < <(nix_deps "$file")
-    case "$file" in
-    */Frameworks/*)
+    # A dylib lists its own install name first in otool -L; plugins have
+    # one too, and it must not stay a /nix/store path. (Bundles have none.)
+    if [ -n "$(otool -D "$file" | tail -n +2)" ]; then
         args+=(-id "@rpath/$(basename "$file")")
-        rpath=@loader_path
-        ;;
+    fi
+    case "$file" in
+    */Frameworks/*) rpath=@loader_path ;;
     */PlugIns/*) rpath=@loader_path/../../Frameworks ;;
     *) rpath=@executable_path/../Frameworks ;;
     esac
@@ -176,8 +178,11 @@ for file in "${machos[@]}"; do
     args+=(-add_rpath "$rpath")
     install_name_tool "${args[@]}" "$file"
 done
-leftover=$(for file in "${machos[@]}"; do otool -L "$file" | tail -n +2; done | grep -c /nix/store || true)
-[ "$leftover" -eq 0 ] || die "$leftover references to /nix/store remain"
+leftover=$(for file in "${machos[@]}"; do otool -L "$file" | tail -n +2 | sed "s|^|$file: |"; done | grep /nix/store || true)
+if [ -n "$leftover" ]; then
+    printf '%s\n' "$leftover" | head -n 20 >&2
+    die "$(printf '%s\n' "$leftover" | wc -l | tr -d ' ') references to /nix/store remain"
+fi
 
 # Resources: font, icon, Info.plist.
 cp -L "$font" "$contents/Resources/fonts/DejaVuSans.ttf"
