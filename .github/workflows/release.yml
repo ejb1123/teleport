@@ -1,35 +1,338 @@
-name: Build Nix distribution artifacts
+name: Release
+# Pushing a tag v<Cargo.toml version> builds every artefact, tests each one
+# on stock distribution images and publishes a GitHub Release with them,
+# SHA256SUMS and release notes (docs/distribution.md, "Making a release").
+# Run manually to build and test without releasing, or to (re)build an
+# existing tag's release.
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and release (empty = build and test the branch, no release)
+        type: string
+        default: ''
+
 permissions:
   contents: read
+
+concurrency:
+  group: release-${{ github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
-  build:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      ref: ${{ steps.version.outputs.ref }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - id: version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag=$GITHUB_REF_NAME
+          else
+            tag=$INPUT_TAG
+          fi
+          # The tag must name the version in Cargo.toml (and the files that
+          # repeat it); the artefact names come from it.
+          tools/release-version.sh check ${tag:+"$tag"}
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "ref=${tag:-$GITHUB_SHA}"
+          } >> "$GITHUB_OUTPUT"
+
+  # AppImage, .deb, .rpm and the generic tarball, from the flake.
+  linux:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - uses: cachix/install-nix-action@b85815f71a6de0ddee80b8a80a98d43f4bcc66c7 # v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
+      - name: Build AppImage, .deb, .rpm and tarball
+        run: |
+          nix build --print-build-logs .#appimage .#deb .#rpm .#tarball -o out
+          mkdir dist
+          cp out/*.AppImage out-1/*.deb out-2/*.rpm out-3/*.tar.gz dist/
+          chmod u+w dist/*
+          ls -l dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: linux
+          path: dist/
+          if-no-files-found: error
+
+  # The AUR package teleport-desktop-bin, built with makepkg from the tarball
+  # (as an AUR user builds it from the release), and its PKGBUILD/.SRCINFO.
+  arch:
+    needs: [version, linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: linux
+          path: linux
+      - name: makepkg in archlinux:latest
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir -p aur arch
+          docker run --rm -e VERSION -v "$PWD:/src" archlinux:latest bash -euc '
+            pacman -Syu --noconfirm --needed base-devel >/dev/null
+            useradd -m builder
+            mkdir /build && chown builder /build
+            su builder -c "/src/tools/arch-pkgbuild.sh $VERSION /src/linux/teleport-$VERSION-x86_64-linux.tar.gz /build --with-tarball"
+            su builder -c "cd /build && makepkg --nodeps --noconfirm"
+            cp /build/PKGBUILD /build/.SRCINFO /build/teleport-desktop-bin.install /src/aur/
+            cp /build/*.pkg.tar.zst /src/arch/
+            chown -R "$(stat -c %u:%g /src)" /src/aur /src/arch'
+          ls -la aur arch
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: arch
+          path: arch/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aur-teleport-desktop-bin
+          path: aur/
+          include-hidden-files: true
+          if-no-files-found: error
+
+  # Doctor, installed files and a loopback session (tools/package-smoke.sh)
+  # on stock images without Nix.
+  linux-test:
+    needs: [version, linux, arch]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14]
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+        include:
+          - {image: 'ubuntu:22.04', kind: deb}
+          - {image: 'ubuntu:24.04', kind: deb}
+          - {image: 'debian:12', kind: deb}
+          - {image: 'debian:13', kind: deb}
+          - {image: 'fedora:latest', kind: rpm}
+          - {image: 'opensuse/tumbleweed', kind: rpm}
+          - {image: 'opensuse/leap:15.6', kind: rpm}
+          - {image: 'opensuse/leap:16.0', kind: rpm}
+          - {image: 'archlinux:latest', kind: arch}
+          - {image: 'cachyos/cachyos:latest', kind: arch}
+          - {image: 'ubuntu:22.04', kind: appimage}
+          - {image: 'fedora:latest', kind: appimage}
+          - {image: 'debian:12', kind: tarball}
+          - {image: 'archlinux:latest', kind: tarball}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
-      - uses: cachix/install-nix-action@b85815f71a6de0ddee80b8a80a98d43f4bcc66c7
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+          sparse-checkout: tools
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: '{linux,arch}'
+          merge-multiple: true
+      - name: ${{ matrix.kind }} on ${{ matrix.image }}
+        run: |
+          docker run --rm -v "$PWD/dist:/dist:ro" -v "$PWD/tools:/tools:ro" \
+            "${{ matrix.image }}" sh /tools/package-smoke.sh "${{ matrix.kind }}"
+
+  # The client Flatpak (the host is not supported in the sandbox).
+  flatpak:
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-26.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6.8
+        with:
+          manifest-path: packaging/flatpak/dev.teleport.Teleport.yml
+          bundle: Teleport-${{ needs.version.outputs.version }}-x86_64.flatpak
+          upload-artifact: false
+          cache-key: flatpak-builder-${{ hashFiles('Cargo.lock', 'packaging/flatpak/*') }}
+      - name: Doctor and loopback session inside the sandbox
+        env:
+          BUNDLE: Teleport-${{ needs.version.outputs.version }}-x86_64.flatpak
+        run: |
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive "$BUNDLE"
+          # No session bus in the container: give flatpak run its own.
+          run() { dbus-run-session -- flatpak run --user dev.teleport.Teleport "$@"; }
+          run --version
+          run doctor
+          data=$HOME/.var/app/dev.teleport.Teleport/data
+          mkdir -p "$data"
+          run host --source test --encoder software --listen 127.0.0.1:4543 \
+            --pairing-file "$data/pairing.json" >host.log 2>&1 &
+          for _ in $(seq 300); do [ -s "$data/pairing.json" ] && break; sleep 0.2; done
+          run client 127.0.0.1:4543 --pairing-file "$data/pairing.json" --headless-frames 60 \
+            --software-decoder >client.log 2>&1 || { cat client.log host.log; exit 1; }
+          grep -q "SMOKE PASS" client.log || { cat client.log host.log; exit 1; }
+          mkdir dist && mv "$BUNDLE" dist/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: flatpak
+          path: dist/
+          if-no-files-found: error
+
+  # Teleport.app as .dmg and .zip, Apple silicon and Intel. Signed with the
+  # Developer ID and notarised when the MACOS_* and NOTARY_* secrets are set;
+  # ad-hoc signed otherwise.
+  macos:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    env:
+      SIGN: ${{ secrets.MACOS_CERTIFICATE_P12 != '' && secrets.NOTARY_KEY_P8 != '' }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+          # CFBundleVersion is the commit count.
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@b85815f71a6de0ddee80b8a80a98d43f4bcc66c7 # v31
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
       - run: nix build --print-build-logs
-      - run: ./result/bin/teleport doctor
-      - name: Export complete Nix closure (not a standalone installer)
-        shell: bash
+      - name: Import the Developer ID certificate
+        if: env.SIGN == 'true'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
         run: |
-          teleport_store_paths=()
-          while IFS= read -r teleport_store_path; do
-            teleport_store_paths+=("$teleport_store_path")
-          done < <(nix-store --query --requisites ./result)
-          nix-store --export "${teleport_store_paths[@]}" | gzip > teleport-${{ runner.os }}-${{ runner.arch }}.nix-export.gz
-          shasum -a 256 teleport-*.nix-export.gz > SHA256SUMS
-      - uses: actions/upload-artifact@v4
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password=$(uuidgen)
+          echo "$MACOS_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$MACOS_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_password" "$keychain"
+          # Keep the existing search list (one word per keychain).
+          read -r -a keychains <<< "$(security list-keychains -d user | tr -d '"' | xargs)"
+          security list-keychains -d user -s "$keychain" "${keychains[@]}"
+          rm "$RUNNER_TEMP/certificate.p12"
+          echo "TELEPORT_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+      - name: Write the notary API key
+        if: env.SIGN == 'true'
+        env:
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+        run: |
+          echo "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          echo "NOTARY_KEY=$RUNNER_TEMP/notary.p8" >> "$GITHUB_ENV"
+      - name: Build, sign and notarise Teleport.app
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+        run: |
+          if [ "$SIGN" = true ]; then
+            tools/macos-app.sh --result result --out dist --dmg \
+              --identity "$MACOS_SIGNING_IDENTITY" --keychain "$TELEPORT_KEYCHAIN"
+          else
+            echo "::warning::No signing secrets: Teleport.app is ad-hoc signed and Gatekeeper will block it on other Macs."
+            tools/macos-app.sh --result result --out dist --dmg
+          fi
+      - name: Run the bundled app without Nix on PATH
+        run: |
+          env -i HOME="$HOME" PATH=/usr/bin:/bin dist/Teleport.app/Contents/MacOS/teleport --version
+          env -i HOME="$HOME" PATH=/usr/bin:/bin dist/Teleport.app/Contents/MacOS/teleport doctor
+      - name: Keep the .dmg and .zip only
+        run: |
+          rm -rf dist/Teleport.app
+          ls -l dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: teleport-nix-${{ runner.os }}-${{ runner.arch }}
-          path: |
-            teleport-*.nix-export.gz
-            SHA256SUMS
+          name: macos-${{ matrix.os }}
+          path: dist/
+          if-no-files-found: error
+      - name: Remove signing material
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/notary.p8"
+          if [ -n "${TELEPORT_KEYCHAIN-}" ]; then security delete-keychain "$TELEPORT_KEYCHAIN"; fi
+
+  release:
+    needs: [version, linux, arch, linux-test, flatpak, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.version.outputs.ref }}
+          # Release notes list the commits since the previous tag.
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: '{linux,arch,flatpak,macos-*}'
+          merge-multiple: true
+      - name: Checksums and release notes
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          tools/release-notes.sh "${TAG:-HEAD}" > notes.md
+          cat notes.md
+      # The cask and formula with this release's version and checksums, for
+      # the tap repository ejb1123/homebrew-teleport (docs/distribution.md).
+      - name: Homebrew tap update
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          tools/homebrew-tap.sh "$VERSION" dist homebrew-tap
+          cat homebrew-tap/*/*.rb
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: homebrew-tap-update
+          path: homebrew-tap/
+      - name: Create the GitHub Release
+        if: needs.version.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          prerelease=()
+          case "$VERSION" in *-*) prerelease=(--prerelease) ;; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A manual re-run for an existing tag replaces the assets.
+            gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" dist/* --verify-tag --title "Teleport $VERSION" \
+              --notes-file notes.md "${prerelease[@]}"
+          fi
