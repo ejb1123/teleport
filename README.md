@@ -102,18 +102,33 @@ reserved. A license will be added before a first release.
 
 ## Installing without Nix
 
-The flake also builds packages that run without Nix
-([installation and distribution](docs/distribution.md)):
+Each tagged release on [GitHub Releases](https://github.com/ejb1123/teleport/releases)
+has packages that run without Nix, tested on stock images of the
+distributions below. Replace `VERSION` with the release's version; details,
+host setup and what each package installs are in
+[installation and distribution](docs/distribution.md).
 
 ```sh
-nix build .#appimage   # Teleport-VERSION-ARCH.AppImage: host and client, any glibc Linux
-nix build .#deb        # .deb with the systemd user unit and udev rules
-nix build .#rpm        # .rpm, the same
-tools/macos-app.sh     # on a Mac: self-contained, signed and notarised Teleport.app
+# Debian 12/13, Ubuntu 22.04/24.04
+sudo apt install ./teleport_VERSION-1_amd64.deb
+# Fedora
+sudo dnf install ./teleport-VERSION-1.x86_64.rpm
+# openSUSE Tumbleweed / Leap (the packages are not signed yet)
+sudo zypper install --allow-unsigned-rpm ./teleport-VERSION-1.x86_64.rpm
+# Arch, CachyOS, Manjaro, EndeavourOS (or the AUR package teleport-desktop-bin)
+sudo pacman -U ./teleport-desktop-bin-VERSION-1-x86_64.pkg.tar.zst
+# Any glibc Linux: AppImage, or the tarball (run teleport-VERSION-x86_64-linux/AppRun)
+chmod +x Teleport-VERSION-x86_64.AppImage && ./Teleport-VERSION-x86_64.AppImage
+# Linux client only, sandboxed
+flatpak install --user ./Teleport-VERSION-x86_64.flatpak
+# macOS 11+ (client): open Teleport-VERSION-arm64.dmg (Intel: -x86_64.dmg), or
+brew install --cask ejb1123/teleport/teleport-desktop
 ```
 
-`packaging/flatpak/` builds a client-only Flatpak. GPU drivers come from the
-installed system. The quick start below uses Nix directly.
+GPU drivers come from the installed system. Releases until notarisation is
+set up are ad-hoc signed on macOS: right-click → Open the first time. The
+quick start below uses Nix directly; `nix build .#appimage` (`.#deb`,
+`.#rpm`, `.#tarball`) builds the same packages from source.
 
 ## Quick start: Linux → Mac
 

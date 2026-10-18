@@ -1,6 +1,6 @@
 # To do later
 
-Open work as of 2026-10-17. Parsec gap numbers (G…) refer to
+Open work as of 2026-10-18. Parsec gap numbers (G…) refer to
 [parsec-comparison.md](parsec-comparison.md); tracker rows (R…) to
 [review-2026-10.md](review-2026-10.md). Usability items are listed in full in
 [ux-audit.md](ux-audit.md).
@@ -57,10 +57,31 @@ Open work as of 2026-10-17. Parsec gap numbers (G…) refer to
     (its `open_decoder` split against G8's `output_format` and labels).
   - The host was never started. A Windows 11 VM run by the perpendicular
     project could test it; see the notes in that project's docs.
-- **Release workflow.** `.github/workflows/release.yml` is on branch
-  `worktree-agent-a47790ac5bc828443` (`8cf999c`), never merged or run.
-  Pushing it needs SSH or a token with the `workflow` scope, plus Apple
-  signing and notarisation secrets for the macOS job.
+- **First release run.** `.github/workflows/release.yml` (tag `v*`) has
+  been checked with actionlint and its package tests run locally in the same
+  containers, but it has never run on GitHub: the Flatpak and macOS jobs
+  (macos-14, macos-15-intel) in particular. Pushing it needs a token with the
+  `workflow` scope; signed and notarised Mac builds need the Apple secrets
+  (distribution.md, "Release artifacts").
+- **Publishing outside GitHub** (distribution.md):
+  - AUR: create the account and SSH key, push `teleport-desktop-bin` from
+    the release's `aur-teleport-desktop-bin` artifact.
+  - Homebrew: `gh repo create ejb1123/homebrew-teleport --public`, then commit
+    the `homebrew-tap-update` artifact each release. `brew audit` has not run
+    on the cask (no Mac); `brew install` of the cask is untested.
+  - Flathub: submit the client manifest (needs a tagged git source, the
+    license, screenshots).
+  - openSUSE Build Service and an Ubuntu PPA, for signed repositories with
+    updates; both build from source without network, so they need vendored
+    crates and spec/debian packaging.
+- **Package names.** The .deb and .rpm are named `teleport`, as is
+  Gravitational's package in its own apt/yum repositories, and both install
+  `/usr/bin/teleport`. Consider `teleport-desktop` (as on Arch and Homebrew)
+  with `Provides`/`Conflicts`/`Replaces: teleport`.
+- **More architectures.** Release packages are x86-64 only; arm64 Linux needs
+  an `ubuntu-24.04-arm` job (and `source_aarch64` in the PKGBUILD).
+- **Arch source package.** `teleport-desktop` built with cargo against Arch's
+  FFmpeg/GStreamer/SDL/PipeWire was not attempted (distribution.md).
 - **Relay on the NixOS module.** The production host has no relay options
   set. Add the relay URL and key (self-hosted or Cloudflare) to enable
   presence, peer-to-peer signalling and remote reach.
@@ -82,7 +103,14 @@ Open work as of 2026-10-17. Parsec gap numbers (G…) refer to
 - **Flaky tests under load.** `relay::auto_route…`,
   `network::full_hd_clean_link_decode_path` and
   `guests::invites_are_limited_to_their_uses_and_lifetime` fail at load
-  above about 10. Make them load-tolerant.
+  above about 10. Make them load-tolerant, then add the `relay` and `guests`
+  suites to CI. On 2026-10-18 `relay::auto_route_and_presence_work_without_namespace_discovery`
+  failed alone twice in a row (once no peer-to-peer answer within 2.5 s,
+  once "relayed client did not confirm the session in time" after a 404 for
+  the broadcast), so it may be more than load.
+- **`host_admin::tests::password_and_code_enrollment_through_a_relay`** takes
+  about 60 s and timed out once under load ("relay closed the connection:
+  timed out"); it is in CI's `--bin teleport --ignored` step.
 - **Intel GPUs.** VA-API text quality on the UHD 630 stays near 17.5 dB on
   dense text, at any preset and bitrate.
 - **Audio.** Uncompressed PCM has no loss concealment; the microphone is mono

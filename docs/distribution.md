@@ -1,21 +1,54 @@
 # Installing and distributing Teleport
 
-| Platform | Package | Host | Client | Needs Nix | Built from |
+| Platform | Release asset | Host | Client | Needs Nix | Built from |
 |---|---|---|---|---|---|
-| Any Linux (glibc, x86-64/arm64) | `Teleport-VERSION-ARCH.AppImage` | yes | yes | no | `nix build .#appimage` |
-| Debian/Ubuntu | `teleport_VERSION-1_ARCH.deb` | yes, with systemd unit and udev rules | yes | no | `nix build .#deb` |
-| Fedora/openSUSE/RHEL | `teleport-VERSION-1.ARCH.rpm` | yes, as above | yes | no | `nix build .#rpm` |
-| Linux, sandboxed | Flatpak `dev.teleport.Teleport` | **no** (see below) | yes | no | `packaging/flatpak/` |
-| macOS 11+ | `Teleport.app` (zip/dmg), signed and notarised | no | yes | no | `tools/macos-app.sh` |
+| Any Linux (glibc, x86-64) | `Teleport-VERSION-x86_64.AppImage` | yes | yes | no | `nix build .#appimage` |
+| Any Linux (glibc, x86-64) | `teleport-VERSION-x86_64-linux.tar.gz` | yes | yes | no | `nix build .#tarball` |
+| Debian 12/13, Ubuntu 22.04/24.04 | `teleport_VERSION-1_amd64.deb` | yes, with systemd unit and udev rules | yes | no | `nix build .#deb` |
+| Fedora, openSUSE Tumbleweed/Leap | `teleport-VERSION-1.x86_64.rpm` | yes, as above | yes | no | `nix build .#rpm` |
+| Arch, CachyOS, Manjaro, EndeavourOS | `teleport-desktop-bin-VERSION-1-x86_64.pkg.tar.zst`, AUR `teleport-desktop-bin` | yes, as above | yes | no | `packaging/arch/PKGBUILD` |
+| Linux, sandboxed | `Teleport-VERSION-x86_64.flatpak` (`dev.teleport.Teleport`) | **no** (see below) | yes | no | `packaging/flatpak/` |
+| macOS 11+ | `Teleport-VERSION-{arm64,x86_64}.{dmg,zip}`, Homebrew cask `teleport-desktop` | no | yes | no | `tools/macos-app.sh` |
 | NixOS / Nix | flake package and NixOS module | yes | yes | yes | `nix build` |
 
-The AppImage, .deb and .rpm package one relocatable directory
-(`nix/bundle.nix`): the Nix-built binary, glibc and its loader, GStreamer and
-its plugins, FFmpeg, SDL, PipeWire's client library, libfido2 and a font, about
-400 MB unpacked. GPU drivers are not in it; they come from the system (see
-"GPU drivers in the relocatable bundle"). The macOS app bundles the same way
-on its side. None of these packages is published yet: the release workflow
-builds them (see "Release artifacts").
+Everything in the first seven rows is attached to each GitHub release with
+`SHA256SUMS` (see "Making a release"). The AppImage, tarball, .deb, .rpm and
+Arch package all contain one relocatable directory (`nix/bundle.nix`): the
+Nix-built binary, glibc and its loader, GStreamer and its plugins, FFmpeg,
+SDL, PipeWire's client library, libfido2 and a font, about 400 MB unpacked.
+GPU drivers are not in it; they come from the system (see "GPU drivers in the
+relocatable bundle"). The macOS app bundles the same way on its side.
+
+Not Gravitational's Teleport: the .deb and .rpm are called `teleport` (a name
+Gravitational's own repositories also use), the Arch package and the
+Homebrew cask `teleport-desktop`, because Arch's AUR and homebrew-core
+already have Gravitational's `teleport`. Both install a `teleport` command,
+so the packages conflict and cannot be installed together (Homebrew links
+ours as `teleport-desktop`).
+
+## Install by distribution
+
+Download the files from the
+[release page](https://github.com/ejb1123/teleport/releases) and check them
+with `sha256sum -c SHA256SUMS --ignore-missing`. The packages are not signed
+yet (see "Release artifacts").
+
+| System | Install | Tested 2026-10-18 (stock containers, `tools/package-smoke.sh`) |
+|---|---|---|
+| Debian 12, 13; Ubuntu 22.04, 24.04 | `sudo apt install ./teleport_VERSION-1_amd64.deb` | install, files, doctor, loopback session |
+| Fedora 44 | `sudo dnf install ./teleport-VERSION-1.x86_64.rpm` | as above |
+| openSUSE Tumbleweed, Leap 15.6, 16.0 | `sudo zypper install --allow-unsigned-rpm ./teleport-VERSION-1.x86_64.rpm` | as above |
+| Arch, CachyOS (Manjaro, EndeavourOS) | `sudo pacman -U ./teleport-desktop-bin-VERSION-1-x86_64.pkg.tar.zst`, or an AUR helper: `yay -S teleport-desktop-bin` | as above, the package built with makepkg in `archlinux:latest` |
+| Any glibc Linux | AppImage (below), or `tar -xzf teleport-VERSION-x86_64-linux.tar.gz` and run `teleport-VERSION-x86_64-linux/AppRun` | AppImage: Ubuntu 22.04, Fedora 44; tarball: Debian 12, Arch: doctor, loopback session |
+| Any Linux with Flatpak (client) | `flatpak install --user ./Teleport-VERSION-x86_64.flatpak` | 2026-10-17 locally (doctor, loopback in the sandbox); the release job is not run yet |
+| macOS 11+ (client) | open the .dmg and drag Teleport to Applications, or `brew install --cask ejb1123/teleport/teleport-desktop` | not tested: no Mac; the release job runs doctor; `brew audit` of the cask passes |
+| NixOS | the flake (see "Opt-in NixOS graphical-session service") | CI (`nix build`) |
+
+Then start `teleport` (the launcher, also in the desktop menu) on the client,
+and on the host follow "Debian, Ubuntu, Fedora: .deb and .rpm" below for the
+systemd user unit, which every native package installs the same way.
+Manjaro and EndeavourOS use Arch's repositories and pacman and are covered by
+the Arch test; CachyOS is tested with its own image (`cachyos/cachyos`).
 
 ## Linux AppImage
 
@@ -60,6 +93,7 @@ an NVIDIA GPU in a non-Nix root, AMD, arm64.
 ```sh
 sudo apt install ./teleport_0.5.4-1_amd64.deb      # Debian, Ubuntu
 sudo dnf install ./teleport-0.5.4-1.x86_64.rpm     # Fedora
+sudo zypper install --allow-unsigned-rpm ./teleport-0.5.4-1.x86_64.rpm   # openSUSE
 teleport                                           # launcher, also in the menu
 ```
 
@@ -103,6 +137,9 @@ on Fedora 43 (containers); the files above are in place with mode 0644,
 `uinput` exists, `systemd-analyze verify` accepts the unit, `udevadm verify`
 the rules, and `/usr/bin/teleport doctor` and the loopback session pass. The
 unit has not run under a real graphical session on these distributions.
+Retested 2026-10-18 with `tools/package-smoke.sh` (install, files, `uinput`,
+doctor, loopback session): the .deb on Ubuntu 22.04 and 24.04 and Debian 12
+and 13, the .rpm on Fedora 44 and openSUSE (below).
 
 ## openSUSE
 
@@ -121,6 +158,132 @@ The post-install script creates the `uinput` group with `groupadd` (in
 On Leap 15.6 (glibc 2.38) and 16.0 (2.40) the bundle's glibc 2.42 is newer; that
 does not matter, because the bundle uses its own glibc and loader for
 everything it starts (see "GPU drivers in the relocatable bundle").
+
+## Arch Linux, CachyOS, Manjaro, EndeavourOS
+
+The AUR package is `teleport-desktop-bin` (`packaging/arch/PKGBUILD`):
+`teleport` and `teleport-bin` in the AUR are Gravitational's. It installs the
+release tarball's bundle in `/opt/teleport` and the same system files as the
+.deb/.rpm (table above), plus `/usr/lib/sysusers.d/teleport.conf` for the
+`uinput` group; pacman's own hooks then create the group, reload udev and
+refresh the desktop and icon caches, and its install script loads `uinput`
+and `uhid` and applies the sysctl. It conflicts with Gravitational's
+packages, which also install `/usr/bin/teleport`.
+
+```sh
+# From the AUR, with a helper:
+yay -S teleport-desktop-bin            # or paru -S teleport-desktop-bin
+# By hand:
+git clone https://aur.archlinux.org/teleport-desktop-bin.git
+cd teleport-desktop-bin && makepkg -si
+# Without the AUR: the package attached to the release
+sudo pacman -U ./teleport-desktop-bin-0.5.4-1-x86_64.pkg.tar.zst
+```
+
+The release workflow builds that `.pkg.tar.zst` with makepkg from the same
+PKGBUILD in `archlinux:latest`, and installs and runs it in `archlinux:latest`
+and `cachyos/cachyos` (CachyOS's x86-64-v3 repositories do not matter: the
+bundle brings its own libraries). Manjaro and EndeavourOS use Arch's packages
+and pacman, so the Arch test covers them.
+
+There is no source package (`teleport-desktop`, built with cargo against
+Arch's FFmpeg, GStreamer, SDL 2 and PipeWire) yet: Teleport's build expects
+the paths the Nix wrapper sets (`TELEPORT_FONT`, `TELEPORT_LIBFIDO2`,
+GStreamer plugin paths) and a patched PipeWire for HDR capture, and nobody
+has tried it against Arch's libraries.
+
+### Publishing to the AUR
+
+Done by hand by the maintainer, once per release, from the
+`aur-teleport-desktop-bin` artifact of the release workflow run (PKGBUILD
+with the release's version and sha256, `.SRCINFO`, the install file):
+
+1. Once: create an account on <https://aur.archlinux.org>, add an SSH public
+   key under "My Account", and in `~/.ssh/config`:
+
+   ```
+   Host aur.archlinux.org
+     IdentityFile ~/.ssh/aur
+     User aur
+   ```
+
+2. Once: `git clone ssh://aur@aur.archlinux.org/teleport-desktop-bin.git`
+   (an empty repository; the first push creates the package).
+3. Each release: copy `PKGBUILD`, `.SRCINFO` and `teleport-desktop-bin.install`
+   from the artifact into that clone, check with `namcap PKGBUILD` and a
+   `makepkg -si`, then
+   `git add PKGBUILD .SRCINFO teleport-desktop-bin.install &&
+   git commit -m "Update to 0.6.0" && git push`.
+
+Without the artifact, `tools/arch-pkgbuild.sh 0.6.0
+teleport-0.6.0-x86_64-linux.tar.gz OUTDIR` writes the same files (on Arch, or
+run `makepkg --printsrcinfo > .SRCINFO` there afterwards).
+
+## Generic Linux tarball
+
+`teleport-VERSION-x86_64-linux.tar.gz` is the bundle itself, for systems
+without a package format above or for installing somewhere else:
+
+```sh
+tar -xzf teleport-0.5.4-x86_64-linux.tar.gz -C ~/.local/opt
+~/.local/opt/teleport-0.5.4-x86_64-linux/AppRun doctor
+ln -s ~/.local/opt/teleport-0.5.4-x86_64-linux/AppRun ~/.local/bin/teleport
+```
+
+`AppRun` finds the bundle from its own path, so the directory can live
+anywhere and be symlinked. The host's system files (systemd user unit, udev
+rules, modules-load and sysctl files, portal desktop entry) are in
+`usr/share/teleport/system/`; install them as the .deb does (table above),
+changing the unit's `ExecStart` path if `teleport` is not `/usr/bin/teleport`.
+
+## Homebrew (macOS, and Linux)
+
+The tap is `ejb1123/homebrew-teleport` (`packaging/homebrew/`): a cask for
+the macOS app and a formula for the Linux tarball, both `teleport-desktop`
+because homebrew-core's `teleport` is Gravitational's.
+
+```sh
+brew install --cask ejb1123/teleport/teleport-desktop   # macOS: Teleport.app
+brew install ejb1123/teleport/teleport-desktop          # Linux (Linuxbrew)
+```
+
+The cask installs `Teleport.app` from the release .dmg (Apple silicon or
+Intel), links the command-line client as `teleport-desktop`, and `brew
+uninstall --zap` also removes `~/Library/Application Support/Teleport` (saved
+desktops and pairing credentials), `~/Library/Caches/Teleport` and the
+app's preferences and saved state. Until releases are notarised, macOS
+blocks the ad-hoc signed app: right-click → Open, or
+`xattr -dr com.apple.quarantine /Applications/Teleport.app` (the cask's
+caveats say so).
+
+The formula installs the tarball's bundle in the keg and a `teleport-desktop`
+wrapper around `AppRun`. Homebrew's relocation does not touch it: the
+binaries run through the bundle's own loader. It does not install the host's
+system files (udev rules, systemd unit); Linuxbrew users who run the host
+should use their distribution's package instead.
+
+Checked 2026-10-18 in the `homebrew/brew` container (Homebrew 4.6.20, from
+generated files): `brew style` passes for both; `brew audit --strict` passes
+for the formula, and for the cask with `HOMEBREW_SIMULATE_MACOS_ON_LINUX=1`
+for both architectures (offline; the release URLs do not exist yet); the
+formula installs from the release tarball and `brew test` (its `--version`
+and `doctor`) passes. The cask has not been installed: there is no Mac here.
+
+**Setting up the tap** (the maintainer, once):
+
+```sh
+gh repo create ejb1123/homebrew-teleport --public \
+  --description "Homebrew tap for Teleport (remote desktop)"
+git clone https://github.com/ejb1123/homebrew-teleport && cd homebrew-teleport
+mkdir -p Casks Formula
+```
+
+**Each release:** download the `homebrew-tap-update` artifact of the release
+workflow run (the cask and formula with the release's version and sha256,
+from `tools/homebrew-tap.sh`), copy `Casks/` and `Formula/` into the tap,
+`brew style` and `brew audit --cask --online teleport-desktop` there, commit
+and push. The templates in this repository keep `@VERSION@`/`@SHA256_…@`
+placeholders and are not installable themselves.
 
 ## Flatpak (client)
 
@@ -389,34 +552,114 @@ Diagnose with `TELEPORT_DRIVER_PATH`, `LIBVA_DRIVERS_PATH`, `teleport doctor`
 and the client's F8 decoder line; `LD_DEBUG=libs teleport doctor` shows where
 each library was found.
 
+## Making a release
+
+The version is set once, in `Cargo.toml`; the flake reads it from there,
+and `tools/release-version.sh` keeps the files that repeat it (Cargo.lock,
+`packaging/Info.plist`, the AppStream metainfo's release list, the Arch
+PKGBUILD) in step. A release tag is `v` plus that version; the release
+workflow refuses a tag that does not match.
+
+1. Check "Release validation" below, and that CI is green on `main`.
+2. Bump the version and commit:
+
+   ```sh
+   tools/release-version.sh set 0.6.0     # Cargo.toml, Cargo.lock, Info.plist, metainfo, PKGBUILD
+   git diff                               # optionally add a "## 0.6.0" section to CHANGELOG.md
+   git commit -am "Release 0.6.0"
+   ```
+
+3. Tag and push (pushing a tag needs nothing beyond push access; changes to
+   `.github/workflows/` need a token with the `workflow` scope):
+
+   ```sh
+   git tag -a v0.6.0 -m "Teleport 0.6.0"
+   git push origin main v0.6.0
+   ```
+
+4. The **Release** workflow (`.github/workflows/release.yml`) then builds,
+   tests and publishes the GitHub Release `v0.6.0` with every artefact and
+   `SHA256SUMS`. Its notes are the `## 0.6.0` section of `CHANGELOG.md` if
+   there is one, otherwise the commit subjects since the previous `v*` tag
+   (`tools/release-notes.sh`), followed by install pointers. A version with a
+   hyphen (`0.6.0-rc.1`) is published as a pre-release (its Arch `pkgver`
+   is `0.6.0_rc.1`, since pacman versions cannot contain `-`; nfpm writes
+   the .deb/.rpm version its own way, and no pre-release has been built
+   yet).
+5. Publish the packages that live elsewhere, from the run's artifacts: the
+   AUR (`aur-teleport-desktop-bin`, see "Publishing to the AUR") and the
+   Homebrew tap (`homebrew-tap-update`, see "Homebrew").
+
+Running the workflow by hand (Actions → Release → Run workflow) with an
+empty tag builds and tests the branch without publishing anything; with an
+existing tag it rebuilds that tag and replaces the release's assets.
+
 ## Release artifacts
 
-`.github/workflows/release.yml` (manually dispatched) builds:
+The release workflow's jobs:
 
-- the Nix closure archives (`nix-store --export`, for Nix users, as before);
-- `linux-packages`: the AppImage, .deb and .rpm with `nix build`, then runs
-  the AppImage's doctor and a loopback session in `ubuntu:24.04`, and the
-  .deb (`debian:13`) and .rpm (`fedora:43`) doctors, and uploads them with
-  `SHA256SUMS`;
-- `macos-app`: `tools/macos-app.sh --dmg` on `macos-14` (Apple Silicon), then
-  runs the bundled binary's doctor with a minimal environment.
+| Job | Runs on | Produces / checks |
+|---|---|---|
+| `version` | ubuntu-24.04 | the tag matches `Cargo.toml` and the files that repeat it |
+| `linux` | ubuntu-24.04 | AppImage, .deb, .rpm and tarball (`nix build .#appimage .#deb .#rpm .#tarball`) |
+| `arch` | `archlinux:latest` container | `teleport-desktop-bin-VERSION-1-x86_64.pkg.tar.zst` with makepkg from the tarball, and the AUR files |
+| `linux-test` | stock images, no Nix | `tools/package-smoke.sh`: install, system files, `teleport doctor`, loopback session (`host --source test` and `client --headless-frames 60 --software-decoder`, which must print `SMOKE PASS`) |
+| `flatpak` | `flatpak-github-actions:freedesktop-26.08` | `Teleport-VERSION-x86_64.flatpak`; doctor and loopback session inside the sandbox |
+| `macos` | macos-14 (arm64), macos-15-intel (x86_64) | `Teleport-VERSION-ARCH.dmg` and `.zip` (`tools/macos-app.sh --dmg`); the bundled binary's `--version` and doctor without Nix on PATH |
+| `release` | ubuntu-24.04 | `SHA256SUMS`, notes, the GitHub Release; the `homebrew-tap-update` artifact |
 
-With the `sign_macos` input set, it signs and notarises with these repository
-secrets: `MACOS_CERTIFICATE_P12` (base64 of the Developer ID Application
-certificate and key, exported as .p12), `MACOS_CERTIFICATE_PASSWORD`,
-`MACOS_SIGNING_IDENTITY` (e.g. `Developer ID Application: Jane Doe
-(TEAMID1234)`), `NOTARY_KEY_P8` (base64 of an App Store Connect API key),
-`NOTARY_KEY_ID` and `NOTARY_ISSUER`. The certificate goes into a temporary
-keychain that the job deletes. Without the input the app is ad-hoc signed,
-which Gatekeeper rejects on other Macs (right-click → Open, or
+`linux-test` covers: .deb on Ubuntu 22.04 and 24.04 and Debian 12 and 13;
+.rpm on Fedora (latest), openSUSE Tumbleweed, Leap 15.6 and Leap 16.0; the
+Arch package on Arch and CachyOS; the AppImage on Ubuntu 22.04 and Fedora;
+the tarball on Debian 12 and Arch. `tools/package-smoke.sh KIND` runs the
+same check locally:
+
+```sh
+mkdir -p dist && cp result*/* dist/   # from nix build .#deb etc.
+docker run --rm -v "$PWD/dist:/dist:ro" -v "$PWD/tools:/tools:ro" \
+  opensuse/tumbleweed sh /tools/package-smoke.sh rpm
+```
+
+**macOS signing.** When the repository has the signing secrets, the app is
+signed with the Developer ID and notarised; otherwise it is ad-hoc signed and
+the job warns. Secrets: `MACOS_CERTIFICATE_P12` (base64 of the Developer ID
+Application certificate and key, exported as .p12),
+`MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGNING_IDENTITY` (e.g. `Developer ID
+Application: Jane Doe (TEAMID1234)`), `NOTARY_KEY_P8` (base64 of an App Store
+Connect API key), `NOTARY_KEY_ID` and `NOTARY_ISSUER`. The certificate goes
+into a temporary keychain that the job deletes. An ad-hoc signed app is
+rejected by Gatekeeper on other Macs (right-click → Open, or
 `xattr -dr com.apple.quarantine Teleport.app`, to run it anyway).
 
 Linux packages are not signed: no repository signing key exists yet. The
 AppImage can carry a GPG signature (`appimagetool --sign`) and the .deb/.rpm
 are normally signed by the repository that serves them; both need a key and a
-place to publish, which are outside this repository. No GitHub release is
-published automatically. Checksums do not establish trust on their own;
-obtain artifacts only from a trusted repository or workflow.
+place to publish (below). Checksums do not establish trust on their own;
+obtain artifacts only from the release page or a trusted repository. Only
+x86-64 Linux packages are built; arm64 would need an `ubuntu-24.04-arm` job.
+
+## Future package repositories
+
+Not set up; each would let users get updates with their package manager
+instead of downloading every release:
+
+- **openSUSE Build Service** (build.opensuse.org): one project can build and
+  sign .rpm (openSUSE, Fedora) and .deb (Debian, Ubuntu) repositories. It
+  builds from source in its own sandbox without network access, so it needs
+  an RPM spec / Debian source package with vendored crates (`cargo vendor`)
+  rather than the Nix bundle; or a `_service` that repackages the release
+  tarball, which OBS allows for binary packages in home projects.
+- **Ubuntu PPA** (Launchpad): source packages only, built on Launchpad
+  without network access, so it needs a Debian source package with vendored
+  crates, signed with the maintainer's GPG key and uploaded with `dput`; one
+  upload per Ubuntu series.
+- **Flathub**: submit `packaging/flatpak/dev.teleport.Teleport.yml` (client)
+  as a pull request to `flathub/flathub`; it needs a tagged git source
+  instead of `type: dir`, a license, screenshots in the metainfo, and
+  reviewers' acceptance of `--device=all`.
+- **A self-hosted apt/rpm repository** signed with a project key (e.g. on
+  GitHub Pages, built by the release workflow) is the smallest step that
+  gives signed packages and updates.
 
 ## Release validation
 
