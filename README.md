@@ -49,7 +49,6 @@ for hosts you can't reach directly.
 | Virtual display / privacy mode | | ✅ nested KWin | real monitors |
 | DualShock / DualSense emulation | | ✅ VM with hid-playstation | physical controllers |
 | AV1 | ✅ hardware decode | software encode | hardware encode |
-| Windows client | | in progress (not on main yet) | real Windows |
 | Installers (AppImage, .deb, .rpm, Flatpak) | | ✅ distro containers | macOS `.app` signing |
 
 The full feature list, how each item was tested and what is still open is
@@ -508,7 +507,7 @@ to separate networking/decoding problems from portal/capture problems.
 - Without a relay: direct LAN/VPN connections only. A bitrate above available bandwidth
   causes skipped video groups. Severe control loss/reordering disconnects the
   session instead of silently dropping keyboard/button events.
-- Windows is a future client target, not an implemented or tested platform.
+- Windows is not supported, as a host or as a client.
 - Installers without Nix (AppImage, .deb/.rpm, client Flatpak, signed and
   notarised Mac `.app`) are built from the flake but not published yet, and
   the Mac app has not been built on a Mac; see
