@@ -1261,12 +1261,25 @@ mod tests {
         );
     }
 
+    /// Whether a test that creates uinput devices should skip (GitHub's
+    /// runners cannot open /dev/uinput); see `crate::test_env`.
+    fn skip_without_uinput(test: &str) -> bool {
+        crate::test_env::skip_unless(
+            test,
+            uinput_writable(),
+            "write access to /dev/uinput (docs/gamepad.md)",
+        )
+    }
+
     /// Creates a real device, finds its evdev node and reads back a button,
     /// a stick, a trigger, the d-pad and the ReleaseAll/destroy behaviour.
     #[test]
     #[ignore = "needs write access to /dev/uinput (input/uinput group or a udev rule) and read access to the created /dev/input/event* node"]
     fn uinput_pad_reaches_evdev() {
         use std::io::Read;
+        if skip_without_uinput("uinput_pad_reaches_evdev") {
+            return;
+        }
         let mut pads = Gamepads::new(true);
         assert!(pads.available(), "/dev/uinput is not writable");
         pads.input(&Event::GamepadConnected {
@@ -1386,6 +1399,9 @@ mod tests {
     #[ignore = "needs write access to /dev/uinput, read access to /dev/input/event* and SDL joystick hotplug (udev)"]
     fn sdl_reads_virtual_pad_back_as_the_same_controller() {
         use sdl2::controller::{Axis, Button};
+        if skip_without_uinput("sdl_reads_virtual_pad_back_as_the_same_controller") {
+            return;
+        }
         let sdl = sdl2::init().unwrap();
         let subsystem = sdl.game_controller().unwrap();
         let mut pump = sdl.event_pump().unwrap();
@@ -1532,6 +1548,9 @@ mod tests {
     #[ignore = "needs write access to /dev/uinput and read/write access to the created /dev/input/event* node"]
     fn uinput_pad_rumble_reaches_the_client() {
         use std::io::Write;
+        if skip_without_uinput("uinput_pad_rumble_reaches_the_client") {
+            return;
+        }
         const EVIOCSFF: u64 =
             (1 << 30) | ((size_of::<libc::ff_effect>() as u64) << 16) | ((b'E' as u64) << 8) | 0x80;
         const EVIOCRMFF: u64 =
@@ -1628,6 +1647,9 @@ mod tests {
     #[test]
     #[ignore = "needs write access to /dev/uinput, read/write access to /dev/input/event* and SDL joystick hotplug (udev)"]
     fn sdl_rumble_on_the_virtual_pad_reaches_the_client() {
+        if skip_without_uinput("sdl_rumble_on_the_virtual_pad_reaches_the_client") {
+            return;
+        }
         let sdl = sdl2::init().unwrap();
         let subsystem = sdl.game_controller().unwrap();
         let mut pump = sdl.event_pump().unwrap();

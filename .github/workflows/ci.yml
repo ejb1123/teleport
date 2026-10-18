@@ -1,11 +1,27 @@
 name: Build and test
 on:
   push:
+    # Version tags run the release workflow instead.
+    branches: ['**']
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# Ignored test suites that are NOT run here, because a GitHub ubuntu-24.04
+# runner cannot: network, p2p and wake (unprivileged user/network
+# namespaces, which Ubuntu's AppArmor restricts), audio_latency (a PipeWire
+# session), virtual_display (nested KWin and its portal), mac_surface
+# (VideoToolbox hardware). relay and guests run locally but are not reliable
+# yet under load (docs/todo.md). Tests inside the suites below that need
+# /dev/uinput or a GPU skip with a SKIPPED line under
+# TELEPORT_TEST_SKIP_UNAVAILABLE=1 (src/test_env.rs), or without
+# TELEPORT_TEST_HARDWARE=1 / TELEPORT_TEST_PORTAL=1.
 jobs:
   native:
     strategy:
@@ -13,12 +29,18 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-14]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 75
+    env:
+      TELEPORT_TEST_SKIP_UNAVAILABLE: '1'
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: cachix/install-nix-action@b85815f71a6de0ddee80b8a80a98d43f4bcc66c7 # v31
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
+      # Caches the store paths this job builds (the teleport package, the
+      # bundle) and fetches; cache.nixos.org still serves nixpkgs.
+      - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Formatting
         run: nix develop --command bash -c 'cargo fmt --check && nixfmt --check flake.nix nix/*.nix'
       - name: PipeWire HDR negotiation regression
@@ -31,7 +53,20 @@ jobs:
         run: nix develop --command cargo test --locked --test smoke --test multi_monitor --test ffmpeg_interop -- --ignored --nocapture
       - name: Legacy GStreamer and direct FFmpeg library integration tests
         if: runner.os == 'Linux'
-        run: nix develop --command env TELEPORT_VIDEO_BACKEND=gstreamer cargo test --locked --bin teleport -- --ignored --nocapture
+        run: |
+          # The NV12 renderer test needs an X display and SDL's OpenGL
+          # renderer. The runner has no GPU and no /run/opengl-driver, so give
+          # it the flake's Mesa (llvmpipe), as the packaged wrapper does
+          # (nix/mesa-runtime.sh).
+          mesa=$(nix build --no-link --print-out-paths --inputs-from . nixpkgs#mesa)
+          "$(nix develop --command sh -c 'command -v Xvfb')" :99 -screen 0 1280x720x24 -nolisten tcp &
+          xvfb=$!
+          trap 'kill "$xvfb"' EXIT
+          for _ in $(seq 100); do [ -e /tmp/.X11-unix/X99 ] && break; sleep 0.2; done
+          nix develop --command env TELEPORT_VIDEO_BACKEND=gstreamer DISPLAY=:99 \
+            LD_LIBRARY_PATH="$mesa/lib" LIBGL_DRIVERS_PATH="$mesa/lib/dri" \
+            __EGL_VENDOR_LIBRARY_FILENAMES="$mesa/share/glvnd/egl_vendor.d/50_mesa.json" \
+            cargo test --locked --bin teleport -- --ignored --nocapture
       - name: Native toolbar and launcher interaction tests
         if: runner.os == 'Linux'
         run: nix develop --command cargo test --locked --test ui -- --ignored --nocapture

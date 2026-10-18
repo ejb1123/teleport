@@ -15,13 +15,31 @@ the full commands. Keep host and client on the same revision.
 
 ## macOS client
 
-Without a Mac, `tools/check-macos.sh` type-checks the macOS build from Linux
-(`cargo check -Zbuild-std --target aarch64-apple-darwin --all-targets`, so
-the unit tests `nix build` runs are included; C code stubbed). It
-catches Rust code that only breaks on macOS, such as Linux-only items used
-from cross-platform code; it does not link or compile the C shim, so a real
-Mac build is still the final check. Run it before pushing changes that touch
-cfg-gated code.
+Without a Mac, `tools/check-macos.sh` lints the macOS build from Linux with
+the command CI runs on macos-14 (`cargo clippy -Zbuild-std --target
+aarch64-apple-darwin --all-targets -- -D warnings`, so the unit tests `nix
+build` runs are included; C code stubbed). It catches Rust code that only
+breaks on macOS, such as Linux-only items used from cross-platform code, and
+host-only code that is dead on macOS (gate it with
+`#[cfg(target_os = "linux")]`, or `#[cfg(any(test, target_os = "linux"))]`
+when cross-platform tests use it); it does not link or compile the C shim,
+so a real Mac build is still the final check. Run it before pushing changes
+that touch cfg-gated code.
+
+## Ignored tests in CI
+
+CI (`.github/workflows/ci.yml`) runs the ignored suites a GitHub runner can:
+`smoke`, `multi_monitor`, `ffmpeg_interop`, `ui`, `host_ui`, `access_smoke`,
+`forwarding_smoke`, `package_env` and the binary's own (`cargo test --bin
+teleport -- --ignored`, under Xvfb with the flake's Mesa for SDL's OpenGL
+renderer). It sets `TELEPORT_TEST_SKIP_UNAVAILABLE=1`: tests that need
+`/dev/uinput` or a display then print `SKIPPED <test>: needs ...` and pass;
+without it they fail, so a machine that should have the device notices.
+Hardware-encoder and portal tests run only with `TELEPORT_TEST_HARDWARE=1` /
+`TELEPORT_TEST_PORTAL=1`. Not in CI: `network`, `p2p`, `wake` (user and
+network namespaces), `audio_latency` (PipeWire), `virtual_display` (nested
+KWin), `mac_surface` (a Mac), and `relay` and `guests`, which are not yet
+reliable on a loaded machine.
 
 For code pairing, start the host with `--pair` and its persistent identity
 directory; allow TCP 4443 for enrollment and UDP 4443 for desktop streaming.
