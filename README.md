@@ -1,56 +1,104 @@
 # Teleport
 
-An experimental **native** remote desktop: Linux host, macOS/Linux client,
-Rust + SDL + direct FFmpeg video codecs, with Media over QUIC for video and input. No browser,
-Electron, WebRTC, external relay, or account is required (an optional relay can
-reach hosts behind NAT; see [relay mode](docs/relay.md)).
+A native, low-latency remote desktop and game-streaming app for **Linux hosts**
+and **macOS / Linux clients**, written in Rust. Video goes straight from the
+GPU (DMA-BUF capture into NVENC or VA-API) over [Media over QUIC](https://moq.dev/),
+end-to-end encrypted, with no account, no browser and no cloud service in the
+middle. A self-hosted or public MoQ relay (including Cloudflare's) is optional,
+for hosts you can't reach directly.
 
-This is an experimental implementation, not a production Parsec replacement yet.
-It shares an existing graphical session with your own devices and, if you
-invite them, guests ([guests and shared sessions](docs/guests.md)). Start on a
-LAN or a VPN with direct UDP connectivity.
-See [implementation status](docs/status.md) for verified features and unfinished work.
+> **Status: experimental.** It is used daily on one KDE Plasma 6 / NVIDIA
+> host. Much more is covered by automated tests than by real hardware; the
+> table below says which is which. Expect rough edges.
 
-Video encoding and decoding now default to directly linked FFmpeg libraries
-(no FFmpeg subprocess). GStreamer remains for capture, audio and scheduling.
-See [codec backend and testing](docs/ffmpeg.md), including hardware selection,
-the legacy-backend comparison switch, and current GPU-copy limitations.
+## Highlights
 
-The current development build adds native Linux **Host settings**, persistent
-Teleport username/passphrase login and individually revocable device credentials.
-See [host setup and login](docs/access.md). These are Teleport accounts, not Linux
-login accounts. Security-key login and peripheral forwarding have separate
-implementation and hardware-verification requirements; see
-[security-key design](docs/security-key-design.md).
+- **Fast path:** zero-copy capture → NVENC / VA-API encode, zero-copy CUDA /
+  VA-API presentation on Linux clients; up to 240 FPS negotiated from the
+  client's display; VRR-friendly presentation; per-stage latency in the F8
+  overlay.
+- **Codecs:** H.264, H.265 and AV1 chosen automatically from what both ends
+  decode in hardware; optional 4:4:4 (sharp text) and 10-bit; experimental
+  HDR10 on patched KWin hosts.
+- **Networks:** delay-based rate control with resolution / FPS step-down on
+  narrow links, intra refresh instead of keyframe bursts, direct QUIC,
+  peer-to-peer hole punching across NATs, or an end-to-end encrypted relay
+  (self-hosted `teleport relay`, or Cloudflare's MoQ relay).
+- **Input:** local cursor, automatic pointer lock for games, smooth
+  trackpad scrolling with macOS momentum, keyboard capture, kept-local
+  hotkeys, gamepads with rumble, and DualShock 4 / DualSense emulation
+  (touchpad, motion, lightbar).
+- **Desktop:** multiple monitors, virtual displays and privacy mode (KDE),
+  clipboard, desktop audio (Opus or PCM), microphone passthrough,
+  Wake-on-LAN and opt-in unattended start.
+- **Access:** pairing codes or links, Linux-account or Teleport-account
+  login, per-device keys, revocation; invite **guests** to a shared session
+  with per-guest permissions and live approval.
 
-Version 0.5.0 adds opt-in **existing Linux account login** through PAM, with pinned
-TLS and one-session credentials. See [system login setup](docs/system-login.md).
-It attaches to a running desktop; boot/login-screen session creation is not included.
+## What has been verified where
 
-Version 0.5.2 makes the launcher saved-desktop-first: **Add desktop** saves a name
-and `host:port` without contacting the host or asking for credentials. Select it
-and **Connect** to sign in. First contact presents the full SHA-256 host fingerprint
-for explicit approval; compare it with the host through trusted SSH or locally.
-Approved fingerprints are remembered, and changed identities are blocked rather
-than silently replaced. Linux passwords are never saved; paired-device credentials
-remain reusable and revocable. Connection quality settings are collapsed by default.
+| Area | Real hardware | Automated tests only | Not yet |
+|---|---|---|---|
+| Linux host (KDE Wayland, NVIDIA RTX 3080, Intel UHD 630) | ✅ daily use | | AMD, GNOME, wlroots |
+| Linux client | ✅ | | |
+| macOS client | ✅ connects and streams | scrolling feel, Metal paths | Apple AV1, 4:4:4 |
+| Zero-copy capture / NVENC / VA-API | ✅ | | Quick Sync, AMD |
+| Relay (self-hosted) and peer-to-peer | | ✅ namespaces, NAT emulation | real-world NATs at scale |
+| Cloudflare MoQ relay | ✅ live public relay | | provisioned relays |
+| Guests, approval, invites | | ✅ multi-client tests | real multi-user sessions |
+| Virtual display / privacy mode | | ✅ nested KWin | real monitors |
+| DualShock / DualSense emulation | | ✅ VM with hid-playstation | physical controllers |
+| AV1 | ✅ hardware decode | software encode | hardware encode |
+| Windows client | | in progress (not on main yet) | real Windows |
+| Installers (AppImage, .deb, .rpm, Flatpak) | | ✅ distro containers | macOS `.app` signing |
 
-Version 0.4.1 added an explicit **password + U2F touch** enrollment path for the
-YubiKey NEO and isolates the Linux package from conflicting system SDL/font
-configuration (including Arch). See [NEO setup and limitations](docs/yubikey-neo.md).
-Saved devices still connect using their credentials; this is not a touch-per-session
-policy, and physical NEO acceptance remains pending.
+The full feature list, how each item was tested and what is still open is
+in [docs/status.md](docs/status.md) and the review tracker
+[docs/review-2026-10.md](docs/review-2026-10.md). A feature-by-feature
+comparison with Parsec is in [docs/parsec-comparison.md](docs/parsec-comparison.md).
 
-Version 0.3 adds a redesigned native launcher, selectable stream resolution/FPS/
-bitrate, and a **Stats for nerds** overlay (toolbar or **F8**). Launcher connections
-default to native monitor resolution, 60 FPS and 20 Mbps; preferences apply on
-connection. Both endpoints need the new build for quality negotiation and host
-telemetry. The F8 overlay reports actual streamed pixels, not the client window size;
-the native title stays plain and stable.
-**SDR H.264 and H.265/HEVC are the tested baseline.** An experimental patched-KWin
-HDR path and Mac Metal/EDR renderer are available; see [HDR status](docs/hdr.md).
-`nix run . -- doctor --hdr` tests synthetic codecs. A passing codec probe is not HDR
-desktop support.
+## Quick start
+
+With [Nix](https://nixos.org/download/) (flakes enabled), on both machines:
+
+```sh
+git clone https://github.com/ejb1123/teleport && cd teleport
+nix build
+./result/bin/teleport            # opens the launcher
+```
+
+On the Linux host, start sharing with a one-time pairing code:
+
+```sh
+nix run . -- host --listen 0.0.0.0:4443 --pair
+```
+
+In the client's launcher, **Add desktop** with the host's `address:4443`,
+then pair with the code. NixOS users can use the module instead
+(`services.teleport-desktop`, see [docs/distribution.md](docs/distribution.md)),
+and there are AppImage, .deb, .rpm and Flatpak builds for other distributions.
+Detailed walkthroughs follow below.
+
+## Documentation
+
+| Topic | Docs |
+|---|---|
+| Install and packages | [distribution](docs/distribution.md) |
+| Pairing, accounts, Linux login | [pairing](docs/pairing.md), [access](docs/access.md), [system login](docs/system-login.md) |
+| Guests and shared sessions | [guests](docs/guests.md) |
+| Relay, peer-to-peer, Cloudflare | [relay](docs/relay.md) |
+| Codecs, zero-copy, AV1/4:4:4/10-bit | [ffmpeg](docs/ffmpeg.md), [hdr](docs/hdr.md) |
+| Performance and latency | [performance](docs/performance.md) |
+| Input: cursor, scrolling, keyboard, gamepads | [cursor](docs/cursor.md), [scrolling](docs/scrolling.md), [keyboard capture](docs/keyboard-capture.md), [gamepad](docs/gamepad.md) |
+| Audio and microphone | [audio](docs/audio.md) |
+| Displays: multi-monitor, virtual, privacy | [multi-monitor](docs/multi-monitor.md), [virtual display](docs/virtual-display.md) |
+| Wake-on-LAN and unattended start | [wake and unattended](docs/wake-and-unattended.md) |
+| Testing | [testing](docs/testing.md) |
+
+## License
+
+No license has been chosen yet, so the code is currently all rights
+reserved. A license will be added before a first release.
 
 ## Installing without Nix
 
@@ -514,6 +562,63 @@ the host certificate as on a LAN. Stats (F8) shows `Path p2p, ...`; behind a
 symmetric NAT or with UDP blocked the relay is used as before. `--no-p2p`
 turns it off on either end; `--upnp` opts in to a NAT-PMP port mapping. See
 [peer-to-peer](docs/relay.md#peer-to-peer-through-nats).
+
+## Release history
+
+Notes from earlier versions, kept for reference.
+
+An experimental **native** remote desktop: Linux host, macOS/Linux client,
+Rust + SDL + direct FFmpeg video codecs, with Media over QUIC for video and input. No browser,
+Electron, WebRTC, external relay, or account is required (an optional relay can
+reach hosts behind NAT; see [relay mode](docs/relay.md)).
+
+This is an experimental implementation, not a production Parsec replacement yet.
+It shares an existing graphical session with your own devices and, if you
+invite them, guests ([guests and shared sessions](docs/guests.md)). Start on a
+LAN or a VPN with direct UDP connectivity.
+See [implementation status](docs/status.md) for verified features and unfinished work.
+
+Video encoding and decoding now default to directly linked FFmpeg libraries
+(no FFmpeg subprocess). GStreamer remains for capture, audio and scheduling.
+See [codec backend and testing](docs/ffmpeg.md), including hardware selection,
+the legacy-backend comparison switch, and current GPU-copy limitations.
+
+The current development build adds native Linux **Host settings**, persistent
+Teleport username/passphrase login and individually revocable device credentials.
+See [host setup and login](docs/access.md). These are Teleport accounts, not Linux
+login accounts. Security-key login and peripheral forwarding have separate
+implementation and hardware-verification requirements; see
+[security-key design](docs/security-key-design.md).
+
+Version 0.5.0 adds opt-in **existing Linux account login** through PAM, with pinned
+TLS and one-session credentials. See [system login setup](docs/system-login.md).
+It attaches to a running desktop; boot/login-screen session creation is not included.
+
+Version 0.5.2 makes the launcher saved-desktop-first: **Add desktop** saves a name
+and `host:port` without contacting the host or asking for credentials. Select it
+and **Connect** to sign in. First contact presents the full SHA-256 host fingerprint
+for explicit approval; compare it with the host through trusted SSH or locally.
+Approved fingerprints are remembered, and changed identities are blocked rather
+than silently replaced. Linux passwords are never saved; paired-device credentials
+remain reusable and revocable. Connection quality settings are collapsed by default.
+
+Version 0.4.1 added an explicit **password + U2F touch** enrollment path for the
+YubiKey NEO and isolates the Linux package from conflicting system SDL/font
+configuration (including Arch). See [NEO setup and limitations](docs/yubikey-neo.md).
+Saved devices still connect using their credentials; this is not a touch-per-session
+policy, and physical NEO acceptance remains pending.
+
+Version 0.3 adds a redesigned native launcher, selectable stream resolution/FPS/
+bitrate, and a **Stats for nerds** overlay (toolbar or **F8**). Launcher connections
+default to native monitor resolution, 60 FPS and 20 Mbps; preferences apply on
+connection. Both endpoints need the new build for quality negotiation and host
+telemetry. The F8 overlay reports actual streamed pixels, not the client window size;
+the native title stays plain and stable.
+**SDR H.264 and H.265/HEVC are the tested baseline.** An experimental patched-KWin
+HDR path and Mac Metal/EDR renderer are available; see [HDR status](docs/hdr.md).
+`nix run . -- doctor --hdr` tests synthetic codecs. A passing codec probe is not HDR
+desktop support.
+
 
 ## Development and checks
 
