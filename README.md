@@ -93,6 +93,7 @@ Detailed walkthroughs follow below.
 | Displays: multi-monitor, virtual, privacy | [multi-monitor](docs/multi-monitor.md), [virtual display](docs/virtual-display.md) |
 | Wake-on-LAN and unattended start | [wake and unattended](docs/wake-and-unattended.md) |
 | Testing | [testing](docs/testing.md) |
+| Open work and known bugs | [to do later](docs/todo.md) |
 
 ## License
 
