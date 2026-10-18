@@ -1,12 +1,42 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <title>Teleport</title>
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#3b5bdb"/>
-      <stop offset="1" stop-color="#7048e8"/>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1b2838"/>
+      <stop offset="1" stop-color="#0c121b"/>
     </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#86f3e0"/>
+      <stop offset="1" stop-color="#38bfa8"/>
+    </linearGradient>
+    <linearGradient id="streak" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#5bdfc9" stop-opacity="0"/>
+      <stop offset="1" stop-color="#5bdfc9" stop-opacity="1"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.64" cy="0.47" r="0.48">
+      <stop offset="0" stop-color="#5bdfc9" stop-opacity="0.24"/>
+      <stop offset="1" stop-color="#5bdfc9" stop-opacity="0"/>
+    </radialGradient>
   </defs>
-  <rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)"/>
-  <rect x="44" y="60" width="168" height="112" rx="12" fill="none" stroke="#fff" stroke-width="14"/>
-  <path d="M104 204h48M128 172v32" stroke="#fff" stroke-width="14" stroke-linecap="round"/>
-  <path d="M92 116h60M132 94l24 22-24 22" fill="none" stroke="#fff" stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Tile -->
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#tile)"/>
+  <rect x="64" y="64" width="896" height="896" rx="200" fill="url(#glow)"/>
+  <rect x="66" y="66" width="892" height="892" rx="198" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="4"/>
+
+  <!-- Ghost screen: where the desktop comes from -->
+  <rect x="150" y="340" width="330" height="236" rx="34" fill="none" stroke="#e7f0f6" stroke-opacity="0.26" stroke-width="30"/>
+
+  <!-- Motion streaks -->
+  <rect x="268" y="388" width="232" height="34" rx="17" fill="url(#streak)"/>
+  <rect x="208" y="460" width="292" height="34" rx="17" fill="url(#streak)"/>
+  <rect x="288" y="532" width="212" height="34" rx="17" fill="url(#streak)"/>
+
+  <!-- Arrived screen: a solid face reads at every size -->
+  <rect x="440" y="300" width="440" height="316" rx="44" fill="url(#screen)"/>
+  <!-- Cursor on the remote desktop -->
+  <path d="M600 368 L600 520 L636 484 L662 544 L692 531 L666 473 L718 473 Z" fill="#0c121b"/>
+  <!-- Stand -->
+  <rect x="628" y="616" width="64" height="88" fill="url(#screen)"/>
+  <rect x="548" y="696" width="224" height="44" rx="22" fill="url(#screen)"/>
 </svg>

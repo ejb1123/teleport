@@ -1032,6 +1032,7 @@ fn connect_window(
         .window("Teleport - Connecting", 760, 275)
         .position_centered()
         .build()?;
+    let window = crate::windowing::with_icon(window);
     let mut canvas = crate::windowing::software(window)?;
     let creator = canvas.texture_creator();
     let mut pump = sdl.event_pump().map_err(anyhow::Error::msg)?;
@@ -1248,6 +1249,7 @@ fn session_window(options: &Options) -> Result<SessionWindow> {
             .resizable()
             .allow_highdpi()
             .build()?;
+        crate::windowing::set_icon(&mut window);
         window
             .set_minimum_size(700, 240)
             .map_err(anyhow::Error::msg)?;

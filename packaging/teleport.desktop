@@ -3,6 +3,7 @@ Type=Application
 Name=Teleport
 Comment=Native remote desktop over Media over QUIC
 Exec=teleport
+Icon=dev.teleport.Teleport
 Terminal=false
 Categories=Network;RemoteAccess;
 StartupNotify=true

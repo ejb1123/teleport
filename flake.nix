@@ -179,6 +179,10 @@
               install -Dm644 packaging/teleport.desktop $out/share/applications/teleport.desktop
               substituteInPlace $out/share/applications/teleport.desktop --replace-fail 'Exec=teleport' "Exec=$out/bin/teleport"
               install -Dm644 packaging/icons/dev.teleport.Teleport.svg $out/share/icons/hicolor/scalable/apps/dev.teleport.Teleport.svg
+              for size in 16 24 32 48 64 128 256 512; do
+                install -Dm644 packaging/icons/hicolor/''${size}x''${size}/dev.teleport.Teleport.png \
+                  $out/share/icons/hicolor/''${size}x''${size}/apps/dev.teleport.Teleport.png
+              done
             ''
             + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
               mkdir -p $out/Applications/Teleport.app/Contents/MacOS

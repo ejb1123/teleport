@@ -550,6 +550,7 @@ pub fn run() -> Result<()> {
         .allow_highdpi()
         .resizable()
         .build()?;
+    let window = crate::windowing::with_icon(window);
     let mut canvas = crate::windowing::software(window)?;
     canvas.set_logical_size(1040, 832)?;
     let textures = canvas.texture_creator();

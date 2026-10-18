@@ -179,6 +179,7 @@ impl Displays {
                 .allow_highdpi()
                 .resizable()
                 .build()?;
+            let window = crate::windowing::with_icon(window);
             let mut canvas = if self.options.software_renderer {
                 crate::windowing::software(window)?
             } else {

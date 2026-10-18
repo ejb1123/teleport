@@ -54,6 +54,32 @@ pub fn init() -> Result<(Sdl, VideoSubsystem)> {
     Ok((sdl, video))
 }
 
+/// The app icon for title bars, task switchers and docks that read the
+/// window's own icon: 64x64 RGBA, rendered from
+/// packaging/icons/dev.teleport.Teleport.svg.
+const ICON_RGBA: &[u8; 64 * 64 * 4] = include_bytes!("../packaging/icons/window-64.rgba");
+
+pub fn set_icon(window: &mut Window) {
+    let mut pixels = *ICON_RGBA;
+    // Bytes R, G, B, A in memory: ABGR8888 on little-endian, RGBA8888 on
+    // big-endian; RGBA32 names that byte order on either.
+    match sdl2::surface::Surface::from_data(
+        &mut pixels,
+        64,
+        64,
+        64 * 4,
+        sdl2::pixels::PixelFormatEnum::RGBA32,
+    ) {
+        Ok(icon) => window.set_icon(icon),
+        Err(error) => tracing::debug!(%error, "window icon unavailable"),
+    }
+}
+
+pub fn with_icon(mut window: Window) -> Window {
+    set_icon(&mut window);
+    window
+}
+
 pub fn software(window: Window) -> Result<Canvas<Window>> {
     if window.subsystem().current_video_driver() == "x11" {
         // Only X11 has a CPU framebuffer path. Disabling this on Wayland
