@@ -64,6 +64,9 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
       - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
+        # Only a speed-up: a hung cache must not block the build.
+        timeout-minutes: 5
+        continue-on-error: true
       - name: Build AppImage, .deb, .rpm and tarball
         run: |
           nix build --print-build-logs .#appimage .#deb .#rpm .#tarball -o out
@@ -223,6 +226,9 @@ jobs:
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
       - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
+        # Only a speed-up: a hung cache must not block the build.
+        timeout-minutes: 5
+        continue-on-error: true
       - run: nix build --print-build-logs
       - name: Import the Developer ID certificate
         if: env.SIGN == 'true'

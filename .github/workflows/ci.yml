@@ -40,6 +40,9 @@ jobs:
       # Caches the store paths this job builds (the teleport package, the
       # bundle) and fetches; cache.nixos.org still serves nixpkgs.
       - uses: DeterminateSystems/magic-nix-cache-action@84c0677f58dcedf3b91f8223ce36a9ea5b3c84b7 # v15
+        # Only a speed-up: a hung cache must not block the build.
+        timeout-minutes: 5
+        continue-on-error: true
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Formatting
         run: nix develop --command bash -c 'cargo fmt --check && nixfmt --check flake.nix nix/*.nix'

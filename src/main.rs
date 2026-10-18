@@ -59,7 +59,7 @@ mod stun;
 mod system_login;
 #[cfg(target_os = "linux")]
 mod system_pam;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(test)]
 mod test_env;
 #[cfg(target_os = "linux")]
 mod virtual_display;
