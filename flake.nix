@@ -108,7 +108,8 @@
           deps = environment pkgs;
           teleport = pkgs.rustPlatform.buildRustPackage {
             pname = "teleport";
-            version = "0.5.4";
+            # Cargo.toml is the one place the version is set (docs/distribution.md).
+            version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
             src = pkgs.lib.fileset.toSource {
               root = ./.;
               fileset = pkgs.lib.fileset.unions [
@@ -203,6 +204,7 @@
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           inherit bundle;
           appimage = import ./nix/appimage.nix { inherit pkgs bundle; };
+          tarball = import ./nix/tarball.nix { inherit pkgs bundle; };
           deb = import ./nix/linux-packages.nix {
             inherit pkgs bundle;
             format = "deb";

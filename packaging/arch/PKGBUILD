@@ -1,0 +1,63 @@
+# Maintainer: E.J. Bevenour <ejb1123@protonmail.com>
+#
+# Teleport remote desktop (host and client) for Arch Linux and derivatives
+# (CachyOS, Manjaro, EndeavourOS), from the relocatable bundle attached to
+# each GitHub release (`nix build .#tarball`). Not Gravitational's Teleport,
+# which the AUR packages as `teleport`/`teleport-bin` and which also installs
+# /usr/bin/teleport, hence the conflicts.
+#
+# tools/arch-pkgbuild.sh rewrites pkgver and sha256sums for a release and
+# generates .SRCINFO; docs/distribution.md ("Arch Linux") has the AUR steps.
+pkgname=teleport-desktop-bin
+# The release version (tag without v); pkgver is it with "-" as "_".
+_version=0.5.4
+pkgver=0.5.4
+pkgrel=1
+pkgdesc='Native Linux remote desktop over Media over QUIC (host and client)'
+arch=('x86_64')
+url='https://github.com/ejb1123/teleport'
+license=('LicenseRef-unknown')
+depends=('sh' 'coreutils' 'hicolor-icon-theme')
+optdepends=(
+  'libglvnd: OpenGL/EGL dispatch for the system GPU driver (a fallback is bundled)'
+  'mesa: OpenGL and VA-API drivers for AMD and Intel GPUs'
+  'intel-media-driver: VA-API hardware video on Intel GPUs'
+  'nvidia-utils: NVENC/NVDEC hardware video on NVIDIA GPUs'
+  'kscreen: virtual displays and privacy mode on KDE Plasma hosts'
+)
+provides=('teleport-desktop')
+conflicts=('teleport-desktop' 'teleport' 'teleport-bin' 'teleport-git')
+install=teleport-desktop-bin.install
+# The bundle's binaries and libraries (Nix builds, run through the bundled
+# loader) are shipped as built and tested; makepkg must not rewrite them.
+options=('!strip' '!debug')
+source_x86_64=("https://github.com/ejb1123/teleport/releases/download/v${_version}/teleport-${_version}-x86_64-linux.tar.gz")
+sha256sums_x86_64=('SKIP')
+
+package() {
+  cd "teleport-${_version}-${CARCH}-linux"
+  install -d "$pkgdir/opt/teleport" "$pkgdir/usr/bin"
+  cp -a . "$pkgdir/opt/teleport/"
+  ln -s /opt/teleport/AppRun "$pkgdir/usr/bin/teleport"
+
+  local system=usr/share/teleport/system
+  install -Dm644 usr/share/applications/dev.teleport.Teleport.desktop \
+    "$pkgdir/usr/share/applications/dev.teleport.Teleport.desktop"
+  install -Dm644 "$system/dev.teleport.Host.desktop" \
+    "$pkgdir/usr/share/applications/dev.teleport.Host.desktop"
+  install -Dm644 usr/share/metainfo/dev.teleport.Teleport.metainfo.xml \
+    "$pkgdir/usr/share/metainfo/dev.teleport.Teleport.metainfo.xml"
+  local icon
+  for icon in usr/share/icons/hicolor/*/apps/dev.teleport.Teleport.*; do
+    install -Dm644 "$icon" "$pkgdir/$icon"
+  done
+  install -Dm644 "$system/teleport-desktop.service" \
+    "$pkgdir/usr/lib/systemd/user/teleport-desktop.service"
+  install -Dm644 "$system/70-teleport.rules" "$pkgdir/usr/lib/udev/rules.d/70-teleport.rules"
+  install -Dm644 "$system/teleport-modules.conf" "$pkgdir/usr/lib/modules-load.d/teleport.conf"
+  install -Dm644 "$system/90-teleport.conf" "$pkgdir/usr/lib/sysctl.d/90-teleport.conf"
+  # The `uinput` group the udev rules grant /dev/uinput and /dev/uhid to;
+  # pacman's systemd-sysusers hook creates it.
+  install -d "$pkgdir/usr/lib/sysusers.d"
+  printf 'g uinput - -\n' >"$pkgdir/usr/lib/sysusers.d/teleport.conf"
+}

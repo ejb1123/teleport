@@ -224,4 +224,13 @@ pkgs.runCommand "teleport-bundle-${teleport.version}"
     ln -s usr/share/applications/dev.teleport.Teleport.desktop $root/dev.teleport.Teleport.desktop
     install -Dm644 ${../packaging/linux/dev.teleport.Teleport.metainfo.xml} \
       $root/usr/share/metainfo/dev.teleport.Teleport.metainfo.xml
+    for size in 16 24 32 48 64 128 256 512; do
+      install -Dm644 ${../packaging/icons/hicolor}/''${size}x''${size}/dev.teleport.Teleport.png \
+        $root/usr/share/icons/hicolor/''${size}x''${size}/apps/dev.teleport.Teleport.png
+    done
+    # The host's system setup (systemd user unit, udev rules, module loading,
+    # sysctl, portal desktop entry), for installs from the tarball, the
+    # AppImage or the Arch package (docs/distribution.md).
+    mkdir -p $root/usr/share/teleport/system
+    cp ${../packaging/linux/system}/* $root/usr/share/teleport/system/
   ''

@@ -1,0 +1,22 @@
+# pacman's hooks reload udev rules, create the uinput group (sysusers.d) and
+# refresh the desktop and icon caches; this loads the modules and applies the
+# UDP buffer sysctl now rather than at the next boot. Nothing is enabled.
+post_install() {
+  modprobe uinput 2>/dev/null || true
+  modprobe uhid 2>/dev/null || true
+  sysctl -q -p /usr/lib/sysctl.d/90-teleport.conf 2>/dev/null || true
+  cat <<'EOF'
+==> Teleport: `teleport` opens the launcher (also in the menu).
+==> To run the host in your graphical session (see docs/distribution.md):
+      mkdir -p ~/.config/teleport
+      echo 'TELEPORT_LISTEN=192.168.1.10:4443' >~/.config/teleport/host.env
+      systemctl --user enable --now teleport-desktop
+==> Virtual gamepads need: sudo usermod -aG uinput "$USER" (then log in again)
+EOF
+}
+
+post_upgrade() {
+  modprobe uinput 2>/dev/null || true
+  modprobe uhid 2>/dev/null || true
+  sysctl -q -p /usr/lib/sysctl.d/90-teleport.conf 2>/dev/null || true
+}

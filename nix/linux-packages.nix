@@ -58,40 +58,62 @@ let
         }
       ]
       # Store files are read-only; installed configuration is 0644.
-      ++ map (file: file // { file_info.mode = 420; }) [
-        {
-          src = "${bundle}/usr/share/applications/dev.teleport.Teleport.desktop";
-          dst = "/usr/share/applications/dev.teleport.Teleport.desktop";
-        }
-        {
-          src = "${system}/dev.teleport.Host.desktop";
-          dst = "/usr/share/applications/dev.teleport.Host.desktop";
-        }
-        {
-          src = "${bundle}/usr/share/icons/hicolor/scalable/apps/dev.teleport.Teleport.svg";
-          dst = "/usr/share/icons/hicolor/scalable/apps/dev.teleport.Teleport.svg";
-        }
-        {
-          src = "${bundle}/usr/share/metainfo/dev.teleport.Teleport.metainfo.xml";
-          dst = "/usr/share/metainfo/dev.teleport.Teleport.metainfo.xml";
-        }
-        {
-          src = "${system}/teleport-desktop.service";
-          dst = "/usr/lib/systemd/user/teleport-desktop.service";
-        }
-        {
-          src = "${system}/70-teleport.rules";
-          dst = "/usr/lib/udev/rules.d/70-teleport.rules";
-        }
-        {
-          src = "${system}/teleport-modules.conf";
-          dst = "/usr/lib/modules-load.d/teleport.conf";
-        }
-        {
-          src = "${system}/90-teleport.conf";
-          dst = "/usr/lib/sysctl.d/90-teleport.conf";
-        }
-      ];
+      ++ map (file: file // { file_info.mode = 420; }) (
+        [
+          {
+            src = "${bundle}/usr/share/applications/dev.teleport.Teleport.desktop";
+            dst = "/usr/share/applications/dev.teleport.Teleport.desktop";
+          }
+          {
+            src = "${system}/dev.teleport.Host.desktop";
+            dst = "/usr/share/applications/dev.teleport.Host.desktop";
+          }
+          {
+            src = "${bundle}/usr/share/icons/hicolor/scalable/apps/dev.teleport.Teleport.svg";
+            dst = "/usr/share/icons/hicolor/scalable/apps/dev.teleport.Teleport.svg";
+          }
+        ]
+        ++
+          map
+            (size: {
+              src = "${bundle}/usr/share/icons/hicolor/${size}x${size}/apps/dev.teleport.Teleport.png";
+              dst = "/usr/share/icons/hicolor/${size}x${size}/apps/dev.teleport.Teleport.png";
+            })
+            (
+              map toString [
+                16
+                24
+                32
+                48
+                64
+                128
+                256
+                512
+              ]
+            )
+        ++ [
+          {
+            src = "${bundle}/usr/share/metainfo/dev.teleport.Teleport.metainfo.xml";
+            dst = "/usr/share/metainfo/dev.teleport.Teleport.metainfo.xml";
+          }
+          {
+            src = "${system}/teleport-desktop.service";
+            dst = "/usr/lib/systemd/user/teleport-desktop.service";
+          }
+          {
+            src = "${system}/70-teleport.rules";
+            dst = "/usr/lib/udev/rules.d/70-teleport.rules";
+          }
+          {
+            src = "${system}/teleport-modules.conf";
+            dst = "/usr/lib/modules-load.d/teleport.conf";
+          }
+          {
+            src = "${system}/90-teleport.conf";
+            dst = "/usr/lib/sysctl.d/90-teleport.conf";
+          }
+        ]
+      );
       scripts.postinstall = "${system}/postinstall.sh";
     }
   );

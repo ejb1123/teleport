@@ -1,0 +1,27 @@
+pkgbase = teleport-desktop-bin
+	pkgdesc = Native Linux remote desktop over Media over QUIC (host and client)
+	pkgver = 0.5.4
+	pkgrel = 1
+	url = https://github.com/ejb1123/teleport
+	install = teleport-desktop-bin.install
+	arch = x86_64
+	license = LicenseRef-unknown
+	depends = sh
+	depends = coreutils
+	depends = hicolor-icon-theme
+	optdepends = libglvnd: OpenGL/EGL dispatch for the system GPU driver (a fallback is bundled)
+	optdepends = mesa: OpenGL and VA-API drivers for AMD and Intel GPUs
+	optdepends = intel-media-driver: VA-API hardware video on Intel GPUs
+	optdepends = nvidia-utils: NVENC/NVDEC hardware video on NVIDIA GPUs
+	optdepends = kscreen: virtual displays and privacy mode on KDE Plasma hosts
+	provides = teleport-desktop
+	conflicts = teleport-desktop
+	conflicts = teleport
+	conflicts = teleport-bin
+	conflicts = teleport-git
+	options = !strip
+	options = !debug
+	source_x86_64 = https://github.com/ejb1123/teleport/releases/download/v0.5.4/teleport-0.5.4-x86_64-linux.tar.gz
+	sha256sums_x86_64 = SKIP
+
+pkgname = teleport-desktop-bin
