@@ -1,6 +1,6 @@
 pkgbase = teleport-desktop-bin
 	pkgdesc = Native Linux remote desktop over Media over QUIC (host and client)
-	pkgver = 0.6.0
+	pkgver = 0.6.1
 	pkgrel = 1
 	url = https://github.com/ejb1123/teleport
 	install = teleport-desktop-bin.install
@@ -21,7 +21,7 @@ pkgbase = teleport-desktop-bin
 	conflicts = teleport-git
 	options = !strip
 	options = !debug
-	source_x86_64 = https://github.com/ejb1123/teleport/releases/download/v0.6.0/teleport-0.6.0-x86_64-linux.tar.gz
+	source_x86_64 = https://github.com/ejb1123/teleport/releases/download/v0.6.1/teleport-0.6.1-x86_64-linux.tar.gz
 	sha256sums_x86_64 = SKIP
 
 pkgname = teleport-desktop-bin
