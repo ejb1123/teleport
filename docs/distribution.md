@@ -395,8 +395,8 @@ directory (default `dist/`). The script:
 
 1. copies the unwrapped binary, GStreamer's plugin scanner and plugins,
    libfido2 and every `/nix/store` dylib they load (recursively, by
-   `otool -L`) into `Contents/MacOS`, `Contents/PlugIns/gstreamer-1.0` and
-   `Contents/Frameworks`, rewrites their install names and rpaths to
+   `otool -L`) into `Contents/MacOS`, `Contents/PlugIns` (no subdirectory: `codesign`
+   takes any directory there for a bundle) and `Contents/Frameworks`, rewrites their install names and rpaths to
    `@rpath`/`@loader_path`/`@executable_path` and fails if any `/nix/store`
    reference remains. The binary finds its plugins, font and libfido2 from
    its own location (`app_bundle_environment` in `src/main.rs`), so the

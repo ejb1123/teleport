@@ -22,7 +22,7 @@
 # What it does:
 #   1. copies the unwrapped Rust binary, GStreamer's plugin scanner, the
 #      plugins, libfido2 and every /nix/store dylib they load into the bundle
-#      (Contents/MacOS, PlugIns/gstreamer-1.0, Frameworks), rewriting install
+#      (Contents/MacOS, PlugIns, Frameworks), rewriting install
 #      names to @rpath so nothing refers to /nix/store any more;
 #   2. writes Info.plist (bundle id dev.teleport.Teleport, version, microphone
 #      usage string), Teleport.icns and the UI font;
@@ -102,7 +102,7 @@ scanner=$(dirname "$(dirname "$gst_lib")")/libexec/gstreamer-1.0/gst-plugin-scan
 app=$out/Teleport.app
 contents=$app/Contents
 rm -rf "$app"
-mkdir -p "$contents/MacOS" "$contents/Frameworks" "$contents/PlugIns/gstreamer-1.0" \
+mkdir -p "$contents/MacOS" "$contents/Frameworks" "$contents/PlugIns" \
     "$contents/Resources/fonts"
 
 # Bundled Mach-O files, for rewriting and signing.
@@ -116,8 +116,12 @@ copy() {
 }
 
 # /nix/store dylibs a Mach-O file loads (system libraries are left alone).
+# A dylib's own install name, which otool -L also lists, is not one of them.
 nix_deps() {
-    otool -L "$1" | tail -n +2 | awk '{ print $1 }' | grep '^/nix/store/' || true
+    local id
+    id=$(otool -D "$1" | tail -n +2)
+    otool -L "$1" | tail -n +2 | awk '{ print $1 }' | grep '^/nix/store/' \
+        | grep -vxF "${id:-/}" || true
 }
 
 # Copies each /nix/store dependency into Frameworks under the name it is
@@ -142,8 +146,8 @@ for dir in $plugin_dirs; do
     for plugin in "$dir"/*.dylib "$dir"/*.so; do
         [ -e "$plugin" ] || continue
         name=$(basename "$plugin")
-        [ ! -e "$contents/PlugIns/gstreamer-1.0/$name" ] || continue
-        copy "$plugin" "$contents/PlugIns/gstreamer-1.0/$name"
+        [ ! -e "$contents/PlugIns/$name" ] || continue
+        copy "$plugin" "$contents/PlugIns/$name"
         bundle_deps "$plugin"
     done
 done
@@ -169,7 +173,7 @@ for file in "${machos[@]}"; do
     fi
     case "$file" in
     */Frameworks/*) rpath=@loader_path ;;
-    */PlugIns/*) rpath=@loader_path/../../Frameworks ;;
+    */PlugIns/*) rpath=@loader_path/../Frameworks ;;
     *) rpath=@executable_path/../Frameworks ;;
     esac
     while IFS= read -r old; do

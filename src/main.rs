@@ -205,7 +205,7 @@ enum Command {
 /// A self-contained macOS `Teleport.app` (tools/macos-app.sh) has no wrapper
 /// script to point Teleport at its bundled GStreamer plugins, font and
 /// libfido2, so derive them from the bundle layout:
-/// `Contents/MacOS/teleport` next to `Contents/PlugIns/gstreamer-1.0`.
+/// `Contents/MacOS/teleport` next to the GStreamer plugins in `Contents/PlugIns`.
 /// Must run before any thread starts (it sets environment variables).
 #[cfg(target_os = "macos")]
 fn app_bundle_environment() {
@@ -216,7 +216,7 @@ fn app_bundle_environment() {
     else {
         return;
     };
-    let plugins = contents.join("PlugIns/gstreamer-1.0");
+    let plugins = contents.join("PlugIns");
     if !plugins.is_dir() {
         return;
     }

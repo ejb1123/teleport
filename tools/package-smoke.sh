@@ -58,7 +58,10 @@ arch)
 appimage)
     # No FUSE in a container: unpack to a temporary directory instead.
     export APPIMAGE_EXTRACT_AND_RUN=1
-    teleport=$(one 'Teleport-*.AppImage')
+    # Artifact downloads drop the executable bit, and /dist is read-only.
+    cp "$(one 'Teleport-*.AppImage')" /tmp/Teleport.AppImage
+    chmod +x /tmp/Teleport.AppImage
+    teleport=/tmp/Teleport.AppImage
     ;;
 tarball)
     mkdir -p /opt/teleport-tarball
