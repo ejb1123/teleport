@@ -2411,7 +2411,7 @@ async fn run_session(
     }
     // The metadata goes out before video starts: a client that chooses the
     // codec (Desktop::codec_selection) needs it to decide.
-    let info = desktop(options, capture, video_start_group)?;
+    let mut info = desktop(options, capture, video_start_group)?;
     {
         let desktop = members.customize(first_id, &info);
         let session = members
@@ -2520,7 +2520,7 @@ async fn run_session(
         audio: audio_track.clone().map(|track| (audio_settings, track)),
     };
     members.stream_audio = shared.audio.as_ref().map(|(settings, _)| *settings);
-    let mut pipeline = start_encoder(
+    let started = start_encoder(
         options,
         capture.pipeline_source_for_range(options.dynamic_range)?,
         (info.width, info.height),
@@ -2529,7 +2529,34 @@ async fn run_session(
         &video,
     )
     .await
-    .context("encoder start failed")??;
+    .context("encoder start failed")?;
+    let mut pipeline = match started {
+        Ok(pipeline) => pipeline,
+        // KDE can drop the portal's PipeWire stream without closing the
+        // session (displays hotplugging as they wake): PipeWire then has no
+        // such node and the capture never starts. Recreate it once.
+        Err(error) if capture.is_portal() => {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "capture would not start; recreating the desktop portal session"
+            );
+            capture.release_all().await;
+            reopen_capture(capture).await?;
+            info = desktop(options, capture, video_start_group)?;
+            members.desktop(&info)?;
+            start_encoder(
+                options,
+                capture.pipeline_source_for_range(options.dynamic_range)?,
+                (info.width, info.height),
+                options.fps,
+                members.limit(options.bitrate),
+                &video,
+            )
+            .await
+            .context("encoder start failed")??
+        }
+        Err(error) => return Err(error),
+    };
     let audio = match (options.audio_source.as_deref(), audio_track) {
         (Some(source), Some(track)) => {
             tracing::info!(audio = audio_settings.label(), "session desktop audio");
