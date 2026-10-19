@@ -339,7 +339,7 @@ pub async fn run(mut options: Options) -> Result<()> {
         options.identity_dir.is_some() || !options.pairing_file.exists(),
         "pairing file already exists; choose a new --pairing-file (credentials rotate each host start)"
     );
-    media::doctor()?;
+    media::check_host_media()?;
     if options.flash_on_input {
         ensure!(
             options.source == "test",
@@ -490,11 +490,7 @@ async fn serve(options: &Options, idle: &mut Option<Capture>) -> Result<()> {
     // Warm the hardware encoder probe so the first client does not wait for it.
     let kind = options.encoder;
     if options.smoke_hardware_codecs.is_none() {
-        std::thread::spawn(move || {
-            media::hardware_codecs(kind);
-            media::hardware_444_codecs(kind);
-            media::hardware_ten_bit_codecs(kind);
-        });
+        std::thread::spawn(move || media::log_hardware_encoders(kind));
     }
     let mut config = moq_native::ServerConfig::default();
     config.bind = Some(options.listen.clone());

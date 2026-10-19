@@ -53,6 +53,7 @@ unsafe extern "C" {
     fn tp_codec_error(error: c_int, buffer: *mut c_char, length: c_int);
     #[cfg(target_os = "linux")]
     fn tp_codec_available(encoder: c_int, name: *const c_char) -> c_int;
+    fn tp_log_install(sink: extern "C" fn(c_int, *const c_char));
 }
 
 /// Whether this FFmpeg build has an encoder (or decoder) called `name`.
@@ -62,6 +63,73 @@ pub fn available(encoder: bool, name: &str) -> bool {
         return false;
     };
     unsafe { tp_codec_available(encoder.into(), name.as_ptr()) != 0 }
+}
+
+// av_log levels (libavutil/log.h).
+const AV_LOG_ERROR: c_int = 16;
+const AV_LOG_WARNING: c_int = 24;
+const AV_LOG_INFO: c_int = 32;
+
+thread_local! {
+    /// Nesting depth of [`probing`] on this thread.
+    static PROBING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The last warning or error FFmpeg logged inside [`probing`].
+    static PROBE_MESSAGE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// FFmpeg's log lines, through `tracing` instead of stderr. Inside
+/// [`probing`] they are expected outcomes and stay at debug.
+extern "C" fn log_line(level: c_int, line: *const c_char) {
+    // Never unwind into FFmpeg.
+    let _ = std::panic::catch_unwind(|| {
+        let line = unsafe { CStr::from_ptr(line) }.to_string_lossy();
+        let line = line.trim_end();
+        if PROBING.with(|depth| depth.get() > 0) {
+            if level <= AV_LOG_WARNING {
+                PROBE_MESSAGE.with(|message| *message.borrow_mut() = Some(line.to_owned()));
+            }
+            tracing::debug!(level, "ffmpeg (probe): {line}");
+        } else if level <= AV_LOG_ERROR {
+            tracing::error!("ffmpeg: {line}");
+        } else if level <= AV_LOG_WARNING {
+            tracing::warn!("ffmpeg: {line}");
+        } else if level <= AV_LOG_INFO {
+            tracing::info!("ffmpeg: {line}");
+        } else {
+            tracing::trace!(level, "ffmpeg: {line}");
+        }
+    });
+}
+
+/// Send FFmpeg's log through `tracing` (once per process).
+pub fn route_log() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe { tp_log_install(log_line) });
+}
+
+/// Run a capability probe whose failures are expected (an encoder or
+/// decoder this machine may lack): FFmpeg's messages on this thread go to
+/// debug, and a failure carries FFmpeg's last warning or error as context.
+pub fn probing<T>(probe: impl FnOnce() -> Result<T>) -> Result<T> {
+    route_log();
+    struct Depth;
+    impl Drop for Depth {
+        fn drop(&mut self) {
+            PROBING.with(|depth| depth.set(depth.get() - 1));
+        }
+    }
+    PROBING.with(|depth| depth.set(depth.get() + 1));
+    let outer = PROBE_MESSAGE.with(|message| message.borrow_mut().take());
+    let result = {
+        let _depth = Depth;
+        probe()
+    };
+    let message =
+        PROBE_MESSAGE.with(|message| std::mem::replace(&mut *message.borrow_mut(), outer));
+    match (result, message) {
+        (Err(error), Some(message)) => Err(error.context(message)),
+        (result, _) => result,
+    }
 }
 
 #[derive(Clone)]
@@ -170,6 +238,7 @@ pub struct Frame {
 }
 impl Codec {
     pub fn new(config: Config) -> Result<Self> {
+        route_log();
         let name = CString::new(config.name.as_str())?;
         let mut error = 0;
         let pointer = unsafe {
@@ -788,6 +857,69 @@ mod tests {
             "libx265 must report that it needs a reopen"
         );
         ensure!(hevc.config.kbps == 1000);
+        Ok(())
+    }
+    /// Feeds the software H.264 decoder a corrupt SPS, which FFmpeg reports
+    /// through av_log, and returns what `tracing` recorded on this thread.
+    fn corrupt_stream_log(probe: bool) -> Result<(String, Option<anyhow::Error>)> {
+        #[derive(Clone, Default)]
+        struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let capture = Capture::default();
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let decode = || -> Result<()> {
+            let mut decoder = Codec::new(Config {
+                encoder: false,
+                name: "software".into(),
+                ..software_config(false)
+            })?;
+            let mut packet = vec![0, 0, 0, 1, 0x67];
+            packet.extend([0xff; 32]);
+            let _ = decoder.submit(&packet, 1);
+            let _ = decoder.receive();
+            anyhow::bail!("no frame decoded")
+        };
+        let error = tracing::subscriber::with_default(subscriber, || {
+            if probe { probing(decode) } else { decode() }.err()
+        });
+        let log = String::from_utf8(capture.0.lock().unwrap().clone())?;
+        Ok((log, error))
+    }
+    #[test]
+    fn probe_keeps_ffmpeg_messages_at_debug_and_in_the_error() -> Result<()> {
+        let (log, error) = corrupt_stream_log(true)?;
+        ensure!(
+            log.contains("ffmpeg (probe): [h264 @"),
+            "not captured: {log}"
+        );
+        ensure!(
+            !log.contains(" WARN ") && !log.contains(" ERROR "),
+            "probe logged above debug: {log}"
+        );
+        let error = format!("{:#}", error.context("probe succeeded")?);
+        ensure!(
+            error.starts_with("[h264 @") && error.ends_with("no frame decoded"),
+            "{error}"
+        );
+        // Outside a probe the same message is a visible warning.
+        let (log, _) = corrupt_stream_log(false)?;
+        ensure!(
+            log.contains(" WARN ") && log.contains("ffmpeg: [h264 @"),
+            "{log}"
+        );
         Ok(())
     }
     #[test]
