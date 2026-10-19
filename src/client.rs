@@ -108,7 +108,7 @@ pub struct Options {
     pub scroll_speed: f64,
     /// Scroll direction on the host: `auto` scrolls like this computer's own
     /// windows (its natural-scrolling setting included), `natural` and
-    /// `traditional` force one convention (docs/scrolling.md).
+    /// `traditional` force one convention (scrolling.md).
     #[arg(long, value_enum, default_value_t = crate::scroll::Direction::Auto)]
     pub scroll_direction: crate::scroll::Direction,
     /// Encoder speed/quality trade-off for this session: `latency`,
@@ -159,7 +159,7 @@ pub struct Options {
     /// Keep this hotkey on this computer: never send it to the host, also
     /// while keyboard capture is on (e.g. a voice chat push-to-talk key).
     /// SDL key names with optional modifiers: `F13`, `ScrollLock`,
-    /// `Ctrl+Shift+M`. Repeat for more (docs/keyboard-capture.md).
+    /// `Ctrl+Shift+M`. Repeat for more (keyboard-capture.md).
     #[arg(long, value_parser = crate::key_options::Hotkey::parse)]
     pub keep_local: Vec<crate::key_options::Hotkey>,
     /// Swap Ctrl and Command (Super) for the host: Command+C on a Mac

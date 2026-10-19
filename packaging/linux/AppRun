@@ -7,7 +7,8 @@
 # through the bundled loader with an explicit library path rather than the
 # system's: the bundle comes first, then the system's driver directories
 # (NVIDIA, Mesa, VA-API, CUDA, oneVPL), which the bundle deliberately leaves
-# out. See docs/distribution.md, "GPU drivers in the relocatable bundle".
+# out. See usr/share/doc/teleport/distribution.md in this bundle, "GPU drivers
+# in the relocatable bundle".
 set -eu
 
 here=$(dirname -- "$(readlink -f -- "$0")")

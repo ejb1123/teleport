@@ -150,7 +150,10 @@ pub fn doctor() -> Result<()> {
     println!("Desktop HDR capture: NOT TESTED (requires authorized source caps)");
     println!("End-to-end HDR: EXPERIMENTAL, requires patched KWin and Mac Metal/EDR");
     println!("Real desktop capture and physical HDR display: NOT VERIFIED by this test");
-    println!("A codec PASS is not HDR desktop support; see docs/hdr.md.");
+    println!(
+        "A codec PASS is not HDR desktop support; see {}.",
+        crate::docs::page("hdr.md")
+    );
     Ok(())
 }
 

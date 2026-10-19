@@ -1,0 +1,24 @@
+# Unattended start: the .deb/.rpm/Arch counterpart of the NixOS module's
+# `teleport-lock-on-login` (`unattended.enable`). Locks the graphical session
+# right after a display manager's automatic login (PAM service *-autologin)
+# and waits until logind reports it locked; a session someone logged in to
+# with a password is left alone. Not enabled by installing the package. For
+# the account the display manager logs in automatically:
+#
+#   systemctl --user enable teleport-lock-on-login
+#
+# The rest of the setup (automatic login, KDE pre-authorisation, optional
+# unlock after a Linux-password login) is in
+# /usr/share/doc/teleport/wake-and-unattended.md, "Unattended start without
+# NixOS", or https://github.com/ejb1123/teleport/blob/main/docs/wake-and-unattended.md
+[Unit]
+Description=Lock the session a display manager logged in automatically (Teleport unattended start)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/teleport lock-session --only-automatic-login --timeout 60
+
+[Install]
+WantedBy=graphical-session.target

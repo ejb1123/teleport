@@ -193,8 +193,11 @@
             meta.mainProgram = "teleport";
           };
           # Relocatable Linux bundle and its packages (docs/distribution.md).
+          # The system-login PAM helper, linked to run on the distribution's
+          # glibc and libpam (.deb, .rpm, Arch package; nix/pam-helper.nix).
+          pamHelper = import ./nix/pam-helper.nix { inherit pkgs; };
           bundle = import ./nix/bundle.nix {
-            inherit pkgs teleport;
+            inherit pkgs teleport pamHelper;
             inherit (deps) media;
           };
         in
@@ -203,6 +206,7 @@
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
           inherit bundle;
+          pam-helper = pamHelper;
           appimage = import ./nix/appimage.nix { inherit pkgs bundle; };
           tarball = import ./nix/tarball.nix { inherit pkgs bundle; };
           deb = import ./nix/linux-packages.nix {

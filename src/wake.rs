@@ -183,7 +183,8 @@ impl WakeInfo {
             (Some(mac), Some(true)) => format!("Wake-on-LAN armed on the host ({mac})"),
             (Some(mac), Some(false)) => {
                 format!(
-                    "Wake-on-LAN is off on the host card ({mac}); see docs/wake-and-unattended.md"
+                    "Wake-on-LAN is off on the host card ({mac}); see {}",
+                    crate::docs::page("wake-and-unattended.md")
                 )
             }
             (Some(mac), None) => format!("Wake-on-LAN state unknown ({mac})"),

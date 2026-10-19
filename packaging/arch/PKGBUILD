@@ -17,7 +17,8 @@ pkgdesc='Native Linux remote desktop over Media over QUIC (host and client)'
 arch=('x86_64')
 url='https://github.com/ejb1123/teleport'
 license=('LicenseRef-unknown')
-depends=('sh' 'coreutils' 'hicolor-icon-theme')
+depends=('sh' 'coreutils' 'hicolor-icon-theme' 'pam')
+backup=('etc/pam.d/teleport')
 optdepends=(
   'libglvnd: OpenGL/EGL dispatch for the system GPU driver (a fallback is bundled)'
   'mesa: OpenGL and VA-API drivers for AMD and Intel GPUs'
@@ -60,4 +61,17 @@ package() {
   # pacman's systemd-sysusers hook creates it.
   install -d "$pkgdir/usr/lib/sysusers.d"
   printf 'g uinput - -\n' >"$pkgdir/usr/lib/sysusers.d/teleport.conf"
+
+  # Unattended start (wake-and-unattended.md): the lock after an automatic
+  # login, enabled per user, and opt-in examples for SDDM and KDE.
+  install -Dm644 "$system/teleport-lock-on-login.service" \
+    "$pkgdir/usr/lib/systemd/user/teleport-lock-on-login.service"
+  install -Dm644 -t "$pkgdir/usr/share/teleport/examples" usr/share/teleport/examples/*
+  # System login (system-login.md): the PAM helper, linked against the
+  # system's glibc and libpam, root-owned 0755 and never setuid, and its
+  # policy (in backup=, so an administrator's changes are kept).
+  install -Dm755 usr/libexec/teleport/teleport-pam "$pkgdir/usr/lib/teleport/teleport-pam"
+  install -Dm644 "$system/pam-teleport.system-auth" "$pkgdir/etc/pam.d/teleport"
+  # The documentation the help text and the system files cite.
+  install -Dm644 -t "$pkgdir/usr/share/doc/teleport" usr/share/doc/teleport/*
 }

@@ -1,7 +1,9 @@
 # Wake-on-LAN, sleep, and unattended start (G23, G24)
 
 Status (2026-10-17): implemented for Linux hosts (KDE Plasma 6 on NixOS
-tested by evaluation and namespace tests only; see "Verified" below). The
+tested by evaluation and namespace tests only; see "Verified" below).
+2026-10-19: unattended start for the .deb, .rpm and Arch packages
+("Unattended start without NixOS"). The
 client side (launcher, `teleport wake`, `teleport suspend`) works on Linux
 and macOS.
 
@@ -160,6 +162,75 @@ unlocks, and only once that session has joined the desktop (not when its
 connection fails or the host is full); guests already watching see the
 desktop from then on, as they would after typing the password.
 
+### Unattended start without NixOS (.deb, .rpm, Arch)
+
+The .deb, .rpm and Arch (`teleport-desktop-bin`) packages install the same
+pieces as files, all inactive until you turn them on (the tarball and the
+AppImage carry them in `usr/share/teleport/` inside the bundle; install them
+by hand at the paths below):
+
+| NixOS option | Package file | Turned on by |
+|---|---|---|
+| host service | `/usr/lib/systemd/user/teleport-desktop.service` | `systemctl --user enable teleport-desktop` (distribution.md) |
+| `unattended.enable`: lock after the automatic login | `/usr/lib/systemd/user/teleport-lock-on-login.service` | `systemctl --user enable teleport-lock-on-login` |
+| `unattended.enable`: the automatic login (SDDM) | `/usr/share/teleport/examples/sddm-autologin.conf` | copying it to `/etc/sddm.conf.d/` |
+| `unattended.lockEveryLogin` (KDE) | `/usr/share/teleport/examples/kscreenlockerrc` | copying it to `/etc/xdg/kscreenlockerrc` |
+| `preauthorizeRemoteDesktop` | (KDE's permission store) | `flatpak permission-set` once, below |
+| `systemLogin` | `/usr/lib/teleport/teleport-pam`, `/etc/pam.d/teleport` | `--system-auth-helper` (system-login.md) |
+| `unattended.unlockOnSystemLogin` | | `--unlock-on-system-login` |
+| `sessions.lockOnLastDisconnect` | | `--lock-on-last-disconnect` |
+
+For the account `ej` on KDE Plasma 6 with SDDM, after the host service
+works (distribution.md, "Debian, Ubuntu, Fedora: .deb and .rpm"):
+
+```sh
+# 1. As ej: pre-authorise the host with KDE's portal, once. Without it the
+#    portal asks for consent on a screen nobody can see, and the host waits.
+flatpak permission-set kde-authorized remote-desktop dev.teleport.Host yes
+#    (without the flatpak command, the same through D-Bus:)
+# busctl --user call org.freedesktop.impl.portal.PermissionStore \
+#   /org/freedesktop/impl/portal/PermissionStore \
+#   org.freedesktop.impl.portal.PermissionStore SetPermission \
+#   sbssas kde-authorized true remote-desktop dev.teleport.Host 1 yes
+
+# 2. As ej: lock the session the display manager logs in automatically.
+systemctl --user enable teleport-lock-on-login
+
+# 3. As root: SDDM logs ej in at boot (only at boot: Relogin=false).
+sudo install -d /etc/sddm.conf.d
+sudo install -m 0644 /usr/share/teleport/examples/sddm-autologin.conf \
+  /etc/sddm.conf.d/teleport-autologin.conf
+sudo sed -i 's/^User=USER$/User=ej/' /etc/sddm.conf.d/teleport-autologin.conf
+
+# 4. Optional, as root (lockEveryLogin): KWin locks before the desktop is
+#    first drawn, at every login. Merge by hand if the file exists.
+sudo install -m 0644 /usr/share/teleport/examples/kscreenlockerrc /etc/xdg/kscreenlockerrc
+
+# 5. Optional, as ej: Linux-password login that also unlocks, and locking
+#    when the last session leaves. In ~/.config/teleport/host.env:
+#    TELEPORT_HOST_ARGS=--system-auth-helper /usr/lib/teleport/teleport-pam --unlock-on-system-login --lock-on-last-disconnect
+systemctl --user restart teleport-desktop
+```
+
+Check the session name in step 3: it is the file name in
+`/usr/share/wayland-sessions/` (`plasma.desktop` for Plasma 6 on Wayland).
+SDDM reads the files in `/etc/sddm.conf.d/` in name order and then
+`/etc/sddm.conf`, later settings winning: if another of them already sets
+`[Autologin]`, edit that one instead. Another display manager needs its own automatic
+login (GDM: `AutomaticLoginEnable=True` and `AutomaticLogin=ej` in
+`/etc/gdm/custom.conf`, `/etc/gdm3/daemon.conf` on Debian); the lock unit
+works with any of them, since it only looks at logind's PAM service name
+(`*-autologin`).
+
+`teleport-lock-on-login` does nothing after a password login at the
+machine. The host warns at start (`journalctl --user -u teleport-desktop`)
+when it runs on KDE in a locked or automatically logged-in session that is
+not pre-authorised. Read the security trade-offs below before enabling
+step 3. To undo: remove `/etc/sddm.conf.d/teleport-autologin.conf` (and
+`/etc/xdg/kscreenlockerrc`), `systemctl --user disable
+teleport-lock-on-login`, and
+`flatpak permission-remove kde-authorized remote-desktop dev.teleport.Host`.
+
 ### Secure attention: Ctrl+Alt+End
 
 Ctrl+Alt+Del cannot be captured reliably on every client, so the client's
@@ -189,7 +260,9 @@ recreate it without a dialog while locked. Whether locking or unlocking
 alone ends KDE's portal session is not verified; if it does, the same
 recovery applies. Hosts without `preauthorizeRemoteDesktop` would need the
 local consent dialog, which cannot appear on a locked screen, hence the
-NixOS assertion for `unattended`.
+NixOS assertion for `unattended`, and on other distributions the host's
+warning at start (a KDE session that is locked or was logged in
+automatically, without the `kde-authorized` permission).
 
 ### Security trade-offs
 
@@ -263,8 +336,14 @@ lock gives the same practical result for a single-user gaming PC.
   configurations: the generated `sddm.conf.d/00-nixos.conf` `[Autologin]`,
   the lock service, `LockOnStart`, `wakeOnLan`, the polkit rule, the host's
   flags and path, defaults off, and the assertions.
+- `tools/package-smoke.sh` (2026-10-19, stock containers): the .deb, .rpm
+  and Arch package install `teleport-lock-on-login.service`, the SDDM and
+  `kscreenlockerrc` examples and the PAM helper and policy (see
+  system-login.md); unit test of the pre-authorisation check's parsing.
 
-Not verified: a real wake from suspend or power-off (no second machine was
+Not verified: the lock unit, the SDDM example and the pre-authorisation
+warning on a real .deb/.rpm/Arch desktop (no such machine was booted), a
+real wake from suspend or power-off (no second machine was
 woken; magic packets were never sent on the real LAN), a real boot with
 automatic login and lock in a VM, KDE's portal `Closed` signal on monitor
 wake and the recreation under a locked session on hardware, typing into the

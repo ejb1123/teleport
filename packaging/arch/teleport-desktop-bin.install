@@ -7,11 +7,16 @@ post_install() {
   sysctl -q -p /usr/lib/sysctl.d/90-teleport.conf 2>/dev/null || true
   cat <<'EOF'
 ==> Teleport: `teleport` opens the launcher (also in the menu).
-==> To run the host in your graphical session (see docs/distribution.md):
+==> To run the host in your graphical session
+    (/usr/share/doc/teleport/distribution.md):
       mkdir -p ~/.config/teleport
       echo 'TELEPORT_LISTEN=192.168.1.10:4443' >~/.config/teleport/host.env
       systemctl --user enable --now teleport-desktop
 ==> Virtual gamepads need: sudo usermod -aG uinput "$USER" (then log in again)
+==> Linux-password login: add to host.env
+      TELEPORT_HOST_ARGS=--system-auth-helper /usr/lib/teleport/teleport-pam
+    (/usr/share/doc/teleport/system-login.md). Unattended start after a
+    reboot: /usr/share/doc/teleport/wake-and-unattended.md
 EOF
 }
 

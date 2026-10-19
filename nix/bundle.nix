@@ -1,6 +1,7 @@
 {
   pkgs,
   teleport,
+  pamHelper,
   media,
 }:
 # Relocatable Linux bundle (an AppDir): the Nix-built binary with every shared
@@ -231,6 +232,21 @@ pkgs.runCommand "teleport-bundle-${teleport.version}"
     # The host's system setup (systemd user unit, udev rules, module loading,
     # sysctl, portal desktop entry), for installs from the tarball, the
     # AppImage or the Arch package (docs/distribution.md).
-    mkdir -p $root/usr/share/teleport/system
+    mkdir -p $root/usr/share/teleport/system $root/usr/share/teleport/examples
     cp ${../packaging/linux/system}/* $root/usr/share/teleport/system/
+    # Opt-in examples for unattended start (SDDM automatic login, KDE lock on
+    # start; docs/wake-and-unattended.md).
+    cp ${../packaging/linux/examples}/* $root/usr/share/teleport/examples/
+    # The system-login PAM helper, linked against the system's glibc and
+    # libpam (nix/pam-helper.nix): after the checks above, which require every
+    # library to be bundled. The .deb, .rpm and Arch package install it
+    # root-owned as /usr/lib/teleport/teleport-pam (docs/system-login.md).
+    install -Dm755 ${pamHelper}/libexec/teleport-pam $root/usr/libexec/teleport/teleport-pam
+    # The documentation that help text, messages and the system files cite;
+    # the packages install it in /usr/share/doc/teleport.
+    mkdir -p $root/usr/share/doc/teleport
+    cp ${../README.md} $root/usr/share/doc/teleport/README.md
+    cp ${../docs}/*.md $root/usr/share/doc/teleport/
+    # Development notes and audits are not user documentation.
+    rm -f $root/usr/share/doc/teleport/{todo,status,review-2026-10,parsec-comparison,ux-audit,remote-desktop-audit}.md
   ''
