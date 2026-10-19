@@ -70,11 +70,13 @@ privacy-mode guard are started through the AppImage file again
 The host from an AppImage needs the same setup as a .deb install: the
 `uinput` group and udev rules for gamepads, the UDP buffer sysctl and, for
 portal pre-authorisation on KDE, the `dev.teleport.Host` desktop entry. The
-files are in `packaging/linux/system/`; the .deb/.rpm install them for you.
-The system-login PAM helper is not prebuilt (it must link the system's PAM):
-`cc -O2 /opt/teleport/usr/share/teleport/teleport-pam.c -o teleport-pam -lpam`
-(the .deb/.rpm path; in an AppImage the source is in the same place inside
-the image), then follow [system login](system-login.md).
+files are in `usr/share/teleport/system/` inside the image
+(`--appimage-extract`; `packaging/linux/system/` in a checkout); the
+.deb/.rpm install them for you. The system-login PAM helper, linked against
+the system's glibc and libpam, is `usr/libexec/teleport/teleport-pam` inside
+the image; install it root-owned as [system login](system-login.md) ("Other
+Linux hosts") describes. The documentation is in `usr/share/doc/teleport/`;
+`teleport --help` names the pages and points at this version's on GitHub.
 
 Tested (2026-10-17) with `APPIMAGE_EXTRACT_AND_RUN=1` in stock Ubuntu 22.04,
 Ubuntu 24.04 and Fedora 43 containers without Nix: `teleport doctor` passes
@@ -108,6 +110,11 @@ configures on NixOS:
 | `/usr/lib/modules-load.d/teleport.conf` | loads `uinput` and `uhid` at boot |
 | `/usr/lib/sysctl.d/90-teleport.conf` | 8 MiB UDP buffers (`udpBuffers`) |
 | `/usr/share/applications/dev.teleport.Host.desktop` | lets the portal identify (and KDE pre-authorise) the host |
+| `/usr/lib/systemd/user/teleport-lock-on-login.service` | locks the session after an automatic login (`unattended.enable`) |
+| `/usr/share/teleport/examples/sddm-autologin.conf`, `kscreenlockerrc` | opt-in examples: SDDM automatic login, KDE lock on start (`unattended`) |
+| `/usr/lib/teleport/teleport-pam` | system-login PAM helper, root-owned 0755 (`systemLogin`) |
+| `/etc/pam.d/teleport` | its PAM policy (`common-auth` or `system-auth`); kept on upgrade |
+| `/usr/share/doc/teleport/` | `README.md` and `docs/*.md`, which `--help`, messages and the units cite |
 
 Installing creates the `uinput` system group, reloads udev and the sysctl, and
 enables nothing. Per host user:
@@ -132,6 +139,14 @@ module's `preauthorizeRemoteDesktop` does at every start:
 (see "Opt-in NixOS graphical-session service" for what it allows). Uninstalling
 leaves the group and per-user state in `~/.local/state/teleport`.
 
+Linux-password login: add `--system-auth-helper /usr/lib/teleport/teleport-pam`
+to `TELEPORT_HOST_ARGS` ([system login](system-login.md)). Unattended start
+after a reboot (automatic login, then an immediate lock; what the NixOS
+module's `unattended` does): [wake and unattended
+start](wake-and-unattended.md), "Unattended start without NixOS". Ubuntu's
+minimal images tell dpkg to skip `/usr/share/doc`; there `--help` points at
+the documentation on GitHub instead.
+
 Tested (2026-10-17): the .deb installs on Debian 13 and Ubuntu 24.04, the .rpm
 on Fedora 43 (containers); the files above are in place with mode 0644,
 `uinput` exists, `systemd-analyze verify` accepts the unit, `udevadm verify`
@@ -139,7 +154,14 @@ the rules, and `/usr/bin/teleport doctor` and the loopback session pass. The
 unit has not run under a real graphical session on these distributions.
 Retested 2026-10-18 with `tools/package-smoke.sh` (install, files, `uinput`,
 doctor, loopback session): the .deb on Ubuntu 22.04 and 24.04 and Debian 12
-and 13, the .rpm on Fedora 44 and openSUSE (below).
+and 13, the .rpm on Fedora 44 and openSUSE (below). Retested 2026-10-19
+locally with the unattended-start files, the documentation and the PAM
+helper: on all ten package images (.deb, .rpm, Arch, CachyOS) the helper is
+root-owned 0755, the policy root-owned 0644 with the distribution's stack
+(`common-auth` on Debian, Ubuntu and openSUSE, `system-auth` on Fedora, Arch
+and CachyOS), and the helper accepts a test account's password and refuses a
+wrong one. The documentation is not extracted on Ubuntu's and Arch's
+container images, which exclude `/usr/share/doc`.
 
 ## openSUSE
 
@@ -231,10 +253,14 @@ ln -s ~/.local/opt/teleport-0.5.4-x86_64-linux/AppRun ~/.local/bin/teleport
 ```
 
 `AppRun` finds the bundle from its own path, so the directory can live
-anywhere and be symlinked. The host's system files (systemd user unit, udev
-rules, modules-load and sysctl files, portal desktop entry) are in
-`usr/share/teleport/system/`; install them as the .deb does (table above),
-changing the unit's `ExecStart` path if `teleport` is not `/usr/bin/teleport`.
+anywhere and be symlinked. The host's system files (systemd user units, udev
+rules, modules-load and sysctl files, portal desktop entry, PAM policies) are
+in `usr/share/teleport/system/`, the unattended-start examples in
+`usr/share/teleport/examples/`, the PAM helper in
+`usr/libexec/teleport/teleport-pam` and the documentation in
+`usr/share/doc/teleport/` (which `--help` then cites); install them as the
+.deb does (table above), changing the units' `ExecStart` paths if `teleport`
+is not `/usr/bin/teleport`.
 
 ## Homebrew (macOS, and Linux)
 
@@ -603,7 +629,7 @@ The release workflow's jobs:
 | `version` | ubuntu-24.04 | the tag matches `Cargo.toml` and the files that repeat it |
 | `linux` | ubuntu-24.04 | AppImage, .deb, .rpm and tarball (`nix build .#appimage .#deb .#rpm .#tarball`) |
 | `arch` | `archlinux:latest` container | `teleport-desktop-bin-VERSION-1-x86_64.pkg.tar.zst` with makepkg from the tarball, and the AUR files |
-| `linux-test` | stock images, no Nix | `tools/package-smoke.sh`: install, system files, `teleport doctor`, loopback session (`host --source test` and `client --headless-frames 60 --software-decoder`, which must print `SMOKE PASS`) |
+| `linux-test` | stock images, no Nix | `tools/package-smoke.sh`: install, system files (also the unattended-start unit and examples, the documentation, and the PAM helper's and policy's owner and mode), a password check through the PAM helper with a test account, `teleport doctor`, loopback session (`host --source test` and `client --headless-frames 60 --software-decoder`, which must print `SMOKE PASS`) |
 | `flatpak` | `flatpak-github-actions:freedesktop-26.08` | `Teleport-VERSION-x86_64.flatpak`; doctor and loopback session inside the sandbox |
 | `macos` | macos-14 (arm64), macos-15-intel (x86_64) | `Teleport-VERSION-ARCH.dmg` and `.zip` (`tools/macos-app.sh --dmg`); the bundled binary's `--version` and doctor without Nix on PATH |
 | `release` | ubuntu-24.04 | `SHA256SUMS`, notes, the GitHub Release; the `homebrew-tap-update` artifact |

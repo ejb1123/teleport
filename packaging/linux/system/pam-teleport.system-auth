@@ -1,0 +1,8 @@
+# Teleport system login (/usr/share/doc/teleport/system-login.md): password
+# and account checks for the same-user helper /usr/lib/teleport/teleport-pam,
+# through the distribution's system-auth (Fedora, RHEL and derivatives,
+# Arch). No session is opened. The helper refuses this file unless it is
+# root-owned and not writable by group or others. Installed as
+# /etc/pam.d/teleport; unused until a host runs with --system-auth-helper.
+auth       include      system-auth
+account    include      system-auth

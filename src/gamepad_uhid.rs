@@ -196,7 +196,10 @@ impl UhidPad {
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(UHID_PATH)
             .with_context(|| {
-                format!("opening {UHID_PATH}; see docs/gamepad.md for the required permission")
+                format!(
+                    "opening {UHID_PATH}; see {} for the required permission",
+                    crate::docs::page("gamepad.md")
+                )
             })?;
         static CREATED: AtomicU32 = AtomicU32::new(0);
         let phys = format!(

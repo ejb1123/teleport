@@ -1,0 +1,13 @@
+# Teleport unattended start, optional (the NixOS module's
+# `unattended.lockEveryLogin`): KDE Plasma's screen locker locks before the
+# desktop is first drawn, so an automatic login never shows it. Then every
+# login starts locked, password logins at the machine too (you type the
+# password twice). An opt-in example, not active until copied; as root:
+#
+#   install -m 0644 /usr/share/teleport/examples/kscreenlockerrc /etc/xdg/kscreenlockerrc
+#
+# Merge by hand if /etc/xdg/kscreenlockerrc already exists. [$i] makes the
+# setting immutable, so a user's own kscreenlockerrc cannot turn it off.
+# See /usr/share/doc/teleport/wake-and-unattended.md.
+[Daemon]
+LockOnStart[$i]=true

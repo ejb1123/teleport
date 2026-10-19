@@ -68,6 +68,13 @@ tarball)
     tar -xzf "$(one 'teleport-*-linux.tar.gz')" -C /opt/teleport-tarball
     set -- /opt/teleport-tarball/teleport-*/AppRun
     teleport=$1
+    bundle=${teleport%/AppRun}
+    for file in usr/share/doc/teleport/wake-and-unattended.md usr/libexec/teleport/teleport-pam \
+        usr/share/teleport/system/teleport-lock-on-login.service \
+        usr/share/teleport/examples/sddm-autologin.conf; do
+        [ -e "$bundle/$file" ] || { echo "missing $file in the tarball" >&2; exit 1; }
+    done
+    echo "== tarball carries the documentation, PAM helper and unattended files"
     ;;
 *)
     echo "unknown kind $kind" >&2
@@ -90,6 +97,69 @@ deb | rpm | arch)
     # pacman's systemd-sysusers hook.
     getent group uinput >/dev/null || { echo "no uinput group" >&2; exit 1; }
     echo "== uinput group exists"
+    # Unattended start (docs/wake-and-unattended.md) and system login
+    # (docs/system-login.md).
+    for file in /usr/lib/systemd/user/teleport-lock-on-login.service \
+        /usr/share/teleport/examples/sddm-autologin.conf \
+        /usr/share/teleport/examples/kscreenlockerrc \
+        /usr/lib/teleport/teleport-pam /etc/pam.d/teleport; do
+        [ -e "$file" ] || { echo "missing $file" >&2; exit 1; }
+    done
+    echo "== unattended and system-login files installed"
+    # The documentation help text and units cite, unless the image tells
+    # the package manager to drop /usr/share/doc (Ubuntu's minimal images,
+    # the Arch image's NoExtract).
+    if grep -qs '^path-exclude=/usr/share/doc/\*' /etc/dpkg/dpkg.cfg.d/* ||
+        grep -qs '^NoExtract.*usr/share/doc/\*' /etc/pacman.conf; then
+        echo "== /usr/share/doc excluded by this image's package manager configuration"
+        if [ "$kind" = arch ]; then
+            pacman -Qlq teleport-desktop-bin | grep -qx /usr/share/doc/teleport/wake-and-unattended.md ||
+                { echo "the package has no /usr/share/doc/teleport" >&2; exit 1; }
+            echo "== documentation in the package"
+        fi
+    else
+        for file in README.md distribution.md system-login.md wake-and-unattended.md guests.md; do
+            [ -s "/usr/share/doc/teleport/$file" ] || { echo "missing /usr/share/doc/teleport/$file" >&2; exit 1; }
+        done
+        echo "== documentation installed"
+    fi
+    # What the host's validate_helper (src/system_pam.rs) and the helper
+    # itself require: a root-owned 0755 helper (never setuid) in root-owned
+    # directories, and a root-owned policy not writable by group or others.
+    mode() { stat -c '%u %g %a' "$1"; }
+    [ "$(mode /usr/lib/teleport/teleport-pam)" = "0 0 755" ] ||
+        { echo "teleport-pam is $(mode /usr/lib/teleport/teleport-pam), not 0 0 755" >&2; exit 1; }
+    for directory in /usr/lib/teleport /usr/lib /usr /; do
+        [ "$(stat -c '%u' "$directory")" = 0 ] && [ $(($(stat -c '%#a' "$directory") & 022)) = 0 ] ||
+            { echo "$directory is $(mode "$directory")" >&2; exit 1; }
+    done
+    [ "$(mode /etc/pam.d/teleport)" = "0 0 644" ] ||
+        { echo "/etc/pam.d/teleport is $(mode /etc/pam.d/teleport), not 0 0 644" >&2; exit 1; }
+    # The helper runs on this system's glibc and libpam (a loader failure
+    # exits 127 with a message): as root it refuses at once, silently.
+    status=0
+    output=$(/usr/lib/teleport/teleport-pam </dev/null 2>&1) || status=$?
+    [ "$status" = 1 ] && [ -z "$output" ] ||
+        { echo "teleport-pam as root: status $status, output: $output" >&2; exit 1; }
+    # And it checks a real password with this distribution's PAM stack, as
+    # the host runs it: as the account itself, request on stdin (TPAM0001,
+    # big-endian lengths, user, password), "OK" on stdout only on success.
+    # Fedora's image has util-linux-core only, without su.
+    if ! command -v su >/dev/null 2>&1 && command -v dnf >/dev/null 2>&1; then
+        dnf install -y -q util-linux >/dev/null
+    fi
+    useradd -m tpsmoke
+    echo 'tpsmoke:Smoke-pass-1' | chpasswd
+    pam_check() {
+        # $1: password, $2: its length as an octal escape.
+        printf "TPAM0001\\000\\000\\000\\007\\000\\000\\000\\$2%s%s" tpsmoke "$1" |
+            su -s /bin/sh -c /usr/lib/teleport/teleport-pam tpsmoke 2>&1
+    }
+    [ "$(pam_check Smoke-pass-1 014)" = OK ] ||
+        { echo "teleport-pam refused the right password" >&2; cat /etc/pam.d/teleport >&2; exit 1; }
+    [ -z "$(pam_check Wrong-pass-1 014 || true)" ] ||
+        { echo "teleport-pam accepted a wrong password" >&2; exit 1; }
+    echo "== teleport-pam: right password accepted, wrong one refused ($(sed -n 's/^auth[[:space:]]*include[[:space:]]*//p' /etc/pam.d/teleport))"
     ;;
 esac
 

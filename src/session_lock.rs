@@ -13,6 +13,7 @@
 //! authorization; KDE's screen locker follows its Lock and Unlock signals.
 
 use anyhow::{Context, Result, ensure};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// A logind session id (`2`, `c1`, …).
@@ -165,6 +166,89 @@ pub fn automatic_login(service: &str) -> bool {
     service.trim().ends_with("-autologin")
 }
 
+/// KDE's portal permission table and entry that let an application start
+/// remote desktop without the local consent dialog (KRdp's mechanism; the
+/// NixOS module's `preauthorizeRemoteDesktop`).
+const KDE_PERMISSION_TABLE: &str = "kde-authorized";
+const KDE_PERMISSION_ID: &str = "remote-desktop";
+
+/// Whether a permission-store entry (application → permissions) grants
+/// `app` remote desktop: KDE checks for a first permission of `yes`.
+pub fn preauthorized(permissions: &HashMap<String, Vec<String>>, app: &str) -> bool {
+    permissions
+        .get(app)
+        .and_then(|values| values.first())
+        .is_some_and(|value| value == "yes")
+}
+
+/// Whether KDE pre-authorizes the host (`capture::PORTAL_APP_ID`) for
+/// remote desktop; `None` when the permission store cannot be read.
+async fn kde_preauthorized() -> Option<bool> {
+    use ashpd::zbus;
+    let connection = zbus::Connection::session().await.ok()?;
+    let reply = connection
+        .call_method(
+            Some("org.freedesktop.impl.portal.PermissionStore"),
+            "/org/freedesktop/impl/portal/PermissionStore",
+            Some("org.freedesktop.impl.portal.PermissionStore"),
+            "Lookup",
+            &(KDE_PERMISSION_TABLE, KDE_PERMISSION_ID),
+        )
+        .await;
+    match reply {
+        Ok(message) => {
+            let (permissions, _data): (HashMap<String, Vec<String>>, zbus::zvariant::OwnedValue) =
+                message.body().deserialize().ok()?;
+            Some(preauthorized(&permissions, crate::capture::PORTAL_APP_ID))
+        }
+        // No such table or entry: nothing was ever pre-authorized.
+        Err(zbus::Error::MethodError(name, _, _))
+            if name.as_str() == "org.freedesktop.portal.Error.NotFound" =>
+        {
+            Some(false)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Unattended start (G24) needs KDE's pre-authorization: on a locked screen
+/// nobody can answer the portal's consent dialog, so the host would wait
+/// for it until someone unlocks at the machine. Warns when the host starts
+/// on KDE in a session that is locked or was logged in automatically and
+/// the host is not pre-authorized. Silent when anything cannot be read.
+pub async fn warn_unless_preauthorized() {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    if !desktop
+        .split(':')
+        .any(|name| name.eq_ignore_ascii_case("KDE"))
+    {
+        return;
+    }
+    let unattended = tokio::task::spawn_blocking(|| {
+        let session = display_session().ok()?;
+        let automatic = service(&session).is_ok_and(|service| automatic_login(&service));
+        Some(automatic || locked(&session).unwrap_or(false))
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(false);
+    if !unattended {
+        return;
+    }
+    let authorized = tokio::time::timeout(Duration::from_secs(5), kde_preauthorized())
+        .await
+        .ok()
+        .flatten();
+    if authorized == Some(false) {
+        let app = crate::capture::PORTAL_APP_ID;
+        tracing::warn!(
+            "this session is locked or was logged in automatically, but KDE has not pre-authorized {app} for remote desktop: nobody can approve its consent dialog on a locked screen. Run once as this user: flatpak permission-set {KDE_PERMISSION_TABLE} {KDE_PERMISSION_ID} {app} yes (see {})",
+            crate::docs::page("wake-and-unattended.md")
+        );
+    }
+}
+
 /// `teleport lock-session`: lock the user's graphical session and wait until
 /// logind reports it locked (at most `timeout`). With `only_automatic`, a
 /// session someone logged in to with a password is left alone.
@@ -227,6 +311,30 @@ mod tests {
         assert!(parse_locked_hint("yes\n").unwrap());
         assert!(!parse_locked_hint("no").unwrap());
         assert!(parse_locked_hint("").is_err());
+    }
+
+    #[test]
+    fn kde_preauthorization_needs_yes_for_the_host() {
+        let app = "dev.teleport.Host";
+        let entry = |pairs: &[(&str, &[&str])]| -> HashMap<String, Vec<String>> {
+            pairs
+                .iter()
+                .map(|(id, values)| {
+                    (
+                        (*id).to_owned(),
+                        values.iter().map(|value| (*value).to_owned()).collect(),
+                    )
+                })
+                .collect()
+        };
+        assert!(preauthorized(&entry(&[(app, &["yes"])]), app));
+        assert!(!preauthorized(&entry(&[(app, &["no"])]), app));
+        assert!(!preauthorized(&entry(&[(app, &[])]), app));
+        assert!(!preauthorized(
+            &entry(&[("org.kde.krdpserver", &["yes"])]),
+            app
+        ));
+        assert!(!preauthorized(&entry(&[]), app));
     }
 
     #[test]

@@ -1,5 +1,7 @@
-/* Build with the HOST distribution's compiler/libpam: cc -O2 -Wall -Wextra
- * -Werror -o teleport-pam teleport-pam.c -lpam. Never install setuid/setgid.
+/* Must run on the HOST distribution's glibc and libpam: build with its
+ * compiler (cc -O2 -Wall -Wextra -Werror -o teleport-pam teleport-pam.c
+ * -lpam), or link it to the system's loader and libraries as
+ * nix/pam-helper.nix does for the packages. Never install setuid/setgid.
  * stdin: TPAM0001, two big-endian u32 lengths, username, password, EOF.
  * stdout: OK\n on success only. All failures have the same exit status.
  */

@@ -26,29 +26,78 @@ against your NixOS system's PAM stack. Apply your configuration and restart that
 user's host service during a safe maintenance window; no reboot is required.
 This repository update alone does not change the running system configuration.
 
-## Arch host (not needed on a client-only laptop)
+## .deb, .rpm and Arch package host
 
-Build Teleport with Nix, but compile the helper with Arch's compiler/PAM outside
-`nix develop`. Install `base-devel` and `pam` if missing. In a private build
-directory (not a shared predictable temporary filename):
+The packages install the helper and its policy; nothing uses them until the
+host is started with `--system-auth-helper`:
+
+| File | What |
+|---|---|
+| `/usr/lib/teleport/teleport-pam` | the helper, root-owned mode 0755, not setuid; runs as the desktop user |
+| `/etc/pam.d/teleport` | the policy, root-owned 0644: the distribution's `common-auth` and `common-account` (Debian, Ubuntu, openSUSE) or `system-auth` (Fedora, Arch); no session |
+
+The .deb installs the policy as a conffile and the Arch package lists it in
+`backup=`, so changes you make are kept on upgrade. The .rpm serves Fedora
+and openSUSE, which name their stacks differently, so its post-install script
+writes the matching one (`/usr/share/teleport/pam/teleport.system-auth` or
+`teleport.common-auth`) whenever `/etc/pam.d/teleport` is missing, and never
+replaces an existing one. Review it if your distribution's PAM stack is
+customised (extra factors are not supported, see below).
+
+The helper is compiled when the package is built, but linked to run on the
+system's own glibc and libpam: its interpreter is the system's dynamic loader
+and it has no library path of its own, so it loads `/etc/pam.d/teleport` and
+the system's PAM modules like any other program on the machine
+(`nix/pam-helper.nix`). It needs glibc 2.34 or newer. The release smoke test
+checks on each tested distribution that it accepts the right password and
+refuses a wrong one for a test account.
+
+Then, as the desktop user, in `~/.config/teleport/host.env` (distribution.md):
 
 ```sh
-/usr/bin/cc -O2 -Wall -Wextra -Werror /path/to/teleport/packaging/pam/teleport-pam.c -o teleport-pam -lpam
+TELEPORT_HOST_ARGS=--system-auth-helper /usr/lib/teleport/teleport-pam
+```
+
+and `systemctl --user restart teleport-desktop` during a safe maintenance window.
+The packaged unit already passes `--identity-dir`, which system login requires.
+`--unlock-on-system-login` (unattended hosts, wake-and-unattended.md) goes on the
+same line.
+
+## Other Linux hosts (tarball, AppImage, source)
+
+The tarball and the AppImage carry the same helper at
+`usr/libexec/teleport/teleport-pam` and both policies in
+`usr/share/teleport/system/` (`pam-teleport.system-auth`,
+`pam-teleport.common-auth`) inside the bundle. The host refuses a helper that is
+not root-owned or sits in a directory others can write, so install them as root
+(from the unpacked tarball, or `--appimage-extract`):
+
+```sh
+sudo install -Dm755 usr/libexec/teleport/teleport-pam /usr/local/libexec/teleport-pam
+# Only if /etc/pam.d/teleport does not exist; otherwise review and merge.
+sudo install -m 0644 usr/share/teleport/system/pam-teleport.system-auth /etc/pam.d/teleport
+```
+
+Pick `pam-teleport.common-auth` where `/etc/pam.d/common-auth` exists
+(Debian, Ubuntu, openSUSE). Alternatively compile the helper with the
+distribution's compiler and PAM headers (`base-devel` and `pam` on Arch,
+`libpam0g-dev` on Debian), outside `nix develop`, in a private build directory:
+
+```sh
+/usr/bin/cc -O2 -Wall -Wextra -Werror /opt/teleport/usr/share/teleport/teleport-pam.c -o teleport-pam -lpam
 sudo install -Dm755 teleport-pam /usr/local/libexec/teleport-pam
 ```
 
-Review `packaging/pam/teleport.arch`, then install it root-owned mode 0644 at
-`/etc/pam.d/teleport` only if no existing Teleport PAM policy exists. If one
-exists, merge/review it rather than overwriting administrator policy. It includes
-Arch's `system-auth` authentication and account checks. Never make the helper
-setuid/setgid; never use the Nix-built helper with Arch PAM modules.
+(`packaging/pam/teleport-pam.c` in a checkout.) Never make the helper
+setuid/setgid; never use the Nix-built `libexec/teleport-pam` of `nix build`
+(linked to Nix's PAM) with the distribution's PAM modules.
 
-Add `--system-auth-helper /usr/local/libexec/teleport-pam` to your existing
-Teleport user service command. The host also requires `--identity-dir` and must
-run as the desktop user, not root. For a manually launched host:
+Add `--system-auth-helper /usr/local/libexec/teleport-pam` to your Teleport user
+service command. The host also requires `--identity-dir` and must run as the
+desktop user, not root. For a manually launched host:
 
 ```sh
-./result/bin/teleport host --listen 0.0.0.0:4443 \
+teleport host --listen 0.0.0.0:4443 \
   --identity-dir "$HOME/.local/state/teleport/host" \
   --system-auth-helper /usr/local/libexec/teleport-pam
 ```

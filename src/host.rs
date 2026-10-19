@@ -101,7 +101,7 @@ pub struct Options {
     pub source: String,
     /// With `--source test`: stream a black screen that turns white, and
     /// back, on every key or mouse-button press, to time input→photon with a
-    /// photodiode or camera (docs/performance.md).
+    /// photodiode or camera (performance.md).
     #[arg(long)]
     pub flash_on_input: bool,
     /// New private pairing file; never overwritten. Copy securely to the client.
@@ -120,7 +120,9 @@ pub struct Options {
     /// Persistent private identity directory; keeps paired clients valid across restarts.
     #[arg(long, conflicts_with = "pairing_file")]
     pub identity_dir: Option<PathBuf>,
-    /// Enable existing Linux-account login with an installed, host-native PAM helper.
+    /// Enable existing Linux-account login with an installed, host-native PAM
+    /// helper: /usr/lib/teleport/teleport-pam from the .deb, .rpm and Arch
+    /// packages (system-login.md).
     #[arg(long, requires = "identity_dir")]
     pub system_auth_helper: Option<PathBuf>,
     /// Opt in to saving/restoring compositor permissions (approval may still be required).
@@ -132,7 +134,7 @@ pub struct Options {
     pub encoder: media::EncoderKind,
     /// Encoder speed/quality trade-off for clients that do not choose one:
     /// `latency` (the fastest encode), `balanced` or `quality`. None adds
-    /// frame delay (docs/ffmpeg.md).
+    /// frame delay (ffmpeg.md).
     #[arg(long, value_enum, default_value_t = protocol::EncoderPreset::Latency)]
     pub encoder_preset: protocol::EncoderPreset,
     /// Disable receiver-feedback bitrate adjustment.
@@ -140,21 +142,21 @@ pub struct Options {
     pub fixed_bitrate: bool,
     /// Always draw the pointer into the video. By default a desktop portal
     /// session sends it as cursor metadata (when the compositor offers it)
-    /// so clients can draw it locally (docs/cursor.md).
+    /// so clients can draw it locally (cursor.md).
     #[arg(long)]
     pub embedded_cursor: bool,
     /// Virtual displays through the desktop portal (KDE Plasma 6; GNOME
     /// untested): `fallback` streams one when no monitor is connected
     /// (headless) and lets clients add one as an extra monitor; `always`
     /// streams one sized to the client instead of the monitors; `never`
-    /// turns both off (docs/virtual-display.md).
+    /// turns both off (virtual-display.md).
     #[arg(long, value_enum, default_value_t = VirtualDisplay::Fallback)]
     pub virtual_display: VirtualDisplay,
     /// Privacy mode (KDE): while a session lasts, turn the physical monitors
     /// off and stream a virtual display instead; `request` when the client
     /// asks (`teleport client --privacy`), `always` for every session. They
     /// come back on disconnect, on any failure, and through a guard process
-    /// if the host dies (docs/virtual-display.md).
+    /// if the host dies (virtual-display.md).
     #[arg(long, value_enum, default_value_t = PrivacyMode::Off)]
     pub privacy_mode: PrivacyMode,
     /// Privacy mode works here (`--privacy-mode`, a virtual-capable portal
@@ -178,7 +180,7 @@ pub struct Options {
     pub audio_bitrate: u32,
     /// Offer clients a virtual microphone: while a client sends its
     /// microphone (`teleport client --mic`), applications here can record it
-    /// from the "Teleport Microphone" input (PipeWire; docs/audio.md).
+    /// from the "Teleport Microphone" input (PipeWire; audio.md).
     #[arg(long)]
     pub microphone: bool,
     /// `--microphone` works here (PipeWire's `pw-cli`).
@@ -221,7 +223,7 @@ pub struct Options {
     /// Wake relay: send Wake-on-LAN packets on this host's networks when
     /// the owner's devices ask (`teleport wake`, the launcher's Wake), to
     /// wake their other machines here. Never at the MoQ relay's request
-    /// (docs/wake-and-unattended.md).
+    /// (wake-and-unattended.md).
     #[arg(long)]
     pub wake_relay: bool,
     /// With --wake-relay: only wake these hardware addresses (repeatable;
@@ -238,7 +240,7 @@ pub struct Options {
     /// Unlock the desktop session (logind) when a client signs in with this
     /// account's Linux password (system login), which PAM has just
     /// verified. The password is never stored. For unattended hosts that
-    /// log in automatically and lock at once.
+    /// log in automatically and lock at once (wake-and-unattended.md).
     #[arg(long, requires = "system_auth_helper")]
     pub unlock_on_system_login: bool,
     /// What clients are told about waking this host (`Desktop::wake`).
@@ -248,7 +250,7 @@ pub struct Options {
     #[arg(skip)]
     pub secure_attention: bool,
     /// Most sessions at once, owners and guests together (1-8). Sessions
-    /// share one encoder and the host's input (docs/guests.md).
+    /// share one encoder and the host's input (guests.md).
     #[arg(long, default_value_t = crate::guests::MAX_SESSIONS, value_parser = parse_sessions)]
     pub max_sessions: usize,
     /// Keep guests connected when the last owner session leaves (by
@@ -365,6 +367,11 @@ pub async fn run(mut options: Options) -> Result<()> {
             ),
         }
     }
+    // Before the portal, which on a locked screen would wait for a consent
+    // dialog nobody can answer.
+    if options.source != "test" {
+        crate::session_lock::warn_unless_preauthorized().await;
+    }
     let mut capture = Capture::open_host(
         &options.source,
         options.restore_token.as_deref(),
@@ -426,7 +433,8 @@ pub async fn run(mut options: Options) -> Result<()> {
     );
     if wake.mac.is_some() && wake.wake_on_lan == Some(false) {
         tracing::warn!(
-            "Wake-on-LAN is off on this network card; clients cannot wake this host (docs/wake-and-unattended.md)"
+            "Wake-on-LAN is off on this network card; clients cannot wake this host ({})",
+            crate::docs::page("wake-and-unattended.md")
         );
     }
     options.wake = Some(wake);

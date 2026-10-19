@@ -6,10 +6,47 @@
 # .deb or .rpm of the relocatable bundle (nix/bundle.nix), built with nfpm:
 # the bundle in /opt/teleport, `teleport` on PATH, and the system setup that
 # nix/module.nix does on NixOS (systemd user unit, uinput/uhid udev rules and
-# module loading, UDP buffer sysctl, the portal's dev.teleport.Host entry).
-# Installing enables nothing: users opt in per account (docs/distribution.md).
+# module loading, UDP buffer sysctl, the portal's dev.teleport.Host entry,
+# the unattended-start lock unit, the system-login PAM helper and policy),
+# examples for what needs root (SDDM automatic login), and the documentation
+# in /usr/share/doc/teleport. Installing enables nothing: users opt in per
+# account (docs/distribution.md, docs/wake-and-unattended.md).
 let
   system = ../packaging/linux/system;
+  examples = ../packaging/linux/examples;
+  # /etc/pam.d/teleport for the helper. Debian and Ubuntu: a conffile with
+  # their common-auth stack (an administrator's changes are kept). The .rpm
+  # serves Fedora (system-auth) and openSUSE (common-auth), so postinstall.sh
+  # writes the matching policy on first install unless one exists; the
+  # package owns it as a %ghost file.
+  pamPolicy =
+    if format == "deb" then
+      [
+        {
+          src = "${system}/pam-teleport.common-auth";
+          dst = "/etc/pam.d/teleport";
+          type = "config|noreplace";
+        }
+      ]
+    else
+      [
+        {
+          dst = "/etc/pam.d/teleport";
+          type = "ghost";
+        }
+      ];
+  # The documentation the help text and system files cite (README.md and
+  # docs/*.md, in the bundle's usr/share/doc/teleport).
+  docs =
+    map
+      (name: {
+        src = "${bundle}/usr/share/doc/teleport/${name}";
+        dst = "/usr/share/doc/teleport/${name}";
+      })
+      (
+        [ "README.md" ]
+        ++ builtins.filter (pkgs.lib.hasSuffix ".md") (builtins.attrNames (builtins.readDir ../docs))
+      );
   arch =
     {
       deb = {
@@ -112,8 +149,43 @@ let
             src = "${system}/90-teleport.conf";
             dst = "/usr/lib/sysctl.d/90-teleport.conf";
           }
+          # Unattended start (`unattended.enable`): the lock after an
+          # automatic login, enabled per user like teleport-desktop.service.
+          {
+            src = "${system}/teleport-lock-on-login.service";
+            dst = "/usr/lib/systemd/user/teleport-lock-on-login.service";
+          }
+          # Opt-in examples: SDDM automatic login, KDE's lock on start.
+          {
+            src = "${examples}/sddm-autologin.conf";
+            dst = "/usr/share/teleport/examples/sddm-autologin.conf";
+          }
+          {
+            src = "${examples}/kscreenlockerrc";
+            dst = "/usr/share/teleport/examples/kscreenlockerrc";
+          }
+          # Both PAM policies, for reference and for postinstall.sh (.rpm).
+          {
+            src = "${system}/pam-teleport.common-auth";
+            dst = "/usr/share/teleport/pam/teleport.common-auth";
+          }
+          {
+            src = "${system}/pam-teleport.system-auth";
+            dst = "/usr/share/teleport/pam/teleport.system-auth";
+          }
         ]
-      );
+        ++ pamPolicy
+        ++ docs
+      )
+      ++ [
+        # The system-login helper (`systemLogin`; docs/system-login.md):
+        # root-owned 0755, never setuid. The host refuses it otherwise.
+        {
+          src = "${bundle}/usr/libexec/teleport/teleport-pam";
+          dst = "/usr/lib/teleport/teleport-pam";
+          file_info.mode = 493;
+        }
+      ];
       scripts.postinstall = "${system}/postinstall.sh";
     }
   );

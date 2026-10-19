@@ -1164,7 +1164,7 @@ pub fn run() -> Result<()> {
                                             });
                                         let _ = sender.send(match outcome {
                                             Ok(true) => format!("{label} is awake. Connect when ready."),
-                                            Ok(false) => format!("{label} did not answer within 2 minutes. Check Wake-on-LAN in its firmware and network card (docs/wake-and-unattended.md)."),
+                                            Ok(false) => format!("{label} did not answer within 2 minutes. Check Wake-on-LAN in its firmware and network card ({}).", crate::docs::page("wake-and-unattended.md")),
                                             Err(error) => format!("Could not wake {label}: {error:#}"),
                                         });
                                     });

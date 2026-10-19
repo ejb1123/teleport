@@ -8,7 +8,12 @@
 #
 # host.env may also set TELEPORT_VIRTUAL_DISPLAY (never|fallback|always),
 # TELEPORT_PRIVACY_MODE (off|request|always) and TELEPORT_HOST_ARGS (extra
-# arguments, split on spaces). See docs/distribution.md.
+# arguments, split on spaces; `teleport host --help`), for example
+# TELEPORT_HOST_ARGS=--system-auth-helper /usr/lib/teleport/teleport-pam
+# for Linux-password login. Unattended start after a reboot also needs
+# teleport-lock-on-login.service. Documentation: /usr/share/doc/teleport/
+# (distribution.md, system-login.md, wake-and-unattended.md), or
+# https://github.com/ejb1123/teleport/tree/main/docs
 [Unit]
 Description=Teleport remote desktop host (graphical session)
 After=graphical-session.target

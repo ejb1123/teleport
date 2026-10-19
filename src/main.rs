@@ -9,6 +9,7 @@ mod clipboard;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod congestion;
 mod discovery;
+mod docs;
 mod e2e;
 mod ffmpeg;
 mod fullscreen;
@@ -71,7 +72,7 @@ mod windowing;
 mod x11_cursor;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::io::IsTerminal;
 
 /// The executable to start Teleport child processes (sessions, guards,
@@ -103,7 +104,7 @@ enum Command {
     Launcher,
     /// Pair once using the short-lived code shown by a host started with --pair.
     /// With --relay, enter the host's relay pairing link instead of the code.
-    /// A guest enters the invite link the host's owner shared (docs/guests.md).
+    /// A guest enters the invite link the host's owner shared (guests.md).
     Pair {
         address: String,
         #[command(flatten)]
@@ -184,7 +185,7 @@ enum Command {
     /// Ask a desktop to suspend (its host needs --allow-suspend).
     Suspend(host_command::SuspendOptions),
     /// Lock this user's graphical session and wait until it is locked (used
-    /// after an automatic login; docs/wake-and-unattended.md).
+    /// after an automatic login; wake-and-unattended.md).
     #[cfg(target_os = "linux")]
     LockSession {
         /// Give up after this many seconds.
@@ -273,7 +274,11 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|_| "teleport=info,moq_native=warn,moq_net=warn".into()),
         )
         .init();
-    let cli = Cli::parse();
+    // `Cli::parse`, with every --help ending in where the documentation it
+    // cites is installed (docs.rs).
+    let mut command = docs::with_help(Cli::command());
+    let cli = Cli::from_arg_matches_mut(&mut command.get_matches_mut())
+        .unwrap_or_else(|error| error.format(&mut command).exit());
     // The privacy-mode restore paths must work with nothing but the
     // compositor; they never touch media.
     #[cfg(target_os = "linux")]

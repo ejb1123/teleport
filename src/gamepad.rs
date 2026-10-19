@@ -386,7 +386,10 @@ impl UinputPad {
             .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
             .open(UINPUT_PATH)
             .with_context(|| {
-                format!("opening {UINPUT_PATH}; see docs/gamepad.md for the required permission")
+                format!(
+                    "opening {UINPUT_PATH}; see {} for the required permission",
+                    crate::docs::page("gamepad.md")
+                )
             })?;
         let pad = Self { file };
         let fd = pad.file.as_raw_fd();
