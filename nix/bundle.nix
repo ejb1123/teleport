@@ -247,7 +247,7 @@ pkgs.runCommand "teleport-bundle-${teleport.version}"
     # the packages install it in /usr/share/doc/teleport.
     mkdir -p $root/usr/share/doc/teleport
     cp ${../README.md} $root/usr/share/doc/teleport/README.md
-    cp ${../docs}/*.md $root/usr/share/doc/teleport/
-    # Development notes and audits are not user documentation.
-    rm -f $root/usr/share/doc/teleport/{todo,status,review-2026-10,parsec-comparison,ux-audit,remote-desktop-audit}.md
+    ${pkgs.lib.concatMapStrings (name: ''
+      cp ${../docs}/${name} $root/usr/share/doc/teleport/${name}
+    '') (import ./user-docs.nix { inherit (pkgs) lib; })}
   ''

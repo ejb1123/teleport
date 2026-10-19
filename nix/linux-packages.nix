@@ -45,7 +45,7 @@ let
       })
       (
         [ "README.md" ]
-        ++ builtins.filter (pkgs.lib.hasSuffix ".md") (builtins.attrNames (builtins.readDir ../docs))
+        ++ import ./user-docs.nix { inherit (pkgs) lib; }
       );
   arch =
     {
