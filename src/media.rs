@@ -991,6 +991,29 @@ pub fn hardware_ten_bit_codecs(kind: EncoderKind) -> Vec<VideoCodec> {
         .collect()
 }
 
+/// Probe (or reuse) every hardware encoder format and log one summary line:
+/// the encoder per 8-bit codec ("software" when none) and the codecs with
+/// 4:4:4 and 10-bit hardware encoding. Per-format details are at debug.
+#[cfg(target_os = "linux")]
+pub fn log_hardware_encoders(kind: EncoderKind) {
+    let direct = crate::ffmpeg::enabled().unwrap_or(false);
+    let encoders = VideoCodec::ALL
+        .into_iter()
+        .map(|codec| {
+            let name = if direct {
+                ffmpeg_media::hardware_encoder(kind, codec.into())
+            } else {
+                hardware_encoder(kind, codec.into()).then(|| "hardware".to_owned())
+            };
+            format!("{codec:?}={}", name.as_deref().unwrap_or("software"))
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let chroma444 = hardware_444_codecs(kind);
+    let ten_bit = hardware_ten_bit_codecs(kind);
+    tracing::info!(?kind, %encoders, ?chroma444, ?ten_bit, "hardware encoder probe");
+}
+
 /// This build encodes AV1 at all (in hardware or with SVT-AV1): the direct
 /// FFmpeg backend with an AV1 encoder.
 #[cfg(target_os = "linux")]
@@ -1948,25 +1971,55 @@ pub fn audio_subscription() -> moq_net::track::Subscription {
     video_subscription().with_priority(AUDIO_PRIORITY)
 }
 
+/// `teleport doctor`: print the media checks.
 pub fn doctor() -> Result<()> {
+    let (report, missing) = doctor_report()?;
+    for line in &report {
+        println!("{line}");
+    }
+    require_plugins(&missing)
+}
+
+/// Host start: the same checks as `teleport doctor`, with the table at debug
+/// only (it would otherwise fill the journal on every start).
+#[cfg(target_os = "linux")]
+pub fn check_host_media() -> Result<()> {
+    let (report, missing) = doctor_report()?;
+    for line in &report {
+        tracing::debug!("doctor: {line}");
+    }
+    require_plugins(&missing)
+}
+
+fn require_plugins(missing: &[&str]) -> Result<()> {
+    ensure!(
+        missing.is_empty(),
+        "missing GStreamer plugins ({}); run inside nix develop",
+        missing.join(", ")
+    );
+    Ok(())
+}
+
+/// The `teleport doctor` lines and the required GStreamer elements missing.
+fn doctor_report() -> Result<(Vec<String>, Vec<&'static str>)> {
     let direct = crate::ffmpeg::enabled()?;
-    println!(
+    let mut report = vec![format!(
         "Video codec backend: {}",
         if direct {
             "direct FFmpeg"
         } else {
             "GStreamer (legacy)"
         }
-    );
+    )];
     if direct {
         for codec in [VideoCodec::H264, VideoCodec::H265] {
             let decoder = ffmpeg_media::select_decoder(true, codec.into())?;
-            println!(
+            report.push(format!(
                 "FFmpeg {codec:?}: software encode/decode verified ({decoder}); hardware is probed on connection"
-            );
+            ));
         }
     }
-    let mut missing = false;
+    let mut missing = Vec::new();
     for name in [
         "queue",
         "capsfilter",
@@ -1981,9 +2034,7 @@ pub fn doctor() -> Result<()> {
         if direct && matches!(name, "h264parse" | "avdec_h264") {
             continue;
         }
-        let found = gst::ElementFactory::find(name).is_some();
-        println!("{name}: {}", if found { "ok" } else { "MISSING" });
-        missing |= !found;
+        required(&mut report, &mut missing, name);
     }
     #[cfg(target_os = "linux")]
     for name in [
@@ -1996,11 +2047,9 @@ pub fn doctor() -> Result<()> {
         if direct && name == "x264enc" {
             continue;
         }
-        let found = gst::ElementFactory::find(name).is_some();
-        println!("{name}: {}", if found { "ok" } else { "MISSING" });
-        missing |= !found;
+        required(&mut report, &mut missing, name);
     }
-    println!("GStreamer {}", gst::version_string());
+    report.push(format!("GStreamer {}", gst::version_string()));
     for name in [
         "qsvh264enc",
         "qsvh265enc",
@@ -2023,20 +2072,24 @@ pub fn doctor() -> Result<()> {
         "pulsesrc",
         "autoaudiosink",
     ] {
-        println!(
+        report.push(format!(
             "{name}: {} (optional)",
             if gst::ElementFactory::find(name).is_some() {
                 "available"
             } else {
                 "unavailable"
             }
-        );
+        ));
     }
-    ensure!(
-        !missing,
-        "missing GStreamer plugins; run inside nix develop"
-    );
-    Ok(())
+    Ok((report, missing))
+}
+
+fn required(report: &mut Vec<String>, missing: &mut Vec<&'static str>, name: &'static str) {
+    let found = gst::ElementFactory::find(name).is_some();
+    report.push(format!("{name}: {}", if found { "ok" } else { "MISSING" }));
+    if !found {
+        missing.push(name);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

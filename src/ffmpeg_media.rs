@@ -1122,6 +1122,15 @@ fn neutral_frame(width: u32, height: u32, depth10: bool, chroma444: bool) -> Vec
 /// Decode the synthetic stream with `name` and require timestamped frames of
 /// the probe size (and, for output 3, GPU-resident frames).
 fn probe_decoder(name: &str, format: VideoFormat, packets: &[Vec<u8>], output: i32) -> Result<()> {
+    crate::ffmpeg::probing(|| probe_decoder_inner(name, format, packets, output))
+}
+
+fn probe_decoder_inner(
+    name: &str,
+    format: VideoFormat,
+    packets: &[Vec<u8>],
+    output: i32,
+) -> Result<()> {
     let config = config(name, format, output);
     let mut decoder = Codec::new(config.clone())?;
     let mut frames = 0;
@@ -1168,7 +1177,11 @@ fn gpu_decoder_verified(name: &str, format: VideoFormat) -> bool {
             true
         }
         Err(error) => {
-            tracing::warn!(decoder = name, %error, "GPU-resident decoder unavailable");
+            tracing::warn!(
+                decoder = name,
+                error = format!("{error:#}"),
+                "GPU-resident decoder unavailable"
+            );
             false
         }
     };
@@ -1202,13 +1215,24 @@ pub(super) fn select_decoder(software: bool, format: VideoFormat) -> Result<Stri
     let mut last = None;
     for &name in candidates {
         match probe_decoder(name, format, &packets, output_format(format, false)) {
+            // A forced software check (`teleport doctor`, host start) is not
+            // a decoder choice worth reporting at info.
+            Ok(()) if software => {
+                tracing::debug!(backend="ffmpeg", decoder=name, codec=?format.codec, chroma444=format.chroma444, ten_bit=format.ten_bit, "direct decoder produced verified output");
+                cache.insert(key, name.into());
+                return Ok(name.into());
+            }
             Ok(()) => {
                 tracing::info!(backend="ffmpeg", decoder=name, codec=?format.codec, chroma444=format.chroma444, ten_bit=format.ten_bit, "direct decoder produced verified output");
                 cache.insert(key, name.into());
                 return Ok(name.into());
             }
             Err(error) => {
-                tracing::warn!(decoder=name, %error, "FFmpeg decoder unavailable; trying fallback");
+                tracing::warn!(
+                    decoder = name,
+                    error = format!("{error:#}"),
+                    "FFmpeg decoder unavailable; trying fallback"
+                );
                 last = Some(error);
             }
         }
@@ -1662,6 +1686,11 @@ fn encoder_name(kind: EncoderKind, codec: VideoCodec) -> String {
 /// Opens `config` and requires a keyframe from three neutral frames.
 #[cfg(target_os = "linux")]
 fn probe_encoder(config: &Config) -> Result<()> {
+    crate::ffmpeg::probing(|| probe_encoder_inner(config))
+}
+
+#[cfg(target_os = "linux")]
+fn probe_encoder_inner(config: &Config) -> Result<()> {
     let mut codec = Codec::new(config.clone())?;
     let raw = neutral_frame(
         config.width,
@@ -1722,12 +1751,12 @@ pub(super) fn hardware_encoder(kind: EncoderKind, format: VideoFormat) -> Option
         match probe_encoder(&config) {
             Ok(()) => Some(config.name),
             Err(error) => {
-                tracing::debug!(encoder = %config.name, %error, "no hardware encoder");
+                tracing::debug!(encoder = %config.name, error = format!("{error:#}"), "no hardware encoder");
                 None
             }
         }
     });
-    tracing::info!(?codec, chroma444 = format.chroma444, ten_bit = format.ten_bit, encoder = ?found, "hardware encoder probe");
+    tracing::debug!(?codec, chroma444 = format.chroma444, ten_bit = format.ten_bit, encoder = ?found, "hardware encoder probe");
     cache.insert(key, found.clone());
     found
 }
@@ -1817,8 +1846,14 @@ pub(super) fn encoder(
                 selected = Some(config);
                 break;
             }
+            // Auto walks every hardware kind: missing ones are expected (the
+            // host start probe summary already says which work).
+            Err(error) if matches!(kind, EncoderKind::Auto) => {
+                tracing::debug!(encoder=%config.name, error=format!("{error:#}"), "FFmpeg encoder unavailable; trying fallback");
+                last = Some(error);
+            }
             Err(error) => {
-                tracing::warn!(encoder=%config.name,%error,"FFmpeg encoder unavailable; trying fallback");
+                tracing::warn!(encoder=%config.name, error=format!("{error:#}"), "FFmpeg encoder unavailable");
                 last = Some(error);
             }
         }

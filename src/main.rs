@@ -264,6 +264,13 @@ fn main() -> Result<()> {
         // Safety: no other thread exists yet to read the environment.
         unsafe { std::env::set_var("SVT_LOG", "1") };
     }
+    // libva prints "libva info: ..." driver-loading lines to stderr on every
+    // VA display FFmpeg opens (each hardware encoder probe); keep its errors.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("LIBVA_MESSAGING_LEVEL").is_none() {
+        // Safety: no other thread exists yet to read the environment.
+        unsafe { std::env::set_var("LIBVA_MESSAGING_LEVEL", "1") };
+    }
     // Start the frame-timing clock before any instant it may be asked about.
     protocol::clock_us(std::time::Instant::now());
     tracing_subscriber::fmt()
@@ -273,6 +280,8 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|_| "teleport=info,moq_native=warn,moq_net=warn".into()),
         )
         .init();
+    // FFmpeg's own messages through tracing (expected probe failures at debug).
+    ffmpeg::route_log();
     let cli = Cli::parse();
     // The privacy-mode restore paths must work with nothing but the
     // compositor; they never touch media.

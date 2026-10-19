@@ -4,10 +4,13 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/log.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
 #include <libswscale/swscale.h>
 #include <errno.h>
+#include <limits.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -550,3 +553,39 @@ int tp_codec_set_bitrate(TpCodec *codec, int kbps) {
     return 0;
 }
 void tp_codec_error(int error, char *buffer, int length) { av_strerror(error, buffer, length); }
+
+/* Route av_log through `sink` one whole line at a time, so Rust decides how
+ * loudly each message is logged (expected probe failures at debug, the rest
+ * as warnings or errors) instead of FFmpeg printing to stderr. Pieces of a
+ * line arrive in separate calls on the same thread; they are joined per
+ * thread and keep the most severe level seen. */
+typedef void (*TpLogSink)(int level, const char *line);
+static TpLogSink log_sink;
+static _Thread_local char log_line[1024];
+static _Thread_local size_t log_used;
+static _Thread_local int log_prefix = 1, log_level = INT_MAX;
+
+static void log_callback(void *avcl, int level, const char *fmt, va_list vl) {
+    char piece[sizeof log_line];
+    size_t length, room;
+    if (level > av_log_get_level() || !log_sink) return;
+    if (av_log_format_line2(avcl, level, fmt, vl, piece, sizeof piece, &log_prefix) < 0) return;
+    length = strlen(piece);
+    room = sizeof log_line - 1 - log_used;
+    if (length > room) length = room;
+    memcpy(log_line + log_used, piece, length);
+    log_used += length;
+    log_line[log_used] = 0;
+    if (level < log_level) log_level = level;
+    if (!log_used || (log_line[log_used - 1] != '\n' && log_used < sizeof log_line - 1)) return;
+    while (log_used && (log_line[log_used - 1] == '\n' || log_line[log_used - 1] == '\r'))
+        log_line[--log_used] = 0;
+    if (log_used) log_sink(log_level, log_line);
+    log_used = 0;
+    log_level = INT_MAX;
+}
+
+void tp_log_install(TpLogSink sink) {
+    log_sink = sink;
+    av_log_set_callback(log_callback);
+}
