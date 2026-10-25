@@ -1,7 +1,7 @@
 # Self-hosted remote support for TRaX boxes
 
-**Status:** Proposal. Nothing here is built or decided until EJ answers
-[open decisions](#11-open-decisions-for-ej).
+**Status:** Accepted. EJ decided D1 to D9 on 2026-10-25 (see
+[decisions](#11-decisions-ej-2026-10-25)). Nothing is built yet.
 **Date:** 2026-10-25.
 **Asked for by:** EJ, 2026-10-25: "look into getting the teleport app working
 ... so we can use this as a self hosted deployed logmein for our own embedded
@@ -420,11 +420,15 @@ management stream) must be live first; this is its D11, later than B5
 
 ---
 
-## 11. Open decisions for EJ
+## 11. Decisions (EJ, 2026-10-25)
 
-| # | Decision | Options | Recommendation |
+All nine are decided. D1: EJ chose MIT ("licence MIT"), so the repository is
+MIT, and the box package is built without the GPL encoders (libx264/libx265) so
+the shipped binary stays MIT. D2 to D9: EJ accepted every recommendation below.
+
+| # | Decision | Options | Decided |
 |---|---|---|---|
-| D1 | **License.** The repository has none, so TRaX has no right to ship it. Also: Teleport links FFmpeg with libx264/libx265, which makes a distributed binary GPL. | (a) a permissive license (Apache-2.0/MIT) on the repo (b) keep it proprietary and give TPR Group a written license (c) a copyleft license (MPL-2.0 or GPL) | **(b) now if Teleport may become its own product, (a) if not**; either way build the box package without GPL encoders. This is a legal and business call. |
+| D1 | **License.** The repository has none, so TRaX has no right to ship it. Also: Teleport links FFmpeg with libx264/libx265, which makes a distributed binary GPL. | (a) a permissive license (Apache-2.0/MIT) on the repo (b) keep it proprietary and give TPR Group a written license (c) a copyleft license (MPL-2.0 or GPL) | **(a) MIT.** The box package is built without GPL encoders. |
 | D2 | Relay placement | (a) separate `teleport relay` beside the PoPs (b) PoP mediamtx MoQ (c) TRT gateway (d) Cloudflare | **(a)** |
 | D3 | Client | (a) native only (b) browser only (c) native first, browser for customers | **(c)** |
 | D4 | Support staff role | (a) any trax-auth `admin` (b) a new `support` role | **(b)**: support should not need full admin |
