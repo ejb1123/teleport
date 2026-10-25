@@ -696,6 +696,7 @@ pub fn encoder(
             .map_err(|_| anyhow::anyhow!("not a pipeline"))?,
     );
     crate::pw_cursor::attach(&pipeline.0);
+    crate::kms::attach(&pipeline.0);
     let sink = pipeline
         .0
         .by_name("encoded")

@@ -1552,7 +1552,9 @@ const DMABUF_FORMATS: [&str; 4] = ["XR24", "AR24", "XB24", "AB24"];
 
 /// The DMA-BUF variant of a capture description, if the source can produce
 /// DMA-BUFs: a PipeWire source without its system-memory caps (pipewiresrc
-/// then offers our modifiers to the compositor), or a test source that
+/// then offers our modifiers to the compositor), a KMS source of a linear
+/// framebuffer with DMA-BUF caps instead of CPU ones
+/// (`crate::kms::dmabuf_source`), or a test source that
 /// already negotiates `memory:DMABuf`. `TELEPORT_CAPTURE_ZERO_COPY=0` opts
 /// out.
 #[cfg(target_os = "linux")]
@@ -1562,6 +1564,9 @@ fn dmabuf_source(source: &str) -> Option<String> {
     }
     if source.contains("memory:DMABuf") {
         return Some(source.into());
+    }
+    if let Some(source) = crate::kms::dmabuf_source(source) {
+        return Some(source);
     }
     source
         .strip_suffix(&format!(" ! {}", crate::capture::PIPEWIRE_SYSTEM_MEMORY))
@@ -2002,6 +2007,7 @@ fn start(
     );
     attach(&pipeline.0, state.clone());
     crate::pw_cursor::attach(&pipeline.0);
+    crate::kms::attach(&pipeline.0);
     #[cfg(test)]
     if let Some(hook) = tests::PIPELINE_HOOK.lock().unwrap().as_ref() {
         hook(&pipeline.0);

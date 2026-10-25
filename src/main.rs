@@ -32,6 +32,8 @@ mod host_ui;
 mod identity;
 mod key_options;
 mod keyboard_capture;
+#[cfg(target_os = "linux")]
+mod kms;
 mod launcher;
 #[cfg(target_os = "macos")]
 mod mac_scroll;

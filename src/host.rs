@@ -97,8 +97,15 @@ pub struct Options {
     /// Bind address (UDP). Use 0.0.0.0:4443 for LAN access.
     #[arg(long, default_value = "127.0.0.1:4443")]
     pub listen: String,
-    #[arg(long, default_value = "auto", value_parser = ["auto", "portal", "x11", "test"])]
+    /// What to capture: `portal` (Wayland), `x11`, `kms` (the framebuffer a
+    /// display shows, for kiosk compositors; needs CAP_SYS_ADMIN and is
+    /// view-only, docs/kms-capture.md), `test`, or `auto` (portal or X11).
+    #[arg(long, default_value = "auto", value_parser = ["auto", "portal", "x11", "kms", "test"])]
     pub source: String,
+    /// With `--source kms`: the DRM device (default: the first /dev/dri/card*
+    /// with an active display).
+    #[arg(long)]
+    pub kms_device: Option<PathBuf>,
     /// With `--source test`: stream a black screen that turns white, and
     /// back, on every key or mouse-button press, to time input→photon with a
     /// photodiode or camera (performance.md).
@@ -369,9 +376,11 @@ pub async fn run(mut options: Options) -> Result<()> {
     }
     // Before the portal, which on a locked screen would wait for a consent
     // dialog nobody can answer.
-    if options.source != "test" {
+    // The portal consent question does not arise for KMS or test capture.
+    if !matches!(options.source.as_str(), "test" | "kms") {
         crate::session_lock::warn_unless_preauthorized().await;
     }
+    crate::kms::set_device(options.kms_device.clone());
     let mut capture = Capture::open_host(
         &options.source,
         options.restore_token.as_deref(),
