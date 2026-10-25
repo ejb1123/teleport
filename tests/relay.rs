@@ -935,3 +935,142 @@ fn cloudflare_relay_pairs_streams_and_reports_presence() {
         std::thread::sleep(Duration::from_secs(2));
     }
 }
+
+/// `teleport ticket <command> <file>`: the public key it prints.
+fn ticket_keygen(command: &str, path: &std::path::Path) -> String {
+    let output = teleport()
+        .args(["ticket", command])
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{command} failed");
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn sign_ticket(issuer_seed: &std::path::Path, fingerprint: &str, client_key: &str) -> String {
+    let output = teleport()
+        .args(["ticket", "sign", "--issuer-key-file"])
+        .arg(issuer_seed)
+        .args([
+            "--host-fingerprint",
+            fingerprint,
+            "--client-key",
+            client_key,
+        ])
+        .args(["--name", "Support (Integration)", "--session-id", "it-1"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "ticket sign failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+/// `teleport login-ticket` through the relay only, saving the credential.
+fn redeem_ticket(setup: &Setup, ticket: &str, key: &std::path::Path, name: &str) -> Output {
+    let ticket_file = setup.temp.path().join(format!("{name}.ticket"));
+    std::fs::write(&ticket_file, ticket).unwrap();
+    teleport()
+        .args([
+            "login-ticket",
+            "127.0.0.1:9",
+            "--fingerprint",
+            &host_fingerprint(setup),
+        ])
+        .arg("--ticket-file")
+        .arg(&ticket_file)
+        .arg("--key-file")
+        .arg(key)
+        .arg("--save-credential")
+        .arg(setup.temp.path().join(format!("{name}.json")))
+        .args(["--relay", &setup.relay_url])
+        .args(["--relay-fingerprint", &setup.relay_fingerprint])
+        .args(["--relay-key", RELAY_KEY])
+        .env_remove("TELEPORT_RELAY_KEY")
+        .output()
+        .unwrap()
+}
+
+/// A host that trusts an issuer opens one relayed, end-to-end encrypted
+/// guest session for a ticket that issuer signed, with no pairing and no
+/// approval prompt (`--ticket-approval issuer`); the same ticket is refused a
+/// second time, and so is a ticket from any other issuer.
+#[test]
+#[ignore = "requires local UDP sockets and GStreamer plugins"]
+fn issuer_signed_ticket_opens_one_relayed_session() {
+    let keys = tempfile::tempdir().unwrap();
+    let issuer = ticket_keygen("issuer-keygen", &keys.path().join("issuer"));
+    let client_key = ticket_keygen("client-keygen", &keys.path().join("client"));
+    ticket_keygen("issuer-keygen", &keys.path().join("stranger"));
+    let setup = setup_with(
+        &[],
+        &[
+            "--ticket-issuer-key",
+            &issuer,
+            "--ticket-approval",
+            "issuer",
+        ],
+    );
+    let fingerprint = host_fingerprint(&setup);
+    let ticket = sign_ticket(&keys.path().join("issuer"), &fingerprint, &client_key);
+
+    let redeemed = redeem_ticket(&setup, &ticket, &keys.path().join("client"), "first");
+    assert!(
+        redeemed.status.success(),
+        "ticket redemption failed: {}\nhost log:\n{}",
+        String::from_utf8_lossy(&redeemed.stderr),
+        host_log(&setup)
+    );
+    let output = client(
+        &setup,
+        &setup.temp.path().join("first.json"),
+        &setup.relay_fingerprint,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("SMOKE PASS"),
+        "ticket session failed: {stdout}{}\nhost log:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        host_log(&setup)
+    );
+    assert!(stdout.contains("end-to-end encrypted relay session established"));
+    let log = host_log(&setup);
+    assert!(log.contains("session ticket redeemed"), "{log}");
+    assert!(!log.contains("waiting for approval"), "{log}");
+
+    // The credential was for one session: it is spent.
+    let again = client(
+        &setup,
+        &setup.temp.path().join("first.json"),
+        &setup.relay_fingerprint,
+    );
+    assert!(!String::from_utf8_lossy(&again.stdout).contains("SMOKE PASS"));
+    // The ticket itself was for one redemption.
+    assert!(
+        !redeem_ticket(&setup, &ticket, &keys.path().join("client"), "replay")
+            .status
+            .success()
+    );
+    // A ticket from an issuer the host does not trust.
+    let foreign = sign_ticket(&keys.path().join("stranger"), &fingerprint, &client_key);
+    assert!(
+        !redeem_ticket(&setup, &foreign, &keys.path().join("client"), "foreign")
+            .status
+            .success()
+    );
+    // A good ticket presented with another client's key.
+    ticket_keygen("client-keygen", &keys.path().join("thief"));
+    let fresh = sign_ticket(&keys.path().join("issuer"), &fingerprint, &client_key);
+    assert!(
+        !redeem_ticket(&setup, &fresh, &keys.path().join("thief"), "thief")
+            .status
+            .success()
+    );
+    assert!(
+        redeem_ticket(&setup, &fresh, &keys.path().join("client"), "owner")
+            .status
+            .success()
+    );
+}

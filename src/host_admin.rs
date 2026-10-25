@@ -354,6 +354,8 @@ pub struct Control {
     changed: Arc<Notify>,
     epoch: AtomicU64,
     system: Option<crate::system_login::Config>,
+    /// Session ticket redemption (`crate::ticket`), when issuers are trusted.
+    ticket: Option<crate::ticket::Config>,
     relay: Option<crate::relay::Endpoint>,
     hub: Arc<crate::guests::Hub>,
 }
@@ -595,6 +597,13 @@ impl Control {
             b"TPSYS001" if !pairing_only => {
                 let config = self.system.as_ref().context("system login is disabled")?;
                 crate::system_login::handle(stream, source, config, self.access.clone()).await
+            }
+            b"TPTKT001" if !pairing_only => {
+                let config = self
+                    .ticket
+                    .as_ref()
+                    .context("session tickets are disabled")?;
+                crate::ticket::handle(stream, source, config, self.access.clone()).await
             }
             b"TPINVT01" if !pairing_only => tokio::time::timeout(
                 Duration::from_secs(10),
@@ -850,6 +859,10 @@ pub async fn start_with_system(
     let system = helper
         .map(|path| crate::system_login::Config::new(directory, path))
         .transpose()?;
+    let ticket = access
+        .tickets_enabled()
+        .then(|| crate::ticket::Config::new(directory))
+        .transpose()?;
     let path = directory.join("admin.sock");
     let (_directory, address_path) = socket_address(directory)?;
     if let Ok(metadata) = std::fs::symlink_metadata(&path) {
@@ -879,11 +892,13 @@ pub async fn start_with_system(
         changed: Arc::new(Notify::new()),
         epoch: AtomicU64::new(0),
         system,
+        ticket,
         relay,
         hub,
     });
     if control.access.status().username.is_some()
         || control.system.is_some()
+        || control.ticket.is_some()
         || !control.access.invites().is_empty()
     {
         control.bind(&mut *control.network.lock().await).await?;
