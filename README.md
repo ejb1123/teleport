@@ -97,8 +97,11 @@ Detailed walkthroughs follow below.
 
 ## License
 
-No license has been chosen yet, so the code is currently all rights
-reserved. A license will be added before a first release.
+MIT. See [LICENSE](LICENSE).
+
+Builds that link FFmpeg's libx264 or libx265 are GPL as distributed,
+because those encoders are GPL. Build without them (hardware encoders
+only: NVENC, VA-API, QSV) to ship an MIT-only binary.
 
 ## Installing without Nix
 
