@@ -2088,11 +2088,7 @@ impl Members {
         let Some(pad_block) = self.free_pad_block() else {
             return refuse(member, "no gamepad slots left");
         };
-        let built = (|| -> Result<_> {
-            let mut broadcast = member.outgoing.create_broadcast(
-                "desktop",
-                moq_net::broadcast::Route::new().with_announce(true),
-            )?;
+        let built = desktop_broadcast(&member.outgoing, |broadcast| {
             let mut idle = Vec::new();
             let mut tasks = Vec::new();
             for codec in protocol::VideoCodec::ALL {
@@ -2140,8 +2136,11 @@ impl Members {
                     }
                 }
             }
-            Ok((broadcast, idle, tasks, metadata, updates))
-        })();
+            Ok((idle, tasks, metadata, updates))
+        })
+        .map(|(broadcast, (idle, tasks, metadata, updates))| {
+            (broadcast, idle, tasks, metadata, updates)
+        });
         let (broadcast, idle, mut tasks, metadata, updates) = match built {
             Ok(built) => built,
             Err(error) => {
@@ -2267,10 +2266,10 @@ async fn run_session(
     // Each client opts in again; a new session starts with the pointer in video.
     capture.local_cursor = false;
     capture.select_monitor(capture.active_monitor).await?;
-    let mut broadcast = first.outgoing.create_broadcast(
-        "desktop",
-        moq_net::broadcast::Route::new().with_announce(true),
-    )?;
+    // Announced only once every track below exists (see `desktop_broadcast`).
+    let mut broadcast = first
+        .outgoing
+        .create_broadcast("desktop", moq_net::broadcast::Route::new())?;
     // Every codec's track exists until the client has chosen (SelectCodec):
     // it subscribes to its choice right after sending it.
     let mut video_tracks = Vec::new();
@@ -2320,6 +2319,7 @@ async fn run_session(
             audio_tracks.push((format, broadcast.create_track(format.track(), None)?));
         }
     }
+    broadcast.set_route(moq_net::broadcast::Route::announced())?;
     let input = tokio::time::timeout(Duration::from_secs(10), subscribe_input(&first.incoming))
         .await
         .context("client did not open input track")??;
@@ -4317,6 +4317,22 @@ fn publish_update(track: &mut moq_net::track::Producer, update: Update) -> Resul
 }
 
 /// Aborts a session-scoped helper task when the session ends.
+/// Create the `desktop` broadcast unannounced, let `build` create its tracks,
+/// and only then announce it. A client subscribes to `desktop` (and its
+/// codec, monitor and audio tracks) as soon as it sees the announcement;
+/// announcing first let a fast client ask for a track that did not exist yet
+/// and get "not found" (moq error 13), which `tests/smoke.rs` hit on slower
+/// CI runners.
+fn desktop_broadcast<T>(
+    origin: &moq_net::origin::Producer,
+    build: impl FnOnce(&mut moq_net::broadcast::Producer) -> Result<T>,
+) -> Result<(moq_net::broadcast::Producer, T)> {
+    let mut broadcast = origin.create_broadcast("desktop", moq_net::broadcast::Route::new())?;
+    let built = build(&mut broadcast)?;
+    broadcast.set_route(moq_net::broadcast::Route::announced())?;
+    Ok((broadcast, built))
+}
+
 struct AbortOnDrop<T = Result<()>>(tokio::task::JoinHandle<T>);
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
@@ -4480,6 +4496,32 @@ async fn ordered_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client that subscribes the moment it sees `desktop` announced finds
+    /// every track, however slowly the host creates them (smoke.rs failed with
+    /// "remote error: code=13", not found, when the host announced first).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn desktop_is_announced_only_after_its_tracks_exist() -> Result<()> {
+        let origin = moq_net::Origin::random().produce();
+        let watcher = origin.consume();
+        let client = tokio::spawn(async move {
+            let remote = watcher
+                .announced_broadcast("desktop")
+                .await
+                .context("no announcement")?;
+            remote.track("desktop")?.subscribe(None).await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let (_broadcast, _tracks) = desktop_broadcast(&origin, |broadcast| {
+            let video = broadcast.create_track("h264", None)?;
+            // A slow host: the client has long been waiting by now.
+            std::thread::sleep(Duration::from_millis(200));
+            let metadata = broadcast.create_track("desktop", None)?;
+            Ok((video, metadata))
+        })?;
+        tokio::time::timeout(Duration::from_secs(5), client).await???;
+        Ok(())
+    }
     #[test]
     fn pointer_motion_applies_only_newer_positions_from_either_path() {
         let last = AtomicU64::new(0);
