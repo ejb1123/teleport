@@ -56,8 +56,17 @@ pub struct Options {
     pub listen: String,
     /// Directory holding a persistent relay TLS identity (created if absent),
     /// so clients can keep pinning the same relay fingerprint.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "tls_cert")]
     pub identity_dir: Option<std::path::PathBuf>,
+    /// A certificate chain (PEM) from a CA, for example Let's Encrypt for
+    /// the relay's DNS name: what browsers need for WebTransport
+    /// (docs/relay.md#browsers). Clients then verify it with system roots
+    /// instead of pinning --relay-fingerprint.
+    #[arg(long, requires = "tls_key")]
+    pub tls_cert: Option<std::path::PathBuf>,
+    /// The private key (PEM) for --tls-cert.
+    #[arg(long, requires = "tls_cert")]
+    pub tls_key: Option<std::path::PathBuf>,
     /// MoQ versions to accept (repeatable). Defaults to moq-lite-05 and IETF
     /// MoQ Transport drafts 16 and 14.
     #[arg(long = "version", hide = true)]
@@ -121,13 +130,23 @@ pub async fn serve(options: Options) -> Result<()> {
     config.quic.idle_timeout = Some(protocol::QUIC_IDLE_TIMEOUT);
     config.quic.keep_alive = Some(protocol::QUIC_KEEP_ALIVE);
     config.quic.mtu_discovery = Some(protocol::QUIC_MTU_DISCOVERY);
-    match options.identity_dir.as_deref() {
-        Some(directory) => {
+    match (
+        options.identity_dir.as_deref(),
+        &options.tls_cert,
+        &options.tls_key,
+    ) {
+        (_, Some(cert), Some(key)) => {
+            config.tls.cert = vec![cert.clone()];
+            config.tls.key = vec![key.clone()];
+        }
+        (Some(directory), _, _) => {
             let identity = crate::identity::open(directory)?;
             config.tls.cert = vec![identity.certificate];
             config.tls.key = vec![identity.key];
         }
-        None => config.tls.generate = vec!["teleport-relay".into()],
+        // Short-lived (14 days) ECDSA P-256: what a browser accepts through
+        // WebTransport serverCertificateHashes.
+        _ => config.tls.generate = vec!["teleport-relay".into(), "localhost".into()],
     }
     let mut server = config.init()?;
     let fingerprint = server
