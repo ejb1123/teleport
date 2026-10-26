@@ -1073,6 +1073,8 @@ mod tests {
         let relay = tokio::spawn(crate::relay::serve(crate::relay::Options {
             listen: relay_address.to_string(),
             identity_dir: Some(relay_identity),
+            tls_cert: None,
+            tls_key: None,
             versions: Vec::new(),
             key: Some("relay key".into()),
             stun_listen: Some("off".into()),

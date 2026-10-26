@@ -608,6 +608,36 @@ credentials, pairing codes and candidates are never visible.
   moq-lite with one side and moq-transport with the other (only possible when
   pinning versions with `TELEPORT_RELAY_VERSIONS`) does not connect them.
 
+## Browsers and CA certificates
+
+The relay accepts browsers over WebTransport (HTTP/3) on the same UDP port
+as native clients: moq-native negotiates `h3` beside the raw `moqt`
+versions. A browser must trust the relay's certificate, in one of two ways.
+
+**A CA certificate**, for anything users reach:
+
+```sh
+teleport relay --tls-cert fullchain.pem --tls-key privkey.pem --key "$KEY"
+```
+
+Use Let's Encrypt, say, for the relay's DNS name. Native clients then verify
+it against the system roots and need no `--relay-fingerprint`. The files
+are **reloaded when they change**, so a renewal written over them by
+cert-manager or certbot (key first, then the chain) is served to new
+connections without a restart. Running sessions keep their connection. The
+printed `RELAY FINGERPRINT` is the certificate at startup; with a CA
+certificate, clients should not pin it.
+
+**`serverCertificateHashes`**, for local development only. Without
+`--identity-dir` or `--tls-cert`, the relay makes a fresh ECDSA P-256
+certificate valid for 14 days, which is what browsers accept by hash. It
+prints that certificate's SHA-256 as `RELAY FINGERPRINT`; pass it to the
+browser as the hash.
+
+**The relay key** travels as the `key` query parameter and is checked when
+the MoQ session is set up. A browser that never speaks MoQ keeps an idle
+WebTransport session until it times out, and sees nothing.
+
 ## Tests
 
 - `cargo test --bin teleport e2e:: bridge:: relay::` — handshake, tamper,
