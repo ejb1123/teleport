@@ -67,8 +67,11 @@ pub struct Claims {
     pub max_session_s: u64,
 }
 
-/// A ticket whose signature, audience and lifetime checked out.
+/// A ticket whose signature, audience and lifetime checked out. Only hosts
+/// (Linux) read the fields; elsewhere `teleport ticket sign` uses [`verify`]
+/// only as a check.
 #[derive(Clone, Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct Verified {
     pub claims: Claims,
     pub client_key: [u8; 32],
