@@ -2264,23 +2264,8 @@ mod tests {
                 stats.decoder_recoveries.store(3, Ordering::Relaxed);
                 let (pipeline, input, image) =
                     decoder_with_stats_output(true, stats.clone(), codec, prefer_nv12)?;
-                let key = stats.received(bytes.len(), 77);
-                let mut buffer = gst::Buffer::from_mut_slice(bytes.to_vec());
-                stamp_video_buffer(buffer.get_mut().unwrap(), key);
-                input.push_buffer(buffer)?;
-                input.end_of_stream()?;
-                let deadline = Instant::now() + Duration::from_secs(3);
-                let frame = loop {
-                    if let Some(frame) = image.lock().unwrap().take() {
-                        break frame;
-                    }
-                    pipeline.error()?;
-                    ensure!(
-                        Instant::now() < deadline,
-                        "no decoded red frame for {codec:?}"
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
-                };
+                let frame = present_keyframe(&stats, &input, &image, &pipeline, &bytes, 77)
+                    .with_context(|| format!("no decoded red frame for {codec:?}"))?;
                 assert_eq!(frame.video_group, Some(77));
                 assert_eq!(frame.decoder_recovery, 3);
                 assert_eq!((frame.width, frame.height), (320, 180));
@@ -2959,6 +2944,61 @@ mod tests {
         Ok(())
     }
 
+    /// Push one keyframe (`bytes`, video group `group`), end the stream and
+    /// return the frame the decoder presents for it.
+    ///
+    /// The decoder presents nothing older than 250 ms, and its start-up on a
+    /// slow machine can take that long by itself, so a keyframe sent to a cold
+    /// decoder may be dropped as stale (production recovers by asking for a
+    /// fresh keyframe; CI's ubuntu runner hit "capture/decoder reached end of
+    /// stream" this way). So warm the decoder with one copy first, wait until
+    /// it has taken that in, and only then send the copy that must be
+    /// presented. Either copy may be the one shown: both carry `group`.
+    fn present_keyframe(
+        stats: &crate::stats::StreamStats,
+        input: &AppSrc,
+        image: &LatestImage,
+        pipeline: &Pipeline,
+        bytes: &[u8],
+        group: u64,
+    ) -> Result<Image> {
+        let push = || -> Result<()> {
+            let key = stats.received(bytes.len(), group);
+            let mut buffer = gst::Buffer::from_mut_slice(bytes.to_vec());
+            stamp_video_buffer(buffer.get_mut().unwrap(), key);
+            input.push_buffer(buffer)?;
+            Ok(())
+        };
+        push()?;
+        // Decoders that hold a frame until the next one show nothing here;
+        // the second copy (or the end of stream) releases it.
+        let warm = Instant::now() + Duration::from_secs(2);
+        while image.lock().unwrap().is_none()
+            && stats.decoded_frames.load(Ordering::Relaxed) == 0
+            && stats.stale_frames.load(Ordering::Relaxed) == 0
+            && Instant::now() < warm
+        {
+            pipeline.error()?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        push()?;
+        input.end_of_stream()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(frame) = image.lock().unwrap().take() {
+                return Ok(frame);
+            }
+            pipeline.error().with_context(|| {
+                format!(
+                    "no decoded frame ({} stale)",
+                    stats.stale_frames.load(Ordering::Relaxed)
+                )
+            })?;
+            ensure!(Instant::now() < deadline, "no decoded frame in time");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     #[ignore = "requires GStreamer software encoders and available video decoders"]
     fn decoded_frames_preserve_generation_for_both_codecs() -> Result<()> {
@@ -2989,22 +3029,8 @@ mod tests {
                     .buffer()
                     .context("missing fixture buffer")?
                     .map_readable()?;
-                let pts = stats.received(bytes.len(), 77);
-                let mut buffer = gst::Buffer::from_mut_slice(bytes.to_vec());
-                stamp_video_buffer(buffer.get_mut().unwrap(), pts);
-                input.push_buffer(buffer)?;
-                input.end_of_stream()?;
-                let deadline = Instant::now() + Duration::from_secs(3);
-                let frame = loop {
-                    if let Some(frame) = image.lock().unwrap().take() {
-                        break frame;
-                    }
-                    ensure!(
-                        Instant::now() < deadline,
-                        "no decoded generation frame for {codec:?}"
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
-                };
+                let frame = present_keyframe(&stats, &input, &image, &decoded, &bytes, 77)
+                    .with_context(|| format!("no decoded generation frame for {codec:?}"))?;
                 eprintln!(
                     "generation preserved: {codec:?} {}",
                     stats.decoder.lock().unwrap()
