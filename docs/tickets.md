@@ -106,3 +106,33 @@ small setups and for testing an issuer.
   holds the issuer's private key can open sessions on every host that trusts
   it, within those hosts' `--ticket-approval` policy. Keep that key in a
   service, not on a laptop.
+
+## Tickets in the handshake
+
+A client can skip the redemption step and open a relayed session with the
+ticket directly. A browser has no TLS stack to run inside a relay stream, so
+this is how browser clients connect. Native clients do it with
+`teleport client --ticket-file T --key-file K --relay ...`, which is relay
+only.
+
+1. The relayed hello is marked `ticket` and carries no credential. Its
+   identifier is keyed with a public constant, so until step 3 the session
+   keys rest only on the X25519 exchange. The host is authenticated by its
+   transcript signature, as always.
+2. The host answers any ticket hello if it trusts at least one issuer.
+3. The client's key confirmation carries, sealed under the session keys:
+   - the session id;
+   - the ticket;
+   - an Ed25519 signature over the transcript with the ticket's `cnf` key.
+
+   The host verifies the ticket exactly as in redemption: issuer, audience,
+   lifetime, a `jti` it has not seen, and the `cnf` signature. It then leases
+   the session at once. Nothing is released before that succeeds.
+
+**What the relay learns.** The relay never sees the ticket, so it cannot
+learn who it is for (`sub`) or the permissions. It sees only that a ticket
+hello took place.
+
+**Refusals.** A ticket for another host, a replayed ticket, or a ticket
+signed for another key gets no session. The client then times out waiting,
+and the host log says why.
