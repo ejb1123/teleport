@@ -1189,3 +1189,138 @@ fn issuer_signed_ticket_opens_one_relayed_session() {
             .success()
     );
 }
+
+/// A one-shot issuer on loopback, as a web site's redeem URL behaves: the
+/// first POST gets a ticket for the key it carries, every later one 410.
+fn issuer_site(
+    issuer_seed: std::path::PathBuf,
+    fingerprint: String,
+    relay_url: String,
+    relay_fingerprint: String,
+) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://{}/redeem/one-time-secret",
+        listener.local_addr().unwrap()
+    );
+    std::thread::spawn(move || {
+        let mut spent = false;
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            let body = loop {
+                let n = stream.read(&mut buffer).unwrap();
+                request.extend_from_slice(&buffer[..n]);
+                if let Some(split) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..split]).to_lowercase();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .unwrap()
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= split + 4 + length {
+                        break request[split + 4..split + 4 + length].to_vec();
+                    }
+                }
+            };
+            let (status, answer) = if spent {
+                (
+                    "410 Gone",
+                    serde_json::json!({"error": "this session link is no longer valid"}),
+                )
+            } else {
+                spent = true;
+                let posted: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let ticket = sign_ticket(
+                    &issuer_seed,
+                    &fingerprint,
+                    posted["client_key"].as_str().unwrap(),
+                );
+                (
+                    "200 OK",
+                    serde_json::json!({
+                        "ticket": ticket,
+                        "name": "Integration box",
+                        "host_fingerprint": fingerprint,
+                        "relay": {"url": relay_url, "fingerprint": relay_fingerprint, "key": RELAY_KEY},
+                    }),
+                )
+            };
+            let answer = answer.to_string();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+        }
+    });
+    url
+}
+
+/// `teleport open` with a web page's link: the client makes its own key,
+/// gets a ticket for it from the single-use URL, and opens the session
+/// through the relay the issuer named. The link works once.
+#[test]
+#[ignore = "requires local UDP/TCP sockets and GStreamer plugins"]
+fn a_redeem_link_opens_one_relayed_session() {
+    let keys = tempfile::tempdir().unwrap();
+    let issuer = ticket_keygen("issuer-keygen", &keys.path().join("issuer"));
+    let setup = setup_with(
+        &[],
+        &[
+            "--ticket-issuer-key",
+            &issuer,
+            "--ticket-approval",
+            "issuer",
+        ],
+    );
+    let url = issuer_site(
+        keys.path().join("issuer"),
+        host_fingerprint(&setup),
+        setup.relay_url.clone(),
+        setup.relay_fingerprint.clone(),
+    );
+    let link = format!(
+        "teleport://redeem?url={}",
+        url::form_urlencoded::byte_serialize(url.as_bytes()).collect::<String>()
+    );
+    let open = |name: &str| {
+        teleport()
+            .args(["open", &link, "--save-credential"])
+            .arg(setup.temp.path().join(name))
+            .env_remove("TELEPORT_RELAY_KEY")
+            .output()
+            .unwrap()
+    };
+    let first = open("link.json");
+    assert!(
+        first.status.success(),
+        "open failed: {}{}\nhost log:\n{}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr),
+        host_log(&setup)
+    );
+    assert!(String::from_utf8_lossy(&first.stdout).contains("Integration box"));
+    let output = client(
+        &setup,
+        &setup.temp.path().join("link.json"),
+        &setup.relay_fingerprint,
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("SMOKE PASS"),
+        "session from a link failed: {stdout}\nhost log:\n{}",
+        host_log(&setup)
+    );
+    let again = open("again.json");
+    assert!(!again.status.success());
+    assert!(
+        String::from_utf8_lossy(&again.stderr).contains("no longer valid"),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+}

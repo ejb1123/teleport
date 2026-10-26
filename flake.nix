@@ -123,6 +123,7 @@
                 ./packaging/pam
                 ./packaging/icons
                 ./packaging/teleport.desktop
+                ./packaging/teleport-open.desktop
                 ./packaging/Info.plist
                 ./nix/mesa-runtime.sh
               ];
@@ -179,6 +180,8 @@
             + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
               install -Dm644 packaging/teleport.desktop $out/share/applications/teleport.desktop
               substituteInPlace $out/share/applications/teleport.desktop --replace-fail 'Exec=teleport' "Exec=$out/bin/teleport"
+              install -Dm644 packaging/teleport-open.desktop $out/share/applications/teleport-open.desktop
+              substituteInPlace $out/share/applications/teleport-open.desktop --replace-fail 'Exec=teleport' "Exec=$out/bin/teleport"
               install -Dm644 packaging/icons/dev.teleport.Teleport.svg $out/share/icons/hicolor/scalable/apps/dev.teleport.Teleport.svg
               for size in 16 24 32 48 64 128 256 512; do
                 install -Dm644 packaging/icons/hicolor/''${size}x''${size}/dev.teleport.Teleport.png \
