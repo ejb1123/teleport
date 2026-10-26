@@ -33,8 +33,16 @@ pub struct Options {
     /// Host name or IP and UDP port, e.g. 192.168.1.20:4443.
     pub address: String,
     /// Private pairing file copied from the host.
-    #[arg(long)]
-    pub pairing_file: PathBuf,
+    #[arg(long, required_unless_present = "ticket_file")]
+    pub pairing_file: Option<PathBuf>,
+    /// Open the session with a session ticket instead of a pairing
+    /// (tickets.md#tickets-in-the-handshake): sent sealed in the relayed
+    /// handshake, signed with --key-file. Relay only.
+    #[arg(long, requires_all = ["key_file", "relay"], conflicts_with = "pairing_file")]
+    pub ticket_file: Option<PathBuf>,
+    /// The client key the ticket names (`teleport ticket client-keygen`).
+    #[arg(long, requires = "ticket_file")]
+    pub key_file: Option<PathBuf>,
     /// Desktop name for the window title (the launcher passes its saved
     /// name); default: the address.
     #[arg(long, hide = true)]
@@ -321,8 +329,39 @@ impl std::fmt::Display for DirectUnreachable {
 }
 
 impl Options {
+    /// The credential: the pairing file, or for a ticket session a
+    /// one-session stand-in naming the ticket's host and key (its token is
+    /// random and never sent) plus the ticket itself.
+    fn credential(&self) -> Result<(Pairing, Option<String>)> {
+        let Some(ticket_file) = &self.ticket_file else {
+            let path = self
+                .pairing_file
+                .as_ref()
+                .context("--pairing-file is required")?;
+            return Ok((Pairing::read(path)?, None));
+        };
+        let ticket = std::fs::read_to_string(ticket_file)?.trim().to_owned();
+        let key_file = self
+            .key_file
+            .as_ref()
+            .context("--ticket-file needs --key-file")?;
+        let pairing = Pairing {
+            token: crate::identity::token(),
+            fingerprint: crate::ticket::audience(&ticket)?,
+            device_key: Some(crate::ticket::read_client_seed(key_file)?.to_string()),
+        };
+        pairing.validate()?;
+        Ok((pairing, Some(ticket)))
+    }
+
     fn effective_route(&self) -> Result<crate::relay::Route> {
         use crate::relay::Route;
+        if self.ticket_file.is_some() {
+            ensure!(
+                matches!(self.route, None | Some(Route::Relay)),
+                "a ticket session goes through the relay only (--route relay)"
+            );
+        }
         let route = self.route.unwrap_or(if self.relay.is_some() {
             Route::Relay
         } else {
@@ -460,7 +499,7 @@ async fn connect_via(
         .forward_ssh_agent
         .then(crate::ssh_agent::agent_path)
         .transpose()?;
-    let pairing = Pairing::read(&options.pairing_file)?;
+    let (pairing, ticket) = options.credential()?;
     ensure!(
         !options.address.contains('/') && !options.address.contains('@'),
         "use host:port, not a URL"
@@ -494,6 +533,7 @@ async fn connect_via(
                 },
                 &pairing,
                 url.query().unwrap_or_default(),
+                ticket.as_deref(),
             )
             .await?,
         ),
@@ -1449,7 +1489,11 @@ fn remember_wake(options: &Options, desktop: &Desktop) {
         return;
     };
     let result = (|| {
-        let pairing = Pairing::read(&options.pairing_file)?;
+        anyhow::ensure!(
+            options.ticket_file.is_none(),
+            "ticket sessions are not saved"
+        );
+        let pairing = Pairing::read(options.pairing_file.as_ref().context("no pairing file")?)?;
         let mut profiles = crate::profiles::load()?;
         crate::profiles::set_wake(&options.address, &pairing.fingerprint, wake, &mut profiles)
     })();
