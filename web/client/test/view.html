@@ -1,0 +1,36 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>@teleport/web end-to-end check</title>
+<canvas id="screen" width="16" height="16"></canvas>
+<script type="module">
+  import { openSession } from "/dist/teleport-web.js";
+  // Open a session from `redeemUrl`, wait for `want` decoded frames (or an
+  // error, or `ms`), then report frames, states and how many distinct
+  // colours the canvas shows.
+  window.run = async (redeemUrl, want = 10, ms = 30000) => {
+    const canvas = document.getElementById("screen");
+    const states = [];
+    let session;
+    const done = new Promise((resolve) => {
+      const timer = setTimeout(resolve, ms);
+      const check = setInterval(() => {
+        if ((session && session.frames >= want) || states.some(([s]) => s === "error" || s === "ended")) {
+          clearTimeout(timer); clearInterval(check); resolve();
+        }
+      }, 100);
+    });
+    try {
+      session = await openSession(canvas, { redeemUrl, onState: (s, d) => states.push([s, d || ""]) });
+    } catch (e) {
+      states.push(["thrown", String(e && e.message || e)]);
+    }
+    await done;
+    const frames = session ? session.frames : 0;
+    const ctx = canvas.getContext("2d");
+    const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+    const colours = new Set();
+    for (let i = 0; i < pixels.length; i += 4 * 97) colours.add(`${pixels[i]},${pixels[i + 1]},${pixels[i + 2]}`);
+    session && session.close();
+    return { frames, width: canvas.width, height: canvas.height, distinct: colours.size, states };
+  };
+</script>
