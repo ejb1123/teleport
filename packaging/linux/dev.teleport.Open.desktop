@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Teleport session link
+Comment=Open a Teleport session from a web page
+Exec=teleport open %u
+Icon=dev.teleport.Teleport
+Terminal=false
+NoDisplay=true
+MimeType=x-scheme-handler/teleport;

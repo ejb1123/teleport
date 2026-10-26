@@ -223,6 +223,7 @@ pkgs.runCommand "teleport-bundle-${teleport.version}"
     ln -s dev.teleport.Teleport.png $root/.DirIcon
     install -Dm644 ${../packaging/linux/dev.teleport.Teleport.desktop} $root/usr/share/applications/dev.teleport.Teleport.desktop
     ln -s usr/share/applications/dev.teleport.Teleport.desktop $root/dev.teleport.Teleport.desktop
+    install -Dm644 ${../packaging/linux/dev.teleport.Open.desktop} $root/usr/share/applications/dev.teleport.Open.desktop
     install -Dm644 ${../packaging/linux/dev.teleport.Teleport.metainfo.xml} \
       $root/usr/share/metainfo/dev.teleport.Teleport.metainfo.xml
     for size in 16 24 32 48 64 128 256 512; do
