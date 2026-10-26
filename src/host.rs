@@ -132,6 +132,17 @@ pub struct Options {
     /// packages (system-login.md).
     #[arg(long, requires = "identity_dir")]
     pub system_auth_helper: Option<PathBuf>,
+    /// Accept session tickets signed by this issuer (64 hex digits, a raw
+    /// Ed25519 public key; repeatable): access granted by a fleet's own
+    /// service instead of a pairing (docs/tickets.md). Ticket sessions are
+    /// guests with the permissions the ticket names.
+    #[arg(long = "ticket-issuer-key", requires = "identity_dir", value_parser = parse_issuer_key)]
+    pub ticket_issuer_keys: Vec<[u8; 32]>,
+    /// Who approves a ticket session: `local` asks at the host like any
+    /// guest; `issuer` admits it at once because the issuer already
+    /// obtained consent (its sessions also stay when no owner is connected).
+    #[arg(long, value_enum, default_value_t = TicketApproval::Local, requires = "ticket_issuer_keys")]
+    pub ticket_approval: TicketApproval,
     /// Opt in to saving/restoring compositor permissions (approval may still be required).
     #[arg(long)]
     pub restore_token: Option<PathBuf>,
@@ -295,6 +306,16 @@ impl Options {
             approval_timeout: Duration::from_secs(self.guest_approval_timeout),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum TicketApproval {
+    Local,
+    Issuer,
+}
+
+fn parse_issuer_key(value: &str) -> std::result::Result<[u8; 32], String> {
+    crate::ticket::parse_issuer_key(value).map_err(|error| error.to_string())
 }
 
 fn parse_sessions(value: &str) -> std::result::Result<usize, String> {
@@ -560,6 +581,14 @@ async fn serve(options: &Options, idle: &mut Option<Capture>) -> Result<()> {
         .as_deref()
         .map(|directory| crate::access::ServerState::open(directory, pairing.clone()))
         .transpose()?;
+    if let Some(access) = &access
+        && !options.ticket_issuer_keys.is_empty()
+    {
+        access.set_ticket_issuers(
+            options.ticket_issuer_keys.clone(),
+            options.ticket_approval == TicketApproval::Issuer,
+        )?;
+    }
     let relay_endpoint = options.relay.clone().map(|url| crate::relay::Endpoint {
         url,
         fingerprint: options.relay_fingerprint.clone(),
@@ -1122,8 +1151,10 @@ async fn admit(
     // Trusted guests skip approval only while an owner is there, unless the
     // host keeps guests without an owner (`--keep-guests-without-owner`).
     let approval = guest
+        && !member.role.preapproved
         && (!member.role.trusted || (hub.policy.kick_guests_with_owner && !hub.owner_connected()));
-    member.needs_owner = guest && !approval && hub.policy.kick_guests_with_owner;
+    member.needs_owner =
+        guest && !approval && !member.role.preapproved && hub.policy.kick_guests_with_owner;
     if approval {
         tracing::info!(session = member.id, guest = %member.role.name, "guest asks to join; waiting for approval");
         // The guest leaving withdraws its request.
@@ -1849,6 +1880,14 @@ impl Members {
             && !self.sessions.values().any(|s| s.role.is_owner())
         {
             for guest in self.order.clone() {
+                // Ticket sessions an issuer approved do not depend on an owner.
+                if self
+                    .sessions
+                    .get(&guest)
+                    .is_some_and(|s| s.role.preapproved)
+                {
+                    continue;
+                }
                 self.detach(
                     guest,
                     "the last owner left",

@@ -483,6 +483,10 @@ pub struct SessionRole {
     pub name: String,
     pub permissions: crate::protocol::Permissions,
     pub trusted: bool,
+    /// Admitted on a session ticket whose issuer already obtained consent
+    /// (`--ticket-approval issuer`, docs/tickets.md): no live approval, and
+    /// not tied to an owner being connected.
+    pub preapproved: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -494,6 +498,7 @@ impl SessionRole {
             name: name.into(),
             permissions: crate::protocol::Permissions::ALL,
             trusted: true,
+            preapproved: false,
         }
     }
 
@@ -653,7 +658,44 @@ mod server {
         sources: Mutex<HashMap<IpAddr, Vec<u64>>>,
         slots: tokio::sync::Semaphore,
         system_sessions: Mutex<HashMap<Vec<u8>, SystemSession>>,
+        tickets: Mutex<Tickets>,
     }
+    /// Session tickets (`crate::ticket`): trusted issuers, the credentials
+    /// redeemed tickets were exchanged for (memory only, one session each)
+    /// and the ticket ids already used.
+    #[derive(Default)]
+    struct Tickets {
+        issuers: Vec<[u8; 32]>,
+        /// `--ticket-approval issuer`: the issuer obtained consent.
+        preapproved: bool,
+        sessions: HashMap<Vec<u8>, TicketSession>,
+        /// `jti` -> when it may be forgotten (its expiry plus the skew).
+        used: HashMap<String, u64>,
+    }
+    struct TicketSession {
+        name: String,
+        sid: String,
+        permissions: crate::protocol::Permissions,
+        /// The client key the ticket named; relayed sessions must prove it.
+        device_key: Vec<u8>,
+        /// Unused credentials lapse.
+        deadline: std::time::Instant,
+        max_session: Duration,
+        /// Set when the session is leased; it ends `max_session` later.
+        started: Option<std::time::Instant>,
+    }
+    impl TicketSession {
+        fn live(&self, now: std::time::Instant) -> bool {
+            match self.started {
+                Some(started) => now < started + self.max_session,
+                None => now < self.deadline,
+            }
+        }
+    }
+    /// Most redeemed but unfinished tickets at once.
+    const MAX_TICKET_SESSIONS: usize = 16;
+    /// How long a redeemed ticket credential waits for its session.
+    const TICKET_START: Duration = Duration::from_secs(60);
     struct SystemSession {
         generation: u64,
         deadline: std::time::Instant,
@@ -684,6 +726,8 @@ mod server {
         proof: KeyProof,
         /// Leased from a single-use system-login ticket.
         ticket: bool,
+        /// Leased from a redeemed session ticket (`crate::ticket`).
+        issued: bool,
     }
     impl SessionLease {
         /// Whether the credential is the desktop owner's, for owner-only
@@ -721,6 +765,11 @@ mod server {
         fn drop(&mut self) {
             if let Ok(mut sessions) = self.state.system_sessions.lock() {
                 sessions.remove(&self.hash);
+            }
+            if self.issued
+                && let Ok(mut tickets) = self.state.tickets.lock()
+            {
+                tickets.sessions.remove(&self.hash);
             }
         }
     }
@@ -828,6 +877,7 @@ mod server {
                 sources: Mutex::new(HashMap::new()),
                 slots: tokio::sync::Semaphore::new(4),
                 system_sessions: Mutex::new(HashMap::new()),
+                tickets: Mutex::new(Tickets::default()),
             }))
         }
 
@@ -981,6 +1031,10 @@ mod server {
         /// The panic button: every managed device, guests included, and
         /// every open invite (a leaked link must not enroll anyone after it).
         pub fn revoke_all_devices(&self) -> Result<()> {
+            // Redeemed session tickets end too (memory only, nothing to persist).
+            if let Ok(mut tickets) = self.tickets.lock() {
+                tickets.sessions.clear();
+            }
             self.update(|r| {
                 r.devices.clear();
                 r.invites.clear();
@@ -1023,6 +1077,14 @@ mod server {
             {
                 for hash in sessions.keys() {
                     push(hash, None, true);
+                }
+            }
+            if let Ok(tickets) = self.tickets.lock() {
+                let now = std::time::Instant::now();
+                for (hash, session) in &tickets.sessions {
+                    if session.live(now) {
+                        push(hash, Some(&session.device_key), true);
+                    }
                 }
             }
             credentials
@@ -1078,6 +1140,21 @@ mod server {
             {
                 return Some(SessionRole::owner("Linux account login", None));
             }
+            if let Ok(tickets) = self.tickets.lock()
+                && let Some(session) = tickets.sessions.get(hash)
+                && session.live(std::time::Instant::now())
+                && proof.accepts(Some(&session.device_key))
+            {
+                // Always a guest: the ticket's permissions are all it may do.
+                return Some(SessionRole {
+                    role: crate::protocol::Role::Guest,
+                    device: Some(format!("ticket:{}", session.sid)),
+                    name: session.name.clone(),
+                    permissions: session.permissions,
+                    trusted: false,
+                    preapproved: tickets.preapproved,
+                });
+            }
             let record = self.record.lock().ok()?;
             let device = matching_device(&record, hash, proof)?;
             Some(match device.summary.guest {
@@ -1088,6 +1165,7 @@ mod server {
                     name: device.summary.name.clone(),
                     permissions: grant.permissions,
                     trusted: grant.trusted,
+                    preapproved: false,
                 },
             })
         }
@@ -1305,6 +1383,84 @@ mod server {
             })
         }
 
+        /// Trust session tickets signed by these issuers (`--ticket-issuer-key`);
+        /// `preapproved`: their sessions skip live approval
+        /// (`--ticket-approval issuer`).
+        pub fn set_ticket_issuers(&self, issuers: Vec<[u8; 32]>, preapproved: bool) -> Result<()> {
+            let mut tickets = self
+                .tickets
+                .lock()
+                .map_err(|_| anyhow::anyhow!("access unavailable"))?;
+            tickets.issuers = issuers;
+            tickets.preapproved = preapproved;
+            Ok(())
+        }
+
+        pub fn tickets_enabled(&self) -> bool {
+            self.tickets.lock().is_ok_and(|t| !t.issuers.is_empty())
+        }
+
+        /// Exchange a session ticket for a one-session credential bound to the
+        /// client key it names. `proves` checks the client's possession of that
+        /// key. Each ticket id is accepted once.
+        pub fn redeem_ticket(
+            &self,
+            text: &str,
+            proves: impl FnOnce(&[u8; 32]) -> bool,
+        ) -> Result<Pairing> {
+            let mut tickets = self
+                .tickets
+                .lock()
+                .map_err(|_| anyhow::anyhow!("access unavailable"))?;
+            let time = now();
+            let verified =
+                crate::ticket::verify(text, &tickets.issuers, &self.legacy.fingerprint, time)?;
+            ensure!(
+                proves(&verified.client_key),
+                "the client did not prove the ticket's key"
+            );
+            let instant = std::time::Instant::now();
+            tickets.used.retain(|_, until| *until > time);
+            tickets.sessions.retain(|_, s| s.live(instant));
+            ensure!(
+                !tickets.used.contains_key(&verified.claims.jti),
+                "session ticket already used"
+            );
+            ensure!(
+                tickets.sessions.len() < MAX_TICKET_SESSIONS && tickets.used.len() < 4096,
+                "too many session tickets at once"
+            );
+            tickets.used.insert(
+                verified.claims.jti.clone(),
+                verified.claims.exp + crate::ticket::SKEW,
+            );
+            let token = crate::identity::token();
+            tickets.sessions.insert(
+                token_hash(&token),
+                TicketSession {
+                    name: verified.claims.sub.clone(),
+                    sid: verified.claims.sid.clone(),
+                    permissions: verified.permissions,
+                    device_key: verified.client_key.to_vec(),
+                    deadline: instant + TICKET_START,
+                    max_session: verified.max_session,
+                    started: None,
+                },
+            );
+            tracing::info!(
+                issuer = %verified.claims.iss,
+                session = %verified.claims.sid,
+                name = %verified.claims.sub,
+                permissions = %verified.permissions.label(),
+                "session ticket redeemed"
+            );
+            Ok(Pairing {
+                token,
+                fingerprint: self.legacy.fingerprint.clone(),
+                device_key: None,
+            })
+        }
+
         /// System tickets are claimed exactly once; dropping the lease destroys
         /// them on disconnect, cancellation or failed stream setup. Saved trust
         /// remains reusable and its lease removal is a no-op.
@@ -1342,8 +1498,8 @@ mod server {
                 .system_sessions
                 .lock()
                 .map_err(|_| anyhow::anyhow!("access unavailable"))?;
-            if !saved {
-                let session = sessions.get_mut(&hash).context("unauthorized session")?;
+            let mut issued = false;
+            if !saved && let Some(session) = sessions.get_mut(&hash) {
                 ensure!(
                     record.u2f.is_none()
                         && session.generation == record.generation
@@ -1352,12 +1508,30 @@ mod server {
                     "system login ticket already used or expired"
                 );
                 session.active = true;
+            } else if !saved {
+                let mut tickets = self
+                    .tickets
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("access unavailable"))?;
+                let session = tickets
+                    .sessions
+                    .get_mut(&hash)
+                    .context("unauthorized session")?;
+                ensure!(
+                    session.started.is_none()
+                        && session.live(std::time::Instant::now())
+                        && proof.accepts(Some(&session.device_key)),
+                    "session ticket already used or expired"
+                );
+                session.started = Some(std::time::Instant::now());
+                issued = true;
             }
             Ok(SessionLease {
                 state: self.clone(),
                 hash,
                 proof,
-                ticket: !saved,
+                ticket: !saved && !issued,
+                issued,
             })
         }
 
@@ -2055,6 +2229,100 @@ mod server {
                     .enroll_guest(&open.id, &open.secret, &key()?)
                     .is_err()
             );
+            Ok(())
+        }
+
+        /// A session ticket buys exactly one session: as the guest the ticket
+        /// names, only with the client key it names, never twice, and never
+        /// past its duration. Each refusal is checked against a control that
+        /// succeeds under the same conditions.
+        #[test]
+        fn session_tickets_open_one_keyed_guest_session_and_expire() -> Result<()> {
+            use crate::ticket::tests::{ISSUER_SEED, claims, issuer};
+            let (_temporary, state) = state()?;
+            let fingerprint = "b".repeat(64);
+            let (client, _) = crate::e2e::DeviceKey::generate()?;
+            let (stranger, _) = crate::e2e::DeviceKey::generate()?;
+            let time = now();
+            let ticket = crate::ticket::sign(&claims(&fingerprint, &client, time), &ISSUER_SEED)?;
+
+            // No trusted issuer yet: refused.
+            assert!(!state.tickets_enabled());
+            assert!(state.redeem_ticket(&ticket, |_| true).is_err());
+            state.set_ticket_issuers(vec![issuer()], true)?;
+            assert!(state.tickets_enabled());
+            // The client did not prove the key: refused, and the ticket is
+            // not spent by the attempt.
+            assert!(state.redeem_ticket(&ticket, |_| false).is_err());
+            let mut proven = None;
+            let pairing = state.redeem_ticket(&ticket, |key| {
+                proven = Some(*key);
+                true
+            })?;
+            assert_eq!(proven, Some(client.public_key()));
+            // Single use.
+            assert!(state.redeem_ticket(&ticket, |_| true).is_err());
+
+            // A relayed hello may name it, with the ticket's key.
+            let hash = token_hash(&pairing.token);
+            assert!(
+                state
+                    .relay_credentials()
+                    .iter()
+                    .any(|c| c.hash.as_slice() == hash
+                        && c.device_key.as_deref() == Some(client.public_key().as_slice()))
+            );
+            // Another key cannot lease it; the ticket's key can, once.
+            assert!(
+                state
+                    .begin_session_hash(hash.clone(), Some(&stranger.public_key()))
+                    .is_err()
+            );
+            let lease = state.begin_session_hash(hash.clone(), Some(&client.public_key()))?;
+            let role = lease.access().context("leased ticket session")?;
+            assert_eq!(role.role, crate::protocol::Role::Guest);
+            assert_eq!(role.name, "Support (Test)");
+            assert!(role.preapproved && !role.permissions.keyboard_mouse);
+            assert!(!lease.system_login());
+            assert!(
+                state
+                    .begin_session_hash(hash.clone(), Some(&client.public_key()))
+                    .is_err()
+            );
+            // Ended: gone, and not reusable.
+            drop(lease);
+            assert!(!state.authorized_hash(&hash));
+            assert!(state.begin_session(&pairing.token).is_err());
+
+            // A one-second ticket session ends by itself; the panic button
+            // ends a running one.
+            let mut short = claims(&fingerprint, &client, time);
+            short.max_session_s = 1;
+            let pairing =
+                state.redeem_ticket(&crate::ticket::sign(&short, &ISSUER_SEED)?, |_| true)?;
+            let lease = state.begin_session(&pairing.token)?;
+            assert!(lease.access().is_some());
+            std::thread::sleep(Duration::from_millis(1100));
+            assert!(lease.access().is_none());
+            let pairing = state.redeem_ticket(
+                &crate::ticket::sign(&claims(&fingerprint, &client, time), &ISSUER_SEED)?,
+                |_| true,
+            )?;
+            let lease = state.begin_session(&pairing.token)?;
+            assert!(lease.access().is_some());
+            state.revoke_all_devices()?;
+            assert!(lease.access().is_none());
+
+            // Local approval unless the host trusts the issuer's consent.
+            state.set_ticket_issuers(vec![issuer()], false)?;
+            let pairing = state.redeem_ticket(
+                &crate::ticket::sign(&claims(&fingerprint, &client, time), &ISSUER_SEED)?,
+                |_| true,
+            )?;
+            let lease = state.begin_session(&pairing.token)?;
+            assert!(!lease.access().context("leased")?.preapproved);
+            // Tickets never create saved devices.
+            assert!(state.status().devices.is_empty());
             Ok(())
         }
 

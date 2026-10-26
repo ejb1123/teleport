@@ -138,6 +138,12 @@ impl DeviceKey {
             .expect("Ed25519 public keys are 32 bytes")
     }
 
+    /// An Ed25519 signature over `message` (ticket redemption proves the
+    /// key with it, `crate::ticket`).
+    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
+        self.0.sign(message).as_ref().to_vec()
+    }
+
     fn sign_transcript(&self, transcript: &[u8; 32]) -> Vec<u8> {
         self.0.sign(&device_signed(transcript)).as_ref().to_vec()
     }

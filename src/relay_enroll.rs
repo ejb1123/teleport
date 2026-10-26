@@ -476,6 +476,25 @@ pub async fn login_system(
     .await
 }
 
+/// Redeem a session ticket through a relay (`crate::ticket`): like system
+/// login, inside TLS pinned to `fingerprint` that runs end to end through
+/// the relay stream.
+pub async fn redeem_ticket(
+    endpoint: &Endpoint,
+    ticket: &str,
+    device: &str,
+    fingerprint: &str,
+) -> Result<Pairing> {
+    let stream = open(endpoint, &relay::namespace(fingerprint)?).await?;
+    run(
+        stream,
+        Duration::from_secs(20),
+        "ticket redemption",
+        async |stream| crate::ticket::redeem_over(stream, ticket, device, fingerprint).await,
+    )
+    .await
+}
+
 /// Host side: accept enrollment attempts announced in a relay namespace and
 /// hand each stream to `handler`.
 ///

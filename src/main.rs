@@ -64,6 +64,7 @@ mod system_login;
 mod system_pam;
 #[cfg(test)]
 mod test_env;
+mod ticket;
 #[cfg(target_os = "linux")]
 mod virtual_display;
 #[cfg(target_os = "linux")]
@@ -138,6 +139,33 @@ enum Command {
         software_renderer: bool,
         #[command(flatten)]
         relay: relay::RelayArgs,
+    },
+    /// Open a session with a ticket from the host's trusted issuer
+    /// (tickets.md): redeemed once, inside TLS pinned to --fingerprint.
+    LoginTicket {
+        address: String,
+        /// Host SHA-256 certificate fingerprint (the ticket's audience).
+        #[arg(long)]
+        fingerprint: String,
+        /// File holding the ticket (`tkt1....`).
+        #[arg(long)]
+        ticket_file: std::path::PathBuf,
+        /// The client key the ticket names (`teleport ticket client-keygen`).
+        #[arg(long)]
+        key_file: std::path::PathBuf,
+        #[arg(long)]
+        software_renderer: bool,
+        /// Save the one-session credential here (0600) instead of starting
+        /// the client (tests, supervisors that start it themselves).
+        #[arg(long, hide = true)]
+        save_credential: Option<std::path::PathBuf>,
+        #[command(flatten)]
+        relay: relay::RelayArgs,
+    },
+    /// Session ticket keys and signing for a self-hosted issuer (tickets.md).
+    Ticket {
+        #[command(subcommand)]
+        command: ticket::Command,
     },
     /// Open local host settings. Does not expose administration over the network.
     #[cfg(target_os = "linux")]
@@ -290,6 +318,11 @@ fn main() -> Result<()> {
     let mut command = docs::with_help(Cli::command());
     let cli = Cli::from_arg_matches_mut(&mut command.get_matches_mut())
         .unwrap_or_else(|error| error.format(&mut command).exit());
+    // Ticket keys and signing need no media and no desktop.
+    let cli = match cli.command {
+        Some(Command::Ticket { command }) => return ticket::run(command),
+        command => Cli { command },
+    };
     // The privacy-mode restore paths must work with nothing but the
     // compositor; they never touch media.
     #[cfg(target_os = "linux")]
@@ -356,7 +389,6 @@ fn run(command: Option<Command>) -> Result<()> {
             software_renderer,
             relay,
         }) => {
-            use std::io::Write;
             moq_native::tls::parse_fingerprint(&fingerprint)?;
             let password =
                 zeroize::Zeroizing::new(rpassword::prompt_password("Linux account password: ")?);
@@ -375,36 +407,46 @@ fn run(command: Option<Command>) -> Result<()> {
                 ))?,
             };
             drop(password);
-            let mut credential = tempfile::NamedTempFile::new()?;
-            let data = zeroize::Zeroizing::new(serde_json::to_vec(&pairing)?);
-            credential.write_all(&data)?;
-            credential.flush()?;
-            let mut child = std::process::Command::new(crate::self_exe()?);
-            child
-                .arg("client")
-                .arg(address)
-                .arg("--pairing-file")
-                .arg(credential.path());
-            if software_renderer {
-                child.arg("--software-renderer");
-            }
-            if let Some(url) = &relay.relay {
-                child.arg("--relay").arg(url.as_str());
-                if let Some(pin) = &relay.relay_fingerprint {
-                    child.arg("--relay-fingerprint").arg(pin);
-                }
-                // Through the environment, not argv (visible to other users).
-                if let Some(key) = &relay.relay_key {
-                    child.env("TELEPORT_RELAY_KEY", key);
-                }
-            }
-            anyhow::ensure!(
-                child.status()?.success(),
-                "desktop client exited unsuccessfully"
-            );
-            Ok(())
+            launch_client(&address, &pairing, software_renderer, &relay)
+        }
+        Some(Command::LoginTicket {
+            address,
+            fingerprint,
+            ticket_file,
+            key_file,
+            save_credential,
+            software_renderer,
+            relay,
+        }) => {
+            moq_native::tls::parse_fingerprint(&fingerprint)?;
+            let ticket = zeroize::Zeroizing::new(std::fs::read_to_string(&ticket_file)?);
+            let device = ticket::read_client_seed(&key_file)?;
+            let mut pairing = match relay.endpoint() {
+                Some(endpoint) => runtime.block_on(relay_enroll::redeem_ticket(
+                    &endpoint,
+                    ticket.trim(),
+                    &device,
+                    &fingerprint,
+                ))?,
+                None => runtime.block_on(ticket::redeem(
+                    &address,
+                    ticket.trim(),
+                    &device,
+                    &fingerprint,
+                ))?,
+            };
+            let result = match save_credential {
+                Some(path) => crate::identity::write_new(
+                    &path,
+                    &zeroize::Zeroizing::new(serde_json::to_vec(&pairing)?),
+                ),
+                None => launch_client(&address, &pairing, software_renderer, &relay),
+            };
+            pairing.zeroize_secrets();
+            result
         }
         Some(Command::SecurityKey { command }) => security_key::run(command),
+        Some(Command::Ticket { command }) => ticket::run(command),
         #[cfg(target_os = "linux")]
         Some(Command::Host(options)) => runtime.block_on(host::run(*options)),
         #[cfg(target_os = "linux")]
@@ -515,4 +557,43 @@ fn run(command: Option<Command>) -> Result<()> {
         }
         Some(Command::Launcher) | None => launcher::run(),
     }
+}
+
+/// Run `teleport client` with a one-session credential (system login, a
+/// redeemed ticket), handed over in a private temporary file.
+fn launch_client(
+    address: &str,
+    pairing: &protocol::Pairing,
+    software_renderer: bool,
+    relay: &relay::RelayArgs,
+) -> Result<()> {
+    use std::io::Write;
+    let mut credential = tempfile::NamedTempFile::new()?;
+    let data = zeroize::Zeroizing::new(serde_json::to_vec(pairing)?);
+    credential.write_all(&data)?;
+    credential.flush()?;
+    let mut child = std::process::Command::new(crate::self_exe()?);
+    child
+        .arg("client")
+        .arg(address)
+        .arg("--pairing-file")
+        .arg(credential.path());
+    if software_renderer {
+        child.arg("--software-renderer");
+    }
+    if let Some(url) = &relay.relay {
+        child.arg("--relay").arg(url.as_str());
+        if let Some(pin) = &relay.relay_fingerprint {
+            child.arg("--relay-fingerprint").arg(pin);
+        }
+        // Through the environment, not argv (visible to other users).
+        if let Some(key) = &relay.relay_key {
+            child.env("TELEPORT_RELAY_KEY", key);
+        }
+    }
+    anyhow::ensure!(
+        child.status()?.success(),
+        "desktop client exited unsuccessfully"
+    );
+    Ok(())
 }
