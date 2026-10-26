@@ -608,6 +608,26 @@ credentials, pairing codes and candidates are never visible.
   moq-lite with one side and moq-transport with the other (only possible when
   pinning versions with `TELEPORT_RELAY_VERSIONS`) does not connect them.
 
+## Browsers
+
+The relay also accepts browsers over WebTransport (HTTP/3) on the same UDP
+port; moq-native negotiates `h3` beside the raw `moqt` versions. A browser
+must trust the relay's certificate, in one of two ways:
+
+- **A CA certificate**, for anything users reach: `teleport relay --tls-cert
+  fullchain.pem --tls-key key.pem` (for example Let's Encrypt for the relay's
+  DNS name). Native clients then verify it with system roots and need no
+  `--relay-fingerprint`.
+- **`serverCertificateHashes`**, for local development: without
+  `--identity-dir` or `--tls-cert` the relay makes a fresh ECDSA P-256
+  certificate valid for 14 days, which is what browsers accept by hash, and
+  prints its SHA-256 as `RELAY FINGERPRINT`. Pass that as the hash.
+
+The relay key travels as the `key` query parameter and is checked when the
+MoQ session is set up, so a browser that never speaks MoQ keeps an idle
+WebTransport session until it times out, and sees nothing. Checked in
+`web/spike` (risks 1 and 2).
+
 ## Container image
 
 `nix build .#relay-image` builds a script that streams an OCI image running

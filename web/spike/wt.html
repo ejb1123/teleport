@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><title>wt spike</title>
+<script>
+function hexBytes(hex){const a=new Uint8Array(hex.length/2);for(let i=0;i<a.length;i++)a[i]=parseInt(hex.substr(i*2,2),16);return a;}
+// "open" when the session is established and the relay keeps it for holdMs,
+// "closed by relay (...)" when the relay ends it, else the connection error.
+async function connect(url, hashHex, holdMs=3000){
+  let wt;
+  try{
+    wt=new WebTransport(url,{serverCertificateHashes:[{algorithm:"sha-256",value:hexBytes(hashHex)}]});
+    const t=new Promise((_,rej)=>setTimeout(()=>rej(new Error("timeout")),8000));
+    await Promise.race([wt.ready,t]);
+  }catch(e){return "error: "+(e&&e.message||e);}
+  const closed=wt.closed.then(i=>"closed by relay (code "+i.closeCode+")",e=>"closed by relay ("+(e&&e.message||e)+")");
+  const held=new Promise(r=>setTimeout(()=>r("open"),holdMs));
+  const result=await Promise.race([closed,held]);
+  try{wt.close();}catch(e){}
+  return result;
+}
+</script>

@@ -311,6 +311,48 @@ mod tests {
         Ok(())
     }
 
+    /// The browser client spike (web/spike/risk4.py): write two seconds of
+    /// the H.264 access units a session carries, exactly as published, to
+    /// $TELEPORT_DUMP_H264. Each record is a key flag byte (1 = the frame
+    /// starts a group, an IDR), a big-endian u32 length and the frame.
+    #[tokio::test]
+    #[ignore = "writes a file for web/spike; requires GStreamer capture plugins"]
+    async fn dump_h264_access_units_for_the_browser_spike() -> Result<()> {
+        let Some(path) = std::env::var_os("TELEPORT_DUMP_H264") else {
+            return Ok(());
+        };
+        gst::init()?;
+        let mut broadcast = moq_net::broadcast::Info::new().produce();
+        let track = broadcast.create_track(VideoCodec::H264.track(), None)?;
+        let mut subscriber = track.subscribe(None);
+        let _encode = encoder(
+            "videotestsrc is-live=true pattern=ball",
+            (320, 180),
+            30,
+            2000,
+            track,
+            EncoderKind::Software,
+            VideoCodec::H264.into(),
+        )?;
+        let mut out = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while let Ok(group) = tokio::time::timeout_at(deadline, subscriber.recv_group()).await {
+            let mut group = group?.context("track closed")?;
+            let mut first = true;
+            while let Ok(Ok(Some(frame))) =
+                tokio::time::timeout_at(deadline, group.read_frame()).await
+            {
+                out.push(u8::from(first));
+                out.extend_from_slice(&(frame.payload.len() as u32).to_be_bytes());
+                out.extend_from_slice(&frame.payload);
+                first = false;
+            }
+        }
+        ensure!(!out.is_empty(), "no access units");
+        std::fs::write(path, out)?;
+        Ok(())
+    }
+
     /// G9: a still screen gets one refinement burst after it settles, a
     /// moving one none; high bitrates and Intel encoders are left alone.
     #[tokio::test]
