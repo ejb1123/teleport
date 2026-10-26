@@ -608,6 +608,24 @@ credentials, pairing codes and candidates are never visible.
   moq-lite with one side and moq-transport with the other (only possible when
   pinning versions with `TELEPORT_RELAY_VERSIONS`) does not connect them.
 
+## Container image
+
+`nix build .#relay-image` builds a script that streams an OCI image running
+only `teleport relay` (Linux; `./result | docker load`, or push it with
+`skopeo copy docker-archive:/dev/stdin ...`):
+
+- entrypoint `teleport relay`, default arguments
+  `--listen 0.0.0.0:4444 --identity-dir /var/lib/teleport-relay`;
+- runs as uid/gid 65534; the image holds no secret;
+- the access key comes from `TELEPORT_RELAY_KEY`;
+- mount a volume at `/var/lib/teleport-relay` to keep the relay certificate,
+  and with it the fingerprint hosts and clients pin, across restarts;
+- expose UDP 4444 (QUIC) and UDP 3478 (STUN for peer-to-peer).
+
+It contains the unwrapped binary and its linked libraries only (about 1.1 GB
+uncompressed, most of it the media libraries the binary links), none of the
+plugins, drivers or desktop helpers the wrapped package carries.
+
 ## Tests
 
 - `cargo test --bin teleport e2e:: bridge:: relay::` — handshake, tamper,
