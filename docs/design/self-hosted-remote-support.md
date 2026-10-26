@@ -49,10 +49,10 @@ The design in five lines:
    support), the permissions (view or control) and the session id. The box
    asks the person at its screen to approve, unless the owner pre-approved a
    support window, and shows a banner for the whole session.
-5. **Native client first, browser second.** Support staff open a session from
-   the admin site with a `teleport://` deep link. Customers need a browser
-   client (WebTransport + WebCodecs + the E2E layer in WASM), because Teleport
-   has no Windows client.
+5. **The browser is the client** (revised 2026-10-25). Owners (account site)
+   and support (admin site) open sessions in the browser: WebTransport to the
+   relay, the E2E layer in WASM, WebCodecs decode. The native client is an
+   optional extra, opened by the same `teleport://` link.
 
 ---
 
@@ -330,21 +330,78 @@ guest with the grant's permissions.
 
 ## 7. Web or client
 
-### 7.1 Decision A3
+### 7.1 Decision A3, revised: the browser is the primary client
+
+**EJ, 2026-10-25:** "users and support should be able to remote to the box
+with teleport in the web browser." This changes D3 from "native first,
+browser for customers" to **browser first, for box owners (account site)
+and support staff (admin site) alike**. The native client stays as a
+secondary, optional client (`teleport open` from the same links), useful for
+support staff who want full features and the lowest latency.
 
 | Option | Good | Bad |
 |---|---|---|
-| A. Native client only, launched by `teleport://session?...` deep link | Exists today (Linux, macOS), lowest latency, full features. A deep-link scheme already exists for relay pairing links. | No Windows client at all. A customer has to install software. |
-| B. Browser client only | Works for everyone with a current browser. Nothing to install. Fits "through our site". | Large new work: WebTransport to the relay, WebCodecs decode, the E2E layer (`src/e2e.rs`, `src/bridge.rs`) compiled to WASM, input capture in a browser. Relay-only: browsers cannot hole-punch raw QUIC. |
-| **C. A for the first demo and for support staff; B for customers (recommended)** | Support staff use Linux or macOS and can install the client. Customers get the browser. | Two clients to keep in step with the protocol. |
+| A. Native client only | Exists today. | No Windows client; every customer installs software. Rejected by EJ. |
+| **B. Browser first, native optional (decided)** | Works with no install on Chrome, Edge, Firefox and Safari 26.4+. Fits "through our site" for both sites. | The largest piece of new work in this design (below). Relay only: browsers cannot hole-punch raw QUIC. |
 
-Browser client notes: moq-lite already has a WebTransport path in the MoQ
-project, so the relay needs WebTransport listening (HTTP/3) alongside raw
-QUIC; check browser WebTransport and WebCodecs H.264 support at the time
-(Chromium and Firefox have both; confirm Safari). Use H.264 for browser
-sessions. The browser client would live in this repository (it is the
-protocol owner) and be published as a static bundle the account and admin
-sites load.
+### 7.2 Browser support (checked 2026-10-26, caniuse)
+
+| Needed | Chrome / Edge | Firefox | Safari (macOS, iOS) |
+|---|---|---|---|
+| WebTransport | 97 / 98 | 114 | 26.4 |
+| WebCodecs `VideoDecoder` | 94 | 130 | 26.0 (16.4–18.x partial) |
+| WebTransport `serverCertificateHashes` | yes | 125 | 26.4 |
+
+So every current major browser can run it. Older Safari (before 26.4) gets a
+clear "your browser is too old" page, not a broken session.
+
+### 7.3 How it works
+
+- **Transport.** The relay already accepts WebTransport. Its moq-native
+  server takes the HTTP/3 ALPN on the same QUIC socket as raw `moqt`, which
+  must be proven against a browser before anything else is built on it. The
+  browser speaks moq-lite to the relay over WebTransport. The wire must match
+  the pinned `moq-lite-05`, so the JS side pins the matching MoQ library
+  version, or a small moq-lite client is written for it.
+- **Relay certificate.** Browsers need either:
+  - **a CA certificate (recommended):** Let's Encrypt for the relay's DNS
+    name. In the TRaX lab, the cluster's existing `*.dodev` wildcard. `teleport
+    relay` gains `--tls-cert`/`--tls-key` and reloads them.
+  - **`serverCertificateHashes`:** only for local development. It needs an
+    ECDSA certificate valid for at most 14 days, rotated, with its hash given
+    to the page.
+
+  The native client keeps pinning the relay by fingerprint or using system
+  roots.
+- **End to end.** The relay stays outside the trust base. The browser runs
+  the same E2E layer as the native client: `src/e2e.rs`, the object sealing
+  in `src/bridge.rs` and ticket handling, compiled to WebAssembly from one
+  crate.
+- **Redemption without TLS-in-WASM.** Native redemption runs pinned TLS
+  inside a relay stream (`TPTKT001`). For the browser, the ticket instead
+  rides **in the E2E handshake itself**:
+  - the relayed hello carries the ticket, and the client's transcript
+    signature with the ticket's `cnf` key proves possession;
+  - the host checks it exactly as in redemption and leases the session in
+    the same step.
+
+  This saves a round trip and keeps rustls out of the browser. Native
+  clients can use it too.
+- **Decode and display.** WebCodecs `VideoDecoder` takes H.264 Annex B
+  access units, the format Teleport already sends. Output goes to a canvas.
+  A browser session asks for H.264, plus HEVC or AV1 where `isConfigSupported`
+  says yes. Audio, when added, uses WebCodecs `AudioDecoder` with Opus.
+- **Keys.** The page makes the client key (Ed25519, in WASM or WebCrypto) for
+  each session, never stores it, and posts only the public half to the
+  issuer's redeem URL, as in the native link flow.
+- **Input (R2).** Keyboard and pointer go over the same sealed
+  `controls/input` track, from a focused canvas with Pointer Lock and the
+  Keyboard Lock API where available.
+- **Packaging.** The generic client lives in this repository as `web/`: a
+  WASM crate plus a small TypeScript package exposing
+  `openSession(element, redeemUrl)`. It is published as a versioned static
+  bundle. The TRaX embedding (pages, buttons, auth) lives in the TRaX
+  account and admin sites (D8 unchanged).
 
 ---
 
@@ -383,7 +440,7 @@ with no token), not only from the side it allows.
 | T5 | External host-key certification: `--host-key-ephemeral` plus a hook that hands the public key to a local signer and the client side that accepts a cloud-supplied fingerprint for this session. | Generic: any fleet with a device identity. |
 | T6 | Relay token admission: `teleport relay --token-issuer-key`, tokens scoped to one namespace and expiry, replacing `--key` for internet-facing relays. WebTransport listener (for T8). | |
 | T7 | Event stream on the `host-admin` socket: session start, approval, permission change, end, as JSON lines, for ctl to forward. | |
-| T8 | Browser client: WebTransport, WebCodecs, E2E layer in WASM, input. | Later milestone. |
+| T8 | Browser client (`web/`): WebTransport to the relay, the E2E layer and tickets in WASM, ticket-in-handshake, WebCodecs decode; input in R2 (§7.3). Relay `--tls-cert`/`--tls-key` for a browser-trusted certificate. | **R1**: the primary client since 2026-10-25. |
 | T9 | Fix #5 and #6 before the box depends on it. | |
 
 Everything here is generic. None of it names TRaX, studio-api or the box,
@@ -412,11 +469,11 @@ management stream) must be live first; this is its D11, later than B5
 
 | # | Milestone | Done when |
 |---|---|---|
-| **R0** | **Lab demo: a support agent views one lab box from the admin site with customer consent.** | On the HD 530 pilot box: admin clicks **Request support session**; the box screen asks; the operator allows view; the native client opens by deep link and shows the box's output through a TRaX-run relay; the box shows the banner; **End session** in the account site stops it within a second; both audit logs have the session. Shortcuts allowed for R0 only: one relay VM; issuer key in a file on the lab studio-api; kmsgrab instead of the PipeWire node if M1 is not ready; no browser client. |
-| R1 | Owner access | Customer opens their own box from the account site with the native client; support grants with time windows. |
+| **R0** | **Lab demo: a support agent views one lab box from the admin site with customer consent.** | On the HD 530 pilot box: admin clicks **Request support session**; the box screen asks; the operator allows view; the native client opens by deep link and shows the box's output through a TRaX-run relay; the box shows the banner; **End session** in the account site stops it within a second; both audit logs have the session. Shortcuts allowed for R0 only: one relay in the lab cluster; issuer key in a file on the lab studio-api; kmsgrab instead of the PipeWire node if M1 is not ready; the native client (the browser client is R1, see §7). |
+| **R1** | **Browser, view only, owners and support** (EJ 2026-10-25: moved up from R4) | A box owner opens their own box from the account site, and a support agent opens one from the admin site, **in the browser, with no install**: WebTransport to a relay with a browser-trusted certificate, the ticket in the E2E handshake, WebCodecs decode. Owner sessions: no prompt, banner always (§6.3). Tested on Chrome, Firefox and Safari 26.4+. The native client still works from the same links. |
+| R1b | Support grants | Owner pre-approved support windows (D5); the trax-auth `support` role (D4). |
 | R2 | Control | Support control with second approval; uinput input; screen-only controls refuse remote input, proven from the remote side. |
 | R3 | Hardened | Issuer key in Vault transit; relay token admission; per-metro relays; metrics and alerts; security review per ADR-011 D11; license settled. |
-| R4 | Browser client | Customer opens a session from the account site with no install. |
 
 ---
 
@@ -430,7 +487,7 @@ the shipped binary stays MIT. D2 to D9: EJ accepted every recommendation below.
 |---|---|---|---|
 | D1 | **License.** The repository has none, so TRaX has no right to ship it. Also: Teleport links FFmpeg with libx264/libx265, which makes a distributed binary GPL. | (a) a permissive license (Apache-2.0/MIT) on the repo (b) keep it proprietary and give TPR Group a written license (c) a copyleft license (MPL-2.0 or GPL) | **(a) MIT.** The box package is built without GPL encoders. |
 | D2 | Relay placement | (a) separate `teleport relay` beside the PoPs (b) PoP mediamtx MoQ (c) TRT gateway (d) Cloudflare | **(a)** |
-| D3 | Client | (a) native only (b) browser only (c) native first, browser for customers | **(c)** |
+| D3 | Client | (a) native only (b) browser only (c) native first, browser for customers | ~~(c)~~ **Revised 2026-10-25: browser first** for owners and support, native optional (§7.1) |
 | D4 | Support staff role | (a) any trax-auth `admin` (b) a new `support` role | **(b)**: support should not need full admin |
 | D5 | Unattended support | (a) never; someone must be at the box (b) owner pre-approved windows (c) always allowed for support | **(b)** |
 | D6 | Recording | (a) never (b) owner opt-in, stored on the box and uploaded to the owner's storage (c) always, stored by TRaX | **(b)** |
