@@ -106,3 +106,29 @@ small setups and for testing an issuer.
   holds the issuer's private key can open sessions on every host that trusts
   it, within those hosts' `--ticket-approval` policy. Keep that key in a
   service, not on a laptop.
+
+## Links from a web page
+
+An issuer's web site can open a session in the native client with a link:
+
+```
+teleport://redeem?url=<percent-encoded https URL>
+```
+
+The URL is single use and short-lived; it is the only secret in the link.
+`teleport open LINK` (and the `x-scheme-handler/teleport` desktop entry the
+Linux packages install, so a browser can launch it):
+
+1. makes a fresh client key, which never leaves the process;
+2. POSTs `{"client_key": "<base64url public key>"}` to the URL, with no
+   cookies or other credentials;
+3. expects `200` with
+   `{"ticket", "name", "host_fingerprint", "relay": {"url", "fingerprint", "key"}}`
+   (`fingerprint` and `key` may be empty), or an error status with
+   `{"error": "<message>"}`, which it shows;
+4. redeems the ticket through that relay and starts the client, relay only.
+
+The server must spend the URL on the first successful POST and bind the
+ticket's `cnf` to the posted key. Plain `http` URLs are accepted only on
+loopback. macOS does not register the scheme yet: run `teleport open` with
+the link there.

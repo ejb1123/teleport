@@ -48,6 +48,7 @@ mod profiles;
 mod protocol;
 #[cfg(target_os = "linux")]
 mod pw_cursor;
+mod redeem;
 mod relay;
 mod relay_enroll;
 mod scroll;
@@ -159,6 +160,18 @@ enum Command {
         save_credential: Option<std::path::PathBuf>,
         #[command(flatten)]
         relay: relay::RelayArgs,
+    },
+    /// Open a session from a web page's `teleport://redeem?url=...` link
+    /// (tickets.md): a fresh key, a ticket for it from that URL, then the
+    /// session through the relay the issuer names.
+    Open {
+        link: String,
+        #[arg(long)]
+        software_renderer: bool,
+        /// Save the one-session credential here (0600) instead of starting
+        /// the client (tests).
+        #[arg(long, hide = true)]
+        save_credential: Option<std::path::PathBuf>,
     },
     /// Session ticket keys and signing for a self-hosted issuer (tickets.md).
     Ticket {
@@ -406,6 +419,43 @@ fn run(command: Option<Command>) -> Result<()> {
             };
             drop(password);
             launch_client(&address, &pairing, software_renderer, &relay)
+        }
+        Some(Command::Open {
+            link,
+            software_renderer,
+            save_credential,
+        }) => {
+            let url = redeem::redeem_url(&link)?;
+            let (key, seed) = e2e::DeviceKey::generate()?;
+            let seed = zeroize::Zeroizing::new(seed);
+            let grant = runtime.block_on(redeem::fetch(&url, &key))?;
+            let relay = grant.relay.args();
+            let endpoint = relay.endpoint().context("the session names no relay")?;
+            println!(
+                "Opening a session on {} through {}",
+                if grant.name.is_empty() {
+                    "the host"
+                } else {
+                    &grant.name
+                },
+                endpoint.display_url()
+            );
+            let mut pairing = runtime.block_on(relay_enroll::redeem_ticket(
+                &endpoint,
+                &grant.ticket,
+                &seed,
+                &grant.host_fingerprint,
+            ))?;
+            let result = match save_credential {
+                Some(path) => crate::identity::write_new(
+                    &path,
+                    &zeroize::Zeroizing::new(serde_json::to_vec(&pairing)?),
+                ),
+                // Relay only: the address names the session, it is never contacted.
+                None => launch_client("session.invalid:4443", &pairing, software_renderer, &relay),
+            };
+            pairing.zeroize_secrets();
+            result
         }
         Some(Command::LoginTicket {
             address,
