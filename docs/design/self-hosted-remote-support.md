@@ -490,6 +490,7 @@ the shipped binary stays MIT. D2 to D9: EJ accepted every recommendation below.
 | D3 | Client | (a) native only (b) browser only (c) native first, browser for customers | ~~(c)~~ **Revised 2026-10-25: browser first** for owners and support, native optional (§7.1) |
 | D4 | Support staff role | (a) any trax-auth `admin` (b) a new `support` role | **(b)**: support should not need full admin |
 | D5 | Unattended support | (a) never; someone must be at the box (b) owner pre-approved windows (c) always allowed for support | **(b)** |
+| D5a | Owner sessions (amendment, EJ 2026-10-26) | — | **The box's owner opening their own box gets no consent prompt on the box, and the banner is always shown; the box's Stop ends it. Support ALWAYS needs consent at the box (or, from R1b, an owner pre-approved window).** |
 | D6 | Recording | (a) never (b) owner opt-in, stored on the box and uploaded to the owner's storage (c) always, stored by TRaX | **(b)** |
 | D7 | Capture on the box | (a) compositor PipeWire node (b) kmsgrab (c) portal backend | **(a)**, with (b) allowed for R0 |
 | D8 | Where managed-mode code lives | (a) all generic pieces upstream in this repo (b) a TRaX fork | **(a)**: one codebase; nothing in §9.1 is TRaX-specific |
