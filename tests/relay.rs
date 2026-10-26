@@ -1281,4 +1281,117 @@ fn a_ticket_in_the_handshake_opens_one_relayed_session() {
         "control failed: {}",
         host_log(&setup)
     );
+/// A self-signed certificate and key as PEM, and its SHA-256 fingerprint.
+fn pem_identity() -> (String, String, String) {
+    let certified = rcgen::generate_simple_self_signed(vec!["relay.test".into()]).unwrap();
+    let der = certified.cert.der().to_vec();
+    let fingerprint = ring::digest::digest(&ring::digest::SHA256, &der)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let pem = |label: &str, der: &[u8]| {
+        use base64::Engine;
+        let text = base64::engine::general_purpose::STANDARD.encode(der);
+        let lines: Vec<&str> = text
+            .as_bytes()
+            .chunks(64)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            lines.join("\n")
+        )
+    };
+    (
+        pem("CERTIFICATE", &der),
+        pem("PRIVATE KEY", &certified.signing_key.serialize_der()),
+        fingerprint,
+    )
+}
+
+/// What `teleport presence` says through a relay pinned at `pin`: OFFLINE
+/// when the relay answered with that certificate (no host is there),
+/// UNKNOWN when the pin did not match.
+fn pinned_verdict(relay_url: &str, pin: &str) -> String {
+    let output = teleport()
+        .args(["presence", "--relay", relay_url, "--relay-fingerprint", pin])
+        .args([
+            "--relay-key",
+            RELAY_KEY,
+            "--host-fingerprint",
+            &"ab".repeat(32),
+        ])
+        .args(["--wait", "10"])
+        .env_remove("TELEPORT_RELAY_URL")
+        .env_remove("TELEPORT_RELAY_KEY")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| ["ONLINE", "OFFLINE", "UNKNOWN"].contains(line))
+        .unwrap_or("NONE")
+        .to_owned()
+}
+
+/// `teleport relay --tls-cert --tls-key` serves the given certificate (as a
+/// CA-issued one for browsers would be), prints its fingerprint, and picks
+/// up a renewed certificate written over the same files without a restart.
+#[test]
+#[ignore = "requires local UDP sockets"]
+fn relay_serves_and_reloads_a_certificate_from_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let (cert, key) = (temp.path().join("cert.pem"), temp.path().join("key.pem"));
+    let (cert_a, key_a, pin_a) = pem_identity();
+    let (cert_b, key_b, pin_b) = pem_identity();
+    std::fs::write(&cert, &cert_a).unwrap();
+    std::fs::write(&key, &key_a).unwrap();
+    let address = free_udp();
+    let mut relay = Process(
+        teleport()
+            .args([
+                "relay",
+                "--listen",
+                &address,
+                "--key",
+                RELAY_KEY,
+                "--stun-listen",
+                "off",
+            ])
+            .arg("--tls-cert")
+            .arg(&cert)
+            .arg("--tls-key")
+            .arg(&key)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let printed = BufReader::new(relay.0.stdout.take().unwrap())
+        .lines()
+        .map_while(Result::ok)
+        .find_map(|line| line.strip_prefix("RELAY FINGERPRINT ").map(str::to_owned))
+        .expect("relay did not print its fingerprint");
+    assert_eq!(printed, pin_a);
+    let url = format!("moqt://{address}");
+    assert_eq!(pinned_verdict(&url, &pin_a), "OFFLINE");
+    assert_eq!(pinned_verdict(&url, &pin_b), "UNKNOWN");
+
+    // Renewal: the key first, then the certificate, each by rename, as
+    // certificate managers write them.
+    for (path, contents) in [(&key, &key_b), (&cert, &cert_b)] {
+        let staged = path.with_extension("new");
+        std::fs::write(&staged, contents).unwrap();
+        std::fs::rename(&staged, path).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while pinned_verdict(&url, &pin_b) != "OFFLINE" {
+        assert!(
+            Instant::now() < deadline,
+            "the relay never served the renewed certificate"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(pinned_verdict(&url, &pin_a), "UNKNOWN");
 }

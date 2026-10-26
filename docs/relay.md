@@ -608,43 +608,35 @@ credentials, pairing codes and candidates are never visible.
   moq-lite with one side and moq-transport with the other (only possible when
   pinning versions with `TELEPORT_RELAY_VERSIONS`) does not connect them.
 
-## Browsers
+## Browsers and CA certificates
 
-The relay also accepts browsers over WebTransport (HTTP/3) on the same UDP
-port; moq-native negotiates `h3` beside the raw `moqt` versions. A browser
-must trust the relay's certificate, in one of two ways:
+The relay accepts browsers over WebTransport (HTTP/3) on the same UDP port
+as native clients: moq-native negotiates `h3` beside the raw `moqt`
+versions. A browser must trust the relay's certificate, in one of two ways.
 
-- **A CA certificate**, for anything users reach: `teleport relay --tls-cert
-  fullchain.pem --tls-key key.pem` (for example Let's Encrypt for the relay's
-  DNS name). Native clients then verify it with system roots and need no
-  `--relay-fingerprint`.
-- **`serverCertificateHashes`**, for local development: without
-  `--identity-dir` or `--tls-cert` the relay makes a fresh ECDSA P-256
-  certificate valid for 14 days, which is what browsers accept by hash, and
-  prints its SHA-256 as `RELAY FINGERPRINT`. Pass that as the hash.
+**A CA certificate**, for anything users reach:
 
-The relay key travels as the `key` query parameter and is checked when the
-MoQ session is set up, so a browser that never speaks MoQ keeps an idle
-WebTransport session until it times out, and sees nothing. Checked in
-`web/spike` (risks 1 and 2).
+```sh
+teleport relay --tls-cert fullchain.pem --tls-key privkey.pem --key "$KEY"
+```
 
-## Container image
+Use Let's Encrypt, say, for the relay's DNS name. Native clients then verify
+it against the system roots and need no `--relay-fingerprint`. The files
+are **reloaded when they change**, so a renewal written over them by
+cert-manager or certbot (key first, then the chain) is served to new
+connections without a restart. Running sessions keep their connection. The
+printed `RELAY FINGERPRINT` is the certificate at startup; with a CA
+certificate, clients should not pin it.
 
-`nix build .#relay-image` builds a script that streams an OCI image running
-only `teleport relay` (Linux; `./result | docker load`, or push it with
-`skopeo copy docker-archive:/dev/stdin ...`):
+**`serverCertificateHashes`**, for local development only. Without
+`--identity-dir` or `--tls-cert`, the relay makes a fresh ECDSA P-256
+certificate valid for 14 days, which is what browsers accept by hash. It
+prints that certificate's SHA-256 as `RELAY FINGERPRINT`; pass it to the
+browser as the hash.
 
-- entrypoint `teleport relay`, default arguments
-  `--listen 0.0.0.0:4444 --identity-dir /var/lib/teleport-relay`;
-- runs as uid/gid 65534; the image holds no secret;
-- the access key comes from `TELEPORT_RELAY_KEY`;
-- mount a volume at `/var/lib/teleport-relay` to keep the relay certificate,
-  and with it the fingerprint hosts and clients pin, across restarts;
-- expose UDP 4444 (QUIC) and UDP 3478 (STUN for peer-to-peer).
-
-It contains the unwrapped binary and its linked libraries only (about 1.1 GB
-uncompressed, most of it the media libraries the binary links), none of the
-plugins, drivers or desktop helpers the wrapped package carries.
+**The relay key** travels as the `key` query parameter and is checked when
+the MoQ session is set up. A browser that never speaks MoQ keeps an idle
+WebTransport session until it times out, and sees nothing.
 
 ## Tests
 
