@@ -190,7 +190,7 @@ enum Command {
     #[cfg(target_os = "linux")]
     Host(Box<host::Options>),
     /// Open a native remote desktop window.
-    Client(client::Options),
+    Client(Box<client::Options>),
     /// Run a minimal MoQ relay (self-hosted alternative to a provider relay).
     /// It forwards only end-to-end encrypted objects it cannot read.
     Relay(relay::Options),
@@ -551,7 +551,7 @@ fn run(command: Option<Command>) -> Result<()> {
             );
             Ok(())
         }
-        Some(Command::Client(options)) => client::run(options, &runtime),
+        Some(Command::Client(options)) => client::run(*options, &runtime),
         Some(Command::Relay(options)) => runtime.block_on(relay::serve(options)),
         Some(Command::Presence(options)) => runtime.block_on(presence::run(options)),
         Some(Command::Doctor { hdr }) => {
