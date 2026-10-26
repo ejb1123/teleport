@@ -1,0 +1,25 @@
+<!doctype html><meta charset="utf-8"><title>e2e wasm spike</title>
+<script type="module">
+import init, { open_vector, client_hello_id } from "./pkg/teleport_e2e_wasm.js";
+const hex = (h) => Uint8Array.from(h.match(/../g), (b) => parseInt(b, 16));
+const fill = (v) => new Uint8Array(32).fill(v);
+// The native vector (src/e2e.rs vector::SEALED_HEX).
+const SEALED = "0000000000000000d3965c06c620215969137425b61371bc72ff2faa58f4c7c45c0a90a8abd82fd083d1f34aae293ff6049916d7de1fc2d0";
+const open = (sealed, group = 7n) => {
+  try { return "plain: " + new TextDecoder().decode(open_vector(fill(0x11), fill(0x22), fill(0x33), "video", group, sealed)); }
+  catch (e) { return "error: " + (e && e.message || e); }
+};
+window.runE2E = async () => {
+  await init();
+  const good = hex(SEALED);
+  const flipped = hex(SEALED); flipped[20] ^= 1;
+  return {
+    good: open(good),
+    flipped: open(flipped),
+    wrongGroup: open(good, 8n),
+    hello1: client_hello_id("ab".repeat(32)),
+    hello2: client_hello_id("ab".repeat(32)),
+  };
+};
+window.ready = true;
+</script>

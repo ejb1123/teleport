@@ -372,6 +372,19 @@ impl SessionKeys {
         })
     }
 
+    /// Session keys from fixed inputs, for known-answer vectors shared with
+    /// other implementations of this layer (the browser client in
+    /// `web/e2e-wasm`). Real sessions derive them in the handshake only.
+    #[doc(hidden)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn vector(
+        shared: &[u8],
+        credential_hash: &[u8; 32],
+        transcript: &[u8; 32],
+    ) -> Result<Self> {
+        Self::derive(shared, credential_hash, transcript)
+    }
+
     /// Identifier both ends agree on; useful in logs (not secret, not a key).
     pub fn session_id(&self) -> [u8; 16] {
         self.session
@@ -1457,5 +1470,37 @@ mod tests {
         let b = rcgen::generate_simple_self_signed(vec!["b".into()]).unwrap();
         assert!(HostIdentity::new(a.cert.der().to_vec(), &b.signing_key.serialize_der()).is_err());
         assert!(HostIdentity::new(a.cert.der().to_vec(), &a.signing_key.serialize_der()).is_ok());
+    }
+}
+
+/// The known-answer vector `web/e2e-wasm` checks in a browser: keys from
+/// fixed inputs, one object sealed host to client on the `video` track.
+#[cfg(test)]
+pub(crate) mod vector {
+    use super::*;
+
+    pub const SHARED: [u8; 32] = [0x11; 32];
+    pub const CREDENTIAL_HASH: [u8; 32] = [0x22; 32];
+    pub const TRANSCRIPT: [u8; 32] = [0x33; 32];
+    pub const TRACK: &str = "video";
+    pub const GROUP: u64 = 7;
+    pub const PLAINTEXT: &[u8] = b"teleport e2e known-answer vector";
+    pub const SEALED_HEX: &str = "0000000000000000d3965c06c620215969137425b61371bc72ff2faa58f4c7c45c0a90a8abd82fd083d1f34aae293ff6049916d7de1fc2d0";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn known_answer_vector_seals_and_opens() {
+        let keys = SessionKeys::vector(&SHARED, &CREDENTIAL_HASH, &TRANSCRIPT).unwrap();
+        let mut sealer = keys.sealer(Direction::HostToClient, TRACK).unwrap();
+        let sealed = sealer.seal(GROUP, PLAINTEXT).unwrap();
+        println!("SEALED {}", hex(&sealed));
+        assert_eq!(hex(&sealed), SEALED_HEX);
+        let mut opener = keys
+            .opener(Direction::HostToClient, TRACK, Order::Strict)
+            .unwrap();
+        assert_eq!(opener.open(GROUP, &sealed).unwrap(), PLAINTEXT);
     }
 }
