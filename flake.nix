@@ -211,6 +211,7 @@
           inherit bundle;
           pam-helper = pamHelper;
           relay-image = import ./nix/relay-image.nix { inherit pkgs teleport; };
+          web-client = import ./nix/web-client.nix { inherit pkgs; };
           appimage = import ./nix/appimage.nix { inherit pkgs bundle; };
           tarball = import ./nix/tarball.nix { inherit pkgs bundle; };
           deb = import ./nix/linux-packages.nix {
