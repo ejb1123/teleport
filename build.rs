@@ -7,6 +7,8 @@ fn main() {
         "src/gl_nv12.h",
         "src/dmabuf_encode.c",
         "src/dmabuf_encode.h",
+        "src/kms_grab.c",
+        "src/kms_grab.h",
     ] {
         println!("cargo:rerun-if-changed={file}");
     }
@@ -36,15 +38,21 @@ fn main() {
             .cargo_metadata(false)
             .probe("libva")
             .expect("libva is required on Linux");
+        let drm = pkg_config::Config::new()
+            .cargo_metadata(false)
+            .probe("libdrm")
+            .expect("libdrm is required on Linux");
         build
             .files([
                 "src/gl_nv12.c",
                 "src/cuda_gl.c",
                 "src/vaapi_egl.c",
                 "src/dmabuf_encode.c",
+                "src/kms_grab.c",
             ])
             .includes(headers.include_paths)
-            .includes(va.include_paths);
+            .includes(va.include_paths)
+            .includes(drm.include_paths);
         println!("cargo:rustc-link-lib=dl");
     }
     build
@@ -58,8 +66,9 @@ fn main() {
             .expect("FFmpeg library disappeared");
     }
     if linux {
-        // libva for the shim; GStreamer's DMA-BUF memory accessors for capture.
-        for library in ["libva", "gstreamer-allocators-1.0"] {
+        // libva for the shim; libdrm for KMS capture; GStreamer's DMA-BUF
+        // memory accessors for capture.
+        for library in ["libva", "libdrm", "gstreamer-allocators-1.0"] {
             pkg_config::Config::new()
                 .probe(library)
                 .unwrap_or_else(|error| panic!("{library} is required on Linux: {error}"));

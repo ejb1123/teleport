@@ -412,6 +412,11 @@ enum Backend {
         origins: Vec<(i16, i16)>,
     },
     Test,
+    /// `--source kms`: the framebuffer each active display controller
+    /// shows (`crate::kms`), one monitor per CRTC. View-only.
+    Kms {
+        outputs: Vec<(crate::kms::Output, crate::kms::Format)>,
+    },
 }
 
 /// A portal remote socket must outlive the GStreamer source using it. Each
@@ -434,6 +439,14 @@ impl Capture {
         let mut fd = None;
         let mut pipeline = match &self.backend {
             Backend::Test => format!("videotestsrc is-live=true pattern={}", test_pattern(index)),
+            Backend::Kms { outputs } => {
+                ensure!(
+                    range == crate::protocol::DynamicRange::Sdr,
+                    "KMS capture is SDR"
+                );
+                let (output, format) = &outputs[index];
+                crate::kms::description(output, format)
+            }
             Backend::Portal { .. } => {
                 // The socket must come from the session owning the node.
                 let (_, session, node) = self
@@ -507,7 +520,7 @@ impl Capture {
                     )?
                     .check()?;
             }
-            Backend::Test => (),
+            Backend::Test | Backend::Kms { .. } => (),
         }
         Ok(())
     }
@@ -718,9 +731,33 @@ impl Capture {
                 };
                 result.name = "X11";
             }
+            "kms" => {
+                ensure!(!privacy, "privacy mode needs a desktop portal");
+                let kms = tokio::task::spawn_blocking(crate::kms::Kms::open).await??;
+                result.monitors = kms
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .map(|(id, (output, _))| Monitor {
+                        id,
+                        name: output.name.clone(),
+                        width: output.width,
+                        height: output.height,
+                        refresh_mhz: output.refresh_mhz,
+                        virtual_display: false,
+                    })
+                    .collect();
+                result.backend = Backend::Kms {
+                    outputs: kms.outputs,
+                };
+                result.name = "KMS";
+            }
             _ => anyhow::bail!("unknown capture source"),
         }
-        result.gamepads = crate::gamepad::Gamepads::new(!matches!(result.backend, Backend::Test));
+        result.gamepads = crate::gamepad::Gamepads::new(!matches!(
+            result.backend,
+            Backend::Test | Backend::Kms { .. }
+        ));
         if let Err(error) = result.select_monitor(monitor).await {
             // Never leave a portal session (and a virtual output) behind.
             result.close().await;
@@ -761,6 +798,10 @@ impl Capture {
                 "videotestsrc is-live=true pattern={}",
                 test_pattern(self.active_monitor)
             ),
+            Backend::Kms { outputs } => {
+                let (output, format) = &outputs[self.active_monitor];
+                crate::kms::description(output, format)
+            }
             Backend::Portal { fd, .. } => format!(
                 "pipewiresrc name={} fd={} path={} do-timestamp=true keepalive-time={KEEPALIVE_MS} ! {PIPEWIRE_SYSTEM_MEMORY}",
                 crate::pw_cursor::source_name(self.active_monitor),
@@ -788,8 +829,8 @@ impl Capture {
             return Ok(self.pipeline_source());
         }
         ensure!(
-            !matches!(self.backend, Backend::X11 { .. }),
-            "HDR capture requires a compatible Wayland compositor; X11 capture is SDR"
+            !matches!(self.backend, Backend::X11 { .. } | Backend::Kms { .. }),
+            "HDR capture requires a compatible Wayland compositor; X11 and KMS capture are SDR"
         );
         // Require real high-precision PQ RGB, never relabel an 8-bit source.
         // Test mode generates synthetic PQ code values, not desktop capture.
@@ -825,7 +866,7 @@ impl Capture {
                     )?
                     .check()?;
             }
-            Backend::Test => (),
+            Backend::Test | Backend::Kms { .. } => (),
         }
         Ok(())
     }
@@ -857,7 +898,7 @@ impl Capture {
                     )?
                     .check()?;
             }
-            Backend::Test => (),
+            Backend::Test | Backend::Kms { .. } => (),
         }
         Ok(())
     }
@@ -899,7 +940,7 @@ impl Capture {
                     }
                 }
             }
-            Backend::Test => {
+            Backend::Test | Backend::Kms { .. } => {
                 if (x, y) != (0, 0) {
                     tracing::info!(x, y, "test host scroll");
                 }
@@ -961,7 +1002,7 @@ impl Capture {
                             )?
                             .check()?;
                     }
-                    Backend::Test => (),
+                    Backend::Test | Backend::Kms { .. } => (),
                 }
             }
             Event::RelativeMotion { dx, dy } => match &self.backend {
@@ -986,7 +1027,7 @@ impl Capture {
                         )?
                         .check()?;
                 }
-                Backend::Test => (),
+                Backend::Test | Backend::Kms { .. } => (),
             },
             Event::Scroll { x, y } => self.scroll_notches(x, y).await?,
             Event::ScrollSmooth { dx, dy, finish } => match &self.backend {
@@ -1000,7 +1041,7 @@ impl Capture {
                     let (x, y) = self.scroll_notches.add(dx, dy, finish);
                     self.scroll_notches(x, y).await?;
                 }
-                Backend::Test => {
+                Backend::Test | Backend::Kms { .. } => {
                     tracing::info!(dx, dy, finish, "test host smooth scroll");
                 }
             },
@@ -1310,7 +1351,7 @@ impl Capture {
         match self.backend {
             Backend::X11 { .. } => true,
             Backend::Portal { .. } => self.allow_cursor_metadata && self.cursor_metadata_available,
-            Backend::Test => false,
+            Backend::Test | Backend::Kms { .. } => false,
         }
     }
 

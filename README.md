@@ -93,6 +93,7 @@ Detailed walkthroughs follow below.
 | Input: cursor, scrolling, keyboard, gamepads | [cursor](docs/cursor.md), [scrolling](docs/scrolling.md), [keyboard capture](docs/keyboard-capture.md), [gamepad](docs/gamepad.md) |
 | Audio and microphone | [audio](docs/audio.md) |
 | Displays: multi-monitor, virtual, privacy | [multi-monitor](docs/multi-monitor.md), [virtual display](docs/virtual-display.md) |
+| Kiosks without a portal or X server: KMS capture | [KMS capture](docs/kms-capture.md) |
 | Wake-on-LAN and unattended start | [wake and unattended](docs/wake-and-unattended.md) |
 | Testing | [testing](docs/testing.md) |
 | Open work and known bugs | [to do later](docs/todo.md) |
@@ -153,7 +154,9 @@ nix run . -- host --listen 0.0.0.0:4443 --pair \
 On Wayland, choose the **monitors you want to share** in the local permission dialog and grant
 keyboard/mouse control. The host uses the RemoteDesktop/ScreenCast portals and
 PipeWire directly; it does not capture through XWayland. `--source auto` selects
-the portal for Wayland and X11 capture/XTest for an X11 session.
+the portal for Wayland and X11 capture/XTest for an X11 session. `--source kms` reads the
+framebuffer a display shows, for kiosk compositors with neither (view-only,
+needs `CAP_SYS_ADMIN`; [KMS capture](docs/kms-capture.md)).
 
 Allow **UDP 4443** for streaming and **TCP 4443** for password or code enrollment
 from your Mac through the host firewall. Teleport does not
