@@ -631,7 +631,7 @@ The release workflow's jobs:
 | `arch` | `archlinux:latest` container | `teleport-desktop-bin-VERSION-1-x86_64.pkg.tar.zst` with makepkg from the tarball, and the AUR files |
 | `linux-test` | stock images, no Nix | `tools/package-smoke.sh`: install, system files (also the unattended-start unit and examples, the documentation, and the PAM helper's and policy's owner and mode), a password check through the PAM helper with a test account, `teleport doctor`, loopback session (`host --source test` and `client --headless-frames 60 --software-decoder`, which must print `SMOKE PASS`) |
 | `flatpak` | `flatpak-github-actions:freedesktop-26.08` | `Teleport-VERSION-x86_64.flatpak`; doctor and loopback session inside the sandbox |
-| `macos` | macos-14 (arm64), macos-15-intel (x86_64) | `Teleport-VERSION-ARCH.dmg` and `.zip` (`tools/macos-app.sh --dmg`); the bundled binary's `--version` and doctor without Nix on PATH |
+| `macos` | macos-15 (arm64), macos-15-intel (x86_64) | `Teleport-VERSION-ARCH.dmg` and `.zip` (`tools/macos-app.sh --dmg`); the bundled binary's `--version` and doctor without Nix on PATH |
 | `release` | ubuntu-24.04 | `SHA256SUMS`, notes, the GitHub Release; the `homebrew-tap-update` artifact |
 
 `linux-test` covers: .deb on Ubuntu 22.04 and 24.04 and Debian 12 and 13;
