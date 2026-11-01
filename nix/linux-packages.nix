@@ -37,16 +37,10 @@ let
       ];
   # The documentation the help text and system files cite (README.md and
   # docs/*.md, in the bundle's usr/share/doc/teleport).
-  docs =
-    map
-      (name: {
-        src = "${bundle}/usr/share/doc/teleport/${name}";
-        dst = "/usr/share/doc/teleport/${name}";
-      })
-      (
-        [ "README.md" ]
-        ++ import ./user-docs.nix { inherit (pkgs) lib; }
-      );
+  docs = map (name: {
+    src = "${bundle}/usr/share/doc/teleport/${name}";
+    dst = "/usr/share/doc/teleport/${name}";
+  }) ([ "README.md" ] ++ import ./user-docs.nix { inherit (pkgs) lib; });
   arch =
     {
       deb = {
