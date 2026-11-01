@@ -634,10 +634,13 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// `ticket`: open the session with a session ticket (a ticket hello) signed
+/// by the pairing's device key, instead of naming the pairing's token.
 pub async fn client(
     endpoint: &Endpoint,
     pairing: &protocol::Pairing,
     request: &str,
+    ticket: Option<&str>,
 ) -> Result<ClientSession> {
     let link = connect(endpoint, &namespace(&pairing.fingerprint)?).await?;
     let session_id = hex(&e2e::random::<16>());
@@ -646,7 +649,11 @@ pub async fn client(
         .as_deref()
         .map(e2e::DeviceKey::from_hex)
         .transpose()?;
-    let handshake = ClientHandshake::new(&pairing.token, request, device)?;
+    let handshake = match (ticket, device) {
+        (Some(ticket), Some(device)) => ClientHandshake::for_ticket(ticket, request, device)?,
+        (Some(_), None) => anyhow::bail!("a ticket session needs its client key"),
+        (None, device) => ClientHandshake::new(&pairing.token, request, device)?,
+    };
     let hello = publish_one(
         &link.outgoing,
         &format!("{session_id}/hello"),
@@ -845,6 +852,70 @@ pub async fn intake(
             // The request is bound into the transcript, so a relay cannot
             // move a hello between the session and signalling paths.
             if signalling != (hello.request == crate::p2p::SIGNAL_REQUEST) {
+                return;
+            }
+            // A ticket hello: no stored credential to identify; the sealed
+            // ticket in the confirmation authorizes the session (docs/tickets.md).
+            if hello.ticket {
+                if signalling || !access.tickets_enabled() {
+                    tracing::warn!("rejected a relayed ticket hello (signalling, or no trusted issuer)");
+                    return;
+                }
+                let Ok((reply, pending)) = identity.respond(&hello, &e2e::TICKET_HELLO) else {
+                    return;
+                };
+                let Ok(reply) = serde_json::to_vec(&reply) else {
+                    return;
+                };
+                let Ok(reply) =
+                    publish_one(&outgoing, &format!("{session_id}/reply"), reply).await
+                else {
+                    return;
+                };
+                let confirmed = tokio::time::timeout(CONFIRM_TIMEOUT, async {
+                    let broadcast = incoming
+                        .consume()
+                        .announced_broadcast(format!("{session_id}/confirm").as_str())
+                        .await
+                        .context("no confirmation")?;
+                    let objects =
+                        read_frames(&broadcast, e2e::PendingSession::TICKET_OBJECTS).await?;
+                    let objects: Vec<&[u8]> = objects.iter().map(|object| &object[..]).collect();
+                    pending.confirm_ticket(&objects, |ticket, proves| {
+                        let mut proven = None;
+                        let pairing = access.redeem_ticket(ticket, |key| {
+                            let ok = proves(key);
+                            if ok {
+                                proven = Some(*key);
+                            }
+                            ok
+                        })?;
+                        let key = proven.context("ticket key not proven")?;
+                        Ok((e2e::credential_hash(&pairing.token), key))
+                    })
+                })
+                .await;
+                let (keys, (credential, key)) = match confirmed {
+                    Ok(Ok(done)) => done,
+                    Ok(Err(error)) => {
+                        tracing::warn!(error = format!("{error:#}"), "relayed ticket refused");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!("relayed ticket client did not confirm in time");
+                        return;
+                    }
+                };
+                let _ = accepted
+                    .send(Accepted {
+                        session_id,
+                        request: hello.request,
+                        credential,
+                        device_key: Some(key.to_vec()),
+                        keys: Arc::new(keys),
+                        _reply: reply,
+                    })
+                    .await;
                 return;
             }
             let mut candidates = access.relay_credentials();

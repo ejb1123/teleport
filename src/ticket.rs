@@ -152,6 +152,24 @@ pub fn issuer_public_key(issuer_seed: &[u8; 32]) -> Result<String> {
     Ok(hex(key.public_key().as_ref()))
 }
 
+/// The host a ticket names (`aud`), read WITHOUT verifying the signature:
+/// only for a client choosing where to send it. The host verifies.
+pub fn audience(text: &str) -> Result<String> {
+    let body = text.strip_prefix(PREFIX).context("not a session ticket")?;
+    let (payload, _) = body.split_once('.').context("malformed session ticket")?;
+    let claims: Claims = serde_json::from_slice(
+        &URL_SAFE_NO_PAD
+            .decode(payload)
+            .context("malformed session ticket")?,
+    )
+    .context("malformed session ticket")?;
+    ensure!(
+        lower_hex(&claims.aud, 64),
+        "malformed session ticket audience"
+    );
+    Ok(claims.aud)
+}
+
 /// Check a ticket for the host with `fingerprint` at `now` (unix seconds).
 /// The caller still has to enforce single use of `jti` and the client's
 /// possession of `cnf`.

@@ -62,6 +62,12 @@ use subtle::ConstantTimeEq;
 const PROTOCOL: &[u8] = b"teleport-e2e-v1";
 const HOST_SIGNATURE_LABEL: &[u8] = b"teleport-e2e-v1 host transcript";
 const DEVICE_SIGNATURE_LABEL: &[u8] = b"teleport-e2e-v1 device transcript";
+/// The "credential hash" of a ticket hello: a public constant, so before the
+/// confirmation only the X25519 exchange keeps the session keys secret (the
+/// host is authenticated by its transcript signature, as always). The client
+/// is authenticated afterwards, by the sealed ticket and its `cnf` key's
+/// transcript signature ([`PendingSession::confirm_ticket`]).
+pub const TICKET_HELLO: [u8; 32] = *b"teleport-e2e-v1 ticket hello\0\0\0\0";
 /// Track key label for the client's key-confirmation objects.
 const CONFIRM_TRACK: &str = "confirm";
 /// Length of an Ed25519 public key as stored by hosts.
@@ -81,6 +87,12 @@ pub struct ClientHello {
     /// the relay, but bound into the signed transcript: a client whose
     /// request was altered rejects the host reply.
     pub request: String,
+    /// A ticket hello (`crate::ticket`, docs/tickets.md#tickets-in-the-handshake):
+    /// the credential is a session ticket the client sends SEALED in its
+    /// confirmation, so the relay never sees it. The credential identifier
+    /// is then keyed with [`TICKET_HELLO`], not a stored hash.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ticket: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -313,6 +325,10 @@ fn transcript(hello: &ClientHello, host_ephemeral: &[u8], certificate: &[u8]) ->
         context.update(&(part.len() as u32).to_be_bytes());
         context.update(part);
     }
+    // Only ticket hellos add a part, so every other transcript is unchanged.
+    if hello.ticket {
+        context.update(b"ticket");
+    }
     context
         .finish()
         .as_ref()
@@ -519,6 +535,8 @@ pub struct ClientHandshake {
     hello: ClientHello,
     credential_hash: [u8; 32],
     device: Option<DeviceKey>,
+    /// A ticket hello's ticket, sent sealed in the confirmation.
+    ticket: Option<String>,
 }
 
 /// A client's verified handshake: the session keys and the confirmation
@@ -554,13 +572,28 @@ impl ClientHandshake {
             credential_id: credential_id(&credential_hash, &ephemeral, request),
             ephemeral,
             request: request.to_owned(),
+            ticket: false,
         };
         Ok(Self {
             secret,
             hello,
             credential_hash,
             device,
+            ticket: None,
         })
+    }
+
+    /// A ticket hello: `ticket` (`tkt1...`) authorizes the session, `device`
+    /// is the client key the ticket names (`cnf`), which signs the transcript.
+    pub fn for_ticket(ticket: &str, request: &str, device: DeviceKey) -> Result<Self> {
+        ensure!(
+            ticket.starts_with(crate::ticket::PREFIX),
+            "not a session ticket"
+        );
+        let mut handshake = Self::from_hash(TICKET_HELLO, request, Some(device))?;
+        handshake.hello.ticket = true;
+        handshake.ticket = Some(ticket.to_owned());
+        Ok(handshake)
     }
 
     pub fn hello(&self) -> &ClientHello {
@@ -597,6 +630,9 @@ impl ClientHandshake {
         // Sealed so the relay cannot link the signature to a device key.
         let mut sealer = keys.sealer(Direction::ClientToHost, CONFIRM_TRACK)?;
         let mut confirmation = vec![sealer.seal(0, &keys.session_id())?];
+        if let Some(ticket) = &self.ticket {
+            confirmation.push(sealer.seal(0, ticket.as_bytes())?);
+        }
         if let Some(device) = &self.device {
             confirmation.push(sealer.seal(0, &device.sign_transcript(&transcript))?);
         }
@@ -650,6 +686,50 @@ impl PendingSession {
                 .map_err(|_| anyhow!("device signature is invalid"))?;
         }
         Ok(self.keys)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PendingSession {
+    /// Objects in a ticket hello's confirmation: the session id, the
+    /// ticket and the `cnf` key's transcript signature.
+    pub const TICKET_OBJECTS: usize = 3;
+
+    /// Check a ticket hello's confirmation. `redeem` is given the ticket and
+    /// a check that a key signed this session's transcript; it must verify the
+    /// ticket (issuer, audience, lifetime, single use) and require that check
+    /// for the ticket's `cnf` key. Keys are released only if it succeeds.
+    pub fn confirm_ticket<T>(
+        self,
+        objects: &[&[u8]],
+        redeem: impl FnOnce(&str, &dyn Fn(&[u8; 32]) -> bool) -> Result<T>,
+    ) -> Result<(SessionKeys, T)> {
+        let mut opener = self
+            .keys
+            .opener(Direction::ClientToHost, CONFIRM_TRACK, Order::Strict)?;
+        let first = objects.first().context("missing key confirmation")?;
+        ensure!(
+            bool::from(opener.open(0, first)?.ct_eq(&self.keys.session_id())),
+            "key confirmation mismatch"
+        );
+        let ticket = opener.open(0, objects.get(1).context("missing session ticket")?)?;
+        let ticket = std::str::from_utf8(&ticket).context("malformed session ticket")?;
+        let proof = opener.open(
+            0,
+            objects.get(2).context("client did not sign the session")?,
+        )?;
+        ensure!(
+            proof.len() == DEVICE_SIGNATURE_LEN,
+            "malformed client signature"
+        );
+        let signed = device_signed(&self.transcript);
+        let proves = |key: &[u8; 32]| {
+            signature::UnparsedPublicKey::new(&signature::ED25519, key)
+                .verify(&signed, &proof)
+                .is_ok()
+        };
+        let granted = redeem(ticket, &proves)?;
+        Ok((self.keys, granted))
     }
 }
 
@@ -831,6 +911,58 @@ pub fn test_session() -> (SessionKeys, SessionKeys) {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    /// A ticket hello: the ticket travels only inside the sealed
+    /// confirmation, and the host learns which key signed the transcript.
+    /// A confirmation signed by another key, or naming another ticket, is
+    /// refused before any keys are released.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ticket_hellos_seal_the_ticket_and_prove_its_key() -> Result<()> {
+        let certified = rcgen::generate_simple_self_signed(vec!["teleport.local".into()])?;
+        let der = certified.cert.der().to_vec();
+        let fingerprint: String = digest::digest(&digest::SHA256, &der)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let host = HostIdentity::new(der, &certified.signing_key.serialize_der())?;
+        let ticket = "tkt1.payload.signature";
+        let run = |signer: DeviceKey, expected: [u8; 32]| -> Result<Option<String>> {
+            let client = ClientHandshake::for_ticket(ticket, "codec=h264", signer)?;
+            assert!(client.hello().ticket);
+            let hello_json = serde_json::to_string(client.hello())?;
+            assert!(!hello_json.contains("tkt1"), "the hello leaks the ticket");
+            let (reply, pending) = host.respond(client.hello(), &TICKET_HELLO)?;
+            let established = client.finish(&reply, &fingerprint)?;
+            assert_eq!(
+                established.confirmation.len(),
+                PendingSession::TICKET_OBJECTS
+            );
+            assert!(
+                established
+                    .confirmation
+                    .iter()
+                    .all(|o| !o.windows(4).any(|w| w == b"tkt1"))
+            );
+            let objects: Vec<&[u8]> = established.confirmation.iter().map(Vec::as_slice).collect();
+            Ok(pending
+                .confirm_ticket(&objects, |seen, proves| {
+                    ensure!(proves(&expected), "the ticket's key did not sign");
+                    Ok(seen.to_owned())
+                })
+                .ok()
+                .map(|(_, seen)| seen))
+        };
+        let (key, _) = DeviceKey::generate()?;
+        let public = key.public_key();
+        assert_eq!(run(key, public)?.as_deref(), Some(ticket));
+        let (other, _) = DeviceKey::generate()?;
+        assert_eq!(run(other, public)?, None);
+        // Not a ticket.
+        assert!(ClientHandshake::for_ticket("nope", "", DeviceKey::generate()?.0).is_err());
+        Ok(())
+    }
 
     struct Fixture {
         host: HostIdentity,

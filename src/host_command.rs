@@ -211,7 +211,8 @@ async fn exchange(
         if relayed {
             let endpoint = target.relay.as_ref().context("no relay configured")?;
             let relay =
-                crate::relay::client(endpoint, &pairing, url.query().unwrap_or_default()).await?;
+                crate::relay::client(endpoint, &pairing, url.query().unwrap_or_default(), None)
+                    .await?;
             let (incoming, session) = (relay.incoming.clone(), relay.link.session.clone());
             Ok::<_, anyhow::Error>((incoming, session, Some(relay)))
         } else {

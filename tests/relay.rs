@@ -1324,3 +1324,88 @@ fn a_redeem_link_opens_one_relayed_session() {
         String::from_utf8_lossy(&again.stderr)
     );
 }
+
+/// `teleport client --ticket-file --key-file`: the ticket rides sealed in
+/// the relayed handshake (no TCP or TLS redemption), signed with the key it
+/// names. One session per ticket; a ticket for another host, or presented
+/// with another key, gets nothing.
+fn ticket_client(setup: &Setup, ticket: &str, key: &std::path::Path, name: &str) -> Output {
+    let ticket_file = setup.temp.path().join(format!("{name}.hello-ticket"));
+    std::fs::write(&ticket_file, ticket).unwrap();
+    teleport()
+        .args(["client", "127.0.0.1:9", "--ticket-file"])
+        .arg(&ticket_file)
+        .arg("--key-file")
+        .arg(key)
+        .args(["--relay", &setup.relay_url])
+        .args(["--relay-fingerprint", &setup.relay_fingerprint])
+        .args(["--relay-key", RELAY_KEY])
+        .args(["--headless-frames", "30", "--software-decoder"])
+        .env_remove("TELEPORT_RELAY_KEY")
+        .output()
+        .unwrap()
+}
+
+#[test]
+#[ignore = "requires local UDP sockets and GStreamer plugins"]
+fn a_ticket_in_the_handshake_opens_one_relayed_session() {
+    let keys = tempfile::tempdir().unwrap();
+    let issuer = ticket_keygen("issuer-keygen", &keys.path().join("issuer"));
+    let client_key = ticket_keygen("client-keygen", &keys.path().join("client"));
+    ticket_keygen("client-keygen", &keys.path().join("thief"));
+    let setup = setup_with(
+        &[],
+        &[
+            "--ticket-issuer-key",
+            &issuer,
+            "--ticket-approval",
+            "issuer",
+        ],
+    );
+    let fingerprint = host_fingerprint(&setup);
+    let ticket = sign_ticket(&keys.path().join("issuer"), &fingerprint, &client_key);
+
+    let output = ticket_client(&setup, &ticket, &keys.path().join("client"), "first");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("SMOKE PASS"),
+        "ticket-hello session failed: {stdout}{}\nhost log:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        host_log(&setup)
+    );
+    assert!(host_log(&setup).contains("session ticket redeemed"));
+    // The relay never saw the ticket: hellos carry only a flag.
+    assert!(
+        !std::fs::read_to_string(setup.temp.path().join("relay.log"))
+            .unwrap_or_default()
+            .contains(&ticket)
+    );
+
+    let refused = |output: Output| !String::from_utf8_lossy(&output.stdout).contains("SMOKE PASS");
+    // Replayed.
+    assert!(refused(ticket_client(
+        &setup,
+        &ticket,
+        &keys.path().join("client"),
+        "replay"
+    )));
+    // A good ticket with another key.
+    let fresh = sign_ticket(&keys.path().join("issuer"), &fingerprint, &client_key);
+    assert!(refused(ticket_client(
+        &setup,
+        &fresh,
+        &keys.path().join("thief"),
+        "thief"
+    )));
+    // A ticket for another host (aud), sent to this one.
+    let other = sign_ticket(&keys.path().join("issuer"), &"ab".repeat(32), &client_key);
+    let output = ticket_client(&setup, &other, &keys.path().join("client"), "other");
+    assert!(refused(output));
+    // Control: the fresh ticket still works with its own key.
+    let output = ticket_client(&setup, &fresh, &keys.path().join("client"), "control");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("SMOKE PASS"),
+        "control failed: {}",
+        host_log(&setup)
+    );
+}
