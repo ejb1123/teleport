@@ -224,3 +224,45 @@ times (present to present). Window close logs a `frame pacing summary`;
 headless runs report `frame_time_*_us` and `paced_held_*_us`, which
 `tests/network.rs` prints as `PACE` lines (`wifi_like_link` against
 `wifi_like_link_with_smooth_pacing`).
+
+## Recording metrics
+
+`teleport client --record-metrics` (launcher: **Advanced → Metrics:
+recording**) writes the numbers F8 shows to a file, once a second, for the
+whole session. Review it later with `teleport metrics`, or attach it to a
+bug report. Nothing is sent anywhere, and nothing in the file identifies
+the host or you: no address, desktop name, fingerprint, account or pixels.
+
+Status: development (2026-11). Covered by `tests/metrics.rs` (ignored; it
+needs UDP sockets).
+
+Each session is one file, named after its start time, in
+`$XDG_STATE_HOME/teleport/metrics` (`~/.local/state/teleport/metrics`; on
+macOS `~/Library/Application Support/Teleport/metrics`), mode 0600, or in
+the directory `--metrics-dir DIR` names. Lines are JSON objects, flushed as
+they are written, so a crash loses at most the last one:
+
+| `record` | When | Fields |
+|---|---|---|
+| `session` | first | `at` (UTC), `version`, `os`, `arch`, `transport` (`direct`, `relay`, `p2p`), `headless`, `source` (the host's capture source) |
+| `stream` | whenever it changes | `codec`, `dynamic_range`, `width`, `height`, `fps`, `bitrate_kbps`, `decoder`, `encoder` (the host's), `renderer` (the local GPU or software renderer) |
+| `sample` | once a second | `t` (seconds), `received_fps`, `decoded_fps`, `displayed_fps`, `video_mbps`, `rtt_ms`, `queue_delay_ms`, `decode_us`, `host_encode_us`, `skipped_groups`, `decoder_recoveries`, `decode_errors`, `stale_frames`, `stall_ms` (that second's deltas and rates), `e2e_us` (recent-window p50/p95 per stage, `null` without host frame timing), `warnings` (raised that second) |
+| `summary` | last | `reason` (`closed`, `reconnect`, `error`), totals of the counters, `e2e_us` over the whole run, `frame_time_us` (`mean`, `sd`, `p95`), `warnings` |
+
+The meanings are the F8 table's above. A session that ends in an error
+still gets a summary (`reason: error`); one that is killed has none.
+
+```sh
+teleport metrics ls                     # sessions, newest first
+teleport metrics show                   # the latest: stream, summary, worst seconds
+teleport metrics show FILE --worst 10
+teleport metrics export report.jsonl --last 3   # one file to attach to an issue
+```
+
+`show` lists the seconds with lost video, decoder resets, warnings or
+stalls of 500 ms or more, worst first (capture-to-present p95 breaks ties),
+so the moment a session stuttered is easy to find. `export` concatenates
+sessions and tags each line with its
+`session`; read it before attaching it. Submitting recordings is by hand,
+through a GitHub issue, which is also where to say what the session felt
+like at the times the file shows.

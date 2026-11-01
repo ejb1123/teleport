@@ -203,7 +203,7 @@ const SETTINGS_TABS: [(&str, &[usize]); 4] = [
     ("Display", &[0, 1, 2, 4, 9, 14, 20, 21]),
     ("Input", &[10, 18, 19, 15, 22, 23]),
     ("Audio & sharing", &[6, 17, 16, 5, 7]),
-    ("Advanced", &[3, 8, 11, 13, 12]),
+    ("Advanced", &[3, 8, 11, 13, 12, 24]),
 ];
 
 /// A setting button's place on its tab: three per row under the tabs;
@@ -409,7 +409,7 @@ fn approval_confirm_rect() -> Rect {
 }
 
 /// Connection settings buttons shown (the rest of the grid stays empty).
-const PREF_BUTTONS: usize = 24;
+const PREF_BUTTONS: usize = 25;
 /// The settings caption's top; the grid starts below it.
 const PREF_CAPTION_Y: i32 = 390;
 /// Top of the status panel, which the grid must stay above.
@@ -598,6 +598,8 @@ pub fn run() -> Result<()> {
     let mut mute = false;
     // On-screen network, decoder and host warnings (`--no-warnings` when off).
     let mut overlay_warnings = true;
+    // Record each session's metrics to a file (`--record-metrics`).
+    let mut record_metrics = false;
     // Frame pacing: lowest latency (default) or smooth (`--pacing smooth`).
     let mut smooth_pacing = false;
     let mut agent_consent = AgentConsent::default();
@@ -1259,6 +1261,9 @@ pub fn run() -> Result<()> {
                                 if hit(pref_rect(settings_tab, 23), x, y) {
                                     scroll_speed = (scroll_speed + 1) % SCROLL_SPEED.len();
                                 }
+                                if hit(pref_rect(settings_tab, 24), x, y) {
+                                    record_metrics = !record_metrics;
+                                }
                                 if hit(pref_rect(settings_tab, 9), x, y) {
                                     stream.vsync = !stream.vsync;
                                 }
@@ -1491,6 +1496,9 @@ pub fn run() -> Result<()> {
                         }
                         if !overlay_warnings {
                             command.arg("--no-warnings");
+                        }
+                        if record_metrics {
+                            command.arg("--record-metrics");
                         }
                         if smooth_pacing {
                             command.args(["--pacing", "smooth"]);
@@ -2001,6 +2009,11 @@ pub fn run() -> Result<()> {
                             TEN_BIT[ten_bit].0,
                             SCROLL_DIRECTION[scroll_direction].0,
                             SCROLL_SPEED[scroll_speed].0,
+                            if record_metrics {
+                                "Metrics: recording"
+                            } else {
+                                "Metrics off"
+                            },
                         ];
                         for (tab, (name, _)) in SETTINGS_TABS.iter().enumerate() {
                             ui.button(
