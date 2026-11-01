@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Lint the macOS (aarch64-apple-darwin) build from Linux, without a Mac or the
-# macOS SDK, with the same command CI runs on macos-14:
+# macOS SDK, with the same command CI runs on macos-15:
 # `cargo clippy --locked --all-targets -- -D warnings`. Catches
 # name-resolution and type errors in Rust code that only compiles on macOS,
 # and code that only the Linux host uses (dead on macOS). It does not link,

@@ -16,7 +16,7 @@ the full commands. Keep host and client on the same revision.
 ## macOS client
 
 Without a Mac, `tools/check-macos.sh` lints the macOS build from Linux with
-the command CI runs on macos-14 (`cargo clippy -Zbuild-std --target
+the command CI runs on macos-15 (`cargo clippy -Zbuild-std --target
 aarch64-apple-darwin --all-targets -- -D warnings`, so the unit tests `nix
 build` runs are included; C code stubbed). It catches Rust code that only
 breaks on macOS, such as Linux-only items used from cross-platform code, and

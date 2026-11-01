@@ -60,7 +60,7 @@ Open work as of 2026-10-18. Parsec gap numbers (G…) refer to
 - **First release run.** `.github/workflows/release.yml` (tag `v*`) has
   been checked with actionlint and its package tests run locally in the same
   containers, but it has never run on GitHub: the Flatpak and macOS jobs
-  (macos-14, macos-15-intel) in particular. Pushing it needs a token with the
+  (macos-15, macos-15-intel) in particular. Pushing it needs a token with the
   `workflow` scope; signed and notarised Mac builds need the Apple secrets
   (distribution.md, "Release artifacts").
 - **Publishing outside GitHub** (distribution.md):
