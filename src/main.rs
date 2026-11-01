@@ -11,6 +11,8 @@ mod congestion;
 mod discovery;
 mod docs;
 mod e2e;
+#[cfg(target_os = "linux")]
+mod events;
 mod ffmpeg;
 mod fullscreen;
 #[cfg(target_os = "linux")]

@@ -143,6 +143,15 @@ pub struct Options {
     /// obtained consent (its sessions also stay when no owner is connected).
     #[arg(long, value_enum, default_value_t = TicketApproval::Local, requires = "ticket_issuer_keys")]
     pub ticket_approval: TicketApproval,
+    /// Append host events (ready, sessions joining and leaving, refusals,
+    /// exit) to this file as JSON lines, for a supervisor that started the
+    /// host (docs/supervision.md). Created 0640.
+    #[arg(long)]
+    pub events_file: Option<PathBuf>,
+    /// Exit (status 0) when the session engine ends: the last session left
+    /// or failed. For hosts started per session by a supervisor.
+    #[arg(long)]
+    pub exit_after_session: bool,
     /// Opt in to saving/restoring compositor permissions (approval may still be required).
     #[arg(long)]
     pub restore_token: Option<PathBuf>,
@@ -358,6 +367,9 @@ pub struct HardwareFormats {
 }
 
 pub async fn run(mut options: Options) -> Result<()> {
+    if let Some(path) = &options.events_file {
+        crate::events::open(path)?;
+    }
     if let Some(helper) = &options.system_auth_helper {
         crate::system_pam::validate_helper(helper)?;
         ensure!(
@@ -576,6 +588,13 @@ async fn serve(options: &Options, idle: &mut Option<Capture>) -> Result<()> {
         crate::identity::write_new(pairing_path, &serde_json::to_vec_pretty(&pairing)?)?;
     }
     tracing::info!(address = %server.local_addr()?, pairing_file = %pairing_path.display(), "Host ready; use saved trust, a --pair code, or securely import the pairing file. UDP port must be reachable.");
+    crate::events::emit(
+        "ready",
+        serde_json::json!({
+            "fingerprint": pairing.fingerprint,
+            "address": server.local_addr()?.to_string(),
+        }),
+    );
     let access = options
         .identity_dir
         .as_deref()
@@ -702,6 +721,10 @@ async fn serve(options: &Options, idle: &mut Option<Capture>) -> Result<()> {
             match crate::relay::connect_host(endpoint, &relay_namespace).await {
                 Ok(link) => {
                     tracing::info!(relay = %endpoint.display_url(), namespace = %relay_namespace, "connected to relay; accepting end-to-end encrypted sessions");
+                    crate::events::emit(
+                        "relay_connected",
+                        serde_json::json!({"relay": endpoint.display_url().to_string(), "namespace": relay_namespace}),
+                    );
                     // Signed "online" statements for launchers (see presence.rs).
                     let presence = tokio::spawn(crate::presence::publish(
                         link.outgoing.clone(),
@@ -836,6 +859,12 @@ async fn serve(options: &Options, idle: &mut Option<Capture>) -> Result<()> {
                         Err(error) => tracing::warn!(error = format!("{error:#}"), "could not lock the desktop"),
                     }
                 }
+                if options.exit_after_session {
+                    tracing::info!("the session ended; exiting (--exit-after-session)");
+                    crate::events::emit("exiting", serde_json::json!({"reason": "the session ended"}));
+                    *idle = Some(capture);
+                    break;
+                }
                 *idle = Some(capture);
                 joins = Some(receiver);
                 continue;
@@ -857,6 +886,7 @@ async fn serve(options: &Options, idle: &mut Option<Capture>) -> Result<()> {
                 continue;
             }
             _ = &mut shutdown => {
+                crate::events::emit("exiting", serde_json::json!({"reason": "shutdown"}));
                 if let Some(running) = engine.take() {
                     hub.poke(crate::guests::Command::Shutdown);
                     let exit = running.await;
@@ -1157,6 +1187,10 @@ async fn admit(
         guest && !approval && !member.role.preapproved && hub.policy.kick_guests_with_owner;
     if approval {
         tracing::info!(session = member.id, guest = %member.role.name, "guest asks to join; waiting for approval");
+        crate::events::emit(
+            "approval_requested",
+            serde_json::json!({"session": member.id, "name": member.role.name}),
+        );
         // The guest leaving withdraws its request.
         let departure = member.departure();
         let gone = async move {
@@ -1174,6 +1208,10 @@ async fn admit(
         // Revoked while it waited: never admitted.
         if outcome != Approval::Allowed || member.current_role().is_none() {
             tracing::info!(session = member.id, guest = %member.role.name, ?outcome, "guest not admitted");
+            crate::events::emit(
+                "session_refused",
+                serde_json::json!({"session": member.id, "name": member.role.name, "reason": format!("{outcome:?}")}),
+            );
             member.close();
             return;
         }
@@ -1844,6 +1882,10 @@ impl Members {
         }
         capture.destroy_pads(session.pad_block);
         tracing::info!(session = id, name = %session.role.name, role = session.role.role.label(), transport = session.member.kind, reason, "session left");
+        crate::events::emit(
+            "session_left",
+            serde_json::json!({"session": id, "name": session.role.name, "reason": reason}),
+        );
         // Its streams stop now; the first session's broadcast (holding the
         // shared tracks) stays with the engine.
         session.tasks.clear();
@@ -2101,6 +2143,10 @@ impl Members {
     ) -> Option<crate::guests::SessionId> {
         let refuse = |member: Member, reason: &str| {
             tracing::warn!(session = member.id, name = %member.role.name, reason, "session refused");
+            crate::events::emit(
+                "session_refused",
+                serde_json::json!({"session": member.id, "name": member.role.name, "reason": reason}),
+            );
             member.close();
             None
         };
@@ -2241,6 +2287,16 @@ impl Members {
             }
         }
         tracing::info!(session = id, name = %role.name, role = role.role.label(), permissions = %role.permissions.label(), transport = self.sessions[&id].member.kind, "session joined the shared desktop");
+        crate::events::emit(
+            "session_joined",
+            serde_json::json!({
+                "session": id,
+                "name": role.name,
+                "role": role.role.label(),
+                "permissions": role.permissions.label(),
+                "transport": self.sessions[&id].member.kind,
+            }),
+        );
         if !role.is_owner() {
             self.notice_owners(&format!(
                 "{} joined as a guest ({})",
@@ -2458,6 +2514,16 @@ async fn run_session(
         );
         members.order.push(first_id);
         tracing::info!(session = first_id, name = %role.name, role = role.role.label(), "session started the desktop");
+        crate::events::emit(
+            "session_joined",
+            serde_json::json!({
+                "session": first_id,
+                "name": role.name,
+                "role": role.role.label(),
+                "permissions": role.permissions.label(),
+                "transport": members.sessions[&first_id].member.kind,
+            }),
+        );
         members.publish(hub);
         members.sync_approvals(hub);
     }

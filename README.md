@@ -86,6 +86,7 @@ Detailed walkthroughs follow below.
 | Pairing, accounts, Linux login | [pairing](docs/pairing.md), [access](docs/access.md), [system login](docs/system-login.md) |
 | Guests and shared sessions | [guests](docs/guests.md) |
 | Session tickets from your own issuer | [tickets](docs/tickets.md) |
+| Running a host from a supervisor | [supervision](docs/supervision.md) |
 | Relay, peer-to-peer, Cloudflare | [relay](docs/relay.md) |
 | Codecs, zero-copy, AV1/4:4:4/10-bit | [ffmpeg](docs/ffmpeg.md), [hdr](docs/hdr.md) |
 | Performance and latency | [performance](docs/performance.md) |
