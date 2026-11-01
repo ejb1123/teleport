@@ -1,0 +1,11 @@
+# The one moq-native function src/e2e.rs uses (`tls::parse_fingerprint`),
+# without moq-native's QUIC stack, which does not target wasm32.
+[package]
+name = "teleport-fingerprint"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[dependencies]
+anyhow = "1"

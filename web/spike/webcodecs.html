@@ -1,0 +1,72 @@
+<!doctype html><meta charset="utf-8"><title>webcodecs spike</title>
+<script>
+// Records from dump_h264_access_units_for_the_browser_spike: key flag, u32 BE length, frame.
+function parse(buf) {
+  const v = new DataView(buf), out = [];
+  for (let i = 0; i < buf.byteLength;) {
+    const key = v.getUint8(i) === 1, n = v.getUint32(i + 1);
+    out.push({ key, data: new Uint8Array(buf, i + 5, n) }); i += 5 + n;
+  }
+  return out;
+}
+// Decode `units` as Teleport sends them (Annex B, no description); count frames.
+async function decode(units, codec) {
+  let frames = 0, errors = [];
+  const d = new VideoDecoder({ output: (f) => { frames++; f.close(); }, error: (e) => errors.push(e.message) });
+  try {
+    d.configure({ codec, optimizeForLatency: true });
+    units.forEach((u, i) => d.decode(new EncodedVideoChunk({ type: u.key ? "key" : "delta", timestamp: i * 33333, data: u.data })));
+    await d.flush();
+  } catch (e) { errors.push(e.message || String(e)); }
+  try { d.close(); } catch (_) {}
+  return { frames, errors };
+}
+// Annex B -> AVC (length-prefixed NAL units) with an avcC description built
+// from the first SPS and PPS: the format some WebCodecs builds require.
+function nals(data) {
+  const out = []; let i = 0, start = -1;
+  while (i + 3 <= data.length) {
+    const sc4 = data[i] === 0 && data[i+1] === 0 && data[i+2] === 0 && data[i+3] === 1;
+    const sc3 = data[i] === 0 && data[i+1] === 0 && data[i+2] === 1;
+    if (sc3 || sc4) { if (start >= 0) out.push(data.subarray(start, i)); i += sc4 ? 4 : 3; start = i; } else i++;
+  }
+  if (start >= 0) out.push(data.subarray(start));
+  return out;
+}
+function toAvc(units) {
+  let sps, pps;
+  const chunks = units.map((u) => {
+    const parts = nals(u.data).filter((n) => { const t = n[0] & 31; if (t === 7) sps ??= n; if (t === 8) pps ??= n; return t !== 7 && t !== 8; });
+    const len = parts.reduce((a, n) => a + 4 + n.length, 0), buf = new Uint8Array(len), v = new DataView(buf.buffer);
+    let o = 0; for (const n of parts) { v.setUint32(o, n.length); buf.set(n, o + 4); o += 4 + n.length; }
+    return { key: u.key, data: buf };
+  });
+  const d = [1, sps[1], sps[2], sps[3], 0xff, 0xe1, sps.length >> 8, sps.length & 255, ...sps, 1, pps.length >> 8, pps.length & 255, ...pps];
+  return { chunks, description: new Uint8Array(d) };
+}
+async function decodeAvc(units, codec) {
+  const { chunks, description } = toAvc(units);
+  let frames = 0, errors = [];
+  const d = new VideoDecoder({ output: (f) => { frames++; f.close(); }, error: (e) => errors.push(e.message) });
+  try {
+    d.configure({ codec, description, optimizeForLatency: true });
+    chunks.forEach((u, i) => d.decode(new EncodedVideoChunk({ type: u.key ? "key" : "delta", timestamp: i * 33333, data: u.data })));
+    await d.flush();
+  } catch (e) { errors.push(e.message || String(e)); }
+  try { d.close(); } catch (_) {}
+  return { frames, errors };
+}
+window.runDecode = async () => {
+  const units = parse(await (await fetch("h264.bin")).arrayBuffer());
+  const sps = units[0].data[4 + 1].toString(16).padStart(2, "0") + units[0].data[4 + 2].toString(16).padStart(2, "0") + units[0].data[4 + 3].toString(16).padStart(2, "0");
+  const codec = "avc1." + sps;
+  const support = await VideoDecoder.isConfigSupported({ codec });
+  const good = await decode(units, codec);
+  // Corrupt keyframe: keep the start code, overwrite the rest with noise.
+  const bad = units.map((u) => ({ key: u.key, data: u.data.slice() }));
+  for (let i = 4; i < bad[0].data.length; i++) bad[0].data[i] = (i * 151 + 7) & 0xff;
+  const corrupt = await decode(bad.slice(0, 1), codec);
+  const avc = await decodeAvc(units, codec);
+  return { codec, supported: support.supported, units: units.length, keys: units.filter((u) => u.key).length, good, corrupt, avc };
+};
+</script>

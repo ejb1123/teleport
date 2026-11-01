@@ -1,0 +1,26 @@
+# Teleport's end-to-end layer (src/e2e.rs, compiled from the same file) for
+# the browser client: wasm32-unknown-unknown through wasm-bindgen.
+# Spike (docs/design/self-hosted-remote-support.md §7.3): client handshake
+# and object opening, checked against the native known-answer vector.
+[package]
+name = "teleport-e2e-wasm"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1"
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+serde = { version = "1", features = ["derive"] }
+subtle = "2"
+zeroize = "1"
+wasm-bindgen = "=0.2.127"
+x509-parser = "0.18"
+moq_native = { package = "teleport-fingerprint", path = "fingerprint" }
+
+# Its own workspace: the native application does not build it.
+[workspace]
