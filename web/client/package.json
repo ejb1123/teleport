@@ -1,0 +1,20 @@
+{
+  "name": "@teleport/web",
+  "version": "0.1.0",
+  "description": "Open a Teleport remote desktop session in the browser (view only): WebTransport, end-to-end encryption in WebAssembly, WebCodecs.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "main": "dist/teleport-web.js",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@moq/net": "0.3.5"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vitest": "3.2.4"
+  }
+}

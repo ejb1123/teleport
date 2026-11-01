@@ -1,0 +1,4 @@
+node_modules/
+wasm/
+# a directory, or the result symlink test/run.sh makes
+dist
