@@ -247,6 +247,15 @@ pub struct Options {
     /// degrades (they are still logged).
     #[arg(long)]
     pub no_warnings: bool,
+    /// Record this session's metrics (the F8 numbers, once a second) to a
+    /// file for later review with `teleport metrics`
+    /// (performance.md#recording-metrics). Nothing is sent anywhere.
+    #[arg(long)]
+    pub record_metrics: bool,
+    /// Record to DIR instead of the standard directory (implies
+    /// --record-metrics).
+    #[arg(long, value_name = "DIR")]
+    pub metrics_dir: Option<PathBuf>,
     /// Which pad the host emulates for each local controller: `auto` (a
     /// DualShock 4 or DualSense for PlayStation controllers, otherwise an
     /// Xbox 360 pad), `xbox`, `ds4` or `dualsense`. Hosts without
@@ -1801,6 +1810,24 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
         send(&events, outgoing.event)?;
         negotiation.sent(local_display);
     }
+    // `--record-metrics`: one file for this session (docs/performance.md,
+    // "Recording metrics"). Dropped unfinished, it still gets a summary.
+    let mut recorder = if options.record_metrics || options.metrics_dir.is_some() {
+        let session = crate::metrics::Session {
+            transport: session_path.as_str(),
+            headless: options.headless_frames.is_some(),
+            source: &desktop.source,
+        };
+        match crate::metrics::Recorder::start(options.metrics_dir.as_deref(), session) {
+            Ok(recorder) => Some(recorder),
+            Err(error) => {
+                tracing::warn!(error = format!("{error:#}"), "not recording metrics");
+                None
+            }
+        }
+    } else {
+        None
+    };
     if let Some(frames) = options.headless_frames {
         ensure!(frames > 0, "headless frame count must be positive");
         // Long network-condition runs get ~3x real time at 30 FPS.
@@ -2279,9 +2306,28 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             if count > 0 && last_health.elapsed() >= Duration::from_secs(1) {
                 last_health = Instant::now();
                 let sample = health.sample(&stream_stats, &desktop, host_encode_us, &host_encoder);
-                for text in warnings.observe(&sample, last_health) {
+                let raised = warnings.observe(&sample, last_health);
+                for text in &raised {
                     warning_count += 1;
                     tracing::warn!(%text, "session warning");
+                }
+                if let Some(recorder) = recorder.as_mut() {
+                    recorder.stream(stream_description(
+                        &desktop,
+                        &stream_stats,
+                        &host_encoder,
+                        "headless",
+                    ));
+                    recorder.second(crate::metrics::Second {
+                        snapshot: &stream_stats.snapshot(),
+                        displayed_frames: count as u64,
+                        rtt: probe_rtts.last().copied(),
+                        queue_delay_ms: sample.queue_delay_ms,
+                        host_encode_us,
+                        stall_ms: sample.stall_ms,
+                        e2e: (!e2e_latency.is_empty()).then(|| e2e_latency.percentiles(false)),
+                        warnings: &raised,
+                    });
                 }
             }
             // Wake for the next paced frame on time.
@@ -2409,6 +2455,17 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             decoder = %stream_stats.decoder.lock().unwrap(),
             "SMOKE PASS: authenticated MoQ video decoded"
         );
+        if let Some(recorder) = recorder.take() {
+            recorder.finish(crate::metrics::Summary {
+                snapshot: &snapshot,
+                displayed_frames: count as u64,
+                e2e: (e2e_latency.frames() > 0).then(|| e2e_latency.percentiles(true)),
+                e2e_frames: e2e_latency.frames(),
+                frame_time_us: pace.frame_time_us(),
+                warnings: warning_count,
+                reason: "closed",
+            });
+        }
         return Ok(false);
     }
     let (sdl, video, mut canvas) = window_state.take().context("session window missing")?;
@@ -2535,6 +2592,7 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     let mut frame_latency: Option<crate::stats::FrameLatency> = None;
     // G22: on-screen warnings and the F8 graph.
     let mut warnings = crate::overlay::Warnings::new(!options.no_warnings);
+    let mut warning_count = 0_usize;
     let mut health = HealthSampler::default();
     let mut graph = crate::overlay::Graph::default();
     let mut last_video_present: Option<Instant> = None;
@@ -3825,8 +3883,28 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
             ];
             if total_frames > 0 {
                 let sample = health.sample(&stream_stats, &desktop, host_encode_us, &host_encoder);
-                for text in warnings.observe(&sample, Instant::now()) {
+                let raised = warnings.observe(&sample, Instant::now());
+                for text in &raised {
+                    warning_count += 1;
                     tracing::warn!(%text, "session warning");
+                }
+                if let Some(recorder) = recorder.as_mut() {
+                    recorder.stream(stream_description(
+                        &desktop,
+                        &stream_stats,
+                        &host_encoder,
+                        &graphics_name,
+                    ));
+                    recorder.second(crate::metrics::Second {
+                        snapshot: &snapshot,
+                        displayed_frames: total_frames as u64,
+                        rtt,
+                        queue_delay_ms: sample.queue_delay_ms,
+                        host_encode_us,
+                        stall_ms: sample.stall_ms,
+                        e2e: (!e2e_latency.is_empty()).then(|| e2e_latency.percentiles(false)),
+                        warnings: &raised,
+                    });
                 }
             }
             stats = Instant::now();
@@ -4298,6 +4376,17 @@ fn run_session(options: &Options, runtime: &Runtime, link: Link) -> Result<bool>
     }
     present_timer.log();
     log_end_to_end(&e2e_latency, &clock);
+    if let Some(recorder) = recorder.take() {
+        recorder.finish(crate::metrics::Summary {
+            snapshot: &stream_stats.snapshot(),
+            displayed_frames: total_frames as u64,
+            e2e: (e2e_latency.frames() > 0).then(|| e2e_latency.percentiles(true)),
+            e2e_frames: e2e_latency.frames(),
+            frame_time_us: pace.frame_time_us(),
+            warnings: warning_count,
+            reason: if reconnect { "reconnect" } else { "closed" },
+        });
+    }
     let (frame_time_mean_us, frame_time_sd_us, frame_time_p95_us) = pace.frame_time_us();
     let (held_p50_us, held_p95_us) = pace.held_us();
     tracing::info!(
@@ -4494,6 +4583,26 @@ impl HealthSampler {
             stall_ms: stall_us / 1000,
             stall_late_ms: late_us.map(|late| late / 1000),
         }
+    }
+}
+
+/// The stream as a metrics file describes it (`metrics::Recorder::stream`).
+fn stream_description(
+    desktop: &Desktop,
+    stats: &crate::stats::StreamStats,
+    encoder: &str,
+    renderer: &str,
+) -> crate::metrics::Stream {
+    crate::metrics::Stream {
+        codec: desktop.codec.label().to_owned(),
+        dynamic_range: desktop.dynamic_range.label().to_owned(),
+        width: desktop.width,
+        height: desktop.height,
+        fps: desktop.fps,
+        bitrate_kbps: desktop.bitrate,
+        decoder: stats.decoder.lock().unwrap().clone(),
+        encoder: encoder.to_owned(),
+        renderer: renderer.to_owned(),
     }
 }
 

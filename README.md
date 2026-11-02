@@ -89,7 +89,7 @@ Detailed walkthroughs follow below.
 | Running a host from a supervisor | [supervision](docs/supervision.md) |
 | Relay, peer-to-peer, Cloudflare | [relay](docs/relay.md) |
 | Codecs, zero-copy, AV1/4:4:4/10-bit | [ffmpeg](docs/ffmpeg.md), [hdr](docs/hdr.md) |
-| Performance and latency | [performance](docs/performance.md) |
+| Performance, latency and recording metrics | [performance](docs/performance.md) |
 | Input: cursor, scrolling, keyboard, gamepads | [cursor](docs/cursor.md), [scrolling](docs/scrolling.md), [keyboard capture](docs/keyboard-capture.md), [gamepad](docs/gamepad.md) |
 | Audio and microphone | [audio](docs/audio.md) |
 | Displays: multi-monitor, virtual, privacy | [multi-monitor](docs/multi-monitor.md), [virtual display](docs/virtual-display.md) |
@@ -329,7 +329,11 @@ not in it; `teleport host --source test --flash-on-input` and a photodiode
 or high-speed camera time input to photon. F8 opens with a rolling graph of
 frame time, latency and bitrate, and short warnings appear over the video
 when the network, decoder or host degrades (`--no-warnings` or the
-launcher's **Warnings off** hides them). `--pacing smooth` (launcher
+launcher's **Warnings off** hides them). `--record-metrics` (launcher
+**Advanced → Metrics: recording**) saves those numbers once a second to a
+local file for `teleport metrics` to review later or for you to attach to a
+bug report; nothing is sent anywhere (see
+[recording metrics](docs/performance.md#recording-metrics)). `--pacing smooth` (launcher
 **Pacing: smooth**) trades a little latency (a buffer of at most 3 frames
 or 50 ms) for frames shown at the even cadence they were captured; the
 default shows each frame as soon as it is decoded. See

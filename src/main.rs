@@ -40,6 +40,7 @@ mod launcher;
 #[cfg(target_os = "macos")]
 mod mac_scroll;
 mod media;
+mod metrics;
 mod natpmp;
 mod overlay;
 mod p2p;
@@ -181,6 +182,12 @@ enum Command {
     Ticket {
         #[command(subcommand)]
         command: ticket::Command,
+    },
+    /// Recorded session metrics (`client --record-metrics`): list, inspect
+    /// or export them (performance.md#recording-metrics).
+    Metrics {
+        #[command(subcommand)]
+        command: metrics::Command,
     },
     /// Open local host settings. Does not expose administration over the network.
     #[cfg(target_os = "linux")]
@@ -336,6 +343,7 @@ fn main() -> Result<()> {
     // Ticket keys and signing need no media and no desktop.
     let cli = match cli.command {
         Some(Command::Ticket { command }) => return ticket::run(command),
+        Some(Command::Metrics { command }) => return metrics::run(command),
         command => Cli { command },
     };
     // The privacy-mode restore paths must work with nothing but the
@@ -499,6 +507,7 @@ fn run(command: Option<Command>) -> Result<()> {
         }
         Some(Command::SecurityKey { command }) => security_key::run(command),
         Some(Command::Ticket { command }) => ticket::run(command),
+        Some(Command::Metrics { command }) => metrics::run(command),
         #[cfg(target_os = "linux")]
         Some(Command::Host(options)) => runtime.block_on(host::run(*options)),
         #[cfg(target_os = "linux")]
